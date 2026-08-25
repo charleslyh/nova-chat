@@ -1,0 +1,14 @@
+[package]
+name = "nova-conformance"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nova-core = { workspace = true }
+nova-ports = { workspace = true }
+nova-adapter-mem = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

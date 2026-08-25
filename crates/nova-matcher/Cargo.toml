@@ -1,0 +1,10 @@
+[package]
+name = "nova-matcher"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nova-core = { workspace = true }
+nova-ports = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }

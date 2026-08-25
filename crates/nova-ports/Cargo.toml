@@ -1,0 +1,10 @@
+[package]
+name = "nova-ports"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nova-core = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }

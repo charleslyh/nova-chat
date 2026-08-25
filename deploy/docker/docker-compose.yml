@@ -1,0 +1,12 @@
+services:
+  home:
+    image: scratch
+    profiles: ["full"]
+    # Skeleton only — real images added when deploy automation is wired (D17).
+    # Local verification uses `just procs`, not this file.
+
+  # Placeholder comment service to keep compose valid for `docker compose config`
+  placeholder:
+    image: alpine:3.20
+    command: ["true"]
+    profiles: ["manual"]

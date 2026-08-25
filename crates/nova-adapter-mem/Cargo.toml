@@ -1,0 +1,11 @@
+[package]
+name = "nova-adapter-mem"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nova-core = { workspace = true }
+nova-ports = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }

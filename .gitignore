@@ -1,0 +1,9 @@
+/target
+**/.env
+deploy/docker/.env
+.DS_Store
+reports/*.md
+!reports/.gitkeep
+config/.ready-*
+target/nova-procs/
+target/nova-sim/

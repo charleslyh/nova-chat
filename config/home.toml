@@ -1,0 +1,4 @@
+region = "home"
+role = "home"
+listen = "127.0.0.1:18080"
+pending_threshold = 10000

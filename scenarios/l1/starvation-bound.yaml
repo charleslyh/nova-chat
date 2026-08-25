@@ -1,0 +1,14 @@
+id: l1-starvation-bound-virtual-clock
+topology: logical-home
+oracles: [StarvationBound, AllTerminal]
+covers: [FR-2.4, D15]
+steps:
+  - action: register_worker
+    capacity: 8
+  - action: submit
+    kind: aigc_video
+    units: 4
+  - action: advance_ms
+    ms: 1000
+  - action: claim_and_complete
+    success: true

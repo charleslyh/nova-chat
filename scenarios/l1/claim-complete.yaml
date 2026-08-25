@@ -1,0 +1,12 @@
+id: l1-claim-complete
+topology: logical-home
+oracles: [NoDoubleClaim, AllTerminal, NoOversell]
+covers: [CR-1, CR-3, CR-7, FR-2.1]
+steps:
+  - action: register_worker
+    capacity: 8
+  - action: submit
+    kind: agent
+    units: 2
+  - action: claim_and_complete
+    success: true

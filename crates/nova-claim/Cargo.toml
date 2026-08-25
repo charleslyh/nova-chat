@@ -1,0 +1,12 @@
+[package]
+name = "nova-claim"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nova-core = { workspace = true }
+nova-ports = { workspace = true }
+nova-matcher = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

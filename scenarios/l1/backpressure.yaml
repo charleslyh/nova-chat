@@ -1,0 +1,6 @@
+id: l1-backpressure
+topology: logical-home
+oracles: []
+covers: [FR-21]
+steps:
+  - action: expect_backpressure

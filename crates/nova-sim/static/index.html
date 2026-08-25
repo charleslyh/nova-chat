@@ -1,0 +1,944 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Nova Sim</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --ink: #0f1c1a;
+      --muted: #5a6b67;
+      --line: #c5d2ce;
+      --paper: #e8eeec;
+      --panel: #f6f9f8;
+      --home: #0d7377;
+      --edge: #3d5a80;
+      --worker: #c45c26;
+      --ok: #1b7f4a;
+      --bad: #b42318;
+      --left-w: 500px;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; height: 100%; overflow: hidden;
+      font-family: "Outfit", system-ui, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(ellipse 80% 50% at 0% 0%, #d5eae6 0%, transparent 50%),
+        radial-gradient(ellipse 60% 40% at 100% 100%, #efe4da 0%, transparent 45%),
+        var(--paper);
+    }
+    .app {
+      height: 100%;
+      display: grid;
+      grid-template-rows: 44px 1fr;
+    }
+    .topbar {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 0.85rem;
+      border-bottom: 1px solid var(--line);
+      background: color-mix(in srgb, var(--panel) 90%, transparent);
+      backdrop-filter: blur(8px);
+    }
+    .topbar h1 { margin: 0; font-size: 1.15rem; letter-spacing: -0.03em; }
+    .topbar .hint { color: var(--muted); font-size: 0.78rem; margin-left: 0.75rem; }
+    .topbar-actions { display: flex; gap: 0.4rem; }
+    button {
+      font: inherit; cursor: pointer;
+      border: 1px solid var(--ink); background: var(--ink); color: #f4f7f6;
+      padding: 0.28rem 0.65rem; border-radius: 2px;
+    }
+    button.ghost { background: transparent; color: var(--ink); }
+    button.warn { background: #8a3b18; border-color: #8a3b18; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .layout {
+      height: 100%;
+      display: grid;
+      grid-template-columns: var(--left-w) minmax(0, 1fr);
+      gap: 0;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .left {
+      width: var(--left-w);
+      min-width: var(--left-w);
+      max-width: var(--left-w);
+      display: grid;
+      grid-template-rows: 1fr 1fr;
+      min-height: 0;
+      border-right: 1px solid var(--line);
+      overflow: hidden;
+      z-index: 2;
+      background: var(--panel);
+    }
+    .pane {
+      min-height: 0; display: flex; flex-direction: column;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      position: relative;
+      overflow: hidden;
+    }
+    .pane:last-child { border-bottom: none; }
+    .pane-h {
+      flex: 0 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0.35rem 0.55rem;
+      font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase;
+      color: var(--muted); border-bottom: 1px solid var(--line);
+    }
+    .pane-b { flex: 1; min-height: 0; overflow: auto; position: relative; }
+    #topo-pane { overflow: hidden; }
+    #topo {
+      width: 100%; height: 100%; display: none;
+      background: linear-gradient(180deg, #fff 0%, #f1f6f4 100%);
+    }
+    #topo.is-on { display: block; }
+    #topo-empty { display: none; }
+    #topo-empty.is-on { display: block; }
+    .right {
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      background: #101816;
+      color: #cfe7e1;
+      overflow: hidden;
+      z-index: 1;
+    }
+    .right .pane-h { color: #8fb3ab; border-color: #243330; }
+    .tl-toolbar {
+      display: flex; align-items: center; gap: 0.75rem;
+      font-family: "IBM Plex Mono", monospace; font-size: 0.68rem;
+      text-transform: none; letter-spacing: 0;
+    }
+    .tl-span-ctl {
+      display: flex; align-items: center; gap: 0.35rem; color: #8fb3ab;
+    }
+    .tl-span-ctl input[type="range"] {
+      width: 110px; accent-color: #3d9b8f; cursor: pointer;
+    }
+    #tl-span-label { color: #cfe7e1; min-width: 3.2rem; }
+    #timeline-wrap {
+      flex: 1; min-height: 0; min-width: 0;
+      overflow: hidden;
+      padding: 0.35rem 0.5rem 0.25rem;
+      display: flex;
+      flex-direction: column;
+    }
+    .tl-panel {
+      flex: 1; min-height: 0; min-width: 0;
+      display: grid;
+      grid-template-columns: 128px minmax(0, 1fr);
+      gap: 0;
+    }
+    .tl-labels {
+      min-height: 0; overflow: hidden;
+      border-right: 1px solid #243330;
+      background: #101816;
+    }
+    .tl-main {
+      min-height: 0; min-width: 0; overflow: hidden;
+      position: relative;
+    }
+    .tl-label-slot {
+      height: 22px;
+      border-bottom: 1px solid #243330;
+      box-sizing: border-box;
+      font-family: "IBM Plex Mono", monospace; font-size: 0.68rem;
+      padding: 0.25rem 0.4rem;
+      color: #9ec4bb; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      display: flex; align-items: center;
+    }
+    .tl-label-slot.row { height: 30px; }
+    .tl-axis {
+      height: 22px; position: relative;
+      font-family: "IBM Plex Mono", monospace; font-size: 0.58rem; color: #6a8a82;
+      border-bottom: 1px solid #243330;
+    }
+    .tl-axis span { position: absolute; transform: translateX(-50%); top: 4px; }
+    .tl-track {
+      position: relative; height: 30px;
+      border-bottom: 1px solid #243330;
+      background: repeating-linear-gradient(
+        90deg, transparent, transparent 39px, #1a2926 39px, #1a2926 40px
+      );
+    }
+    .tl-mark {
+      position: absolute; top: 5px; transform: translateX(-50%);
+      font-family: "IBM Plex Mono", monospace; font-size: 0.58rem;
+      padding: 0.1rem 0.28rem; border-radius: 2px; white-space: nowrap;
+      cursor: default; max-width: 96px; overflow: hidden; text-overflow: ellipsis;
+      z-index: 1;
+    }
+    .tl-mark.home { background: var(--home); color: #fff; }
+    .tl-mark.edge { background: var(--edge); color: #fff; }
+    .tl-mark.worker { background: var(--worker); color: #fff; }
+    #tl-minimap {
+      flex: 0 0 44px;
+      margin: 0 0.5rem 0.45rem 0.5rem;
+      position: relative;
+      border: 1px solid #243330;
+      border-radius: 2px;
+      background: #0c1412;
+      overflow: hidden;
+      cursor: pointer;
+      user-select: none;
+    }
+    #tl-minimap[hidden] { display: none !important; }
+    #tl-mm-canvas {
+      display: block; width: 100%; height: 100%;
+    }
+    #tl-mm-mask {
+      position: absolute; top: 0; bottom: 0;
+      background: rgba(61, 155, 143, 0.22);
+      border: 1px solid rgba(110, 210, 190, 0.75);
+      box-sizing: border-box;
+      pointer-events: auto;
+      cursor: grab;
+    }
+    #tl-mm-mask.dragging { cursor: grabbing; }
+    #tl-mm-range {
+      position: absolute; right: 6px; bottom: 2px;
+      font-family: "IBM Plex Mono", monospace; font-size: 0.58rem;
+      color: #6a8a82; pointer-events: none;
+    }
+    table.tasks {
+      width: 100%; border-collapse: collapse;
+      font-family: "IBM Plex Mono", monospace; font-size: 0.7rem;
+    }
+    table.tasks th, table.tasks td {
+      text-align: left; padding: 0.35rem 0.45rem;
+      border-bottom: 1px solid var(--line);
+    }
+    table.tasks th { color: var(--muted); font-weight: 500; font-size: 0.65rem; }
+    table.tasks tr:hover { background: #eef5f3; }
+    .pill {
+      display: inline-block; padding: 0.05rem 0.3rem; border-radius: 2px;
+      border: 1px solid var(--line); font-size: 0.65rem;
+    }
+    .pill.pending { color: var(--edge); }
+    .pill.claimed { color: var(--worker); }
+    .pill.succeeded { color: var(--ok); }
+    .pill.failed { color: var(--bad); }
+    .ctx {
+      position: fixed; z-index: 50; min-width: 160px;
+      background: #fff; border: 1px solid var(--ink); border-radius: 2px;
+      box-shadow: 0 8px 24px rgba(15,28,26,0.18);
+      padding: 0.25rem 0; display: none;
+    }
+    .ctx button {
+      display: block; width: 100%; text-align: left;
+      border: none; background: transparent; color: var(--ink);
+      padding: 0.4rem 0.75rem; border-radius: 0;
+    }
+    .ctx button:hover { background: #e8f2ef; }
+    .ctx .sep { height: 1px; background: var(--line); margin: 0.25rem 0; }
+    .pane-h-right { display: flex; align-items: center; gap: 0.4rem; }
+    .pane-h .mini {
+      padding: 0.15rem 0.4rem; font-size: 0.7rem;
+    }
+    .drop-wrap { position: relative; }
+    .drop-menu {
+      position: absolute; right: 0; top: calc(100% + 4px); z-index: 40;
+      min-width: 140px; display: none;
+      background: #fff; border: 1px solid var(--ink); border-radius: 2px;
+      box-shadow: 0 8px 24px rgba(15,28,26,0.18); padding: 0.25rem 0;
+    }
+    .drop-menu.open { display: block; }
+    .drop-menu button {
+      display: block; width: 100%; text-align: left;
+      border: none; background: transparent; color: var(--ink);
+      padding: 0.4rem 0.75rem; border-radius: 0; font-size: 0.78rem;
+    }
+    .drop-menu button:hover { background: #e8f2ef; }
+    .modal-bg {
+      position: fixed; inset: 0; background: rgba(15,28,26,0.35);
+      display: none; align-items: center; justify-content: center; z-index: 60;
+    }
+    .modal-bg.open { display: flex; }
+    .modal {
+      width: min(380px, 92vw); background: var(--panel);
+      border: 1px solid var(--ink); border-radius: 4px; padding: 1rem;
+      box-shadow: 0 16px 40px rgba(15,28,26,0.25);
+      animation: pop 160ms ease;
+    }
+    @keyframes pop {
+      from { opacity: 0; transform: translateY(6px) scale(0.98); }
+      to { opacity: 1; transform: none; }
+    }
+    .modal h3 { margin: 0 0 0.75rem; font-size: 1rem; }
+    .modal label {
+      display: grid; gap: 0.2rem; margin-bottom: 0.55rem;
+      font-size: 0.8rem; color: var(--muted);
+    }
+    .modal input, .modal select {
+      font: inherit; padding: 0.4rem 0.45rem;
+      border: 1px solid var(--line); border-radius: 2px; background: #fff; color: var(--ink);
+    }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 0.4rem; margin-top: 0.75rem; }
+    .toast {
+      position: fixed; right: 0.75rem; bottom: 0.75rem; z-index: 70;
+      background: #101816; color: #cfe7e1; padding: 0.5rem 0.75rem;
+      border-radius: 2px; font-size: 0.78rem; display: none;
+      font-family: "IBM Plex Mono", monospace;
+    }
+    .empty { padding: 1rem; color: var(--muted); font-size: 0.85rem; }
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; grid-template-rows: 45vh 55vh; }
+      .left {
+        width: auto; min-width: 0; max-width: none;
+        border-right: none; border-bottom: 1px solid var(--line);
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div style="display:flex;align-items:baseline">
+        <h1>Nova Sim</h1>
+        <span class="hint">右键删除节点 · Add 添加 Region/Worker</span>
+      </div>
+      <div class="topbar-actions">
+      </div>
+    </header>
+    <div class="layout">
+      <div class="left">
+        <section class="pane">
+          <div class="pane-h">
+            <span>节点拓扑</span>
+            <div class="pane-h-right">
+              <span id="topo-meta"></span>
+              <button type="button" class="ghost mini" id="btn-preset">三区预设</button>
+              <div class="drop-wrap">
+                <button type="button" class="ghost mini" id="btn-topo-add">添加</button>
+                <div class="drop-menu" id="topo-add-menu">
+                  <button type="button" data-add="region">添加 Region…</button>
+                  <button type="button" data-add="worker">添加 Worker…</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="pane-b" id="topo-pane">
+            <div class="empty is-on" id="topo-empty">暂无节点。点「三区预设」或「添加」。</div>
+            <svg id="topo" viewBox="0 0 640 360"></svg>
+          </div>
+        </section>
+        <section class="pane">
+          <div class="pane-h">
+            <span>任务列表</span>
+            <div class="pane-h-right">
+              <button type="button" class="ghost mini" id="btn-refresh">刷新</button>
+              <button type="button" class="ghost mini" id="btn-submit-pane">添加</button>
+            </div>
+          </div>
+          <div class="pane-b" id="task-pane"></div>
+        </section>
+      </div>
+      <aside class="right">
+        <div class="pane-h">
+          <span>节点动作时间线</span>
+          <div class="tl-toolbar">
+            <label class="tl-span-ctl" title="可视窗口跨度">
+              窗口
+              <input type="range" id="tl-span" min="0" max="100" value="35" />
+              <span id="tl-span-label">30s</span>
+            </label>
+            <span id="tl-meta"></span>
+          </div>
+        </div>
+        <div id="timeline-wrap"></div>
+        <div id="tl-minimap" hidden>
+          <canvas id="tl-mm-canvas"></canvas>
+          <div id="tl-mm-mask"></div>
+          <div id="tl-mm-range"></div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <div class="ctx" id="ctx"></div>
+  <div class="modal-bg" id="modal-bg"><div class="modal" id="modal"></div></div>
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let state = { regions: [], tasks: [], timeline: [], timeline_rows: [], events: [] };
+    let ctxTarget = null;
+    let tlSig = "";
+    const TL_MIN_SPAN_MS = 5_000;
+    const tlView = {
+      spanMs: 30_000,
+      startMs: 0,
+      followEnd: true,
+      spanSlider: 35,
+    };
+    let mmDrag = null;
+
+    const $ = (s) => document.querySelector(s);
+    const toast = (m) => {
+      const t = $("#toast"); t.textContent = m; t.style.display = "block";
+      clearTimeout(toast._t); toast._t = setTimeout(() => t.style.display = "none", 2600);
+    };
+
+    async function api(path, opts = {}) {
+      const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
+      return data;
+    }
+
+    async function refresh() {
+      state = await api("/api/state");
+      renderTopo();
+      renderTasks();
+      renderTimeline();
+    }
+
+    function hideCtx() { $("#ctx").style.display = "none"; ctxTarget = null; }
+    function showCtx(x, y, items) {
+      const el = $("#ctx");
+      el.innerHTML = items.map(it =>
+        it === "|" ? '<div class="sep"></div>' :
+        `<button type="button" data-act="${it.act}">${it.label}</button>`
+      ).join("");
+      el.style.display = "block";
+      el.style.left = Math.min(x, window.innerWidth - 180) + "px";
+      el.style.top = Math.min(y, window.innerHeight - 8 - items.length * 32) + "px";
+      el.querySelectorAll("button").forEach(b => {
+        b.onclick = async () => {
+          const act = b.dataset.act;
+          hideCtx();
+          try { await handleCtx(act); await refresh(); }
+          catch (e) { toast(e.message); }
+        };
+      });
+    }
+
+    async function handleCtx(act) {
+      const t = ctxTarget; if (!t) return;
+      if (t.type === "region" && act === "remove") {
+        openConfirm(`删除区域 ${t.id}？`, async () => {
+          await api(`/api/regions/${encodeURIComponent(t.id)}`, { method: "DELETE" });
+        });
+      }
+      if (t.type === "worker" && act === "remove") {
+        openConfirm(`删除 Worker ${t.id.slice(0, 8)}…？`, async () => {
+          await api(`/api/workers/${encodeURIComponent(t.id)}`, { method: "DELETE" });
+        });
+      }
+      if (t.type === "task") {
+        if (act === "copy") {
+          await navigator.clipboard.writeText(t.id);
+          toast("已复制 task id");
+        }
+        if (act === "submit") openSubmitDialog(t.via);
+      }
+    }
+
+    function hideDropMenus() {
+      document.querySelectorAll(".drop-menu.open").forEach((el) => el.classList.remove("open"));
+    }
+
+    function openConfirm(message, onOk) {
+      openModal("确认", `<p style="margin:0 0 0.5rem;color:var(--muted);font-size:0.9rem">${message}</p>`, async () => {
+        await onOk();
+      });
+    }
+
+    function openModal(title, fieldsHtml, onOk) {
+      const bg = $("#modal-bg");
+      $("#modal").innerHTML = `
+        <h3>${title}</h3>
+        <form id="modal-form">${fieldsHtml}
+          <div class="modal-actions">
+            <button type="button" class="ghost" id="modal-cancel">取消</button>
+            <button type="submit">确定</button>
+          </div>
+        </form>`;
+      bg.classList.add("open");
+      $("#modal-cancel").onclick = () => bg.classList.remove("open");
+      $("#modal-form").onsubmit = async (e) => {
+        e.preventDefault();
+        try {
+          await onOk(new FormData(e.target));
+          bg.classList.remove("open");
+          await refresh();
+        } catch (err) { toast(err.message); }
+      };
+    }
+
+    function openAddRegionDialog() {
+      openModal("添加区域", `
+        <label>区域 ID<input name="id" required placeholder="edge-d" /></label>
+        <label>角色<select name="role">
+          <option value="edge">edge（提交转发）</option>
+          <option value="home">home（权威领取）</option>
+        </select></label>
+        <label>监听（可空）<input name="listen" placeholder="127.0.0.1:18083" /></label>
+      `, async (fd) => {
+        await api("/api/regions", {
+          method: "POST",
+          body: JSON.stringify({
+            id: fd.get("id"), role: fd.get("role"),
+            listen: fd.get("listen") || null,
+          }),
+        });
+      });
+    }
+
+    function openWorkerDialog(regionId) {
+      if (!state.regions.length) {
+        toast("请先添加 Region");
+        return;
+      }
+      const opts = state.regions.map((r) =>
+        `<option value="${r.id}" ${r.id === regionId ? "selected" : ""}>${r.id} (${r.role})</option>`
+      ).join("");
+      openModal("添加 Worker", `
+        <label>挂到区域<select name="region_id" required>${opts}</select></label>
+        <label>容量<input name="capacity" type="number" min="1" value="8" /></label>
+        <label>类型偏好<select name="kind_bias">
+          <option value="agent">agent</option>
+          <option value="aigc_image">aigc_image</option>
+          <option value="aigc_video">aigc_video</option>
+        </select></label>
+        <label>执行延迟 ms<input name="work_ms" type="number" min="0" value="200" /></label>
+      `, async (fd) => {
+        const rid = fd.get("region_id");
+        await api(`/api/regions/${encodeURIComponent(rid)}/workers`, {
+          method: "POST",
+          body: JSON.stringify({
+            capacity: Number(fd.get("capacity")),
+            kind_bias: fd.get("kind_bias"),
+            work_ms: Number(fd.get("work_ms")),
+          }),
+        });
+      });
+    }
+
+    function openSubmitDialog(preferRegion) {
+      const opts = state.regions.map(r =>
+        `<option value="${r.id}" ${r.id === preferRegion ? "selected" : ""}>${r.id} (${r.role})</option>`
+      ).join("");
+      openModal("下发任务", `
+        <label>经哪个区域<select name="region_id">${opts}</select></label>
+        <label>类型<select name="kind">
+          <option value="agent">agent</option>
+          <option value="aigc_image">aigc_image</option>
+          <option value="aigc_video">aigc_video</option>
+        </select></label>
+        <label>容量需求<input name="units" type="number" min="1" value="2" /></label>
+      `, async (fd) => {
+        const data = await api("/api/tasks", {
+          method: "POST",
+          body: JSON.stringify({
+            region_id: fd.get("region_id"),
+            kind: fd.get("kind"),
+            units: Number(fd.get("units")),
+          }),
+        });
+        toast(data.response || "ok");
+      });
+    }
+
+    function syncTopoChrome() {
+      const hasNodes = state.regions.length > 0;
+      const preset = $("#btn-preset");
+      if (preset) preset.hidden = hasNodes;
+      $("#topo-meta").textContent = hasNodes
+        ? `${state.regions.length} regions · ${state.regions.reduce((n, r) => n + r.workers.length, 0)} workers`
+        : "";
+    }
+
+    function renderTopo() {
+      const svg = $("#topo");
+      const empty = $("#topo-empty");
+      const rs = state.regions;
+      syncTopoChrome();
+      if (!rs.length) {
+        empty.classList.add("is-on");
+        svg.classList.remove("is-on");
+        svg.innerHTML = "";
+        return;
+      }
+      empty.classList.remove("is-on");
+      svg.classList.add("is-on");
+      const W = 640, H = 640;
+      svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+      const homes = rs.filter(r => r.role === "home");
+      const edges = rs.filter(r => r.role === "edge");
+      const nodes = [];
+      homes.forEach((r, i) => nodes.push({ type: "region", r, x: W * 0.5, y: 90 + i * 60 }));
+      edges.forEach((r, i) => {
+        const n = Math.max(edges.length, 1);
+        nodes.push({ type: "region", r, x: (W / (n + 1)) * (i + 1), y: 280 });
+      });
+      let html = "";
+      for (const e of edges) {
+        const from = nodes.find(n => n.r.id === e.id);
+        const to = nodes.find(n => n.r.role === "home");
+        if (from && to) {
+          html += `<line x1="${from.x}" y1="${from.y-20}" x2="${to.x}" y2="${to.y+20}" stroke="#9bb0ab" stroke-width="1.5" stroke-dasharray="4 3"/>`;
+        }
+      }
+      // workers under their region
+      for (const n of nodes) {
+        n.r.workers.forEach((w, wi) => {
+          const wx = n.x + (wi - (n.r.workers.length - 1) / 2) * 70;
+          const wy = n.y + 70;
+          html += `<line x1="${n.x}" y1="${n.y+20}" x2="${wx}" y2="${wy-14}" stroke="#c9b2a4" stroke-width="1"/>`;
+          const op = w.running ? 1 : 0.4;
+          html += `<g class="node" data-type="worker" data-id="${w.id}" opacity="${op}" style="cursor:pointer">
+            <rect x="${wx-30}" y="${wy-14}" width="60" height="28" rx="2" fill="#c45c26"/>
+            <text x="${wx}" y="${wy+3}" text-anchor="middle" fill="#fff" font-size="10" font-family="IBM Plex Mono">w:${w.id.slice(0,4)}</text>
+          </g>`;
+        });
+      }
+      for (const n of nodes) {
+        const fill = n.r.role === "home" ? "#0d7377" : "#3d5a80";
+        const op = n.r.healthy ? 1 : (n.r.server_running ? 0.55 : 0.35);
+        html += `<g class="node" data-type="region" data-id="${n.r.id}" opacity="${op}" style="cursor:pointer">
+          <rect x="${n.x-52}" y="${n.y-22}" width="104" height="44" rx="2" fill="${fill}"/>
+          <text x="${n.x}" y="${n.y-2}" text-anchor="middle" fill="#f4f7f6" font-size="13">${n.r.id}</text>
+          <text x="${n.x}" y="${n.y+14}" text-anchor="middle" fill="#d7ebe8" font-size="10" font-family="IBM Plex Mono">${n.r.role} · p${n.r.pending ?? "—"}</text>
+        </g>`;
+      }
+      svg.innerHTML = html;
+      svg.querySelectorAll(".node").forEach(g => {
+        g.addEventListener("contextmenu", (ev) => {
+          ev.preventDefault(); ev.stopPropagation();
+          const type = g.dataset.type;
+          const id = g.dataset.id;
+          ctxTarget = { type, id };
+          showCtx(ev.clientX, ev.clientY, [
+            { act: "remove", label: "删除" },
+          ]);
+        });
+      });
+    }
+
+    function renderTasks() {
+      const host = $("#task-pane");
+      if (!state.tasks.length) {
+        host.innerHTML = `<div class="empty">暂无任务。点「添加」下发。</div>`;
+        return;
+      }
+      host.innerHTML = `<table class="tasks">
+        <thead><tr><th>ID</th><th>类型</th><th>状态</th><th>via</th><th>owner</th></tr></thead>
+        <tbody>
+          ${state.tasks.map(t => `
+            <tr class="task-row" data-id="${t.id}" data-via="${t.via_region || ""}" title="右键操作">
+              <td title="${t.id}">${t.id.slice(0,8)}…</td>
+              <td>${t.kind}</td>
+              <td><span class="pill ${t.state}">${t.state}</span></td>
+              <td>${t.via_region || "—"}</td>
+              <td>${t.owner ? t.owner.slice(0,8)+"…" : "—"}</td>
+            </tr>`).join("")}
+        </tbody>
+      </table>`;
+      host.querySelectorAll(".task-row").forEach(tr => {
+        tr.addEventListener("contextmenu", (ev) => {
+          ev.preventDefault();
+          ctxTarget = { type: "task", id: tr.dataset.id, via: tr.dataset.via || undefined };
+          showCtx(ev.clientX, ev.clientY, [
+            { act: "copy", label: "复制 Task ID" },
+            { act: "submit", label: "再下一单…" },
+          ]);
+        });
+      });
+    }
+
+    function fmtDur(ms) {
+      const s = ms / 1000;
+      if (s < 10) return s.toFixed(1) + "s";
+      if (s < 60) return Math.round(s) + "s";
+      if (s < 3600) {
+        const m = Math.floor(s / 60);
+        const r = Math.round(s % 60);
+        return `${m}m${r.toString().padStart(2, "0")}s`;
+      }
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      return `${h}h${m}m`;
+    }
+
+    function tlTotalMs() {
+      const events = state.timeline || [];
+      return Math.max(1, ...events.map((e) => e.t_ms), TL_MIN_SPAN_MS);
+    }
+
+    function spanFromSlider(v, total) {
+      const t = Math.max(total, TL_MIN_SPAN_MS);
+      const min = TL_MIN_SPAN_MS;
+      const max = t;
+      const p = Math.min(100, Math.max(0, Number(v))) / 100;
+      // 对数映射：左侧细调短窗口，右侧接近全量
+      const span = min * Math.pow(max / min, p);
+      return Math.min(max, Math.max(min, span));
+    }
+
+    function sliderFromSpan(span, total) {
+      const t = Math.max(total, TL_MIN_SPAN_MS);
+      const min = TL_MIN_SPAN_MS;
+      const max = t;
+      const s = Math.min(max, Math.max(min, span));
+      if (max <= min) return 100;
+      return Math.round(100 * Math.log(s / min) / Math.log(max / min));
+    }
+
+    function clampTlView() {
+      const total = tlTotalMs();
+      tlView.spanMs = Math.min(Math.max(TL_MIN_SPAN_MS, tlView.spanMs), total);
+      if (tlView.followEnd) {
+        tlView.startMs = Math.max(0, total - tlView.spanMs);
+      } else {
+        tlView.startMs = Math.max(0, Math.min(tlView.startMs, Math.max(0, total - tlView.spanMs)));
+      }
+    }
+
+    function renderTimeline(force = false) {
+      const rows = state.timeline_rows || [];
+      const events = state.timeline || [];
+      const wrap = $("#timeline-wrap");
+      const mm = $("#tl-minimap");
+      if (!rows.length) {
+        tlSig = "empty";
+        wrap.innerHTML = `<div class="empty" style="color:#8fb3ab">启动区域后，此处按节点显示动作。</div>`;
+        mm.hidden = true;
+        $("#tl-meta").textContent = "0 events";
+        return;
+      }
+
+      const total = tlTotalMs();
+      clampTlView();
+      const start = tlView.startMs;
+      const span = tlView.spanMs;
+      const end = start + span;
+
+      $("#tl-meta").textContent = `${events.length} events · ${fmtDur(start)}–${fmtDur(end)}`;
+      $("#tl-span-label").textContent = fmtDur(span);
+      const slider = $("#tl-span");
+      if (slider && document.activeElement !== slider) {
+        slider.value = String(sliderFromSpan(span, total));
+      }
+
+      const rowKey = rows.map((r) => r.node_id + ":" + r.label).join("|");
+      const last = events.length ? events[events.length - 1] : null;
+      const sig = JSON.stringify({
+        rowKey,
+        n: events.length,
+        last,
+        start,
+        span,
+        follow: tlView.followEnd,
+      });
+      if (!force && sig === tlSig && wrap.querySelector(".tl-panel")) {
+        paintMinimap(events, total, start, span);
+        return;
+      }
+
+      const width = Math.max(280, ($(".right")?.clientWidth || 600) - 128 - 24);
+      const xOf = (t) => ((t - start) / span) * (width - 24) + 12;
+
+      let labels = `<div class="tl-label-slot"></div>`;
+      for (const row of rows) {
+        labels += `<div class="tl-label-slot row" title="${row.node_id}">${row.label}</div>`;
+      }
+
+      let axis = `<div class="tl-axis" style="width:${width}px">`;
+      const ticks = 5;
+      for (let i = 0; i <= ticks; i++) {
+        const t = start + (span * i) / ticks;
+        axis += `<span style="left:${xOf(t)}px">${fmtDur(t)}</span>`;
+      }
+      axis += `</div>`;
+
+      let tracks = "";
+      for (const row of rows) {
+        const marks = events.filter(
+          (e) => e.node_id === row.node_id && e.t_ms >= start && e.t_ms <= end
+        );
+        tracks += `<div class="tl-track" style="width:${width}px">`;
+        const byT = {};
+        for (const e of marks) {
+          const k = e.t_ms;
+          const idx = byT[k] || 0;
+          byT[k] = idx + 1;
+          const x = xOf(e.t_ms) + idx * 8;
+          const tip = `${e.action} @ ${fmtDur(e.t_ms)}${e.task_id ? " · " + e.task_id.slice(0, 8) : ""}${e.detail ? " · " + e.detail : ""}`;
+          tracks += `<span class="tl-mark ${e.node_kind}" style="left:${x}px" title="${tip.replace(/"/g, "'")}">${e.action}</span>`;
+        }
+        tracks += `</div>`;
+      }
+
+      wrap.innerHTML = `<div class="tl-panel">
+        <div class="tl-labels">${labels}</div>
+        <div class="tl-main">${axis}${tracks}</div>
+      </div>`;
+      mm.hidden = false;
+      paintMinimap(events, total, start, span);
+      tlSig = sig;
+    }
+
+    function paintMinimap(events, total, start, span) {
+      const mm = $("#tl-minimap");
+      const canvas = $("#tl-mm-canvas");
+      const mask = $("#tl-mm-mask");
+      const range = $("#tl-mm-range");
+      if (!mm || !canvas || mm.hidden) return;
+
+      const w = mm.clientWidth || 300;
+      const h = mm.clientHeight || 44;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(w * dpr);
+      canvas.height = Math.floor(h * dpr);
+      canvas.style.width = w + "px";
+      canvas.style.height = h + "px";
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+
+      const colors = { home: "#0d7377", edge: "#3d5a80", worker: "#c45c26" };
+      // lanes by kind for readability
+      for (const e of events) {
+        const x = (e.t_ms / total) * w;
+        const kind = e.node_kind || "edge";
+        const y0 = kind === "home" ? 6 : kind === "edge" ? 16 : 26;
+        ctx.fillStyle = colors[kind] || "#8fb3ab";
+        ctx.fillRect(Math.max(0, x - 1), y0, 2, 10);
+      }
+
+      const leftPct = (start / total) * 100;
+      const widthPct = Math.max(2, (span / total) * 100);
+      mask.style.left = leftPct + "%";
+      mask.style.width = widthPct + "%";
+      range.textContent = `全长 ${fmtDur(total)}`;
+    }
+
+    function setViewStartFromRatio(ratio) {
+      const total = tlTotalMs();
+      clampTlView();
+      const maxStart = Math.max(0, total - tlView.spanMs);
+      tlView.startMs = Math.max(0, Math.min(maxStart, ratio * total));
+      tlView.followEnd = tlView.startMs >= maxStart - 1;
+      renderTimeline(true);
+    }
+
+    function bindMinimap() {
+      const mm = $("#tl-minimap");
+      const mask = $("#tl-mm-mask");
+      if (!mm || !mask) return;
+
+      mask.onpointerdown = (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const total = tlTotalMs();
+        mmDrag = {
+          startX: ev.clientX,
+          originStart: tlView.startMs,
+          total,
+          span: tlView.spanMs,
+          width: mm.clientWidth,
+        };
+        mask.classList.add("dragging");
+        mask.setPointerCapture(ev.pointerId);
+        tlView.followEnd = false;
+      };
+      mask.onpointermove = (ev) => {
+        if (!mmDrag) return;
+        const dx = ev.clientX - mmDrag.startX;
+        const dMs = (dx / mmDrag.width) * mmDrag.total;
+        const maxStart = Math.max(0, mmDrag.total - mmDrag.span);
+        tlView.startMs = Math.max(0, Math.min(maxStart, mmDrag.originStart + dMs));
+        renderTimeline(true);
+      };
+      const endDrag = (ev) => {
+        if (!mmDrag) return;
+        mmDrag = null;
+        mask.classList.remove("dragging");
+        try { mask.releasePointerCapture(ev.pointerId); } catch (_) {}
+        const total = tlTotalMs();
+        tlView.followEnd = tlView.startMs >= Math.max(0, total - tlView.spanMs) - 1;
+      };
+      mask.onpointerup = endDrag;
+      mask.onpointercancel = endDrag;
+
+      mm.onclick = (ev) => {
+        if (ev.target === mask || mmDrag) return;
+        const rect = mm.getBoundingClientRect();
+        const x = ev.clientX - rect.left;
+        const total = tlTotalMs();
+        clampTlView();
+        // 点击处尽量居中到窗口
+        const center = (x / rect.width) * total;
+        tlView.followEnd = false;
+        tlView.startMs = center - tlView.spanMs / 2;
+        clampTlView();
+        tlView.followEnd = tlView.startMs >= Math.max(0, total - tlView.spanMs) - 1;
+        renderTimeline(true);
+      };
+    }
+
+    function bindSpanSlider() {
+      const slider = $("#tl-span");
+      if (!slider) return;
+      const apply = () => {
+        const total = tlTotalMs();
+        const prevEnd = tlView.startMs + tlView.spanMs;
+        tlView.spanMs = spanFromSlider(slider.value, total);
+        tlView.spanSlider = Number(slider.value);
+        if (tlView.followEnd) {
+          tlView.startMs = Math.max(0, total - tlView.spanMs);
+        } else {
+          // 尽量保持窗口右缘
+          tlView.startMs = Math.max(0, prevEnd - tlView.spanMs);
+        }
+        clampTlView();
+        renderTimeline(true);
+      };
+      slider.oninput = apply;
+      slider.onchange = apply;
+    }
+
+    $("#topo").addEventListener("contextmenu", (ev) => {
+      if (ev.target.closest(".node")) return;
+      ev.preventDefault();
+      hideCtx();
+    });
+    document.addEventListener("click", (e) => {
+      if (!e.target.closest(".ctx")) hideCtx();
+      if (!e.target.closest(".drop-wrap")) hideDropMenus();
+    });
+    $("#btn-topo-add").onclick = (e) => {
+      e.stopPropagation();
+      hideCtx();
+      $("#topo-add-menu").classList.toggle("open");
+    };
+    $("#topo-add-menu").querySelectorAll("[data-add]").forEach((b) => {
+      b.onclick = () => {
+        hideDropMenus();
+        if (b.dataset.add === "region") openAddRegionDialog();
+        if (b.dataset.add === "worker") openWorkerDialog();
+      };
+    });
+    $("#btn-preset").onclick = async () => {
+      try { await api("/api/preset/three-region", { method: "POST" }); await refresh(); }
+      catch (e) { toast(e.message); }
+    };
+    $("#btn-submit-pane").onclick = () => openSubmitDialog();
+    $("#btn-refresh").onclick = () => refresh();
+    $("#modal-bg").addEventListener("click", (e) => {
+      if (e.target === $("#modal-bg")) $("#modal-bg").classList.remove("open");
+    });
+
+    bindSpanSlider();
+    bindMinimap();
+    refresh();
+    setInterval(refresh, 1500);
+    window.addEventListener("resize", () => renderTimeline(true));
+  </script>
+</body>
+</html>
