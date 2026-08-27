@@ -1,97 +1,46 @@
 # 设计文档
 
-> 依据：[`../requirements/spec.md`](../requirements/spec.md) · [`../requirements/parameters.md`](../requirements/parameters.md)
-> 约束：[`../architecture/decisions.md`](../architecture/decisions.md) · [`../architecture/invariants.md`](../architecture/invariants.md)
+> 依据：[`../requirements/`](../requirements/) · [`../architecture/`](../architecture/)
 
 ---
 
-## 1. 命名与状态规则
+## 规则
 
 | 规则 | 说明 |
 |------|------|
-| **编号按完成顺序分配** | 文档完成时取下一个序号。因此 `design/` 下的编号**永远连续**，不存在空号 |
-| **只有编号文档是实现依据** | 已对齐需求基线与全部生效决策 |
-| **`drafts/` 内为素材，不可实现** | 未对齐基线，编号未定。改写完成后取下一序号移出 |
-| **规划顺序不体现在文件名上** | 规划见 §3 路线图。未开始的步骤**不预留文件与编号** |
-
-> 未开始的步骤不预留文件与编号——预留会使目录出现空号，且未对齐基线的草稿会被误认为正式设计。
+| 编号按完成顺序 | `design/` 下编号连续 |
+| 仅编号文档可实现 | 对齐需求与生效 ADR |
+| `drafts/` 不可直接实现 | 改写后取下一序号移出 |
 
 ---
 
-## 2. 现有文档
+## 正式设计
 
-### 2.1 正式设计（实现依据）
+| # | 文档 | 产出 |
+|---|------|------|
+| **01** | [`01-session-stream.md`](./01-session-stream.md) | gateway、流端口、Meta、Agent/reaper |
+| **02** | [`02-verification.md`](./02-verification.md) | Trace + Oracle；验证先行 |
 
-| # | 文档 | 覆盖需求 | 核心产出 |
-|---|------|---------|---------|
-| **01** | [`01-claim-and-match.md`](./01-claim-and-match.md) | FR-2 全部子项、CR-1、CR-3、CR-7、CR-8、FR-16~FR-20 | 匹配器契约与不变量、无锁三段领取、防饥饿预留排水、执行权与失效回收 |
+## 草稿
 
-### 2.2 草稿（素材，禁止直接实现）
+| 文档 | 状态 |
+|------|------|
+| [`drafts/stream-channel-adapters.md`](./drafts/stream-channel-adapters.md) | 选型对比（一期 mem；生产默认 Redis Streams） |
+| [`drafts/security.md`](./drafts/security.md) | 鉴权素材（后续）；已去掉匹配器沙箱前提 |
 
-| 文档 | 状态 | 主要问题 |
-|------|------|---------|
-| [`drafts/observation.md`](./drafts/observation.md) | ⛔ **须按 D18 改写** | 原「默认 Mirror / 任务=Room / 热层淘汰即丢」与 **D18** 冲突；跨区改为回源→副本分期 |
-| [`drafts/conversation.md`](./drafts/conversation.md) | ⛔ **素材（D18）** | Session 日志、Turn=Task、方案 A、扇出与并行策略；与 observation 一并改写 |
-| [`drafts/stream-channel-adapters.md`](./drafts/stream-channel-adapters.md) | 📋 **选型对比** | Redis Streams vs NATS JetStream；一期默认 Redis（D18） |
-| [`drafts/security.md`](./drafts/security.md) | ⚠️ **有重大缺口** | 内容基本有效，但**缺少匹配器 DSL 沙箱**这一最高风险攻击面 |
-
-> **风险不同**：`observation.md` 若直接实现会做出与 D8 相反的多区域架构；`conversation.md` 对齐 D18 但仍须等事件/存储端口；`security.md` 若直接实现会漏掉 DSL 沙箱。
+已并入 01 的 conversation / observation 草稿见 [`../archive/`](../archive/)。
 
 ---
 
-## 3. 路线图
+## 路线图
 
 ```mermaid
-%%{init: {"flowchart": {"curve": "basis", "rankSpacing": 55, "nodeSpacing": 26}}}%%
+%%{init: {"flowchart": {"curve": "basis", "rankSpacing": 55}}}%%
 flowchart TB
-    S1["<b>已完成</b> 领取与匹配<br/>01-claim-and-match"] --> S2
-    S2["<b>进行中</b> 任务池与存储"] --> S3
-    S3["生命周期与事件模型"] --> S4
-    S4["观测与协作<br/>（改写 observation + conversation）"] --> S5
-    S5["身份与幂等"] --> S6
-    S6["鉴权与安全<br/>（补齐 drafts/security）"] --> S7
-    S7["可观测性与容量治理"]
+    S0["✅ 02 验证 Trace+Oracle"] --> S1
+    S1["✅ 01 Session 流 + gateway"] --> S2
+    S2["热 miss / 冷层出口"] --> S3
+    S3["Redis Streams 适配器"] --> S4
+    S4["跨区 Mirror（实测）"] --> S5
+    S5["鉴权票"]
 ```
-
-| 顺序 | 步骤 | 状态 | 必须产出的决策 |
-|------|------|------|--------------|
-| 1 | 领取与匹配 | ✅ 完成 → `01` | 见 §2.1 |
-| 2 | **任务池与存储** | ▶ **下一步** | 存储选型、表结构与索引、容量账本落地、幂等提交、背压阈值、粗过滤查询计划验证 |
-| 3 | 生命周期与事件模型 | ⬜ | 任务状态机、事件类型约定、全序号分配点、领取与输出路径的分离边界 |
-| 4 | 观测与协作 | ⬜ 改写草稿 | 快照+增量、Session 游标（D18）、SSE、互动消息；StreamChannel `StreamId` 与第一适配器 |
-| 5 | 身份与幂等 | ⬜ | 确定性任务标识、提交闸门、孤儿任务恢复、列表查询视图 |
-| 6 | 鉴权与安全 | ⬜ 补齐草稿 | 令牌体系、订阅鉴权、**DSL 沙箱**、出口脱敏、限流 |
-| 7 | 可观测性与容量治理 | ⬜ | 不变量监控指标、越界告警、锚点校准流程、故障演练清单 |
-
-**为什么是这个顺序**：步骤 2 的存储形态决定步骤 3 事件模型的落点；步骤 3 确定的路径分离边界（D11）决定步骤 4 的通道选择；步骤 4/5 与领取层耦合最弱，可最后细化。
-
----
-
-## 4. 下一步（步骤 2）开展清单
-
-| # | 议题 | 已有输入 |
-|---|------|---------|
-| 1 | 存储选型 | `parameters.md` §4（规模）· `01` §2.1（无锁三段式） |
-| 2 | 表结构：任务、设备、预留 | `01` §2.3（领取 CAS）· §4.3（回收） |
-| 3 | 容量账本落地 | **D10 已定**（服务端核算）· CR-3 / CR-10 |
-| 4 | 索引设计与粗过滤查询计划验证 | `01` §1.2（两层匹配）· INV-17 |
-| 5 | 幂等提交机制 | INV-2（不得依赖 TTL 窗口） |
-| 6 | 背压：待领取阈值与拒绝语义 | `parameters.md` §4.2（阈值 1 万）· FR-21 / INV-29 |
-| 7 | 巡检任务：预留、超时、不可调度、重试超限 | `01` §3.2 · §4.3 |
-| 8 | 与输出路径的边界 | **D11 已定**（强制分离） |
-| 9 | 查询与领取的同库共存形态（同表加索引 vs 冷热分表） | **D13 已定**（不引入独立视图）· 须满足 FR-22 |
-| 10 | **查询路径的超时与并发限制**（防止慢查询挤占领取资源） | **FR-24** —— D13 引入的派生风险 |
-
-> **无阻塞项，可直接开展。**
-
----
-
-## 5. 文档规范
-
-| 要求 | 说明 |
-|------|------|
-| 头部标注依据 | 列出本文满足的 FR/CR 编号与相关 INV 小节 |
-| 每项设计标注需求来源 | 便于反查覆盖度与验收 |
-| 违反不变量须显式说明 | 若确需违反某条 INV，必须在 `decisions.md` 新增决策记录并说明代价 |
-| 遗留问题单列一节 | 不在文中散落 TODO |
-| 草稿改写后必须逐条核对冲突表 | 头部冲突表全部处置完毕，方可移出 `drafts/` |

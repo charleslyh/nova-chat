@@ -1,0 +1,30 @@
+name: attempt-fence
+covers:
+  - CR-3
+  - CR-7
+  - INV-5
+  - INV-6
+oracles:
+  - SeqMonotonic
+  - SingleClaimPerAttempt
+  - SubmittedTurnsTerminal
+  - StaleAppendRejected
+trace: true
+steps:
+  - action: create_session
+  - action: submit_turn
+    text: fence-me
+    key: k-fence-1
+    expect: accepted
+  - action: claim
+    deadline_ms: 1
+  - action: append_delta
+    payload: ok
+    expect_stale: false
+  - action: advance_ms
+    by: 10
+  - action: reap
+  - action: append_delta
+    payload: zombie
+    attempt: 1
+    expect_stale: true

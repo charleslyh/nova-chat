@@ -1,16 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/nova-core",
-    "crates/nova-ports",
-    "crates/nova-matcher",
-    "crates/nova-claim",
-    "crates/nova-adapter-mem",
-    "crates/nova-conformance",
-    "crates/nova-testkit",
-    "crates/nova-server",
-    "crates/nova-mock-worker",
-    "crates/nova-sim",
+    "crates/core",
+    "crates/adapters/mem",
+    "crates/gateway",
+    "testing/conformance",
+    "testing/harness",
+    "testing/mock-agent",
+    "testing/sim",
     "xtask",
 ]
 
@@ -20,13 +17,10 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-nova-core = { path = "crates/nova-core" }
-nova-ports = { path = "crates/nova-ports" }
-nova-matcher = { path = "crates/nova-matcher" }
-nova-claim = { path = "crates/nova-claim" }
-nova-adapter-mem = { path = "crates/nova-adapter-mem" }
-nova-conformance = { path = "crates/nova-conformance" }
-nova-testkit = { path = "crates/nova-testkit" }
+nova-sessions-core = { path = "crates/core" }
+adapters-mem = { path = "crates/adapters/mem" }
+conformance = { path = "testing/conformance" }
+harness = { path = "testing/harness" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "process", "signal", "fs"] }
 serde = { version = "1", features = ["derive"] }
@@ -42,3 +36,5 @@ parking_lot = "0.12"
 toml = "0.8"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }

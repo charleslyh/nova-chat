@@ -1,0 +1,11 @@
+[package]
+name = "nova-sessions-core"
+version.workspace = true
+edition.workspace = true
+description = "Session domain types and protocols (traits)"
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }

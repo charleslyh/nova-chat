@@ -1,0 +1,24 @@
+name: hot-miss-gap
+covers:
+  - INV-14
+  - CR-4
+  - FR-13
+oracles:
+  - SeqMonotonic
+  - SubmittedTurnsTerminal
+  - NoSilentGap
+trace: true
+steps:
+  - action: create_session
+  - action: submit_turn
+    text: gap-me
+    key: k-gap-1
+    expect: accepted
+  - action: claim_and_complete
+    tokens: 5
+  - action: trim_earliest
+    new_earliest: 4
+  - action: expect_gap
+    from_seq: 1
+  - action: expect_no_gap
+    from_seq: 4

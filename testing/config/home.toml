@@ -1,0 +1,5 @@
+# Authority region API
+region = "home"
+role = "home"
+listen = "127.0.0.1:18080"
+run_reaper = true

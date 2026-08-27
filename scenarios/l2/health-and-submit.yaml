@@ -1,6 +1,0 @@
-id: l2-health-and-submit
-topology: three-region-local
-oracles: []
-covers: [D17, FR-1, D4]
-# Executed by xtask verify l2 against local multi-process topology.
-faults: []

@@ -1,0 +1,16 @@
+name: health-and-session
+covers:
+  - FR-1
+  - FR-15
+oracles: []
+trace: true
+steps:
+  - action: http_get
+    url: http://127.0.0.1:18080/health
+    expect_contains: '"ok":true'
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/sessions
+    expect_contains: session_id
+  - action: http_get
+    url: http://127.0.0.1:18081/health
+    expect_contains: '"ok":true'

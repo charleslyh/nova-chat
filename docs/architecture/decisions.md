@@ -1,35 +1,52 @@
 # 架构决策记录（ADR）
 
-> 版本：v1.1
+> 版本：v2.0
 > 依据：[`../requirements/spec.md`](../requirements/spec.md) · [`../requirements/parameters.md`](../requirements/parameters.md)
-> 本文记录**已定夺的架构决策及其理由**。决策的「结论」进入设计文档，「理由与备选方案」留在本文，供后续质疑与回溯。
+> 速览：[`README.md`](./README.md)
 >
-> **修改规则**：已生效的决策不删改，需变更时新增一条 `SUPERSEDED BY` 记录，保留原决策以维持追溯链。
+> 本文记录**已定夺的架构决策及其理由**。决策的「结论」进入设计文档，「理由与备选方案」留在本文。
+>
+> **修改规则**：已生效的决策不删改；变更时新增 `SUPERSEDED BY`，保留追溯链。
 
 ---
 
-## 索引
+## 现行生效（优先阅读）
+
+| # | 结论 |
+|---|------|
+| [D19](#d19-产品范围为-session-流式-api单门面) | Session 流式服务；`nova-sessions`；POST+SSE 同进程 |
+| [D11](#d11-领取路径与输出路径分离) | meta ≠ stream |
+| [D18](#d18-对话层在任务系统之上--session-日志与-turn-领取) | Session 日志/快照/游标/热→冷/回源（Turn=Task 已废止） |
+| [D8](#d8-单域起步) · [D4](#d4-领取不跨区域) | 单域权威；claim 不跨区 |
+| [D14](#d14-承载技术一律端口化) · [D15](#d15-验证分层与虚拟时钟) · [D17](#d17-本机验证与-docker-部署分离) | 端口化 · 分层验证 · 无 Docker 前置 |
+
+其余条目多为任务系统时代决策，已 ⛔ SUPERSEDED BY D19，正文保留备查。
+
+---
+
+## 完整索引
 
 | # | 决策 | 结论 | 状态 |
 |---|------|------|------|
-| [D1](#d1-容量模型不在架构层锁定) | 容量模型 | 抽象为匹配器，规则可扩展 | ✅ 生效 |
-| [D2](#d2-匹配采用-first-fit--设备自主拉取) | 匹配方式 | first-fit + 设备自主拉取 | ✅ 生效 |
-| [D3](#d3-规模按-dau-50-万为设计基准) | 规模基准 | DAU 50 万，池 < 1 万，领取 < 100/s | ✅ 生效 |
-| [D4](#d4-领取不跨区域) | 跨区领取 | 不做，区域内绑定 | ✅ 生效 |
-| [D5](#d5-防饥饿采用老化--定向预留排水) | 防饥饿 | 老化 + 定向预留排水 | ✅ 生效 |
-| [D6](#d6-不做抢占) | 抢占 | 不做 | ✅ 生效 |
-| [D7](#d7-不做延迟定时任务) | 延迟任务 | 不做 | ✅ 生效 |
-| [D8](#d8-单域起步) | 多域 | 单域起步，不做容灾切换 | ✅ 生效 |
-| [D9](#d9-不做任务级执行权时限与续期) | 执行权时限 | 设备级存活 + 静态执行上界 | ✅ 生效 |
-| [D10](#d10-容量账本由服务端核算) | 容量账本 | 服务端按在途任务推算 | ✅ 生效 |
-| [D11](#d11-领取路径与输出路径分离) | 路径分层 | 强制分离 | ✅ 生效 |
-| [D12](#d12-策略切换采用请求级版本快照) | 策略切换语义 | 请求级版本快照；收紧型变更需额外保证 | ✅ 生效 |
-| [D13](#d13-本期不引入独立查询视图) | 独立查询视图 | **本期不引入**，查询与权威数据同库同步 | ✅ 生效 |
-| [D14](#d14-承载技术一律端口化) | 技术承载 | 端口 + 可替换适配器；不绑定具体产品 | ✅ 生效 |
-| [D15](#d15-验证分层与虚拟时钟) | 验证策略 | 分层下沉；虚拟时钟为一等能力 | ✅ 生效 |
-| [D16](#d16-任务类型不进入核心流程分支) | 任务类型 | 仅为数据与 per-type 上界覆盖 | ✅ 生效 |
-| [D17](#d17-本机验证与-docker-部署分离) | 验证/部署 | 本机 L0–L2 不依赖 Docker | ✅ 生效 |
-| [D18](#d18-对话层在任务系统之上--session-日志与-turn-领取) | 对话 / Session | Session 可回放日志 + Turn=Task；开屏靠快照 | ✅ 生效 |
+| [D1](#d1-容量模型不在架构层锁定) | 容量模型 | 抽象为匹配器 | ⛔ SUPERSEDED BY D19 |
+| [D2](#d2-匹配采用-first-fit--设备自主拉取) | 匹配方式 | first-fit + 拉取 | ⛔ SUPERSEDED BY D19 |
+| [D3](#d3-规模按-dau-50-万为设计基准) | 规模基准（任务池口径） | DAU 50 万… | ⛔ SUPERSEDED BY D19 |
+| [D4](#d4-领取不跨区域) | 跨区领取 | 不做 | ✅ 生效（Turn claim 仍单域） |
+| [D5](#d5-防饥饿采用老化--定向预留排水) | 防饥饿 | 老化 + 预留 | ⛔ SUPERSEDED BY D19 |
+| [D6](#d6-不做抢占) | 抢占 | 不做 | ⛔ SUPERSEDED BY D19 |
+| [D7](#d7-不做延迟定时任务) | 延迟任务 | 不做 | ⛔ SUPERSEDED BY D19 |
+| [D8](#d8-单域起步) | 多域 | 单域权威 | ✅ 生效 |
+| [D9](#d9-不做任务级执行权时限与续期) | 执行权时限 | Agent 存活 + Turn 上界 | ⚠ 部分保留 |
+| [D10](#d10-容量账本由服务端核算) | 容量账本 | 服务端核算 | ⛔ SUPERSEDED BY D19 |
+| [D11](#d11-领取路径与输出路径分离) | 路径分层 | **meta ≠ stream** | ✅ 生效 |
+| [D12](#d12-策略切换采用请求级版本快照) | 策略切换 | 版本快照 | ⛔ SUPERSEDED BY D19 |
+| [D13](#d13-本期不引入独立查询视图) | 查询视图 | 不引入 | ⛔ SUPERSEDED BY D19 |
+| [D14](#d14-承载技术一律端口化) | 技术承载 | 端口 + 适配器 | ✅ 生效 |
+| [D15](#d15-验证分层与虚拟时钟) | 验证策略 | 分层；虚拟时钟 | ✅ 生效 |
+| [D16](#d16-任务类型不进入核心流程分支) | 任务类型 | 不进分支 | ⛔ SUPERSEDED BY D19 |
+| [D17](#d17-本机验证与-docker-部署分离) | 验证/部署 | L0–L2 无 Docker | ✅ 生效 |
+| [D18](#d18-对话层在任务系统之上--session-日志与-turn-领取) | Session 日志 | 可回放 + 快照 | ⚠ 部分 SUPERSEDED BY D19 |
+| [D19](#d19-产品范围为-session-流式-api单门面) | 范围收口 | `nova-sessions`；无任务系统 | ✅ 生效 |
 
 ---
 
@@ -210,19 +227,13 @@
 
 | | |
 |---|---|
-| **依据** | `parameters.md` §4.4 输出数据量推导 |
-| **结论** | 任务领取与流式输出**不共用同一承载**：领取为低频强一致，输出为高频可批量 |
+| **依据** | `parameters.md` 输出事件 vs meta CAS 数量级（原任务领取口径；D19 后为 meta vs stream） |
+| **结论** | **meta（Session 锁 / Turn claim）与 stream（Session 事件 append）不共用同一承载** |
+| **澄清（D19）** | 本决策约束**存储路径**，不要求 HTTP POST 与 SSE 分进程 |
 
-**理由（量化）**
+**理由（量化）**：提交/claim ~70/s 量级强一致；流事件 ~2 万条/s 保序。同承载会互相拖死。
 
-| 路径 | 吞吐 | 一致性要求 |
-|------|------|-----------|
-| 任务领取 | **70/s** | 强一致（CR-1 唯一性判定） |
-| 流式输出 | **10 万条/s** | 保序即可（CR-6） |
-
-二者吞吐相差约 **4 个数量级**，一致性要求也不同。用同一承载会导致：要么为满足输出吞吐而牺牲领取的强一致，要么为满足领取的强一致而无法承载输出吞吐。
-
-> **这是本决策集中唯一由量化数据强制得出的架构分层**，而非设计偏好。
+> **这是由量化数据强制得出的分层**，而非「两个接入服务」偏好。
 
 ---
 
@@ -415,7 +426,7 @@ flowchart LR
 
 | | |
 |---|---|
-| **需求** | FR-2.6、OR-4；三类画像见 `task-profiles.md` |
+| **需求** | FR-2.6、OR-4（任务系统时代；⛔ SUPERSEDED BY D19） |
 | **结论** | `TaskKind` 仅为 `TaskSpec` 数据字段与 per-type 执行上界覆盖；匹配仍由受限 DSL 表达。禁止在提交/领取/生命周期核心路径写死类型分支 |
 | **代价** | 类型差异须落在参数、画像与 DSL/容量需求数据上，而非 if-else 流程 |
 
@@ -451,10 +462,10 @@ flowchart LR
 
 | | |
 |---|---|
-| **需求** | FR-9~FR-15（跨设备查阅、续订、流式渲染）；Agent 多轮会话（`task-profiles` 中 `agent`）及同会话内后续 image/video 等任务 |
-| **结论** | ① **Conversation / Session** 是产品 UX 身份，不是 TCP/WS 连接，也不是 Worker 租约。② **Turn（一轮用户输入 + 一次生成）= Task**，Worker **按 Turn 领取**，不按 Session 粘滞领取。③ 客户端面向的可回放真相是 **Session 级 append-only 日志**，序号为 **per-session 单调 seq**（由通道分配）；用户消息、锁/busy、轮次边界、Agent token、图片/视频进度与产物等 **进入同一条 Session 流**（方案 A）。④ **开屏靠带 `snapshot_seq` 的渲染快照 + 增量**，禁止靠全量回放 TextDelta。⑤ **占用锁为 Session 级 CAS**（当前策略 `max_in_flight_turns_per_session = 1`）；禁止态以流上的 busy/idle 事件为准，不用 presence。⑥ **同一 Session** 同时订阅者预期 **≤ 5**（非全产品人少）：不做分层扇出，Realtime 实例内 1 路订阅复用即可。⑦ 写入侧 TextDelta **聚合窗口本期不定**（配置项，非架构锁）。⑧ **有效 Session 日志始终可订**；热层可卸载到冷存储；热 miss 须明确报错并导向快照/冷层（INV-14）。⑨ **跨区**：一期 Realtime 就近 + **读回源**；二期 Mirror 仅实测触发。⑩ 绿场第一热层适配器 **Redis Streams**（JetStream 留作副本阶段选项）。 |
+| **需求** | FR-9~FR-15（跨设备查阅、续订、流式渲染）；多轮 Session（任务系统时代画像已归档） |
+| **结论** | ① **Conversation / Session** 是产品 UX 身份，不是 TCP/WS 连接，也不是 Worker 租约。② **Turn（一轮用户输入 + 一次生成）= Task**，Worker **按 Turn 领取**，不按 Session 粘滞领取。③ 客户端面向的可回放真相是 **Session 级 append-only 日志**，序号为 **per-session 单调 seq**（由通道分配）；用户消息、锁/busy、轮次边界、Agent token、图片/视频进度与产物等 **进入同一条 Session 流**（方案 A）。④ **开屏靠带 `snapshot_seq` 的渲染快照 + 增量**，禁止靠全量回放 TextDelta。⑤ **占用锁为 Session 级 CAS**（当前策略 `max_in_flight_turns_per_session = 1`）；禁止态以流上的 busy/idle 事件为准，不用 presence。⑥ **同一 Session** 同时订阅者预期 **≤ 5**（非全产品人少）：不做分层扇出，订路径实例内 1 路订阅复用即可。⑦ 写入侧 TextDelta **聚合窗口本期不定**（配置项，非架构锁）。⑧ **有效 Session 日志始终可订**；热层可卸载到冷存储；热 miss 须明确报错并导向快照/冷层（INV-14）。⑨ **跨区**：一期就近接入 + **读回源**；二期 Mirror 仅实测触发。⑩ 绿场第一热层适配器 **Redis Streams**（JetStream 留作副本阶段选项）。 |
 | **代价** | Session 热层事件量高于「仅信封」方案；必须维护快照与可合并标记（INV-16），否则开屏与存储会被 token 洪水打穿 |
-| **素材** | [`../design/drafts/conversation.md`](../design/drafts/conversation.md)（草稿）· [`../design/drafts/stream-channel-adapters.md`](../design/drafts/stream-channel-adapters.md)（Redis vs JetStream 选型对比） |
+| **素材** | 已归档草稿（`archive/draft-conversation.md` 等）· [`../design/drafts/stream-channel-adapters.md`](../design/drafts/stream-channel-adapters.md)（Redis vs JetStream） |
 
 **已拍板的三轴（选型前置）**
 
@@ -504,7 +515,7 @@ flowchart LR
 | 阶段 | 做法 | 产品含义 |
 |------|------|----------|
 | **正确性先行** | Session 可回放日志 + 快照 + 热→冷 | 与选 Redis/JetStream 无关 |
-| **跨区一期** | Realtime **就近接入**，读路径 **回源**（外区 RG 向写入权威区拉/订同一条 Session 流） | 外区用户能订；源区流存储不可用则外区热订不可用 |
+| **跨区一期** | 就近接入同一服务（`nova-sessions`），读路径 **回源**（外区向写入权威区拉/订同一条 Session 流） | 外区用户能订；源区流存储不可用则外区热订不可用 |
 | **跨区二期** | 仅当实测跨区延迟或源区故障影响不可接受时，加 **Mirror/本地只读副本** | 源区短暂故障时外区仍可读已复制部分；就近读 |
 
 - 一期 **不**为 Mirror 提前锁定 JetStream。
@@ -545,4 +556,42 @@ flowchart LR
 | 第一期即 Mirror | 实现与运维成本高；回源已满足「跨区能订」；仅实测不够时进入二期 |
 | 以 D8 或「7 天可丢」为由排除 JetStream / 排除跨区观测 | **已纠正**：D8 管领取权威；保留是热→冷；跨区观测按上表分期 |
 
-**落地顺序**：不插队。依赖路线图「存储 → 生命周期/事件 → 观测与协作（改写 observation + 并入本决策）」。跨区一期回源、二期副本见上表。详见 [`../plans/conversation-and-stream.md`](../plans/conversation-and-stream.md) · [`../plans/README.md`](../plans/README.md)。
+**落地顺序**：不插队。跨区一期回源、二期副本见上表。现行推进见 [`../plans/current.md`](../plans/current.md) · [`../plans/README.md`](../plans/README.md)。
+
+> **SUPERSEDED IN PART BY D19（2026-08-27）**：废止「Turn = Task / 任务系统之上」的产品定位；Session 可回放日志、快照、游标、跨区回源、热→冷、Redis Streams 默认等契约由 D19 继承并升格为产品主轴。文中「Realtime」指订路径能力，**不是**独立服务身份。
+
+---
+
+## D19 产品范围为 Session 流式 API（单门面）
+
+| | |
+|---|---|
+| **需求** | [`spec.md`](../requirements/spec.md) v2：Session / Turn / 流式观测 |
+| **结论** | ① 产品是 **Session 级可回放消息服务**，不是分布式任务/容量调度系统。② **Turn** 对齐一次 Responses/Messages 补全；**不是** Task；无容量匹配、装箱、任务池。③ 对外 **单一会话服务**（`nova-sessions`）：`POST` Session/Turn、`GET` 快照与 SSE `from_seq`；可选 `stream=true` 便利发起方。④ **POST 与 SSE 一期同进程**；Tokio 下「长连接风暴拖死 CAS」论证不足；拆读写 Deployment 仅实测触发，不改客户端协议。⑤ **meta（锁/pending/attempt）与 stream（事件 WAL）分承载**（继承 D11）。⑥ Agent / meta 为最简模拟或后续替换；reaper 管失联与执行上界。⑦ 跨区：就近打同一服务；写转发权威区；读回源；Mirror 二期。⑧ 继承 D18 中 Session 日志 / 快照 / 游标 / 热→冷 / Redis 默认等条款；废止 Turn=Task。 |
+| **代价** | 任务系统已有设计与代码需归档/删除；规模参数改按 Session/流重写 |
+| **SUPERSEDES** | D1, D2, D3（任务池口径）, D5, D6, D7, D10, D12, D13, D16；D18 中 Turn=Task / 「任务系统之上」定位；[`arc.md`](./arc.md) §3「必须 Gateway+Realtime 两服务」的部署措辞（推导文保留，产品契约以本决策为准） |
+
+**门面与层级**
+
+| 它们（Messages / Responses） | 我们 |
+|------------------------------|------|
+| 一次补全 +（Responses）`previous_response_id` 链 | Turn + **Session WAL**（观测主资源） |
+| 同 API 上 SSE | 同 `nova-sessions` 上 SSE |
+| 无跨补全活流多订 | 同 Session ≤5 订阅者 |
+
+**进程 vs 存储**
+
+| 层 | 决策 |
+|----|------|
+| 门面 | 单一 API |
+| 进程 | 一期合并 POST+SSE；后期可拆 Deployment |
+| 存储 | meta ≠ stream（硬性） |
+
+**否决**
+
+| 方案 | 理由 |
+|------|------|
+| 保留容量感知任务系统为产品主轴 | 范围已收口 |
+| 先验 Gateway / Realtime 两服务 | 运维复杂；指标下 ROI 为负；门面应对齐 Responses |
+| 合并 meta 与 stream 同库 | 违反 D11 数量级 |
+

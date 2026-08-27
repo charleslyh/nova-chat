@@ -2,17 +2,19 @@
 
 > ## ⚠️ 草稿，需补充后方可作为实现依据
 >
-> 本文与领取机制无关，**内容基本有效**，但存在一处**重大缺口**。补齐后将作为正式设计文档移出本目录（编号按完成顺序分配）。
+> 产品范围已收口为 Session 流（[D19](../../architecture/decisions.md#d19-产品范围为-session-流式-api单门面)）。本文保留长连接鉴权素材；**一期不实现完整鉴权**（见 [`../../plans/current.md`](../../plans/current.md)）。补齐后将作为正式设计移出本目录。
 >
 > | 缺口 / 冲突 | 说明 | 处置 |
 > |------------|------|------|
-> | **缺少匹配器 DSL 沙箱** | D1 引入了受限 DSL，它是**本系统最高风险的代码执行入口**，而本文攻击面清单未覆盖 | **必须新增**（约束见 [`01-claim-and-match.md`](../01-claim-and-match.md) §1.4） |
-> | §5 跨区域授权 | 按 2~3 区域简化即可，机制本身不变 | 简化 |
+> | ~~匹配器 DSL 沙箱~~ | D1 已废止；无 DSL 执行入口 | **不再适用** |
+> | 授权对象用语 | 正文多处仍写 `task_id` | 升格时改为 **`session_id`**（及 Turn 写路径） |
+> | 「Realtime Gateway」 | 部署措辞 | 升格时改为 **`nova-sessions` 订路径** |
+> | §5 跨区域授权 | 按 2~3 区域简化即可 | 简化 |
 >
-> **可复用部分**：§1 三层令牌 · §2 `EventSource` 鉴权（一次性 ticket）· §3 授权模型 · §4 长连接持续校验 · §6 出口脱敏 · §7 上行限流 · §8 攻击面清单
+> **可复用部分**：§1 三层令牌 · §2 `EventSource` 鉴权（一次性 ticket）· §3 授权模型 · §4 长连接持续校验 · §6 出口脱敏 · §7 上行限流 · §8 攻击面清单（去掉匹配器项）
 >
-> 相关需求：CR-9、SEC-1~SEC-6 · 相关不变量：[`invariants.md`](../../architecture/invariants.md) §5
-> 配套草稿：[`observation.md`](./observation.md) · [`conversation.md`](./conversation.md)
+> 相关需求：SEC-1~SEC-6 · 相关不变量：[`invariants.md`](../../architecture/invariants.md)  
+> 正式流设计：[`../01-session-stream.md`](../01-session-stream.md)
 >
 > 本文覆盖三个通常被忽略的问题：**长连接期间的权限撤销**、**`EventSource` 无法携带 Authorization 头**、**跨区域授权不跨洋**。
 

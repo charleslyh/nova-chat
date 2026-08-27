@@ -1,0 +1,24 @@
+name: double-claim
+covers:
+  - CR-1
+  - INV-1
+oracles:
+  - SeqMonotonic
+  - SingleClaimPerAttempt
+  - SubmittedTurnsTerminal
+trace: true
+steps:
+  - action: create_session
+  - action: submit_turn
+    text: only-one
+    key: k-dc-1
+    expect: accepted
+  - action: claim
+    expect: some
+  - action: claim
+    expect: none
+  - action: append_delta
+    payload: a
+    expect_stale: false
+  - action: complete
+    status: done

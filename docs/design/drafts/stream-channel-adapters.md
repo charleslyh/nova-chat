@@ -2,16 +2,16 @@
 
 > ## 性质
 >
-> **选型对比文档**（适配器层，D14）。对齐 [D18](../../architecture/decisions.md#d18-对话层在任务系统之上--session-日志与-turn-领取)，供迭代 3「观测与协作」锁定第一生产适配器时使用。
+> **选型对比文档**（适配器层，D14）。对齐 [D18](../../architecture/decisions.md#d18-对话层在任务系统之上--session-日志与-turn-领取) / [D19](../../architecture/decisions.md#d19-产品范围为-session-流式-api单门面)，供后续生产热层适配器锁定时使用。
 >
 > - **不是**实现依据（无端口签名落地细节）；实现须另出编号设计文档。
 > - **不**将 L0–L2 验证绑到任一产品（D17：本机继续 mem）。
-> - Kafka / Redpanda 不在本文展开（事件速率逼近越界线再评估，见 D18）。
+> - Kafka / Redpanda 不在本文展开（事件速率逼近越界线再评估）。
 >
-> 相关：[`conversation.md`](./conversation.md) · [`observation.md`](./observation.md) · [`../../plans/conversation-and-stream.md`](../../plans/conversation-and-stream.md)  
-> 端口：[`crates/nova-ports/src/stream.rs`](../../../crates/nova-ports/src/stream.rs)（当前为 `TaskId`；观测阶段须泛化为 `StreamId`）  
+> 相关：[`../01-session-stream.md`](../01-session-stream.md) · [`../../plans/current.md`](../../plans/current.md)  
+> 端口契约：[`crates/core`](../../../crates/core/)（`nova-sessions-core`）  
 > 系统量化：[`../../requirements/parameters.md`](../../requirements/parameters.md)  
-> 正式不变式：正文中「热层缺序号须明确报错」对应 [INV-14](../../architecture/invariants.md)（本文不反复引用编号）
+> 正式不变式：热层缺序号须明确报错 → [INV-14](../../architecture/invariants.md)
 
 ---
 
@@ -27,10 +27,12 @@ Chat / Agent **Session 级可回放事件日志**（D18）：
 | 序号 | **per-session 连续 seq**，通道内分配；禁止把引擎全局 seq 当 API 游标 |
 | 内容 | 方案 A：用户消息、锁、轮次、token、进度与产物等同流 |
 | 开屏 | **快照 + 短增量**；禁止无快照长回放 |
-| 同订 | **同一 Session** 同时订阅 ≤ 5；扇出在 Realtime Gateway |
+| 同订 | **同一 Session** 同时订阅 ≤ 5；扇出在 `nova-sessions` 订路径（D19） |
+
 | 保留 | 热→冷卸载；有效 Session **始终可订**；热层缺序号时**明确报错**并改走快照/冷层，禁止静默补洞 |
 | 跨区 | 一期 Realtime 就近 + **读回源**；二期 Mirror 仅实测触发 |
-| 客户端 | **禁止**直连流引擎；只经业务 Gateway API（SSE 等） |
+| 客户端 | **禁止**直连流引擎；只经 `nova-sessions`（SSE 等） |
+
 
 ### 0.2 端口必须满足（产品无关）
 
@@ -39,7 +41,8 @@ Chat / Agent **Session 级可回放事件日志**（D18）：
 | `append` → 返回 `session_seq` | 可回放 WAL；与领取路径分离（D11） |
 | `read_from(stream_id, from_seq, limit)` | 精确续订 |
 | 热层无该 seq | **明确错误**，不得静默补洞（改走快照/冷层） |
-| 不含 | 公网扇出、快照存储、鉴权（属 Gateway / 其它端口） |
+| 不含 | 公网扇出、快照存储、鉴权（属 `nova-sessions` / 其它端口） |
+
 
 两者对上述契约 **均可适配**；差别在同构度、成本、跨区副本与编码厚度。
 
@@ -47,8 +50,8 @@ Chat / Agent **Session 级可回放事件日志**（D18）：
 
 ## 1. 决策用量化输入
 
-> 系统级以 [`parameters.md`](../../requirements/parameters.md) 为准（**规划推导，非实测**）。Chat 会话形态为行业公开数据 + 规划先验，**须埋点校准**后方可升格为硬锚点。  
-> 用途：判断负荷是否逼近某产品舒适区；**不**替代 D18「模型同构 → 一期 Redis」的主结论。
+> 系统级以 [`parameters.md`](../../requirements/parameters.md) **现行 Session/流口径**为准（**规划推导，非实测**）。下表部分行保留任务系统时代标签作数量级参考；Chat 会话形态为行业公开数据 + 规划先验，**须埋点校准**后方可升格为硬锚点。  
+> 用途：判断负荷是否逼近某产品舒适区；**不**替代 D18/D19「模型同构 → 一期 Redis」的主结论。
 
 ### 1.1 本系统：DAU 假设与导出负荷
 

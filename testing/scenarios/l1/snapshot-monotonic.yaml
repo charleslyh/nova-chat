@@ -1,0 +1,29 @@
+name: snapshot-monotonic
+covers:
+  - INV-15
+  - CR-4
+oracles:
+  - SeqMonotonic
+trace: true
+steps:
+  - action: create_session
+  - action: snapshot_get
+    expect_none: true
+  - action: snapshot_put
+    snapshot_seq: 2
+    expect: ok
+  - action: snapshot_get
+    expect_seq: 2
+  - action: snapshot_put
+    snapshot_seq: 1
+    expect: stale
+  - action: snapshot_get
+    expect_seq: 2
+  - action: snapshot_put
+    snapshot_seq: 2
+    expect: ok
+  - action: snapshot_put
+    snapshot_seq: 5
+    expect: ok
+  - action: snapshot_get
+    expect_seq: 5

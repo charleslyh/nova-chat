@@ -2,8 +2,9 @@
 **/.env
 deploy/docker/.env
 .DS_Store
-reports/*.md
-!reports/.gitkeep
-config/.ready-*
+testing/reports/*.md
+testing/reports/traces/
+!testing/reports/.gitkeep
+testing/config/.ready-*
 target/nova-procs/
-target/nova-sim/
+target/sim/
