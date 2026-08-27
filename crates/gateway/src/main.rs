@@ -7,16 +7,14 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use futures::stream;
-use futures::StreamExt;
 use adapters_mem::MemWorld;
 use nova_sessions_core::{
     Attempt, Bubble, EventKind, IdempotencyKey, SessionId, SessionSnapshot, StreamEvent, TurnId,
@@ -124,6 +122,7 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/{id}/turns", post(create_turn))
         .route("/v1/sessions/{id}/snapshot", get(get_snapshot))
         .route("/v1/sessions/{id}/stream", get(stream_sse))
+        .route("/v1/sessions/{id}/events", get(list_events))
         // ops / test: INV-32 read-only degrade toggle (home)
         .route("/v1/admin/read_only", post(set_read_only))
         .route("/v1/admin/pending_limit", post(set_pending_limit))
@@ -160,45 +159,68 @@ async fn reap_once(world: &MemWorld) -> Result<()> {
     let aborted = world.meta.reap(now, 90_000).await?;
     for (turn_id, _old_attempt, session_id) in aborted {
         // Envelope only (no attempt) — fence already raised in meta.
-        let _ = world
-            .stream
-            .append(StreamEvent {
+        let _ = append_and_project(
+            world,
+            StreamEvent {
                 session_id,
                 seq: 0,
                 kind: EventKind::AttemptAborted,
                 turn_id: Some(turn_id),
                 attempt: None,
                 payload: "reaped".into(),
-            })
-            .await;
-        let _ = world
-            .stream
-            .append(StreamEvent {
+            },
+        )
+        .await;
+        let _ = append_and_project(
+            world,
+            StreamEvent {
                 session_id,
                 seq: 0,
                 kind: EventKind::TurnFailed,
                 turn_id: Some(turn_id),
                 attempt: None,
                 payload: "reaped".into(),
-            })
-            .await;
-        let _ = world
-            .stream
-            .append(StreamEvent {
+            },
+        )
+        .await;
+        let _ = append_and_project(
+            world,
+            StreamEvent {
                 session_id,
                 seq: 0,
                 kind: EventKind::SessionIdle,
                 turn_id: None,
                 attempt: None,
                 payload: String::new(),
-            })
-            .await;
+            },
+        )
+        .await;
         if let Ok(Some(mut snap)) = world.snapshot.get(session_id).await {
             snap.running.clear();
             let _ = world.snapshot.put(snap).await;
+            world.sync_mirror(session_id).await;
         }
     }
     Ok(())
+}
+
+/// Authority append then project into in-process mirror (V12).
+async fn append_and_project(
+    world: &MemWorld,
+    mut event: StreamEvent,
+) -> Result<u64, StreamError> {
+    let session_id = event.session_id;
+    let seq = world.stream.append(event.clone()).await?;
+    event.seq = seq;
+    world.mirror.project_event(event);
+    let _ = session_id;
+    Ok(seq)
+}
+
+async fn project_snapshot_now(world: &MemWorld, session_id: SessionId) {
+    if let Ok(Some(s)) = world.snapshot.get(session_id).await {
+        let _ = world.mirror.project_snapshot(s);
+    }
 }
 
 #[derive(Serialize)]
@@ -218,7 +240,8 @@ async fn create_session(State(st): State<AppState>) -> Response {
                 bubbles: vec![],
                 running: vec![],
             };
-            let _ = st.world.snapshot.put(snap).await;
+            let _ = st.world.snapshot.put(snap.clone()).await;
+            let _ = st.world.mirror.project_snapshot(snap);
             (StatusCode::CREATED, Json(SessionCreated { session_id: id })).into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -274,30 +297,30 @@ async fn create_turn(
             (StatusCode::ACCEPTED, Json(TurnCreated { turn_id })).into_response()
         }
         SubmitOutcome::Accepted { turn_id } => {
-            let _ = st
-                .world
-                .stream
-                .append(StreamEvent {
+            let _ = append_and_project(
+                &st.world,
+                StreamEvent {
                     session_id,
                     seq: 0,
                     kind: EventKind::SessionBusy,
                     turn_id: Some(turn_id),
                     attempt: None,
                     payload: String::new(),
-                })
-                .await;
-            let tip = st
-                .world
-                .stream
-                .append(StreamEvent {
+                },
+            )
+            .await;
+            let tip = append_and_project(
+                &st.world,
+                StreamEvent {
                     session_id,
                     seq: 0,
                     kind: EventKind::TurnBegin,
                     turn_id: Some(turn_id),
                     attempt: None,
                     payload: body.text.clone(),
-                })
-                .await;
+                },
+            )
+            .await;
 
             if let Ok(Some(mut snap)) = st.world.snapshot.get(session_id).await {
                 snap.bubbles.push(Bubble {
@@ -313,6 +336,7 @@ async fn create_turn(
                     snap.snapshot_seq = seq;
                 }
                 let _ = st.world.snapshot.put(snap).await;
+                project_snapshot_now(&st.world, session_id).await;
             }
 
             let resp = (StatusCode::ACCEPTED, Json(TurnCreated { turn_id })).into_response();
@@ -327,12 +351,19 @@ async fn create_turn(
 }
 
 async fn get_snapshot(State(st): State<AppState>, Path(id): Path<String>) -> Response {
-    if st.cfg.role == "edge" {
-        return forward_raw(&st, "GET", &format!("/v1/sessions/{id}/snapshot")).await;
-    }
     let Ok(session_id) = Uuid::parse_str(&id).map(SessionId) else {
         return err(StatusCode::BAD_REQUEST, "invalid session_id".into());
     };
+    if st.cfg.role == "edge" {
+        if let Err(r) = ensure_mirrored(&st, session_id).await {
+            return r;
+        }
+        return match st.world.mirror.get(session_id).await {
+            Ok(Some(s)) => Json(s).into_response(),
+            Ok(None) => err(StatusCode::NOT_FOUND, "no snapshot".into()),
+            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+    }
     match st.world.snapshot.get(session_id).await {
         Ok(Some(s)) => Json(s).into_response(),
         Ok(None) => err(StatusCode::NOT_FOUND, "no snapshot".into()),
@@ -346,17 +377,54 @@ struct StreamQuery {
     from_seq: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct EventsQuery {
+    #[serde(default)]
+    after_seq: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Home (and edge-forward): batch events for mirror pull projection.
+async fn list_events(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<EventsQuery>,
+) -> Response {
+    if st.cfg.role == "edge" {
+        let after = q.after_seq.unwrap_or(0);
+        let limit = q.limit.unwrap_or(1000);
+        let path = format!("/v1/sessions/{id}/events?after_seq={after}&limit={limit}");
+        return forward_raw(&st, "GET", &path).await;
+    }
+    let Ok(session_id) = Uuid::parse_str(&id).map(SessionId) else {
+        return err(StatusCode::BAD_REQUEST, "invalid session_id".into());
+    };
+    let after = q.after_seq.unwrap_or(0);
+    let limit = q.limit.unwrap_or(1000).min(10_000);
+    let from = after.saturating_add(1);
+    match st.world.stream.read_from(session_id, from, limit).await {
+        Ok(events) => Json(serde_json::json!({ "events": events })).into_response(),
+        Err(StreamError::Gap(g)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "stream_gap",
+                "recover_hint": g.hint,
+                "requested_from": g.requested_from,
+                "earliest_available": g.earliest_available,
+            })),
+        )
+            .into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 async fn stream_sse(
     State(st): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<StreamQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if st.cfg.role == "edge" {
-        // Edge: proxy by reading upstream in a loop is heavy; for sim, redirect clients conceptually
-        // by fetching via HTTP SSE proxy (simplified: pull batches from upstream REST-less — use upstream stream).
-        return forward_sse(&st, &id, q.from_seq, &headers).await;
-    }
     let Ok(session_id) = Uuid::parse_str(&id).map(SessionId) else {
         return err(StatusCode::BAD_REQUEST, "invalid session_id".into());
     };
@@ -364,12 +432,26 @@ async fn stream_sse(
     let mut from = q.from_seq.unwrap_or(1);
     if let Some(last) = headers.get("last-event-id").and_then(|v| v.to_str().ok()) {
         if let Ok(n) = last.parse::<u64>() {
-            from = n + 1; // Last-Event-ID is last received; resume after it
+            from = n + 1;
         }
     }
 
-    // Gap check
-    match st.world.stream.read_from(session_id, from, 1).await {
+    if st.cfg.role == "edge" {
+        if let Err(r) = ensure_mirrored(&st, session_id).await {
+            return r;
+        }
+        return open_sse_from_mirror_edge(st, session_id, from).await;
+    }
+
+    open_sse_from_stream(st.world.stream.clone(), session_id, from).await
+}
+
+async fn open_sse_from_stream(
+    stream: Arc<adapters_mem::MemStreamChannel>,
+    session_id: SessionId,
+    from: u64,
+) -> Response {
+    match stream.read_from(session_id, from, 1).await {
         Err(StreamError::Gap(g)) => {
             return (
                 StatusCode::CONFLICT,
@@ -386,13 +468,12 @@ async fn stream_sse(
         Ok(_) => {}
     }
 
-    let world2 = st.world.clone();
     let start_after = from.saturating_sub(1);
     let s = stream::unfold(start_after, move |after| {
-        let world = world2.clone();
+        let stream = stream.clone();
         async move {
             loop {
-                match world.stream.read_after(session_id, after, 1).await {
+                match stream.read_after(session_id, after, 1).await {
                     Ok(batch) if !batch.is_empty() => {
                         let ev = batch.into_iter().next().unwrap();
                         let data = serde_json::to_string(&ev).unwrap_or_default();
@@ -420,6 +501,132 @@ async fn stream_sse(
     Sse::new(s)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
+}
+
+async fn open_sse_from_mirror_edge(
+    st: AppState,
+    session_id: SessionId,
+    from: u64,
+) -> Response {
+    let mirror = st.world.mirror.clone();
+    match mirror.read_from(session_id, from, 1).await {
+        Err(StreamError::Gap(g)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "stream_gap",
+                    "recover_hint": g.hint,
+                    "requested_from": g.requested_from,
+                    "earliest_available": g.earliest_available,
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Ok(_) => {}
+    }
+
+    let start_after = from.saturating_sub(1);
+    let s = stream::unfold(start_after, move |after| {
+        let st = st.clone();
+        let mirror = st.world.mirror.clone();
+        async move {
+            loop {
+                match mirror.read_after(session_id, after, 1).await {
+                    Ok(batch) if !batch.is_empty() => {
+                        let ev = batch.into_iter().next().unwrap();
+                        let data = serde_json::to_string(&ev).unwrap_or_default();
+                        let next_after = ev.seq;
+                        return Some((
+                            Ok::<_, Infallible>(Event::default().id(ev.seq.to_string()).data(data)),
+                            next_after,
+                        ));
+                    }
+                    Ok(_) => {
+                        let _ = ensure_mirrored(&st, session_id).await;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(StreamError::Gap(g)) => {
+                        let data = serde_json::json!({
+                            "error": "stream_gap",
+                            "recover_hint": g.hint,
+                        })
+                        .to_string();
+                        return Some((Ok(Event::default().event("error").data(data)), after));
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                }
+            }
+        }
+    });
+
+    Sse::new(s)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
+/// Pull home snapshot + events into local mirror (edge read path, V12).
+async fn ensure_mirrored(st: &AppState, session_id: SessionId) -> Result<(), Response> {
+    let Some(up) = &st.cfg.home_upstream else {
+        return Err(err(StatusCode::BAD_GATEWAY, "no home_upstream".into()));
+    };
+    let sid = session_id.0;
+
+    let snap_url = format!("http://{up}/v1/sessions/{sid}/snapshot");
+    match st.http.get(&snap_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(snap) = resp.json::<SessionSnapshot>().await {
+                let _ = st.world.mirror.project_snapshot(snap);
+            }
+        }
+        Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
+            return Err(err(StatusCode::NOT_FOUND, "no snapshot".into()));
+        }
+        Ok(resp) => {
+            return Err(err(
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                format!("upstream snapshot {}", resp.status()),
+            ));
+        }
+        Err(e) => return Err(err(StatusCode::BAD_GATEWAY, e.to_string())),
+    }
+
+    // Catch-up loop: if gap, jump to earliest_available.
+    let mut after = st.world.mirror.tip_seq(session_id).unwrap_or(0);
+    for _ in 0..8 {
+        let ev_url = format!(
+            "http://{up}/v1/sessions/{sid}/events?after_seq={after}&limit=10000"
+        );
+        match st.http.get(&ev_url).send().await {
+            Ok(resp) if resp.status() == StatusCode::CONFLICT => {
+                let v: serde_json::Value = resp.json().await.unwrap_or_default();
+                if let Some(earliest) = v.get("earliest_available").and_then(|x| x.as_u64()) {
+                    after = earliest.saturating_sub(1);
+                    continue;
+                }
+                break;
+            }
+            Ok(resp) if resp.status().is_success() => {
+                #[derive(Deserialize)]
+                struct EventsResp {
+                    events: Vec<StreamEvent>,
+                }
+                let body: EventsResp = match resp.json().await {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                if body.events.is_empty() {
+                    break;
+                }
+                for e in body.events {
+                    after = after.max(e.seq);
+                    st.world.mirror.project_event(e);
+                }
+            }
+            _ => break,
+        }
+    }
+    Ok(())
 }
 
 // --- admin (home) ---
@@ -478,6 +685,7 @@ async fn trim_hot(State(st): State<AppState>, Json(body): Json<TrimHotBody>) -> 
     st.world
         .stream
         .trim_earliest(session_id, body.new_earliest);
+    st.world.mirror.project_trim(session_id, body.new_earliest);
     Json(serde_json::json!({
         "ok": true,
         "session_id": body.session_id,
@@ -511,18 +719,18 @@ async fn agent_claim(State(st): State<AppState>, Json(body): Json<ClaimBody>) ->
     match st.world.meta.claim_turn(agent, now_ms(), 3_600_000).await {
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Ok(Some(c)) => {
-            let _ = st
-                .world
-                .stream
-                .append(StreamEvent {
+            let _ = append_and_project(
+                &st.world,
+                StreamEvent {
                     session_id: c.turn.session_id,
                     seq: 0,
                     kind: EventKind::AttemptStarted,
                     turn_id: Some(c.turn.turn_id),
                     attempt: Some(c.attempt),
                     payload: String::new(),
-                })
-                .await;
+                },
+            )
+            .await;
             Json(ClaimResp {
                 turn_id: c.turn.turn_id,
                 session_id: c.turn.session_id,
@@ -570,18 +778,18 @@ async fn agent_append(State(st): State<AppState>, Json(body): Json<AppendBody>) 
         other => return err(StatusCode::BAD_REQUEST, format!("unknown kind {other}")),
     };
     let session_id = SessionId(body.session_id);
-    match st
-        .world
-        .stream
-        .append(StreamEvent {
+    match append_and_project(
+        &st.world,
+        StreamEvent {
             session_id,
             seq: 0,
             kind,
             turn_id: Some(TurnId(body.turn_id)),
             attempt: Some(Attempt(body.attempt)),
             payload: body.payload,
-        })
-        .await
+        },
+    )
+    .await
     {
         Ok(seq) => {
             // Keep open-screen tip fresh mid-turn (FR-9): observers skip full hot replay.
@@ -589,6 +797,7 @@ async fn agent_append(State(st): State<AppState>, Json(body): Json<AppendBody>) 
                 if seq > snap.snapshot_seq {
                     snap.snapshot_seq = seq;
                     let _ = st.world.snapshot.put(snap).await;
+                    project_snapshot_now(&st.world, session_id).await;
                 }
             }
             Json(serde_json::json!({"seq": seq})).into_response()
@@ -623,18 +832,18 @@ async fn agent_complete(State(st): State<AppState>, Json(body): Json<CompleteBod
     } else {
         EventKind::TurnFailed
     };
-    if let Err(e) = st
-        .world
-        .stream
-        .append(StreamEvent {
+    if let Err(e) = append_and_project(
+        &st.world,
+        StreamEvent {
             session_id,
             seq: 0,
             kind,
             turn_id: Some(turn_id),
             attempt: Some(attempt),
             payload: body.assistant_text.clone(),
-        })
-        .await
+        },
+    )
+    .await
     {
         return match e {
             StreamError::StaleAttempt => err(StatusCode::CONFLICT, "stale attempt".into()),
@@ -650,18 +859,18 @@ async fn agent_complete(State(st): State<AppState>, Json(body): Json<CompleteBod
     if let Err(e) = st.world.meta.complete_turn(turn_id, attempt, status).await {
         return err(StatusCode::CONFLICT, e.to_string());
     }
-    let tip = st
-        .world
-        .stream
-        .append(StreamEvent {
+    let tip = append_and_project(
+        &st.world,
+        StreamEvent {
             session_id,
             seq: 0,
             kind: EventKind::SessionIdle,
             turn_id: None,
             attempt: None,
             payload: String::new(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     if let Ok(Some(mut snap)) = st.world.snapshot.get(session_id).await {
         if body.ok && !body.assistant_text.is_empty() {
@@ -678,6 +887,7 @@ async fn agent_complete(State(st): State<AppState>, Json(body): Json<CompleteBod
             snap.snapshot_seq = seq;
         }
         let _ = st.world.snapshot.put(snap).await;
+        project_snapshot_now(&st.world, session_id).await;
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -717,52 +927,6 @@ async fn forward_json<T: Serialize>(
 
 async fn forward_raw(st: &AppState, method: &str, path: &str) -> Response {
     forward_json(st, method, path, None::<()>).await
-}
-
-async fn forward_sse(
-    st: &AppState,
-    session_id: &str,
-    from_seq: Option<u64>,
-    headers: &HeaderMap,
-) -> Response {
-    let Some(up) = &st.cfg.home_upstream else {
-        return err(StatusCode::BAD_GATEWAY, "no home_upstream".into());
-    };
-    let mut url = format!("http://{up}/v1/sessions/{session_id}/stream");
-    if let Some(fs) = from_seq {
-        url.push_str(&format!("?from_seq={fs}"));
-    }
-    let mut req = st.http.get(&url);
-    if let Some(v) = headers.get("last-event-id") {
-        req = req.header("last-event-id", v);
-    }
-    match req.send().await {
-        Ok(resp) => {
-            let status =
-                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            if status == StatusCode::CONFLICT {
-                let bytes = resp.bytes().await.unwrap_or_default();
-                return (status, bytes).into_response();
-            }
-            // Transparent byte proxy — do not re-wrap upstream SSE frames as Event::data.
-            let byte_stream = resp.bytes_stream().map(|chunk| {
-                chunk.map_err(|e| std::io::Error::other(e.to_string()))
-            });
-            let mut builder = Response::builder().status(status);
-            builder = builder.header(
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_static("text/event-stream"),
-            );
-            builder = builder.header(
-                axum::http::header::CACHE_CONTROL,
-                HeaderValue::from_static("no-cache"),
-            );
-            builder
-                .body(Body::from_stream(byte_stream))
-                .unwrap_or_else(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "sse proxy".into()))
-        }
-        Err(e) => err(StatusCode::BAD_GATEWAY, e.to_string()),
-    }
 }
 
 fn err(status: StatusCode, msg: String) -> Response {

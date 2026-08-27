@@ -25,7 +25,7 @@
 | `GET` | `/v1/sessions/{id}/snapshot` | 开屏快照 `{state, snapshot_seq}` |
 | `GET` | `/v1/sessions/{id}/stream?from_seq=` | SSE 增量；`Last-Event-ID` 可映射为 from_seq |
 
-外区：POST 转发权威区；GET 回源 stream/snapshot。
+外区：POST 转发权威区；GET 就近读 **进程内 Mirror**（pull 投影；跨机 Mirror 仍延后）。
 
 客户端游标：`(session_id, last_seq)`。无 sticky。
 
@@ -94,7 +94,8 @@ reap() // 超时回收
 
 ## 6. 明确不做
 
-容量匹配、任务列表、Gateway/Realtime 两服务、Mirror（一期）、并行 Turn、完整鉴权票。
+容量匹配、任务列表、Gateway/Realtime 两服务、跨机 Mirror、并行 Turn、完整鉴权票。
+（进程内只读 Mirror 语义见当期 V12。）
 
 ---
 

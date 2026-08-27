@@ -35,7 +35,7 @@
 |---|------|----------|------------------|------|
 | **V10** | **热 miss → 快照 / 冷层恢复闭环** | FR-13/14 · INV-14 | mem：可 trim 热层 + 内存「冷段」；Gap 必须带 hint；gateway/SSE：409 + 客户端改走 snapshot 再 `from_seq` | ✅ L1 `hot-miss-gap` + L2 `hot-miss-recover-http` |
 | **V11** | **开屏契约产品化** | FR-9 · INV-13 | 统一「snapshot → SSE from snapshot_seq」；中途开屏不依赖全量热回放 | ✅ `stream_from_seq` + L1 `mid-snapshot` + L2 `open-screen-mid-http` |
-| **V12** | **只读 Mirror 语义（进程内）** | FR-10 · 读路径 · INV-32 联动 | mem：权威写 + 异步/同步投影到 mirror 视图；mirror **拒写**；双观察者同序 | L1 双读路径；L2 edge 读 mirror、写仍转发 home |
+| **V12** | **只读 Mirror 语义（进程内）** | FR-10 · 读路径 · INV-32 联动 | mem：权威写 + 异步/同步投影到 mirror 视图；mirror **拒写**；双观察者同序 | ✅ `MemMirrorView` + L1 `mirror-dual-read` + L2 `edge-read-mirror` |
 | **V13** | **多接入 / 无粘性拓扑强化** | FR-17 · INV-12 | 多 gateway 共一份 MemWorld（测试夹具内共享）；杀实例后续订；禁止连接级游标 | L2 多 listen + kill + 游标续订；扩展现有 stop-edge |
 
 可选加深（不挡 V10–V13 退出）：
@@ -87,6 +87,7 @@
 
 | 日期 | 变更 |
 |------|------|
+| 2026-08-27 | **V12**：`MemMirrorView` 拒写投影；edge GET 读 mirror；L1/L2 双读 |
 | 2026-08-27 | **V11**：`stream_from_seq` 开屏契约；append 抬 tip；L1/L2 mid-open |
 | 2026-08-27 | **V10**：mem hot/cold trim + admin `trim_hot`；L1/L2 409→snapshot→续订 |
 | 2026-08-27 | **新当期**：mem 驱动主框架完备；真实 ports 延后；规划 V10–V13 |

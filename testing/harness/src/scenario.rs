@@ -6,7 +6,8 @@ use anyhow::{bail, Context, Result};
 use adapters_mem::MemWorld;
 use nova_sessions_core::{
     AgentId, Attempt, EventKind, IdempotencyKey, MetaStore, SessionLock, SessionSnapshot,
-    SnapshotStore, StreamChannel, StreamError, StreamEvent, SubmitOutcome, TurnStatus,
+    SnapshotError, SnapshotStore, StreamChannel, StreamError, StreamEvent, SubmitOutcome,
+    TurnStatus,
 };
 use serde::Deserialize;
 
@@ -110,6 +111,23 @@ enum Step {
     /// FR-18: set global Pending+Claimed limit.
     SetPendingLimit {
         limit: usize,
+    },
+    /// V12: project authority → mirror (preserve seq).
+    MirrorSync,
+    /// V12: authority vs mirror event seq lists must match.
+    ObserveBoth {
+        from_seq: u64,
+    },
+    /// V12: mirror append must be read-only.
+    MirrorAppend {
+        #[serde(default)]
+        expect: Option<String>,
+    },
+    /// V12: mirror snapshot put must be read-only.
+    MirrorSnapshotPut {
+        snapshot_seq: u64,
+        #[serde(default)]
+        expect: Option<String>,
     },
 }
 
@@ -421,6 +439,7 @@ async fn run_one(path: &Path) -> Result<String> {
             Step::TrimEarliest { new_earliest } => {
                 let sid = session.expect("session");
                 world.stream.test_trim_earliest(sid, new_earliest);
+                world.mirror.project_trim(sid, new_earliest);
                 trace.push(TraceEvent::StreamTrimmed {
                     session_id: sid.0,
                     new_earliest,
@@ -646,6 +665,95 @@ async fn run_one(path: &Path) -> Result<String> {
                     detail: format!("pending_limit={limit}"),
                     at_ms: now_ms,
                 });
+            }
+            Step::MirrorSync => {
+                let sid = session.expect("session");
+                world.sync_mirror(sid).await;
+                trace.push(TraceEvent::MockState {
+                    component: "mirror".into(),
+                    detail: "sync_from_authority".into(),
+                    at_ms: now_ms,
+                });
+            }
+            Step::ObserveBoth { from_seq } => {
+                let sid = session.expect("session");
+                let auth = world.stream.read_from(sid, from_seq, 10_000).await?;
+                let mir = world.mirror.read_from(sid, from_seq, 10_000).await?;
+                let a_seqs: Vec<_> = auth.iter().map(|e| e.seq).collect();
+                let m_seqs: Vec<_> = mir.iter().map(|e| e.seq).collect();
+                trace.push(TraceEvent::MockState {
+                    component: "mirror".into(),
+                    detail: format!("observe_both auth={a_seqs:?} mir={m_seqs:?}"),
+                    at_ms: now_ms,
+                });
+                if a_seqs != m_seqs {
+                    bail!(
+                        "{}: FR-10 dual observers diverged auth={a_seqs:?} mir={m_seqs:?}",
+                        sc.name
+                    );
+                }
+            }
+            Step::MirrorAppend { expect } => {
+                let sid = session.expect("session");
+                let want = expect.as_deref().unwrap_or("read_only");
+                let res = world
+                    .mirror
+                    .append(StreamEvent {
+                        session_id: sid,
+                        seq: 0,
+                        kind: EventKind::TextDelta,
+                        turn_id: None,
+                        attempt: None,
+                        payload: "mirror-write".into(),
+                    })
+                    .await;
+                match (want, res) {
+                    ("read_only", Err(StreamError::ReadOnly)) => {
+                        trace.push(TraceEvent::MockState {
+                            component: "mirror".into(),
+                            detail: "append read_only".into(),
+                            at_ms: now_ms,
+                        });
+                    }
+                    ("read_only", other) => {
+                        bail!("{}: mirror append want read_only got {other:?}", sc.name)
+                    }
+                    (other, _) => bail!("{}: unknown mirror_append expect {other}", sc.name),
+                }
+            }
+            Step::MirrorSnapshotPut {
+                snapshot_seq,
+                expect,
+            } => {
+                let sid = session.expect("session");
+                let want = expect.as_deref().unwrap_or("read_only");
+                let res = world
+                    .mirror
+                    .put(SessionSnapshot {
+                        session_id: sid,
+                        snapshot_seq,
+                        bubbles: vec![],
+                        running: vec![],
+                    })
+                    .await;
+                match (want, res) {
+                    ("read_only", Err(SnapshotError::ReadOnly)) => {
+                        trace.push(TraceEvent::MockState {
+                            component: "mirror".into(),
+                            detail: "snapshot_put read_only".into(),
+                            at_ms: now_ms,
+                        });
+                    }
+                    ("read_only", other) => {
+                        bail!(
+                            "{}: mirror snapshot_put want read_only got {other:?}",
+                            sc.name
+                        )
+                    }
+                    (other, _) => {
+                        bail!("{}: unknown mirror_snapshot_put expect {other}", sc.name)
+                    }
+                }
             }
         }
         now_ms += 1;

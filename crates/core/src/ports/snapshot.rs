@@ -6,6 +6,8 @@ use thiserror::Error;
 pub enum SnapshotError {
     #[error("stale snapshot_seq")]
     StaleSeq,
+    #[error("read only")]
+    ReadOnly,
     #[error("internal: {0}")]
     Internal(String),
 }
