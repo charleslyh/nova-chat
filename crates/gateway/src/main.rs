@@ -569,11 +569,12 @@ async fn agent_append(State(st): State<AppState>, Json(body): Json<AppendBody>) 
         "turn_failed" => EventKind::TurnFailed,
         other => return err(StatusCode::BAD_REQUEST, format!("unknown kind {other}")),
     };
+    let session_id = SessionId(body.session_id);
     match st
         .world
         .stream
         .append(StreamEvent {
-            session_id: SessionId(body.session_id),
+            session_id,
             seq: 0,
             kind,
             turn_id: Some(TurnId(body.turn_id)),
@@ -582,7 +583,16 @@ async fn agent_append(State(st): State<AppState>, Json(body): Json<AppendBody>) 
         })
         .await
     {
-        Ok(seq) => Json(serde_json::json!({"seq": seq})).into_response(),
+        Ok(seq) => {
+            // Keep open-screen tip fresh mid-turn (FR-9): observers skip full hot replay.
+            if let Ok(Some(mut snap)) = st.world.snapshot.get(session_id).await {
+                if seq > snap.snapshot_seq {
+                    snap.snapshot_seq = seq;
+                    let _ = st.world.snapshot.put(snap).await;
+                }
+            }
+            Json(serde_json::json!({"seq": seq})).into_response()
+        }
         Err(StreamError::StaleAttempt) => err(StatusCode::CONFLICT, "stale attempt".into()),
         Err(StreamError::ReadOnly) => err(StatusCode::SERVICE_UNAVAILABLE, "read_only".into()),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),

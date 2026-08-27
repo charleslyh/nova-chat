@@ -85,7 +85,7 @@ reap() // 超时回收
 
 ## 5. 时序要点
 
-1. **开屏**：GET snapshot → SSE `from_seq=snapshot_seq`
+1. **开屏**：GET snapshot → SSE `from_seq = snapshot.stream_from_seq()`（即 `max(snapshot_seq, 1)`）；中途接入不依赖从 seq 1 全量热回放
 2. **Turn**：POST → CAS busy + pending + append turn_begin → 202；Agent claim → append deltas → done + idle
 3. **fence**：reaper 抬 attempt → 旧 append 拒绝
 4. **热 miss**：SSE 返回 409 + recover_hint

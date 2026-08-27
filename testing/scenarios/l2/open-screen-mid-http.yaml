@@ -1,0 +1,48 @@
+name: open-screen-mid-http
+covers:
+  - FR-9
+  - INV-13
+  - FR-13
+oracles: []
+trace: true
+steps:
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/sessions
+    expect_contains: session_id
+    capture:
+      session_id: session_id
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/turns
+    body: '{"text":"open-mid","idempotency_key":"l2-os-1"}'
+    expect_status: 202
+    expect_contains: turn_id
+  # Catch mid-turn open screen (running non-empty)
+  - action: http_get_until
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/snapshot
+    expect_contains: '"running":['
+    timeout_ms: 8000
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/snapshot
+    expect_status: 200
+    expect_contains: snapshot_seq
+    capture:
+      snap_seq: snapshot_seq
+  # Prove mid-open does not need full hot from seq 1
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/admin/trim_hot
+    body: '{"session_id":"{{session_id}}","new_earliest":{{snap_seq}}}'
+    expect_status: 200
+    expect_contains: '"ok":true'
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/stream?from_seq=1
+    expect_status: 409
+    expect_contains: stream_gap
+  - action: http_sse_collect
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/stream?from_seq={{snap_seq}}
+    expect_min_events: 1
+    max_events: 16
+    timeout_ms: 10000
+  - action: http_get_until
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/snapshot
+    expect_contains: '"running":[]'
+    timeout_ms: 10000

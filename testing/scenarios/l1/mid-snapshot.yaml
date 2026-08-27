@@ -2,9 +2,11 @@ name: mid-snapshot
 covers:
   - FR-9
   - INV-13
+  - CR-4
 oracles:
   - SeqMonotonic
   - SingleClaimPerAttempt
+  - NoSilentGap
 trace: true
 steps:
   - action: create_session
@@ -16,11 +18,23 @@ steps:
   - action: append_delta
     payload: partial
     expect_stale: false
+  # Open-screen tip at mid-turn (turn_begin=1, delta=2)
   - action: snapshot_put
     snapshot_seq: 2
     expect: ok
   - action: snapshot_get
     expect_seq: 2
+  # Unload early hot — open screen must not require full replay from seq 1
+  - action: trim_earliest
+    new_earliest: 2
+  - action: expect_cold_min
+    min_events: 1
+  - action: expect_gap
+    from_seq: 1
+    expect_hint: recover_via_snapshot
+  - action: resume_from
+    from_seq: 2
+    expect_min_events: 1
   - action: append_delta
     payload: more
     expect_stale: false

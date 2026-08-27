@@ -294,6 +294,30 @@
       return home;
     }
 
+    async function loadSnapshotOpenScreen() {
+      // FR-9 / INV-13: GET snapshot → SSE from stream_from_seq (max(snapshot_seq, 1))
+      const r = await fetch(`http://${state.listen}/v1/sessions/${state.sessionId}/snapshot`);
+      if (!r.ok) {
+        state.lastSeq = 0;
+        return;
+      }
+      const s = await r.json();
+      $("messages").innerHTML = "";
+      for (const b of s.bubbles || []) {
+        if (b.role === "user" || b.role === "assistant") {
+          addBubble(b.role, b.text || "");
+        }
+      }
+      hideEmpty();
+      const snapSeq = Number(s.snapshot_seq || 0);
+      const from = Math.max(1, snapSeq);
+      state.lastSeq = from - 1;
+      if (Array.isArray(s.running) && s.running.length > 0) {
+        state.assistantEl = addBubble("assistant", "…", true);
+        setBusy(true);
+      }
+    }
+
     async function newSession() {
       await ensureEnv();
       closeStream();
@@ -306,9 +330,10 @@
       state.sessionId = j.session_id;
       $("messages").innerHTML = "";
       hideEmpty();
+      await loadSnapshotOpenScreen();
       openStream();
-      setBusy(false);
-      setStatus(statusLine("idle"));
+      if (!state.busy) setBusy(false);
+      setStatus(statusLine(state.busy ? "busy" : "idle"));
       $("input").focus();
     }
 
