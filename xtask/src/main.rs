@@ -85,6 +85,8 @@ async fn procs(action: &str) -> Result<()> {
     match action {
         "up" => {
             procs_down(&run_dir)?;
+            // sim / 残留进程可能占着同端口；先清掉再起 L2 夹具
+            kill_listeners(&[18080, 18081, 18082])?;
             start_bin(
                 "nova-sessions-gateway",
                 &["--config", "testing/config/home.toml"],
@@ -105,6 +107,7 @@ async fn procs(action: &str) -> Result<()> {
         }
         "down" => {
             procs_down(&run_dir)?;
+            kill_listeners(&[18080, 18081, 18082])?;
         }
         other => bail!("unknown procs action {other}"),
     }
@@ -150,6 +153,24 @@ fn kill_pidfile(path: &Path) -> Result<()> {
         }
     }
     let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+fn kill_listeners(ports: &[u16]) -> Result<()> {
+    for port in ports {
+        let out = Command::new("lsof")
+            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+            .output();
+        let Ok(out) = out else { continue };
+        if !out.status.success() {
+            continue;
+        }
+        for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+            let _ = Command::new("kill").args(["-TERM", pid]).status();
+        }
+    }
+    // brief settle
+    std::thread::sleep(Duration::from_millis(200));
     Ok(())
 }
 
@@ -324,8 +345,8 @@ fn coverage() -> Result<()> {
         }
     }
 
-    // 当期不做：完整压力、只读降级平台、客户端退避协议、多实例无粘性切换。
-    let deferred: BTreeSet<&str> = ["CR-8", "INV-30", "INV-32", "INV-33", "FR-17"]
+    // 当期不做：完整压力、只读降级平台、客户端退避协议。
+    let deferred: BTreeSet<&str> = ["CR-8", "INV-30", "INV-32", "INV-33"]
         .into_iter()
         .collect();
 

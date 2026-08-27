@@ -60,6 +60,20 @@ enum Step {
         #[serde(default = "default_interval")]
         interval_ms: u64,
     },
+    /// Collect SSE `id`/`data` events from a live stream, then disconnect.
+    HttpSseCollect {
+        url: String,
+        #[serde(default = "default_sse_min")]
+        expect_min_events: usize,
+        /// Stop after this many events (default: expect_min_events).
+        #[serde(default)]
+        max_events: Option<usize>,
+        #[serde(default = "default_sse_timeout")]
+        timeout_ms: u64,
+        /// Var name for last event id; also sets `{name}_next` = last+1.
+        #[serde(default)]
+        capture_last_seq: Option<String>,
+    },
 }
 
 fn default_timeout() -> u64 {
@@ -67,6 +81,12 @@ fn default_timeout() -> u64 {
 }
 fn default_interval() -> u64 {
     200
+}
+fn default_sse_min() -> usize {
+    1
+}
+fn default_sse_timeout() -> u64 {
+    10_000
 }
 
 pub async fn run_l2_dir(dir: &Path) -> Result<Vec<String>> {
@@ -198,6 +218,43 @@ async fn run_one(path: &Path) -> Result<String> {
                 }
                 let _ = last;
             }
+            Step::HttpSseCollect {
+                url,
+                expect_min_events,
+                max_events,
+                timeout_ms,
+                capture_last_seq,
+            } => {
+                let url = subst(&url, &vars);
+                let cap = max_events.unwrap_or(expect_min_events).max(expect_min_events);
+                let (ids, bodies) = sse_collect(&url, cap, Duration::from_millis(timeout_ms))
+                    .await
+                    .with_context(|| format!("{}: sse {url}", sc.name))?;
+                if ids.len() < expect_min_events {
+                    bail!(
+                        "{}: sse {url} got {} events, want >= {expect_min_events}",
+                        sc.name,
+                        ids.len()
+                    );
+                }
+                if let Some(var) = capture_last_seq {
+                    let last = *ids.last().unwrap();
+                    vars.insert(var.clone(), last.to_string());
+                    vars.insert(format!("{var}_next"), (last + 1).to_string());
+                }
+                trace.push(TraceEvent::ApiCall {
+                    method: "SSE_COLLECT".into(),
+                    url: url.clone(),
+                    status_ok: true,
+                    detail: format!(
+                        "events={} last_seq={} sample={}",
+                        ids.len(),
+                        ids.last().copied().unwrap_or(0),
+                        bodies.last().map(|s| s.chars().take(80).collect::<String>()).unwrap_or_default()
+                    ),
+                    at_ms: now_ms,
+                });
+            }
         }
         now_ms += 1;
         trace.push(TraceEvent::Clock { now_ms });
@@ -297,4 +354,92 @@ async fn http(method: &str, url: &str, body: Option<&str>) -> Result<String> {
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;
     Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
+/// Read up to `max_events` SSE events from `url`, then drop the connection.
+async fn sse_collect(url: &str, max_events: usize, timeout: Duration) -> Result<(Vec<u64>, Vec<String>)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let rest = url.trim_start_matches("http://");
+    let (addr, path) = rest
+        .split_once('/')
+        .map(|(a, p)| (a, format!("/{p}")))
+        .unwrap_or((rest, "/".into()));
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("connect {addr}"))?;
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await?;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut raw = Vec::new();
+    let mut ids = Vec::new();
+    let mut bodies = Vec::new();
+    let mut header_done = false;
+
+    while ids.len() < max_events {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let mut chunk = [0u8; 2048];
+        let n = match tokio::time::timeout(left, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => break,
+        };
+        raw.extend_from_slice(&chunk[..n]);
+
+        if !header_done {
+            let text = String::from_utf8_lossy(&raw);
+            let Some(pos) = text.find("\r\n\r\n").or_else(|| text.find("\n\n")) else {
+                continue;
+            };
+            let sep = if text[pos..].starts_with("\r\n\r\n") {
+                4
+            } else {
+                2
+            };
+            let status_line = text.lines().next().unwrap_or("");
+            if !status_line.contains("200") {
+                bail!("sse status not 200: {status_line}");
+            }
+            raw = text[pos + sep..].as_bytes().to_vec();
+            header_done = true;
+        }
+
+        let text = String::from_utf8_lossy(&raw);
+        let mut start = 0usize;
+        while let Some(rel) = text[start..].find("\n\n") {
+            let end = start + rel;
+            let frame = text[start..end].trim_start_matches('\r');
+            start = end + 2;
+            let mut id = None;
+            let mut data = String::new();
+            for line in frame.lines() {
+                let line = line.trim_end_matches('\r');
+                if let Some(v) = line.strip_prefix("id:") {
+                    id = v.trim().parse().ok();
+                } else if let Some(v) = line.strip_prefix("data:") {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(v.trim_start());
+                }
+            }
+            if let Some(id) = id {
+                ids.push(id);
+                bodies.push(data);
+                if ids.len() >= max_events {
+                    break;
+                }
+            }
+        }
+        if start > 0 {
+            raw = text[start..].as_bytes().to_vec();
+        }
+    }
+    Ok((ids, bodies))
 }

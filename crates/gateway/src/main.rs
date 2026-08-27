@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -645,16 +646,22 @@ async fn forward_sse(
                 let bytes = resp.bytes().await.unwrap_or_default();
                 return (status, bytes).into_response();
             }
-            let byte_stream = resp.bytes_stream();
-            let mapped = byte_stream.filter_map(|chunk| async move {
-                match chunk {
-                    Ok(b) => Some(Ok::<_, Infallible>(
-                        Event::default().data(String::from_utf8_lossy(&b).to_string()),
-                    )),
-                    Err(_) => None,
-                }
+            // Transparent byte proxy — do not re-wrap upstream SSE frames as Event::data.
+            let byte_stream = resp.bytes_stream().map(|chunk| {
+                chunk.map_err(|e| std::io::Error::other(e.to_string()))
             });
-            Sse::new(mapped).into_response()
+            let mut builder = Response::builder().status(status);
+            builder = builder.header(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            builder = builder.header(
+                axum::http::header::CACHE_CONTROL,
+                HeaderValue::from_static("no-cache"),
+            );
+            builder
+                .body(Body::from_stream(byte_stream))
+                .unwrap_or_else(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "sse proxy".into()))
         }
         Err(e) => err(StatusCode::BAD_GATEWAY, e.to_string()),
     }
