@@ -41,12 +41,16 @@ impl MemStreamChannel {
 #[async_trait]
 impl StreamChannel for MemStreamChannel {
     async fn append(&self, mut event: StreamEvent) -> Result<u64, StreamError> {
+        if self.meta.is_read_only() {
+            return Err(StreamError::ReadOnly);
+        }
         if let (Some(tid), Some(att)) = (event.turn_id, event.attempt) {
             self.meta
                 .check_attempt(tid, att)
                 .await
                 .map_err(|e| match e {
                     nova_sessions_core::MetaError::StaleAttempt => StreamError::StaleAttempt,
+                    nova_sessions_core::MetaError::ReadOnly => StreamError::ReadOnly,
                     other => StreamError::Internal(other.to_string()),
                 })?;
         }

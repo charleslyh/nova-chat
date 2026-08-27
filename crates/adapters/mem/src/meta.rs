@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -24,6 +25,7 @@ struct Inner {
 
 pub struct MemMetaStore {
     inner: Mutex<Inner>,
+    read_only: AtomicBool,
 }
 
 impl MemMetaStore {
@@ -36,6 +38,24 @@ impl MemMetaStore {
                 idem: HashMap::new(),
                 heartbeats: HashMap::new(),
             }),
+            read_only: AtomicBool::new(false),
+        }
+    }
+
+    /// INV-32: toggle read-only degrade (writes rejected, reads still allowed).
+    pub fn set_read_only(&self, enabled: bool) {
+        self.read_only.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::SeqCst)
+    }
+
+    fn guard_writable(&self) -> Result<(), MetaError> {
+        if self.is_read_only() {
+            Err(MetaError::ReadOnly)
+        } else {
+            Ok(())
         }
     }
 }
@@ -66,10 +86,17 @@ impl MetaStore for MemMetaStore {
         idempotency_key: IdempotencyKey,
         _now_ms: u64,
     ) -> Result<SubmitOutcome, MetaError> {
-        let mut g = self.inner.lock();
-        if let Some(tid) = g.idem.get(&idempotency_key.0) {
-            return Ok(SubmitOutcome::Duplicate { turn_id: *tid });
+        // Idempotent replay of an already-accepted key still returns Duplicate even in read-only.
+        {
+            let g = self.inner.lock();
+            if let Some(tid) = g.idem.get(&idempotency_key.0) {
+                return Ok(SubmitOutcome::Duplicate { turn_id: *tid });
+            }
         }
+        if self.is_read_only() {
+            return Ok(SubmitOutcome::ReadOnly);
+        }
+        let mut g = self.inner.lock();
         let sess = g.sessions.get_mut(&session_id).ok_or(MetaError::NotFound)?;
         if matches!(sess.lock, SessionLock::Busy) {
             return Ok(SubmitOutcome::Busy);
@@ -97,6 +124,7 @@ impl MetaStore for MemMetaStore {
         now_ms: u64,
         exec_ttl_ms: u64,
     ) -> Result<Option<ClaimedTurn>, MetaError> {
+        self.guard_writable()?;
         let mut g = self.inner.lock();
         let Some(turn_id) = g.pending.pop_front() else {
             return Ok(None);
@@ -128,6 +156,7 @@ impl MetaStore for MemMetaStore {
         expected_attempt: Attempt,
         to: TurnStatus,
     ) -> Result<(), MetaError> {
+        self.guard_writable()?;
         let mut g = self.inner.lock();
         let Some(rec) = g.turns.get_mut(&turn_id) else {
             return Err(MetaError::NotFound);
@@ -215,6 +244,7 @@ impl MetaStore for MemMetaStore {
     }
 
     async fn check_attempt(&self, turn_id: TurnId, attempt: Attempt) -> Result<(), MetaError> {
+        self.guard_writable()?;
         let g = self.inner.lock();
         let Some(rec) = g.turns.get(&turn_id) else {
             return Err(MetaError::NotFound);

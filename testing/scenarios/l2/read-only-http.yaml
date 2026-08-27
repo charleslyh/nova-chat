@@ -1,0 +1,37 @@
+name: read-only-http
+covers:
+  - INV-32
+oracles: []
+trace: true
+steps:
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/sessions
+    expect_contains: session_id
+    capture:
+      session_id: session_id
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/admin/read_only
+    body: '{"enabled":true}'
+    expect_contains: '"read_only":true'
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/turns
+    body: '{"text":"blocked","idempotency_key":"l2-ro-1"}'
+    expect_status: 503
+    expect_contains: read_only
+  # snapshot read still available
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/snapshot
+    expect_status: 200
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/admin/read_only
+    body: '{"enabled":false}'
+    expect_contains: '"read_only":false'
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/turns
+    body: '{"text":"ok-after","idempotency_key":"l2-ro-2"}'
+    expect_status: 202
+    expect_contains: turn_id
+  - action: http_get_until
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/snapshot
+    expect_contains: '"running":[]'
+    timeout_ms: 10000

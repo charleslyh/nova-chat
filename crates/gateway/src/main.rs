@@ -114,6 +114,8 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/{id}/turns", post(create_turn))
         .route("/v1/sessions/{id}/snapshot", get(get_snapshot))
         .route("/v1/sessions/{id}/stream", get(stream_sse))
+        // ops / test: INV-32 read-only degrade toggle (home)
+        .route("/v1/admin/read_only", post(set_read_only))
         // agent-facing (home only)
         .route("/v1/agent/claim", post(agent_claim))
         .route("/v1/agent/heartbeat", post(agent_heartbeat))
@@ -252,6 +254,7 @@ async fn create_turn(
 
     match outcome {
         SubmitOutcome::Busy => err(StatusCode::CONFLICT, "session busy".into()),
+        SubmitOutcome::ReadOnly => err(StatusCode::SERVICE_UNAVAILABLE, "read_only".into()),
         SubmitOutcome::Duplicate { turn_id } => {
             (StatusCode::ACCEPTED, Json(TurnCreated { turn_id })).into_response()
         }
@@ -404,6 +407,25 @@ async fn stream_sse(
         .into_response()
 }
 
+// --- admin (home) ---
+
+#[derive(Debug, Deserialize)]
+struct ReadOnlyBody {
+    enabled: bool,
+}
+
+async fn set_read_only(State(st): State<AppState>, Json(body): Json<ReadOnlyBody>) -> Response {
+    if st.cfg.role != "home" {
+        return err(StatusCode::FORBIDDEN, "read_only toggle only on home".into());
+    }
+    st.world.meta.set_read_only(body.enabled);
+    Json(serde_json::json!({
+        "ok": true,
+        "read_only": st.world.meta.is_read_only(),
+    }))
+    .into_response()
+}
+
 // --- agent endpoints (home) ---
 
 #[derive(Debug, Deserialize)]
@@ -448,6 +470,9 @@ async fn agent_claim(State(st): State<AppState>, Json(body): Json<ClaimBody>) ->
                 exec_deadline_ms: c.exec_deadline_ms,
             })
             .into_response()
+        }
+        Err(nova_sessions_core::MetaError::ReadOnly) => {
+            err(StatusCode::SERVICE_UNAVAILABLE, "read_only".into())
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -498,6 +523,7 @@ async fn agent_append(State(st): State<AppState>, Json(body): Json<AppendBody>) 
     {
         Ok(seq) => Json(serde_json::json!({"seq": seq})).into_response(),
         Err(StreamError::StaleAttempt) => err(StatusCode::CONFLICT, "stale attempt".into()),
+        Err(StreamError::ReadOnly) => err(StatusCode::SERVICE_UNAVAILABLE, "read_only".into()),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -541,6 +567,7 @@ async fn agent_complete(State(st): State<AppState>, Json(body): Json<CompleteBod
     {
         return match e {
             StreamError::StaleAttempt => err(StatusCode::CONFLICT, "stale attempt".into()),
+            StreamError::ReadOnly => err(StatusCode::SERVICE_UNAVAILABLE, "read_only".into()),
             e => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
     }

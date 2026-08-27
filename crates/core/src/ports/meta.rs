@@ -42,6 +42,8 @@ pub enum SubmitOutcome {
     Accepted { turn_id: TurnId },
     Duplicate { turn_id: TurnId },
     Busy,
+    /// INV-32: read-only degrade rejects new writes.
+    ReadOnly,
 }
 
 #[derive(Debug, Error)]
@@ -52,6 +54,8 @@ pub enum MetaError {
     StaleAttempt,
     #[error("busy")]
     Busy,
+    #[error("read only")]
+    ReadOnly,
     #[error("internal: {0}")]
     Internal(String),
 }

@@ -15,6 +15,8 @@ pub enum StreamError {
     Gap(StreamGap),
     #[error("stale attempt")]
     StaleAttempt,
+    #[error("read only")]
+    ReadOnly,
     #[error("internal: {0}")]
     Internal(String),
 }

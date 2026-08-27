@@ -96,6 +96,10 @@ enum Step {
         #[serde(default)]
         expect_none: bool,
     },
+    /// INV-32: toggle MemWorld read-only degrade.
+    SetReadOnly {
+        enabled: bool,
+    },
 }
 
 pub async fn run_l1_dir(dir: &Path) -> Result<Vec<String>> {
@@ -160,6 +164,9 @@ async fn run_one(path: &Path) -> Result<String> {
                     SubmitOutcome::Accepted { turn_id } => (*turn_id, "accepted"),
                     SubmitOutcome::Duplicate { turn_id } => (*turn_id, "duplicate"),
                     SubmitOutcome::Busy => (nova_sessions_core::TurnId(uuid::Uuid::nil()), "busy"),
+                    SubmitOutcome::ReadOnly => {
+                        (nova_sessions_core::TurnId(uuid::Uuid::nil()), "read_only")
+                    }
                 };
                 if let Some(want) = &expect {
                     if want != outcome {
@@ -579,6 +586,14 @@ async fn run_one(path: &Path) -> Result<String> {
                 trace.push(TraceEvent::MockState {
                     component: "snapshot".into(),
                     detail: format!("get expect_seq={expect_seq:?} none={expect_none}"),
+                    at_ms: now_ms,
+                });
+            }
+            Step::SetReadOnly { enabled } => {
+                world.meta.set_read_only(enabled);
+                trace.push(TraceEvent::MockState {
+                    component: "meta".into(),
+                    detail: format!("read_only={enabled}"),
                     at_ms: now_ms,
                 });
             }
