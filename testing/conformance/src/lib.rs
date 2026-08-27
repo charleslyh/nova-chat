@@ -141,6 +141,15 @@ pub async fn assert_fence_conformance(world: &MemWorld) {
     assert!(matches!(err, Err(StreamError::StaleAttempt)));
 }
 
+/// INV-16: TextDelta may coalesce; terminal / structural events must not.
+pub fn assert_event_coalescing() {
+    assert!(EventKind::TextDelta.coalescible());
+    assert!(!EventKind::TurnBegin.coalescible());
+    assert!(!EventKind::TurnDone.coalescible());
+    assert!(!EventKind::SessionBusy.coalescible());
+    assert!(!EventKind::AttemptStarted.coalescible());
+}
+
 pub async fn run_mem_suite() {
     let world = MemWorld::new();
     let sid = world.meta.create_session().await.unwrap();
@@ -148,6 +157,7 @@ pub async fn run_mem_suite() {
     assert_snapshot_conformance(world.snapshot.clone() as Arc<dyn SnapshotStore>).await;
     assert_meta_conformance(world.meta.clone() as Arc<dyn MetaStore>).await;
     assert_fence_conformance(&world).await;
+    assert_event_coalescing();
 }
 
 /// Same as [`run_mem_suite`], printing each case name as it runs (for `just verify l0`).
@@ -169,6 +179,10 @@ pub async fn run_mem_suite_reported() {
 
     eprint!("  fence ... ");
     assert_fence_conformance(&world).await;
+    eprintln!("ok");
+
+    eprint!("  event-coalesce ... ");
+    assert_event_coalescing();
     eprintln!("ok");
 }
 

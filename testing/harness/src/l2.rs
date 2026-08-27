@@ -35,12 +35,16 @@ enum Step {
         url: String,
         expect_contains: Option<String>,
         #[serde(default)]
+        expect_status: Option<u16>,
+        #[serde(default)]
         capture: HashMap<String, String>,
     },
     HttpPost {
         url: String,
         body: Option<String>,
         expect_contains: Option<String>,
+        #[serde(default)]
+        expect_status: Option<u16>,
         #[serde(default)]
         capture: HashMap<String, String>,
     },
@@ -103,10 +107,12 @@ async fn run_one(path: &Path) -> Result<String> {
             Step::HttpGet {
                 url,
                 expect_contains,
+                expect_status,
                 capture,
             } => {
                 let url = subst(&url, &vars);
                 let resp = http("GET", &url, None).await?;
+                check_status(&sc.name, "GET", &url, &resp, expect_status)?;
                 apply_capture(&resp, &capture, &mut vars)?;
                 let expect = expect_contains.map(|s| subst(&s, &vars));
                 let ok = expect.as_ref().map(|s| resp.contains(s)).unwrap_or(true);
@@ -125,11 +131,13 @@ async fn run_one(path: &Path) -> Result<String> {
                 url,
                 body,
                 expect_contains,
+                expect_status,
                 capture,
             } => {
                 let url = subst(&url, &vars);
                 let body = body.map(|b| subst(&b, &vars));
                 let resp = http("POST", &url, body.as_deref()).await?;
+                check_status(&sc.name, "POST", &url, &resp, expect_status)?;
                 apply_capture(&resp, &capture, &mut vars)?;
                 let expect = expect_contains.map(|s| subst(&s, &vars));
                 let ok = expect.as_ref().map(|s| resp.contains(s)).unwrap_or(true);
@@ -199,6 +207,34 @@ async fn run_one(path: &Path) -> Result<String> {
     run_oracles(&trace, &sc.oracles)?;
     eprintln!("ok");
     Ok(name)
+}
+
+fn http_status(resp: &str) -> Option<u16> {
+    resp.lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+fn check_status(
+    scenario: &str,
+    method: &str,
+    url: &str,
+    resp: &str,
+    expect_status: Option<u16>,
+) -> Result<()> {
+    let Some(want) = expect_status else {
+        return Ok(());
+    };
+    let Some(got) = http_status(resp) else {
+        bail!("{scenario}: {method} {url} missing HTTP status line");
+    };
+    if got != want {
+        bail!("{scenario}: {method} {url} expect status {want} got {got}");
+    }
+    Ok(())
 }
 
 fn subst(s: &str, vars: &HashMap<String, String>) -> String {

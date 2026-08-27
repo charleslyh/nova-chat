@@ -1,5 +1,7 @@
 name: snapshot-monotonic
 covers:
+  - FR-9
+  - INV-13
   - INV-15
   - CR-4
 oracles:

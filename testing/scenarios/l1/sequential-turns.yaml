@@ -1,5 +1,6 @@
 name: sequential-turns
 covers:
+  - FR-5
   - FR-8
   - INV-12
 oracles:

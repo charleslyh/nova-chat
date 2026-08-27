@@ -1,9 +1,13 @@
 name: attempt-fence
 covers:
+  - FR-5
+  - FR-6
+  - FR-7
   - CR-3
   - CR-7
   - INV-5
   - INV-6
+  - INV-10
 oracles:
   - SeqMonotonic
   - SingleClaimPerAttempt

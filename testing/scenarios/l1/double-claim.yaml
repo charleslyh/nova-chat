@@ -1,5 +1,6 @@
 name: double-claim
 covers:
+  - FR-5
   - CR-1
   - INV-1
 oracles:

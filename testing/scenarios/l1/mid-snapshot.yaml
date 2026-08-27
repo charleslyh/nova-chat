@@ -1,0 +1,28 @@
+name: mid-snapshot
+covers:
+  - FR-9
+  - INV-13
+oracles:
+  - SeqMonotonic
+  - SingleClaimPerAttempt
+trace: true
+steps:
+  - action: create_session
+  - action: submit_turn
+    text: mid-open
+    key: k-mid-1
+    expect: accepted
+  - action: claim
+  - action: append_delta
+    payload: partial
+    expect_stale: false
+  - action: snapshot_put
+    snapshot_seq: 2
+    expect: ok
+  - action: snapshot_get
+    expect_seq: 2
+  - action: append_delta
+    payload: more
+    expect_stale: false
+  - action: complete
+    status: done

@@ -1,7 +1,10 @@
 name: home-turn-idempotent
 covers:
-  - CR-2
   - FR-1
+  - FR-2
+  - FR-4
+  - CR-2
+  - INV-34
 oracles: []
 trace: true
 steps:
@@ -13,12 +16,14 @@ steps:
   - action: http_post
     url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/turns
     body: '{"text":"once","idempotency_key":"l2-idem-1"}'
+    expect_status: 202
     expect_contains: turn_id
     capture:
       turn_id: turn_id
   - action: http_post
     url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/turns
     body: '{"text":"once-again","idempotency_key":"l2-idem-1"}'
+    expect_status: 202
     expect_contains: '{{turn_id}}'
   - action: http_get_until
     url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/snapshot

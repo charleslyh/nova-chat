@@ -2,7 +2,9 @@ name: edge-turn-agent
 covers:
   - FR-1
   - FR-8
+  - FR-10
   - FR-15
+  - FR-16
 oracles: []
 trace: true
 steps:
@@ -14,6 +16,7 @@ steps:
   - action: http_post
     url: http://127.0.0.1:18081/v1/sessions/{{session_id}}/turns
     body: '{"text":"hello-from-edge","idempotency_key":"l2-edge-1"}'
+    expect_status: 202
     expect_contains: turn_id
     capture:
       turn_id: turn_id
@@ -23,4 +26,7 @@ steps:
     timeout_ms: 10000
   - action: http_get
     url: http://127.0.0.1:18081/v1/sessions/{{session_id}}/snapshot
+    expect_contains: hello-from-edge
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/snapshot
     expect_contains: hello-from-edge

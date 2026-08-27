@@ -1,5 +1,7 @@
 name: idempotent-submit
 covers:
+  - FR-3
+  - FR-4
   - CR-2
   - INV-2
 oracles:
