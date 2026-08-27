@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -26,6 +26,8 @@ struct Inner {
 pub struct MemMetaStore {
     inner: Mutex<Inner>,
     read_only: AtomicBool,
+    /// FR-18: max Pending+Claimed turns; reject with Overloaded when at limit.
+    pending_limit: AtomicUsize,
 }
 
 impl MemMetaStore {
@@ -39,6 +41,7 @@ impl MemMetaStore {
                 heartbeats: HashMap::new(),
             }),
             read_only: AtomicBool::new(false),
+            pending_limit: AtomicUsize::new(10_000),
         }
     }
 
@@ -51,12 +54,27 @@ impl MemMetaStore {
         self.read_only.load(Ordering::SeqCst)
     }
 
+    pub fn set_pending_limit(&self, limit: usize) {
+        self.pending_limit.store(limit.max(1), Ordering::SeqCst);
+    }
+
+    pub fn pending_limit(&self) -> usize {
+        self.pending_limit.load(Ordering::SeqCst)
+    }
+
     fn guard_writable(&self) -> Result<(), MetaError> {
         if self.is_read_only() {
             Err(MetaError::ReadOnly)
         } else {
             Ok(())
         }
+    }
+
+    fn inflight_locked(g: &Inner) -> usize {
+        g.turns
+            .values()
+            .filter(|t| matches!(t.status, TurnStatus::Pending | TurnStatus::Claimed))
+            .count()
     }
 }
 
@@ -97,6 +115,10 @@ impl MetaStore for MemMetaStore {
             return Ok(SubmitOutcome::ReadOnly);
         }
         let mut g = self.inner.lock();
+        let limit = self.pending_limit();
+        if Self::inflight_locked(&g) >= limit {
+            return Ok(SubmitOutcome::Overloaded);
+        }
         let sess = g.sessions.get_mut(&session_id).ok_or(MetaError::NotFound)?;
         if matches!(sess.lock, SessionLock::Busy) {
             return Ok(SubmitOutcome::Busy);

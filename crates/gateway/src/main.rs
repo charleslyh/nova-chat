@@ -47,6 +47,9 @@ struct Config {
     home_upstream: Option<String>,
     #[serde(default = "default_true")]
     run_reaper: bool,
+    /// FR-18: max Pending+Claimed turns before Overloaded (home only).
+    #[serde(default = "default_pending_limit")]
+    pending_limit: usize,
 }
 
 fn default_region() -> String {
@@ -55,6 +58,10 @@ fn default_region() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_pending_limit() -> usize {
+    10_000
 }
 
 #[derive(Clone)]
@@ -89,6 +96,9 @@ async fn main() -> Result<()> {
     let addr: SocketAddr = cfg.listen.parse()?;
 
     let world = MemWorld::new();
+    if cfg.role == "home" {
+        world.meta.set_pending_limit(cfg.pending_limit);
+    }
     let state = AppState {
         cfg: cfg.clone(),
         world: world.clone(),
@@ -116,6 +126,7 @@ async fn main() -> Result<()> {
         .route("/v1/sessions/{id}/stream", get(stream_sse))
         // ops / test: INV-32 read-only degrade toggle (home)
         .route("/v1/admin/read_only", post(set_read_only))
+        .route("/v1/admin/pending_limit", post(set_pending_limit))
         // agent-facing (home only)
         .route("/v1/agent/claim", post(agent_claim))
         .route("/v1/agent/heartbeat", post(agent_heartbeat))
@@ -255,6 +266,9 @@ async fn create_turn(
     match outcome {
         SubmitOutcome::Busy => err(StatusCode::CONFLICT, "session busy".into()),
         SubmitOutcome::ReadOnly => err(StatusCode::SERVICE_UNAVAILABLE, "read_only".into()),
+        SubmitOutcome::Overloaded => {
+            err(StatusCode::TOO_MANY_REQUESTS, "overloaded".into())
+        }
         SubmitOutcome::Duplicate { turn_id } => {
             (StatusCode::ACCEPTED, Json(TurnCreated { turn_id })).into_response()
         }
@@ -422,6 +436,26 @@ async fn set_read_only(State(st): State<AppState>, Json(body): Json<ReadOnlyBody
     Json(serde_json::json!({
         "ok": true,
         "read_only": st.world.meta.is_read_only(),
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct PendingLimitBody {
+    pending_limit: usize,
+}
+
+async fn set_pending_limit(
+    State(st): State<AppState>,
+    Json(body): Json<PendingLimitBody>,
+) -> Response {
+    if st.cfg.role != "home" {
+        return err(StatusCode::FORBIDDEN, "pending_limit only on home".into());
+    }
+    st.world.meta.set_pending_limit(body.pending_limit);
+    Json(serde_json::json!({
+        "ok": true,
+        "pending_limit": st.world.meta.pending_limit(),
     }))
     .into_response()
 }

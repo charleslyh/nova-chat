@@ -100,6 +100,10 @@ enum Step {
     SetReadOnly {
         enabled: bool,
     },
+    /// FR-18: set global Pending+Claimed limit.
+    SetPendingLimit {
+        limit: usize,
+    },
 }
 
 pub async fn run_l1_dir(dir: &Path) -> Result<Vec<String>> {
@@ -167,6 +171,9 @@ async fn run_one(path: &Path) -> Result<String> {
                     SubmitOutcome::ReadOnly => {
                         (nova_sessions_core::TurnId(uuid::Uuid::nil()), "read_only")
                     }
+                    SubmitOutcome::Overloaded => {
+                        (nova_sessions_core::TurnId(uuid::Uuid::nil()), "overloaded")
+                    }
                 };
                 if let Some(want) = &expect {
                     if want != outcome {
@@ -174,6 +181,10 @@ async fn run_one(path: &Path) -> Result<String> {
                     }
                 } else if outcome == "busy" {
                     bail!("{}: unexpected busy", sc.name);
+                } else if outcome == "overloaded" {
+                    bail!("{}: unexpected overloaded", sc.name);
+                } else if outcome == "read_only" {
+                    bail!("{}: unexpected read_only", sc.name);
                 }
                 trace.push(TraceEvent::TurnSubmitted {
                     session_id: sid.0,
@@ -594,6 +605,14 @@ async fn run_one(path: &Path) -> Result<String> {
                 trace.push(TraceEvent::MockState {
                     component: "meta".into(),
                     detail: format!("read_only={enabled}"),
+                    at_ms: now_ms,
+                });
+            }
+            Step::SetPendingLimit { limit } => {
+                world.meta.set_pending_limit(limit);
+                trace.push(TraceEvent::MockState {
+                    component: "meta".into(),
+                    detail: format!("pending_limit={limit}"),
                     at_ms: now_ms,
                 });
             }

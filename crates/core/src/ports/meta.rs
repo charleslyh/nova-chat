@@ -44,6 +44,8 @@ pub enum SubmitOutcome {
     Busy,
     /// INV-32: read-only degrade rejects new writes.
     ReadOnly,
+    /// FR-18: pending/in-flight turns at or above configured limit.
+    Overloaded,
 }
 
 #[derive(Debug, Error)]

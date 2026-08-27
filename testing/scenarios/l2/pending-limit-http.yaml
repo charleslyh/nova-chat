@@ -1,0 +1,48 @@
+name: pending-limit-http
+covers:
+  - FR-18
+  - INV-29
+oracles: []
+trace: true
+steps:
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/admin/pending_limit
+    body: '{"pending_limit":1}'
+    expect_contains: '"pending_limit":1'
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/sessions
+    expect_contains: session_id
+    capture:
+      session_a: session_id
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/sessions/{{session_a}}/turns
+    body: '{"text":"hold","idempotency_key":"l2-pl-1"}'
+    expect_status: 202
+    expect_contains: turn_id
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/sessions
+    expect_contains: session_id
+    capture:
+      session_b: session_id
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/sessions/{{session_b}}/turns
+    body: '{"text":"blocked","idempotency_key":"l2-pl-2"}'
+    expect_status: 429
+    expect_contains: overloaded
+  - action: http_get_until
+    url: http://127.0.0.1:18080/v1/sessions/{{session_a}}/snapshot
+    expect_contains: '"running":[]'
+    timeout_ms: 10000
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/sessions/{{session_b}}/turns
+    body: '{"text":"ok-after","idempotency_key":"l2-pl-3"}'
+    expect_status: 202
+    expect_contains: turn_id
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/admin/pending_limit
+    body: '{"pending_limit":10000}'
+    expect_contains: '"pending_limit":10000'
+  - action: http_get_until
+    url: http://127.0.0.1:18080/v1/sessions/{{session_b}}/snapshot
+    expect_contains: '"running":[]'
+    timeout_ms: 10000
