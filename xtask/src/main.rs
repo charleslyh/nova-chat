@@ -297,7 +297,7 @@ fn coverage() -> Result<()> {
     // L0 conformance suite (always on).
     let mut covered: BTreeSet<String> = [
         "INV-11", "CR-5", "INV-15", "CR-4", "CR-1", "CR-2", "INV-1", "INV-2", "CR-3", "CR-7",
-        "INV-5", "INV-6", "FR-3", "FR-4", "FR-5", "FR-6", "FR-7", "INV-16",
+        "INV-5", "INV-6", "FR-3", "FR-4", "FR-5", "FR-6", "FR-7", "INV-16", "INV-33",
     ]
     .into_iter()
     .map(str::to_string)
@@ -345,8 +345,8 @@ fn coverage() -> Result<()> {
         }
     }
 
-    // 当期不做：完整压力平台、客户端退避协议（INV-33 偏客户端）。
-    let deferred: BTreeSet<&str> = ["INV-33"].into_iter().collect();
+    // 当期完整压力平台仍不做；INV-33 已由 core 退避库覆盖。
+    let deferred: BTreeSet<&str> = BTreeSet::new();
 
     let covered_baseline: BTreeSet<_> = covered
         .iter()

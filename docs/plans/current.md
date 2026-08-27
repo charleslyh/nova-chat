@@ -30,11 +30,12 @@
 | **V6** | INV-32：只读降级拒写，观测仍可读 | ✅ L1 + L2 |
 | **V7** | CR-8/INV-30 过载拒绝不损坏；停 edge 后游标续订 | ✅ L1 + L2 |
 | **V8** | FR-18 全局 pending/在途阈值 → `Overloaded` / HTTP 429 | ✅ meta + L1/L2 |
+| **V9** | INV-33：`JitteredBackoff` + L0/单测；sim chat 抖动重连 | ✅ |
 | 1–6 | 既有产品闭环（gateway / mem / agent / sim） | `just verify` |
 
 退出（近期）：L0/L1 绿且 Trace+Oracle 成为默认；能力场景持续补齐。`sim` 不替代 CI。
 
-下一步候选：INV-33 客户端退避（偏客户端）；完整压力平台。
+下一步候选：完整压力平台；客户端 SDK 独立成包。
 
 ---
 
@@ -48,6 +49,7 @@
 
 | 日期 | 变更 |
 |------|------|
+| 2026-08-27 | V9：INV-33 JitteredBackoff（core + L0 + sim chat） |
 | 2026-08-27 | V8：pending_limit → Overloaded/429（FR-18 全局在途阈值） |
 | 2026-08-27 | V7：overload-reject-consistent + stop-edge-resume |
 | 2026-08-27 | V6：INV-32 read-only 拒写（admin + L1/L2） |

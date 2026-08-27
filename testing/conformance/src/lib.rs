@@ -150,6 +150,18 @@ pub fn assert_event_coalescing() {
     assert!(!EventKind::AttemptStarted.coalescible());
 }
 
+/// INV-33: reconnect delays grow exponentially and include jitter spread.
+pub fn assert_reconnect_backoff() {
+    use nova_sessions_core::JitteredBackoff;
+    let b = JitteredBackoff::default();
+    let d0 = b.delay(0, 1.0);
+    let d3 = b.delay(3, 1.0);
+    assert!(d3 > d0);
+    let (lo, hi) = b.delay_bounds(2);
+    assert!(hi > lo, "jitter spread required");
+    assert!(hi.as_millis() <= 30_000 * 2);
+}
+
 pub async fn run_mem_suite() {
     let world = MemWorld::new();
     let sid = world.meta.create_session().await.unwrap();
@@ -158,6 +170,7 @@ pub async fn run_mem_suite() {
     assert_meta_conformance(world.meta.clone() as Arc<dyn MetaStore>).await;
     assert_fence_conformance(&world).await;
     assert_event_coalescing();
+    assert_reconnect_backoff();
 }
 
 /// Same as [`run_mem_suite`], printing each case name as it runs (for `just verify l0`).
@@ -183,6 +196,10 @@ pub async fn run_mem_suite_reported() {
 
     eprint!("  event-coalesce ... ");
     assert_event_coalescing();
+    eprintln!("ok");
+
+    eprint!("  reconnect-backoff ... ");
+    assert_reconnect_backoff();
     eprintln!("ok");
 }
 

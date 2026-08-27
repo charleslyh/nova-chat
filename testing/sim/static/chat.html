@@ -124,7 +124,18 @@
       es: null,
       busy: false,
       assistantEl: null,
+      reconnectAttempt: 0,
+      reconnectTimer: null,
     };
+
+    // INV-33: min(200ms * 2^n, 30s) * random(0.5, 1.5)
+    function reconnectDelayMs(attempt) {
+      const base = 200;
+      const max = 30_000;
+      const exp = Math.min(base * Math.pow(2, Math.min(attempt, 20)), max);
+      const jitter = 0.5 + Math.random();
+      return Math.round(exp * jitter);
+    }
 
     const $ = (id) => document.getElementById(id);
 
@@ -166,10 +177,26 @@
     }
 
     function closeStream() {
+      if (state.reconnectTimer) {
+        clearTimeout(state.reconnectTimer);
+        state.reconnectTimer = null;
+      }
       if (state.es) {
         state.es.close();
         state.es = null;
       }
+    }
+
+    function scheduleReconnect() {
+      if (!state.listen || !state.sessionId) return;
+      if (state.reconnectTimer) return;
+      const ms = reconnectDelayMs(state.reconnectAttempt);
+      state.reconnectAttempt += 1;
+      setStatus(`<span class="bad">SSE 断开</span> · ${ms}ms 后重连 (attempt ${state.reconnectAttempt})`);
+      state.reconnectTimer = setTimeout(() => {
+        state.reconnectTimer = null;
+        openStream();
+      }, ms);
     }
 
     function openStream() {
@@ -179,6 +206,10 @@
       const url = `http://${state.listen}/v1/sessions/${state.sessionId}/stream?from_seq=${from}`;
       const es = new EventSource(url);
       state.es = es;
+      es.onopen = () => {
+        state.reconnectAttempt = 0;
+        if (!state.busy) setStatus(statusLine("idle"));
+      };
       es.onmessage = (ev) => {
         if (ev.lastEventId) state.lastSeq = Number(ev.lastEventId) || state.lastSeq;
         let data;
@@ -217,7 +248,12 @@
         }
       };
       es.onerror = () => {
-        /* EventSource auto-reconnects; leave status alone unless prolonged */
+        // Close so the browser does not fight our INV-33 backoff.
+        if (state.es) {
+          state.es.close();
+          state.es = null;
+        }
+        scheduleReconnect();
       };
     }
 

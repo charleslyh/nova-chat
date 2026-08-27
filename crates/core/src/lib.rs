@@ -4,11 +4,13 @@ mod error;
 mod events;
 mod ids;
 mod ports;
+mod reconnect;
 mod snapshot;
 
 pub use error::DomainError;
 pub use events::{EventKind, StreamEvent};
 pub use ids::{AgentId, Attempt, IdempotencyKey, SessionId, TurnId};
+pub use reconnect::JitteredBackoff;
 pub use snapshot::{Bubble, SessionSnapshot};
 
 pub use ports::{
