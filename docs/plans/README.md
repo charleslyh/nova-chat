@@ -1,7 +1,7 @@
 # 落地推进计划
 
 > 执行视图：与 [`../design/README.md`](../design/README.md) §3 路线图对齐，**不复制**其设计顺序正文。
-> 依据：[`../requirements/`](../requirements/) · [`../architecture/decisions.md`](../architecture/decisions.md)（含 D14–D17）
+> 依据：[`../requirements/`](../requirements/) · [`../architecture/decisions.md`](../architecture/decisions.md)（含 D14–D18）
 
 ---
 
@@ -24,12 +24,14 @@
 | **迭代 0** | 基线补全 + 端口骨架 + **验证框架** | FR-2 子项、CR-1/3/10、相关 INV 的**验证能力** | core/ports/matcher/claim/adapter-mem/conformance/testkit/server | Rust、端口划分、mem 沙箱、虚拟时钟、本机多进程拓扑 | `just verify l0/l1/l2`；`just procs up`；`just coverage` | **展开级** → [`iteration-0.md`](./iteration-0.md) |
 | **迭代 1** | 任务池与存储 → `design/02` | FR-4/21/22/23/24、CR-2/3/7/11、INV-1/2/4/29/30/34 | 新存储适配器、claim、patrol | 存储产品、表结构、幂等闸门形态、背压阈值 | 新适配器过 conformance；相关场景绿 | **入口级**（见下） |
 | **迭代 2** | 生命周期与事件模型 → `design/03` | FR-3/5/6/20、CR-7/8 | — | — | — | 标题级 |
-| **迭代 3** | 观测与协作（改写 observation 草稿） | FR-9~15、CR-4/5/6、SR-2/5 | — | — | — | 标题级 |
+| **迭代 3** | 观测与协作（改写 observation + conversation） | FR-9~15、CR-4/5/6、SR-2/5、**D18** | — | StreamChannel `StreamId`、第一输出适配器、Session 快照协议 | — | 标题级 |
 | **迭代 4** | 身份与幂等 | FR-15/22、CR-2、INV-25~28 | — | — | — | 标题级 |
 | **迭代 5** | 鉴权与安全（补 DSL 沙箱） | CR-9、SEC-1~6 | — | — | — | 标题级 |
 | **迭代 6** | 可观测性与容量治理 | OR-1~6 | — | — | — | 标题级 |
 
 迭代 0 **不**产出 `design/` 编号文档。迭代 1–6 对应 design 步骤 2–7。
+
+对话层 / StreamChannel 工作包（不插队实现）：见 [`conversation-and-stream.md`](./conversation-and-stream.md)（D18）。
 
 ### 迭代 1 入口级（下一期）
 
@@ -44,7 +46,9 @@
 
 | 草稿 | 归属轮次 |
 |------|----------|
-| `design/drafts/observation.md` | 迭代 3 |
+| `design/drafts/observation.md` | 迭代 3（与 conversation 合并改写） |
+| `design/drafts/conversation.md` | 迭代 3（D18） |
+| `design/drafts/stream-channel-adapters.md` | 迭代 3（StreamChannel 第一适配器锁定时参照） |
 | `design/drafts/security.md` | 迭代 5 |
 
 ---
@@ -64,4 +68,8 @@
 
 | 日期 | 变更 |
 |------|------|
+| 2026-08-26 | 新增 [`stream-channel-adapters.md`](../design/drafts/stream-channel-adapters.md)：Redis Streams vs JetStream |
+| 2026-08-25 | D18/计划补强：Redis vs JS 性能成本；Session 用量先验（conversation §0.1） |
+| 2026-08-25 | D18 补丁：跨区回源分期、热→冷、Redis Streams 默认；见 [`conversation-and-stream.md`](./conversation-and-stream.md) |
+| 2026-08-25 | 锁定 **D18**（Session 日志 / Turn=Task）；迭代 3 并入 `conversation` 草稿 |
 | 2026-08-24 | 建立 plans/；迭代 0 展开；锁定 D14–D17 与双轨验证 |

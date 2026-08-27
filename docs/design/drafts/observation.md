@@ -6,15 +6,19 @@
 >
 > | 本文内容 | 冲突的决策 | 处置 |
 > |---------|-----------|------|
-> | §6 多区域 Mirror、就近读、跨区降级 | **D8 单域起步** | 删除 |
-> | 全文「Cell」「home Cell」 | D4 + D8（无分片） | 改写为单一权威 |
+> | §6 多区域 Mirror、就近读、跨区降级 | **D8** 管领取权威单域；**观测跨区见 D18** | **改写**：一期 Realtime 回源；二期 Mirror 仅实测触发。勿整段删除「跨区能订」 |
+> | 全文「Cell」「home Cell」 | D4 + D8（领取无分片） | 改写为单一领取权威；观测回源指向该权威区 |
 > | §2.1 / §10.2 快慢双通道 | 本期仅保留权威通道（200ms 聚合） | 简化 |
-> | §8.3 / §8.4 跨区时序 | D8 | 简化为单域 |
+> | §8.3 / §8.4 跨区时序 | 与 D18 分期对齐 | 按回源→副本改写，勿默认 Mirror-first |
+> | 「任务 = Room」、UX 游标 = task 流 | **D18** Session 日志 | 改为 1 Session : N Turn；游标 `(session_id, seq)` |
+> | 热层 `max_age` 后内容作废 | **D18 / INV-14** | 改为热→冷卸载；有效 Session 始终可恢复 |
 >
 > **可复用部分**（改写时保留）：§1 原语与公理 · §3 事件流模型与 attempt 分段 · §4 快照+增量协议 · §5.1 订阅复用 · §7 对外协议与 SSE
 >
-> 相关需求：FR-9~FR-15、CR-4~CR-6 · 相关不变量：[`invariants.md`](../../architecture/invariants.md) §3
-> 配套草稿：[`security.md`](./security.md)
+> **与 D18 / 对话层**：多轮 Agent 的 UX 重放身份是 **Session**（见 [`conversation.md`](./conversation.md)），**不是**「任务 = Room」。改写正式观测设计时必须并入 D18。
+>
+> 相关需求：FR-9~FR-15、CR-4~CR-6 · 相关不变量：[`invariants.md`](../../architecture/invariants.md) §3 · 决策：D18
+> 配套草稿：[`security.md`](./security.md) · [`conversation.md`](./conversation.md)
 
 ---
 

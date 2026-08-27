@@ -12,7 +12,7 @@
 > **可复用部分**：§1 三层令牌 · §2 `EventSource` 鉴权（一次性 ticket）· §3 授权模型 · §4 长连接持续校验 · §6 出口脱敏 · §7 上行限流 · §8 攻击面清单
 >
 > 相关需求：CR-9、SEC-1~SEC-6 · 相关不变量：[`invariants.md`](../../architecture/invariants.md) §5
-> 配套草稿：[`observation.md`](./observation.md)
+> 配套草稿：[`observation.md`](./observation.md) · [`conversation.md`](./conversation.md)
 >
 > 本文覆盖三个通常被忽略的问题：**长连接期间的权限撤销**、**`EventSource` 无法携带 Authorization 头**、**跨区域授权不跨洋**。
 

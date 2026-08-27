@@ -1,6 +1,6 @@
 # 架构决策记录（ADR）
 
-> 版本：v1.0
+> 版本：v1.1
 > 依据：[`../requirements/spec.md`](../requirements/spec.md) · [`../requirements/parameters.md`](../requirements/parameters.md)
 > 本文记录**已定夺的架构决策及其理由**。决策的「结论」进入设计文档，「理由与备选方案」留在本文，供后续质疑与回溯。
 >
@@ -29,6 +29,7 @@
 | [D15](#d15-验证分层与虚拟时钟) | 验证策略 | 分层下沉；虚拟时钟为一等能力 | ✅ 生效 |
 | [D16](#d16-任务类型不进入核心流程分支) | 任务类型 | 仅为数据与 per-type 上界覆盖 | ✅ 生效 |
 | [D17](#d17-本机验证与-docker-部署分离) | 验证/部署 | 本机 L0–L2 不依赖 Docker | ✅ 生效 |
+| [D18](#d18-对话层在任务系统之上--session-日志与-turn-领取) | 对话 / Session | Session 可回放日志 + Turn=Task；开屏靠快照 | ✅ 生效 |
 
 ---
 
@@ -443,3 +444,105 @@ flowchart LR
 | 方案 | 否决理由 |
 |------|---------|
 | 本机 L2 强制 docker compose | 阻塞无 Docker 环境的日常验证 |
+
+---
+
+## D18 对话层在任务系统之上：Session 日志与 Turn 领取
+
+| | |
+|---|---|
+| **需求** | FR-9~FR-15（跨设备查阅、续订、流式渲染）；Agent 多轮会话（`task-profiles` 中 `agent`）及同会话内后续 image/video 等任务 |
+| **结论** | ① **Conversation / Session** 是产品 UX 身份，不是 TCP/WS 连接，也不是 Worker 租约。② **Turn（一轮用户输入 + 一次生成）= Task**，Worker **按 Turn 领取**，不按 Session 粘滞领取。③ 客户端面向的可回放真相是 **Session 级 append-only 日志**，序号为 **per-session 单调 seq**（由通道分配）；用户消息、锁/busy、轮次边界、Agent token、图片/视频进度与产物等 **进入同一条 Session 流**（方案 A）。④ **开屏靠带 `snapshot_seq` 的渲染快照 + 增量**，禁止靠全量回放 TextDelta。⑤ **占用锁为 Session 级 CAS**（当前策略 `max_in_flight_turns_per_session = 1`）；禁止态以流上的 busy/idle 事件为准，不用 presence。⑥ **同一 Session** 同时订阅者预期 **≤ 5**（非全产品人少）：不做分层扇出，Realtime 实例内 1 路订阅复用即可。⑦ 写入侧 TextDelta **聚合窗口本期不定**（配置项，非架构锁）。⑧ **有效 Session 日志始终可订**；热层可卸载到冷存储；热 miss 须明确报错并导向快照/冷层（INV-14）。⑨ **跨区**：一期 Realtime 就近 + **读回源**；二期 Mirror 仅实测触发。⑩ 绿场第一热层适配器 **Redis Streams**（JetStream 留作副本阶段选项）。 |
+| **代价** | Session 热层事件量高于「仅信封」方案；必须维护快照与可合并标记（INV-16），否则开屏与存储会被 token 洪水打穿 |
+| **素材** | [`../design/drafts/conversation.md`](../design/drafts/conversation.md)（草稿）· [`../design/drafts/stream-channel-adapters.md`](../design/drafts/stream-channel-adapters.md)（Redis vs JetStream 选型对比） |
+
+**已拍板的三轴（选型前置）**
+
+| 轴 | 结论 |
+|----|------|
+| 日志 vs 广播 | **必须是可回放日志**（ChatBot / Agent 会话） |
+| 序号命名空间 | **按 Session 编排**，不是按 Task；一个 Session 可含多个 Agent / image / video Turn |
+| 扇出 | 同 Session ≤ 5 订阅者 → **无需分层扇出** |
+
+**与 INV-10 / INV-12 的关系（用语澄清，非废止）**
+
+- INV-10 的「流身份 = `task_id`」约束的是：**任务执行输出与 attempt/fence 的绑定**，以及「以单任务为观测单元」时的共享续订。多轮对话的 **客户端重放游标** 是 `(session_id, last_seq)`（见 INV-12 澄清）。
+- 每条 Session 流事件仍携带 `task_id` / `message_id` / `attempt`，供 CR-4 隔离与 UI 分组；**不得**把整段 Session 领给一台 Worker。
+- INV-12 禁止的是服务端 **连接粘性 / 连接级游标**；**允许** Session 作为领域资源（元数据、锁、快照）。
+
+**并行 Turn（当前否、将来可）**
+
+- **当前**：同一 Session 不可并行多个 Turn（一把 generation 锁）。
+- **将来**若放开：不改 Session 日志与 StreamChannel 主轴；改为锁策略（`max_in_flight > 1`）、快照 `running[]`、UI 按 `message_id` 分组。事件从第一天起即带 `message_id` + `task_id`，避免返工。
+
+**碎片化处置（方案 A 的配套，非另选 B）**
+
+| 层 | 手段 |
+|----|------|
+| 写入 | TextDelta / Progress 可配置聚合（窗口本期不定） |
+| 开屏 | 快照中已折叠历史气泡；只追 `snapshot_seq` 之后增量 |
+| 读路径 | `coalescible` 事件可丢中间态；信封类不可丢（INV-16） |
+
+**StreamChannel 选型方向（适配器，非产品锁定；D14）**
+
+- 端口语义：可回放 WAL；`append` 内部分配 **per-stream（Session）连续 seq**；扇出与快照 **不进** 本端口。
+- **绿场、无既有 Redis/NATS**：第一套生产适配器定为 **Redis Streams**（与 per-session 短流同构、编码薄、与领取路径分离落实 D11）。对外游标 **禁止** 暴露 JetStream 全局 stream seq。
+- **JetStream** 为预留替换/并行选项，主要加分在跨区 **Mirror 副本**阶段，而非一期必选。Kafka 仅在事件速率逼近越界线时评估。
+- L0–L2 继续 mem（D17）。端口键需从仅 `TaskId` **泛化为 `StreamId`（含 session）**——属观测/对话设计步骤，不插队迭代 1 存储选型之前强制实现。
+
+**保留与热→冷（纠正「淘汰=可丢弃」）**
+
+- **有效 Session 日志在业务上须始终可订可读**（含任意时刻打开历史对话）。
+- 热层（Redis Streams / 将来的 JetStream）可按成本做 **卸载**：归档到冷存储（对象存储等）后从热层移除。
+- INV-14 的含义是：热层已无该 `from_seq` 时 **必须明确报错 / 引导**，客户端改走 **快照或冷层**，**禁止**静默从「还能读到的最早热数据」续发。**不是**允许业务丢弃历史。
+- `parameters.md` 中的「输出保留期 7 天」等数字，在对话层语境下解释为 **热层成本锚点**，不是「7 天后内容作废」。冷层保留策略可另定，但不得使有效 Session 无法恢复。
+
+**跨区订阅分期（不与 D8 领取单域混为一谈）**
+
+观测跨区与领取权威是否单域是不同问题。对话/观测路径按下列顺序推进（**已对齐**）：
+
+| 阶段 | 做法 | 产品含义 |
+|------|------|----------|
+| **正确性先行** | Session 可回放日志 + 快照 + 热→冷 | 与选 Redis/JetStream 无关 |
+| **跨区一期** | Realtime **就近接入**，读路径 **回源**（外区 RG 向写入权威区拉/订同一条 Session 流） | 外区用户能订；源区流存储不可用则外区热订不可用 |
+| **跨区二期** | 仅当实测跨区延迟或源区故障影响不可接受时，加 **Mirror/本地只读副本** | 源区短暂故障时外区仍可读已复制部分；就近读 |
+
+- 一期 **不**为 Mirror 提前锁定 JetStream。
+- 二期：若热层已是 JetStream，Mirror 叙事更顺；若仍是 Redis，则上复制方案或按 D14 **换/加** JetStream 适配器。客户端游标始终为 `(session_id, session_seq)`。
+
+**扇出用语**：上表「≤ 5」指 **同一 Session 的同时订阅连接数**，不是全产品观测用户少。全站仍可有大量连接（多 Session × 每 Session 很少人）。
+
+**Redis Streams vs JetStream：性能与成本（选型理由补强，非不可适应性）**
+
+两者对 D18 契约（可回放、per-session seq、热→冷）**均可适配**；一期选 Redis 是模型同构与工程薄，不是 JetStream「不能用」。
+
+| 维度 | Redis Streams（多本账） | JetStream（大河 + subject filter） |
+|------|-------------------------|-------------------------------------|
+| 读本 Session | 只碰该 key；与全站总量基本无关 | 实时 interest 通常轻；**长距离**按 Session filter 追平可能在大河里大量 skip |
+| 成本形态 | 热数据偏 **内存** | 热数据偏 **磁盘日志** |
+| 一期（回源、热窗口短、开屏靠快照） | 更贴「一 Session 一账」 | 亦可；须保证 catch-up 距离有上界 |
+| 二期 Mirror | 复制方案要自证 | Mirror 叙事更成熟 |
+
+**必须守住的性能前提**（与选谁无关）：开屏 = 快照 + **短**增量；禁止无快照地从很老的 seq 在共享大河里全量 filter 回放。有此前提后，filter「跳过税」通常可忽略；无此前提则 JetStream 大河模型会在数据量大时恶化。
+
+**否决**
+
+| 方案 | 否决理由 |
+|------|---------|
+| Session = 长期领取给一台 Worker | 占容量、与 D9 冲突；跨设备查阅不需要执行亲和 |
+| 对话 = Room = 单个 Task（旧观测草稿） | 多轮 / 多类型任务揉进一个 `task_id`，重试与容量账本变形 |
+| CRDT / 仅 PubSub / sticky 连接会话 | 破坏全序、不可续订、或违反 INV-12 |
+| 开屏全量回放 token | 违反 FR-10 / INV-13 精神；切换 Session 不可用 |
+| presence 当禁止态 | 不可靠；必须以 CAS + 流事件为准 |
+| 热层 trim 后静默丢历史且无冷层出口 | 违反「有效 Session 始终可订」；INV-14 必须导向快照/冷层 |
+
+**备选方案**
+
+| 方案 | 否决 / 推迟理由 |
+|------|----------------|
+| Session 日志仅信封，token 挂在 task 流（方案 B） | 开屏需订双流、并发时间线需自拼；与「Session 级重放」决策不符。若聚合+快照无法压住成本，可再开 `SUPERSEDED BY` 评估 |
+| 全局一条大河 seq（原生 JetStream seq 暴露给客户端） | 与 Session 游标决策冲突；不作为默认 |
+| 第一期即 Mirror | 实现与运维成本高；回源已满足「跨区能订」；仅实测不够时进入二期 |
+| 以 D8 或「7 天可丢」为由排除 JetStream / 排除跨区观测 | **已纠正**：D8 管领取权威；保留是热→冷；跨区观测按上表分期 |
+
+**落地顺序**：不插队。依赖路线图「存储 → 生命周期/事件 → 观测与协作（改写 observation + 并入本决策）」。跨区一期回源、二期副本见上表。详见 [`../plans/conversation-and-stream.md`](../plans/conversation-and-stream.md) · [`../plans/README.md`](../plans/README.md)。

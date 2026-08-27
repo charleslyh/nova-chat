@@ -30,10 +30,12 @@
 
 | 文档 | 状态 | 主要问题 |
 |------|------|---------|
-| [`drafts/observation.md`](./drafts/observation.md) | ⛔ **与决策冲突** | 含多区域 Mirror、Cell 分片、快慢双通道——与 **D8 单域**冲突 |
+| [`drafts/observation.md`](./drafts/observation.md) | ⛔ **须按 D18 改写** | 原「默认 Mirror / 任务=Room / 热层淘汰即丢」与 **D18** 冲突；跨区改为回源→副本分期 |
+| [`drafts/conversation.md`](./drafts/conversation.md) | ⛔ **素材（D18）** | Session 日志、Turn=Task、方案 A、扇出与并行策略；与 observation 一并改写 |
+| [`drafts/stream-channel-adapters.md`](./drafts/stream-channel-adapters.md) | 📋 **选型对比** | Redis Streams vs NATS JetStream；一期默认 Redis（D18） |
 | [`drafts/security.md`](./drafts/security.md) | ⚠️ **有重大缺口** | 内容基本有效，但**缺少匹配器 DSL 沙箱**这一最高风险攻击面 |
 
-> **两者的风险不同**：`observation.md` 若被直接实现，会做出一套与基线相反的多区域架构；`security.md` 若被直接实现，会**漏掉代码执行入口的防护**。各文档头部列有详细的冲突表与可复用清单。
+> **风险不同**：`observation.md` 若直接实现会做出与 D8 相反的多区域架构；`conversation.md` 对齐 D18 但仍须等事件/存储端口；`security.md` 若直接实现会漏掉 DSL 沙箱。
 
 ---
 
@@ -45,7 +47,7 @@ flowchart TB
     S1["<b>已完成</b> 领取与匹配<br/>01-claim-and-match"] --> S2
     S2["<b>进行中</b> 任务池与存储"] --> S3
     S3["生命周期与事件模型"] --> S4
-    S4["观测与协作<br/>（改写 drafts/observation）"] --> S5
+    S4["观测与协作<br/>（改写 observation + conversation）"] --> S5
     S5["身份与幂等"] --> S6
     S6["鉴权与安全<br/>（补齐 drafts/security）"] --> S7
     S7["可观测性与容量治理"]
@@ -56,7 +58,7 @@ flowchart TB
 | 1 | 领取与匹配 | ✅ 完成 → `01` | 见 §2.1 |
 | 2 | **任务池与存储** | ▶ **下一步** | 存储选型、表结构与索引、容量账本落地、幂等提交、背压阈值、粗过滤查询计划验证 |
 | 3 | 生命周期与事件模型 | ⬜ | 任务状态机、事件类型约定、全序号分配点、领取与输出路径的分离边界 |
-| 4 | 观测与协作 | ⬜ 改写草稿 | 快照+增量协议、观测游标、SSE 协议、互动消息 |
+| 4 | 观测与协作 | ⬜ 改写草稿 | 快照+增量、Session 游标（D18）、SSE、互动消息；StreamChannel `StreamId` 与第一适配器 |
 | 5 | 身份与幂等 | ⬜ | 确定性任务标识、提交闸门、孤儿任务恢复、列表查询视图 |
 | 6 | 鉴权与安全 | ⬜ 补齐草稿 | 令牌体系、订阅鉴权、**DSL 沙箱**、出口脱敏、限流 |
 | 7 | 可观测性与容量治理 | ⬜ | 不变量监控指标、越界告警、锚点校准流程、故障演练清单 |

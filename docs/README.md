@@ -41,8 +41,8 @@ flowchart LR
 
 | 文档 | 内容 |
 |------|------|
-| [`decisions.md`](./architecture/decisions.md) | 架构决策（D1~D17）及其理由、代价、备选方案 |
-| [`invariants.md`](./architecture/invariants.md) | 37 条设计不变量（INV-1~INV-37），违反任一即某条 CR 不成立 |
+| [`decisions.md`](./architecture/decisions.md) | 架构决策（D1~D18）及其理由、代价、备选方案 |
+| [`invariants.md`](./architecture/invariants.md) | 设计不变量（INV-1~INV-37），违反任一即某条 CR 不成立；§3 含连接会话 vs Session 用语澄清 |
 
 ### design/ — 分步设计
 
@@ -51,7 +51,9 @@ flowchart LR
 | 文档 | 性质 | 说明 |
 |------|------|------|
 | [`01-claim-and-match.md`](./design/01-claim-and-match.md) | ✅ **实现依据** | 领取与匹配 |
-| [`drafts/observation.md`](./design/drafts/observation.md) | ⛔ **草稿，禁止实现** | 观测层素材，含与 D8 冲突的多区域方案 |
+| [`drafts/observation.md`](./design/drafts/observation.md) | ⛔ **草稿，禁止实现** | 须按 D18 改写（跨区回源分期、Session UX、热→冷） |
+| [`drafts/conversation.md`](./design/drafts/conversation.md) | ⛔ **草稿，禁止实现** | 对话层（Session 日志 / Turn=Task），落实 D18 |
+| [`drafts/stream-channel-adapters.md`](./design/drafts/stream-channel-adapters.md) | 📋 **选型对比** | StreamChannel：Redis Streams vs NATS JetStream（对齐 D18） |
 | [`drafts/security.md`](./design/drafts/security.md) | ⚠️ **草稿，禁止实现** | 鉴权素材，缺 DSL 沙箱防护 |
 
 > **编号按完成顺序分配**，因此 `design/` 下的编号永远连续。未开始的步骤不预留文件与编号。
@@ -63,6 +65,7 @@ flowchart LR
 |------|------|
 | [`plans/README.md`](./plans/README.md) | 迭代总览、三级详略规则、双轨自动化入口 |
 | [`plans/iteration-0.md`](./plans/iteration-0.md) | 当期（展开级）迭代文档 |
+| [`plans/conversation-and-stream.md`](./plans/conversation-and-stream.md) | D18 后对话层 / StreamChannel 工作包（不插队） |
 
 > 人工模拟验收控制台：仓库根目录执行 `just sim`，浏览器打开 http://127.0.0.1:19090 （`nova-sim`）。
 
@@ -99,6 +102,7 @@ flowchart LR
 | 8 | **承载技术端口化**；具体产品仅为适配器 | D14 |
 | 9 | **本机 L0–L2 验证不依赖 Docker** | D17 |
 | 10 | **任务类型不进核心流程分支** | D16 |
+| 11 | **多轮对话：Session 可回放日志 + Turn=Task；连接粘性禁止** | D18 / INV-12 |
 
 ---
 
