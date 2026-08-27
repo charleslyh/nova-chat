@@ -28,11 +28,12 @@
 | **V4** | 覆盖补齐：FR/INV 诚实标标 + mid-snapshot + busy 二次拒绝；本期外项 deferred | ✅ `just coverage` in-scope OK |
 | **V5** | FR-17：跨接入点游标续订（edge→home SSE） | ✅ `just verify l2` |
 | **V6** | INV-32：只读降级拒写，观测仍可读 | ✅ L1 + L2 |
+| **V7** | CR-8/INV-30 过载拒绝不损坏；停 edge 后游标续订 | ✅ L1 + L2 |
 | 1–6 | 既有产品闭环（gateway / mem / agent / sim） | `just verify` |
 
 退出（近期）：L0/L1 绿且 Trace+Oracle 成为默认；能力场景持续补齐。`sim` 不替代 CI。
 
-下一步候选：压力场景解禁 CR-8；停实例后的续订强化；INV-33 客户端退避（偏客户端）。
+下一步候选：INV-33 客户端退避（偏客户端）；全局 pending 阈值型过载（FR-18 强化）；完整压力平台。
 
 ---
 
@@ -46,6 +47,7 @@
 
 | 日期 | 变更 |
 |------|------|
+| 2026-08-27 | V7：overload-reject-consistent + stop-edge-resume |
 | 2026-08-27 | V6：INV-32 read-only 拒写（admin + L1/L2） |
 | 2026-08-27 | V5：cross-instance-resume（FR-17 edge→home 游标续订） |
 | 2026-08-27 | V4：covers 补齐 + mid-snapshot / busy 二次拒绝；coverage in-scope OK |

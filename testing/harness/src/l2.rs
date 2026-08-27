@@ -74,6 +74,10 @@ enum Step {
         #[serde(default)]
         capture_last_seq: Option<String>,
     },
+    /// Kill whatever is listening on a TCP port (L2 fixture teardown mid-scenario).
+    KillListener {
+        port: u16,
+    },
 }
 
 fn default_timeout() -> u64 {
@@ -255,6 +259,15 @@ async fn run_one(path: &Path) -> Result<String> {
                     at_ms: now_ms,
                 });
             }
+            Step::KillListener { port } => {
+                kill_listener(port)?;
+                trace.push(TraceEvent::FaultInjected {
+                    kind: "kill_listener".into(),
+                    target: format!("port:{port}"),
+                    at_ms: now_ms,
+                });
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
         }
         now_ms += 1;
         trace.push(TraceEvent::Clock { now_ms });
@@ -329,6 +342,25 @@ fn apply_capture(
             other => other.to_string().trim_matches('"').to_string(),
         };
         vars.insert(var.clone(), s);
+    }
+    Ok(())
+}
+
+fn kill_listener(port: u16) -> Result<()> {
+    use std::process::Command;
+    let out = Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+        .output()
+        .with_context(|| format!("lsof port {port}"))?;
+    if !out.status.success() {
+        // nothing listening is fine for this step's intent
+        return Ok(());
+    }
+    for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+        let st = Command::new("kill").args(["-TERM", pid]).status()?;
+        if !st.success() {
+            bail!("kill -TERM {pid} failed");
+        }
     }
     Ok(())
 }

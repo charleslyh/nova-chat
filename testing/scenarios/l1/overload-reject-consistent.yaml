@@ -1,0 +1,48 @@
+name: overload-reject-consistent
+covers:
+  - CR-8
+  - INV-30
+  - FR-18
+  - INV-29
+oracles:
+  - SeqMonotonic
+  - SingleClaimPerAttempt
+  - SubmittedTurnsTerminal
+trace: true
+steps:
+  # 过载/忙时多次拒绝不得损坏：无双领、无丢已接受 Turn、seq 仍单调
+  - action: create_session
+  - action: submit_turn
+    text: in-flight
+    key: k-ov-1
+    expect: accepted
+  - action: submit_turn
+    text: reject-a
+    key: k-ov-a
+    expect: busy
+  - action: submit_turn
+    text: reject-b
+    key: k-ov-b
+    expect: busy
+  - action: submit_turn
+    text: reject-c
+    key: k-ov-c
+    expect: busy
+  - action: submit_turn
+    text: reject-d
+    key: k-ov-d
+    expect: busy
+  - action: submit_turn
+    text: reject-e
+    key: k-ov-e
+    expect: busy
+  - action: claim_and_complete
+    tokens: 3
+  - action: expect_lock
+    state: idle
+  - action: submit_turn
+    text: after-pressure
+    key: k-ov-2
+    expect: accepted
+  - action: claim_and_complete
+    tokens: 2

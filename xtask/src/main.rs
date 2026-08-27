@@ -345,8 +345,8 @@ fn coverage() -> Result<()> {
         }
     }
 
-    // 当期不做：完整压力平台、客户端退避协议。
-    let deferred: BTreeSet<&str> = ["CR-8", "INV-30", "INV-33"].into_iter().collect();
+    // 当期不做：完整压力平台、客户端退避协议（INV-33 偏客户端）。
+    let deferred: BTreeSet<&str> = ["INV-33"].into_iter().collect();
 
     let covered_baseline: BTreeSet<_> = covered
         .iter()

@@ -1,0 +1,36 @@
+name: stop-edge-resume
+covers:
+  - FR-17
+  - FR-11
+  - INV-12
+oracles: []
+trace: true
+steps:
+  # 在 edge 上读到游标后杀掉 edge，换 home 用同一游标续订
+  - action: http_post
+    url: http://127.0.0.1:18081/v1/sessions
+    expect_contains: session_id
+    capture:
+      session_id: session_id
+  - action: http_post
+    url: http://127.0.0.1:18081/v1/sessions/{{session_id}}/turns
+    body: '{"text":"stop-edge","idempotency_key":"l2-stop-1"}'
+    expect_status: 202
+    expect_contains: turn_id
+  - action: http_get_until
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/snapshot
+    expect_contains: '"running":[]'
+    timeout_ms: 10000
+  - action: http_sse_collect
+    url: http://127.0.0.1:18081/v1/sessions/{{session_id}}/stream?from_seq=1
+    expect_min_events: 2
+    max_events: 2
+    timeout_ms: 8000
+    capture_last_seq: cursor
+  - action: kill_listener
+    port: 18081
+  - action: http_sse_collect
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/stream?from_seq={{cursor_next}}
+    expect_min_events: 1
+    max_events: 8
+    timeout_ms: 8000
