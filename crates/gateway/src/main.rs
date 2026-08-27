@@ -127,6 +127,7 @@ async fn main() -> Result<()> {
         // ops / test: INV-32 read-only degrade toggle (home)
         .route("/v1/admin/read_only", post(set_read_only))
         .route("/v1/admin/pending_limit", post(set_pending_limit))
+        .route("/v1/admin/trim_hot", post(trim_hot))
         // agent-facing (home only)
         .route("/v1/agent/claim", post(agent_claim))
         .route("/v1/agent/heartbeat", post(agent_heartbeat))
@@ -285,7 +286,7 @@ async fn create_turn(
                     payload: String::new(),
                 })
                 .await;
-            let _ = st
+            let tip = st
                 .world
                 .stream
                 .append(StreamEvent {
@@ -305,11 +306,11 @@ async fn create_turn(
                     turn_id: Some(turn_id),
                 });
                 snap.running = vec![turn_id];
-                // bump to latest known by reading tip — use bubble count as soft seq; real seq from stream
-                if let Ok(evs) = st.world.stream.read_from(session_id, 1, 10_000).await {
-                    if let Some(last) = evs.last() {
-                        snap.snapshot_seq = last.seq;
-                    }
+                // Tip from append result — never read_from(1) (fails after hot trim).
+                if let Ok(seq) = tip {
+                    snap.snapshot_seq = seq;
+                } else if let Some(seq) = st.world.stream.tip_seq(session_id) {
+                    snap.snapshot_seq = seq;
                 }
                 let _ = st.world.snapshot.put(snap).await;
             }
@@ -456,6 +457,32 @@ async fn set_pending_limit(
     Json(serde_json::json!({
         "ok": true,
         "pending_limit": st.world.meta.pending_limit(),
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct TrimHotBody {
+    session_id: String,
+    new_earliest: u64,
+}
+
+/// Fault / verification inject: unload hot below `new_earliest` (archives to mem cold).
+async fn trim_hot(State(st): State<AppState>, Json(body): Json<TrimHotBody>) -> Response {
+    if st.cfg.role != "home" {
+        return err(StatusCode::FORBIDDEN, "trim_hot only on home".into());
+    }
+    let Ok(session_id) = Uuid::parse_str(&body.session_id).map(SessionId) else {
+        return err(StatusCode::BAD_REQUEST, "invalid session_id".into());
+    };
+    st.world
+        .stream
+        .trim_earliest(session_id, body.new_earliest);
+    Json(serde_json::json!({
+        "ok": true,
+        "session_id": body.session_id,
+        "new_earliest": body.new_earliest,
+        "cold_len": st.world.stream.cold_len(session_id),
     }))
     .into_response()
 }
@@ -613,7 +640,7 @@ async fn agent_complete(State(st): State<AppState>, Json(body): Json<CompleteBod
     if let Err(e) = st.world.meta.complete_turn(turn_id, attempt, status).await {
         return err(StatusCode::CONFLICT, e.to_string());
     }
-    let _ = st
+    let tip = st
         .world
         .stream
         .append(StreamEvent {
@@ -635,10 +662,10 @@ async fn agent_complete(State(st): State<AppState>, Json(body): Json<CompleteBod
             });
         }
         snap.running.clear();
-        if let Ok(evs) = st.world.stream.read_from(session_id, 1, 10_000).await {
-            if let Some(last) = evs.last() {
-                snap.snapshot_seq = last.seq;
-            }
+        if let Ok(seq) = tip {
+            snap.snapshot_seq = seq;
+        } else if let Some(seq) = st.world.stream.tip_seq(session_id) {
+            snap.snapshot_seq = seq;
         }
         let _ = st.world.snapshot.put(snap).await;
     }

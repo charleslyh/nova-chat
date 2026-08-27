@@ -1,0 +1,55 @@
+name: hot-miss-recover-http
+covers:
+  - FR-13
+  - FR-14
+  - INV-14
+  - CR-4
+oracles: []
+trace: true
+steps:
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/sessions
+    expect_contains: session_id
+    capture:
+      session_id: session_id
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/turns
+    body: '{"text":"hot-miss","idempotency_key":"l2-hm-1"}'
+    expect_status: 202
+    expect_contains: turn_id
+  - action: http_get_until
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/snapshot
+    expect_contains: '"running":[]'
+    timeout_ms: 10000
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/snapshot
+    expect_status: 200
+    expect_contains: snapshot_seq
+    capture:
+      snap_seq: snapshot_seq
+  # Unload hot so early cursors miss (mem archives to cold).
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/admin/trim_hot
+    body: '{"session_id":"{{session_id}}","new_earliest":{{snap_seq}}}'
+    expect_status: 200
+    expect_contains: '"ok":true'
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/stream?from_seq=1
+    expect_status: 409
+    expect_contains: stream_gap
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/stream?from_seq=1
+    expect_status: 409
+    expect_contains: recover_via_snapshot
+  # Open-screen recovery: snapshot → SSE from snapshot_seq
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/snapshot
+    expect_status: 200
+    expect_contains: snapshot_seq
+    capture:
+      snap_seq: snapshot_seq
+  - action: http_sse_collect
+    url: http://127.0.0.1:18080/v1/sessions/{{session_id}}/stream?from_seq={{snap_seq}}
+    expect_min_events: 1
+    max_events: 4
+    timeout_ms: 8000

@@ -33,7 +33,7 @@
 
 | # | 交付 | 框架缺口 | mem / 验证怎么证 | 验收 |
 |---|------|----------|------------------|------|
-| **V10** | **热 miss → 快照 / 冷层恢复闭环** | FR-13/14 · INV-14 | mem：可 trim 热层 + 内存「冷段」；Gap 必须带 hint；gateway/SSE：409 + 客户端改走 snapshot 再 `from_seq` | L1 Oracle `NoSilentGap` + 恢复场景；L2 HTTP 409→开屏→续订 |
+| **V10** | **热 miss → 快照 / 冷层恢复闭环** | FR-13/14 · INV-14 | mem：可 trim 热层 + 内存「冷段」；Gap 必须带 hint；gateway/SSE：409 + 客户端改走 snapshot 再 `from_seq` | ✅ L1 `hot-miss-gap` + L2 `hot-miss-recover-http` |
 | **V11** | **开屏契约产品化** | FR-9 · INV-13 | 统一「snapshot → SSE from snapshot_seq」；中途开屏不依赖全量热回放 | L1/L2：running 中 GET snapshot 再 SSE；时延断言可先做逻辑（不绑 P99 机房） |
 | **V12** | **只读 Mirror 语义（进程内）** | FR-10 · 读路径 · INV-32 联动 | mem：权威写 + 异步/同步投影到 mirror 视图；mirror **拒写**；双观察者同序 | L1 双读路径；L2 edge 读 mirror、写仍转发 home |
 | **V13** | **多接入 / 无粘性拓扑强化** | FR-17 · INV-12 | 多 gateway 共一份 MemWorld（测试夹具内共享）；杀实例后续订；禁止连接级游标 | L2 多 listen + kill + 游标续订；扩展现有 stop-edge |
@@ -87,5 +87,6 @@
 
 | 日期 | 变更 |
 |------|------|
+| 2026-08-27 | **V10**：mem hot/cold trim + admin `trim_hot`；L1/L2 409→snapshot→续订 |
 | 2026-08-27 | **新当期**：mem 驱动主框架完备；真实 ports 延后；规划 V10–V13 |
 | 2026-08-27 | 结项 V1–V9（见上节摘要） |

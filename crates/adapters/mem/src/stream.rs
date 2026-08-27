@@ -10,9 +10,15 @@ use tokio::sync::Notify;
 
 use crate::meta::MemMetaStore;
 
+/// Stable Gap recover hint (FR-13 / INV-14). Clients: GET snapshot → SSE from snapshot_seq.
+pub const RECOVER_VIA_SNAPSHOT: &str = "recover_via_snapshot";
+
 struct SessionLog {
-    events: Vec<StreamEvent>,
-    /// Lowest seq still present (1-based). After trim would rise; mem never trims in v1.
+    /// Hot layer: contiguous events with `seq >= earliest`.
+    hot: Vec<StreamEvent>,
+    /// Cold segment: archived on trim; not served by `read_from` (Gap → snapshot path).
+    cold: Vec<StreamEvent>,
+    /// Lowest seq still in hot (1-based).
     earliest: u64,
 }
 
@@ -36,6 +42,14 @@ impl MemStreamChannel {
             meta,
         }
     }
+
+    fn gap(requested_from: u64, earliest_available: Option<u64>) -> StreamError {
+        StreamError::Gap(StreamGap {
+            requested_from,
+            earliest_available,
+            hint: RECOVER_VIA_SNAPSHOT.into(),
+        })
+    }
 }
 
 #[async_trait]
@@ -57,12 +71,13 @@ impl StreamChannel for MemStreamChannel {
 
         let mut g = self.inner.lock();
         let log = g.by_session.entry(event.session_id).or_insert_with(|| SessionLog {
-            events: Vec::new(),
+            hot: Vec::new(),
+            cold: Vec::new(),
             earliest: 1,
         });
-        let seq = log.events.len() as u64 + log.earliest;
+        let seq = log.hot.len() as u64 + log.earliest;
         event.seq = seq;
-        log.events.push(event);
+        log.hot.push(event);
         drop(g);
         self.notify.notify_waiters();
         Ok(seq)
@@ -79,23 +94,14 @@ impl StreamChannel for MemStreamChannel {
             if from_seq <= 1 {
                 return Ok(vec![]);
             }
-            return Err(StreamError::Gap(StreamGap {
-                requested_from: from_seq,
-                earliest_available: None,
-                hint: "recover_via_snapshot".into(),
-            }));
+            return Err(Self::gap(from_seq, None));
         };
         if from_seq < log.earliest {
-            return Err(StreamError::Gap(StreamGap {
-                requested_from: from_seq,
-                earliest_available: Some(log.earliest),
-                hint: "recover_via_snapshot".into(),
-            }));
+            return Err(Self::gap(from_seq, Some(log.earliest)));
         }
         // from_seq is inclusive for resume "events with seq >= from_seq"
-        // Callers using after_seq exclusive should use read_after.
         Ok(log
-            .events
+            .hot
             .iter()
             .filter(|e| e.seq >= from_seq)
             .take(limit)
@@ -109,20 +115,15 @@ impl StreamChannel for MemStreamChannel {
         after_seq: u64,
         limit: usize,
     ) -> Result<Vec<StreamEvent>, StreamError> {
-        // Poll with notify for up to a short wait.
         for _ in 0..50 {
             {
                 let g = self.inner.lock();
                 if let Some(log) = g.by_session.get(&session_id) {
                     if after_seq + 1 < log.earliest && after_seq > 0 {
-                        return Err(StreamError::Gap(StreamGap {
-                            requested_from: after_seq + 1,
-                            earliest_available: Some(log.earliest),
-                            hint: "recover_via_snapshot".into(),
-                        }));
+                        return Err(Self::gap(after_seq + 1, Some(log.earliest)));
                     }
                     let batch: Vec<_> = log
-                        .events
+                        .hot
                         .iter()
                         .filter(|e| e.seq > after_seq)
                         .take(limit)
@@ -145,14 +146,77 @@ impl StreamChannel for MemStreamChannel {
 }
 
 impl MemStreamChannel {
-    /// Test-only: simulate hot-layer unload (INV-14). Raises `earliest` and drops older events.
-    pub fn test_trim_earliest(&self, session_id: SessionId, new_earliest: u64) {
+    /// Simulate hot-layer unload (INV-14 / FR-14): archive `[earliest, new_earliest)` into cold, then raise earliest.
+    /// Hot `read_from` below `new_earliest` returns Gap with `recover_via_snapshot` — cold is not silently spliced.
+    pub fn trim_earliest(&self, session_id: SessionId, new_earliest: u64) {
         let mut g = self.inner.lock();
         if let Some(log) = g.by_session.get_mut(&session_id) {
-            log.events.retain(|e| e.seq >= new_earliest);
-            if new_earliest > log.earliest {
-                log.earliest = new_earliest;
+            if new_earliest <= log.earliest {
+                return;
             }
+            let (stay, leave): (Vec<_>, Vec<_>) =
+                log.hot.drain(..).partition(|e| e.seq >= new_earliest);
+            log.cold.extend(leave);
+            log.hot = stay;
+            log.earliest = new_earliest;
         }
+    }
+
+    /// Test hook alias.
+    pub fn test_trim_earliest(&self, session_id: SessionId, new_earliest: u64) {
+        self.trim_earliest(session_id, new_earliest);
+    }
+
+    /// Events retained in cold after trims (FR-14: history not discarded).
+    pub fn cold_len(&self, session_id: SessionId) -> usize {
+        let g = self.inner.lock();
+        g.by_session
+            .get(&session_id)
+            .map(|l| l.cold.len())
+            .unwrap_or(0)
+    }
+
+    /// Tip seq in hot (for snapshot refresh without `read_from(1, …)`).
+    pub fn tip_seq(&self, session_id: SessionId) -> Option<u64> {
+        let g = self.inner.lock();
+        g.by_session
+            .get(&session_id)
+            .and_then(|l| l.hot.last().map(|e| e.seq))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::MemMetaStore;
+    use nova_sessions_core::{EventKind, SessionId};
+
+    #[tokio::test]
+    async fn trim_archives_to_cold_and_gaps() {
+        let meta = Arc::new(MemMetaStore::new());
+        let stream = MemStreamChannel::new(meta);
+        let sid = SessionId::new();
+        for i in 0..5 {
+            stream
+                .append(StreamEvent {
+                    session_id: sid,
+                    seq: 0,
+                    kind: EventKind::TextDelta,
+                    turn_id: None,
+                    attempt: None,
+                    payload: format!("{i}"),
+                })
+                .await
+                .unwrap();
+        }
+        stream.trim_earliest(sid, 3);
+        assert_eq!(stream.cold_len(sid), 2);
+        assert!(matches!(
+            stream.read_from(sid, 1, 10).await,
+            Err(StreamError::Gap(g)) if g.hint == RECOVER_VIA_SNAPSHOT && g.earliest_available == Some(3)
+        ));
+        let hot = stream.read_from(sid, 3, 10).await.unwrap();
+        assert_eq!(hot.len(), 3);
+        assert_eq!(hot[0].seq, 3);
     }
 }

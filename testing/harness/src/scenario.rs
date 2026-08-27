@@ -74,6 +74,9 @@ enum Step {
     },
     ExpectGap {
         from_seq: u64,
+        /// Optional: assert Gap.hint equals this string.
+        #[serde(default)]
+        expect_hint: Option<String>,
     },
     ExpectLock {
         state: String,
@@ -95,6 +98,10 @@ enum Step {
         expect_seq: Option<u64>,
         #[serde(default)]
         expect_none: bool,
+    },
+    /// FR-14: after trim, cold must retain archived events.
+    ExpectColdMin {
+        min_events: usize,
     },
     /// INV-32: toggle MemWorld read-only degrade.
     SetReadOnly {
@@ -471,7 +478,7 @@ async fn run_one(path: &Path) -> Result<String> {
                     Err(e) => return Err(e.into()),
                 }
             }
-            Step::ExpectGap { from_seq } => {
+            Step::ExpectGap { from_seq, expect_hint } => {
                 let sid = session.expect("session");
                 match world.stream.read_from(sid, from_seq, 1).await {
                     Ok(evs) => {
@@ -488,7 +495,7 @@ async fn run_one(path: &Path) -> Result<String> {
                             evs.len()
                         );
                     }
-                    Err(StreamError::Gap(_)) => {
+                    Err(StreamError::Gap(g)) => {
                         trace.push(TraceEvent::StreamRead {
                             session_id: sid.0,
                             from_seq,
@@ -496,6 +503,15 @@ async fn run_one(path: &Path) -> Result<String> {
                             gap: true,
                             at_ms: now_ms,
                         });
+                        if let Some(want) = expect_hint {
+                            if g.hint != want {
+                                bail!(
+                                    "{}: gap hint want {want:?} got {:?}",
+                                    sc.name,
+                                    g.hint
+                                );
+                            }
+                        }
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -599,6 +615,21 @@ async fn run_one(path: &Path) -> Result<String> {
                     detail: format!("get expect_seq={expect_seq:?} none={expect_none}"),
                     at_ms: now_ms,
                 });
+            }
+            Step::ExpectColdMin { min_events } => {
+                let sid = session.expect("session");
+                let n = world.stream.cold_len(sid);
+                trace.push(TraceEvent::MockState {
+                    component: "stream_cold".into(),
+                    detail: format!("cold_len={n} min={min_events}"),
+                    at_ms: now_ms,
+                });
+                if n < min_events {
+                    bail!(
+                        "{}: cold_len={n} want >= {min_events} (history must survive trim)",
+                        sc.name
+                    );
+                }
             }
             Step::SetReadOnly { enabled } => {
                 world.meta.set_read_only(enabled);
