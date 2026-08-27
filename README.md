@@ -63,3 +63,5 @@ just sim             # 人工冒烟 → http://127.0.0.1:19090 （Chat：/chat�
 ## 文档入口
 
 从 [`docs/README.md`](docs/README.md) 开始：需求 → D19/D11 → [`design/01-session-stream.md`](docs/design/01-session-stream.md)。
+
+当期计划：[`docs/plans/current.md`](docs/plans/current.md)（**mem 驱动主框架完备，真实 ports 延后**）。
