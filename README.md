@@ -9,7 +9,7 @@ Nova 产品线下的 **Session 级可回放消息服务**：多区域建会话�
 ```bash
 just verify          # 全量自动验证：L0 + L1 + L2
 just unittest        # 单测
-just sim             # 人工冒烟面板 → http://127.0.0.1:19090
+just sim             # 人工冒烟 → http://127.0.0.1:19090 （Chat：/chat）
 ```
 
 ## 命令（按意图）
@@ -30,7 +30,7 @@ just sim             # 人工冒烟面板 → http://127.0.0.1:19090
 
 | 命令 | 作用 |
 |------|------|
-| `just sim` | 人工冒烟控制台（**非**正确性门禁） |
+| `just sim` | 冒烟控制台 `/` + Chat `/chat`（**非**正确性门禁） |
 | `just procs up\|down` | 手动起停 L2 进程 |
 
 ### 部署

@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Nova Sim — Chat</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --ink: #0f1c1a;
+      --muted: #5a6b67;
+      --line: #c5d2ce;
+      --paper: #e8eeec;
+      --panel: #f6f9f8;
+      --home: #0d7377;
+      --user: #1a3a36;
+      --ok: #1b7f4a;
+      --bad: #b42318;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; height: 100%;
+      font-family: "Outfit", system-ui, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(ellipse 70% 45% at 10% 0%, #d5eae6 0%, transparent 55%),
+        radial-gradient(ellipse 50% 35% at 100% 100%, #efe4da 0%, transparent 50%),
+        var(--paper);
+    }
+    .shell {
+      height: 100%; max-width: 720px; margin: 0 auto;
+      display: grid; grid-template-rows: auto 1fr auto;
+      padding: 0 1rem 1rem;
+    }
+    header {
+      display: flex; align-items: baseline; justify-content: space-between;
+      gap: 0.75rem; padding: 0.85rem 0 0.65rem;
+      border-bottom: 1px solid var(--line);
+    }
+    header h1 { margin: 0; font-size: 1.25rem; letter-spacing: -0.03em; }
+    header a { color: var(--home); text-decoration: none; font-size: 0.85rem; }
+    .status {
+      font-family: "IBM Plex Mono", monospace; font-size: 0.72rem;
+      color: var(--muted); margin-top: 0.35rem;
+    }
+    .status .ok { color: var(--ok); }
+    .status .bad { color: var(--bad); }
+    .messages {
+      overflow: auto; padding: 1rem 0; display: flex; flex-direction: column; gap: 0.75rem;
+    }
+    .bubble {
+      max-width: 88%; padding: 0.65rem 0.85rem; border-radius: 4px;
+      line-height: 1.45; white-space: pre-wrap; word-break: break-word;
+    }
+    .bubble.user {
+      align-self: flex-end; background: var(--user); color: #f4f7f6;
+    }
+    .bubble.assistant {
+      align-self: flex-start; background: #fff; border: 1px solid var(--line);
+    }
+    .bubble.assistant.pending { color: var(--muted); font-style: italic; }
+    .bubble .role {
+      font-size: 0.65rem; letter-spacing: 0.08em; text-transform: uppercase;
+      opacity: 0.7; margin-bottom: 0.25rem;
+    }
+    .composer {
+      display: grid; grid-template-columns: 1fr auto; gap: 0.5rem;
+      padding-top: 0.65rem; border-top: 1px solid var(--line);
+    }
+    textarea {
+      font: inherit; resize: none; min-height: 56px; max-height: 140px;
+      padding: 0.55rem 0.65rem; border: 1px solid var(--line); background: #fff;
+      border-radius: 2px;
+    }
+    button {
+      font: inherit; cursor: pointer; align-self: end;
+      border: 1px solid var(--ink); background: var(--ink); color: #f4f7f6;
+      padding: 0.55rem 1rem; border-radius: 2px; height: 56px;
+    }
+    button.ghost { background: transparent; color: var(--ink); height: auto; padding: 0.28rem 0.55rem; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .toolbar { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.5rem; }
+    .empty {
+      margin: auto; text-align: center; color: var(--muted); max-width: 22rem;
+    }
+    .empty p { margin: 0.4rem 0; font-size: 0.95rem; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div>
+        <h1>Chat</h1>
+        <div class="status" id="status">未连接</div>
+        <div class="toolbar">
+          <button type="button" class="ghost" id="btn-boot">启动对话环境</button>
+          <button type="button" class="ghost" id="btn-new" disabled>新会话</button>
+        </div>
+      </div>
+      <a href="/">拓扑控制台 →</a>
+    </header>
+
+    <div class="messages" id="messages">
+      <div class="empty" id="empty">
+        <p>先点「启动对话环境」：拉起 home + mock-agent，并打开一条 Session。</p>
+        <p>然后输入消息发 Turn，assistant 的 text_delta 会流式出现在这里。</p>
+      </div>
+    </div>
+
+    <form class="composer" id="form">
+      <textarea id="input" placeholder="发一条消息…" disabled rows="2"></textarea>
+      <button type="submit" id="btn-send" disabled>发送</button>
+    </form>
+  </div>
+
+  <script>
+    const state = {
+      regionId: null,
+      listen: null,
+      sessionId: null,
+      lastSeq: 0,
+      es: null,
+      busy: false,
+      assistantEl: null,
+    };
+
+    const $ = (id) => document.getElementById(id);
+
+    function setStatus(html) {
+      $("status").innerHTML = html;
+    }
+
+    async function api(path, opts = {}) {
+      const r = await fetch(path, {
+        headers: { "content-type": "application/json" },
+        ...opts,
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || r.statusText);
+      return j;
+    }
+
+    function hideEmpty() {
+      const e = $("empty");
+      if (e) e.remove();
+    }
+
+    function addBubble(role, text, pending = false) {
+      hideEmpty();
+      const el = document.createElement("div");
+      el.className = "bubble " + role + (pending ? " pending" : "");
+      el.innerHTML = `<div class="role">${role}</div><div class="body"></div>`;
+      el.querySelector(".body").textContent = text;
+      $("messages").appendChild(el);
+      $("messages").scrollTop = $("messages").scrollHeight;
+      return el;
+    }
+
+    function setBusy(busy) {
+      state.busy = busy;
+      $("btn-send").disabled = busy || !state.sessionId;
+      $("input").disabled = busy || !state.sessionId;
+      $("btn-new").disabled = !state.listen;
+    }
+
+    function closeStream() {
+      if (state.es) {
+        state.es.close();
+        state.es = null;
+      }
+    }
+
+    function openStream() {
+      closeStream();
+      if (!state.listen || !state.sessionId) return;
+      const from = Math.max(1, state.lastSeq + 1);
+      const url = `http://${state.listen}/v1/sessions/${state.sessionId}/stream?from_seq=${from}`;
+      const es = new EventSource(url);
+      state.es = es;
+      es.onmessage = (ev) => {
+        if (ev.lastEventId) state.lastSeq = Number(ev.lastEventId) || state.lastSeq;
+        let data;
+        try { data = JSON.parse(ev.data); } catch { return; }
+        if (data.error) {
+          setStatus(`<span class="bad">stream: ${data.error}</span>`);
+          return;
+        }
+        const kind = data.kind;
+        const payload = data.payload || "";
+        if (kind === "text_delta") {
+          if (!state.assistantEl) {
+            state.assistantEl = addBubble("assistant", "", true);
+          }
+          state.assistantEl.classList.remove("pending");
+          const body = state.assistantEl.querySelector(".body");
+          body.textContent += payload;
+          $("messages").scrollTop = $("messages").scrollHeight;
+        } else if (kind === "turn_done" || kind === "turn_failed") {
+          if (state.assistantEl) {
+            state.assistantEl.classList.remove("pending");
+            const body = state.assistantEl.querySelector(".body");
+            // Prefer final assistant_text on turn_done when present.
+            if (payload) body.textContent = payload;
+          } else if (payload) {
+            addBubble("assistant", payload);
+          }
+          state.assistantEl = null;
+          setBusy(false);
+          setStatus(statusLine("idle"));
+        } else if (kind === "session_idle") {
+          setBusy(false);
+          setStatus(statusLine("idle"));
+        } else if (kind === "session_busy" || kind === "turn_begin") {
+          setStatus(statusLine("busy"));
+        }
+      };
+      es.onerror = () => {
+        /* EventSource auto-reconnects; leave status alone unless prolonged */
+      };
+    }
+
+    function statusLine(phase) {
+      const sid = state.sessionId ? state.sessionId.slice(0, 8) + "…" : "—";
+      const phaseHtml = phase === "busy"
+        ? `<span class="ok">生成中</span>`
+        : phase === "idle"
+          ? `<span class="ok">就绪</span>`
+          : phase;
+      return `${phaseHtml} · ${state.regionId || "?"} @ ${state.listen || "—"} · session ${sid}`;
+    }
+
+    async function ensureEnv() {
+      setStatus("准备环境…");
+      let snap = await api("/api/state");
+      if (!snap.regions || snap.regions.length === 0) {
+        await api("/api/preset/two-region", { method: "POST", body: "{}" });
+        snap = await api("/api/state");
+      }
+      let home = (snap.regions || []).find((r) => r.role === "home");
+      if (!home) throw new Error("没有 home 区域");
+      if (!home.healthy) {
+        await api(`/api/regions/${home.id}/start`, { method: "POST", body: "{}" });
+        snap = await api("/api/state");
+        home = (snap.regions || []).find((r) => r.id === home.id);
+      }
+      if (!home.agents || home.agents.length === 0) {
+        await api(`/api/regions/${home.id}/agents`, {
+          method: "POST",
+          body: JSON.stringify({ tokens: 12 }),
+        });
+        snap = await api("/api/state");
+        home = (snap.regions || []).find((r) => r.id === home.id);
+      }
+      state.regionId = home.id;
+      state.listen = home.listen;
+      return home;
+    }
+
+    async function newSession() {
+      await ensureEnv();
+      closeStream();
+      state.lastSeq = 0;
+      state.assistantEl = null;
+      const j = await api("/api/sessions", {
+        method: "POST",
+        body: JSON.stringify({ region_id: state.regionId }),
+      });
+      state.sessionId = j.session_id;
+      $("messages").innerHTML = "";
+      hideEmpty();
+      openStream();
+      setBusy(false);
+      setStatus(statusLine("idle"));
+      $("input").focus();
+    }
+
+    $("btn-boot").onclick = async () => {
+      try {
+        $("btn-boot").disabled = true;
+        await newSession();
+      } catch (e) {
+        setStatus(`<span class="bad">${e.message}</span>`);
+      } finally {
+        $("btn-boot").disabled = false;
+      }
+    };
+
+    $("btn-new").onclick = async () => {
+      try {
+        await newSession();
+      } catch (e) {
+        setStatus(`<span class="bad">${e.message}</span>`);
+      }
+    };
+
+    $("form").onsubmit = async (ev) => {
+      ev.preventDefault();
+      const text = $("input").value.trim();
+      if (!text || state.busy || !state.sessionId) return;
+      addBubble("user", text);
+      $("input").value = "";
+      state.assistantEl = addBubble("assistant", "…", true);
+      setBusy(true);
+      setStatus(statusLine("busy"));
+      try {
+        if (!state.es) openStream();
+        await api(`/api/sessions/${state.sessionId}/turns`, {
+          method: "POST",
+          body: JSON.stringify({ text, region_id: state.regionId }),
+        });
+      } catch (e) {
+        if (state.assistantEl) {
+          state.assistantEl.classList.remove("pending");
+          state.assistantEl.querySelector(".body").textContent = "错误: " + e.message;
+        }
+        state.assistantEl = null;
+        setBusy(false);
+        setStatus(`<span class="bad">${e.message}</span>`);
+      }
+    };
+
+    $("input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        $("form").requestSubmit();
+      }
+    });
+  </script>
+</body>
+</html>

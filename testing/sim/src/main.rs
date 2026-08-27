@@ -41,6 +41,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/chat", get(chat))
         .route("/api/state", get(api_state))
         .route("/api/preset/two-region", post(api_preset))
         .route("/api/regions", post(api_add_region))
@@ -64,6 +65,10 @@ async fn main() -> Result<()> {
 
 async fn index() -> Html<&'static str> {
     Html(include_str!("../static/index.html"))
+}
+
+async fn chat() -> Html<&'static str> {
+    Html(include_str!("../static/chat.html"))
 }
 
 async fn api_state(State(sim): State<SharedSim>) -> impl IntoResponse {
