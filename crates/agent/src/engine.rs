@@ -229,6 +229,7 @@ impl Agent {
             stopped: false,
             output_index: 0,
             current_item_id: None,
+            current_content_index: None,
         };
 
         loop {
@@ -544,6 +545,9 @@ struct LedgerSink {
     /// Id of the output item currently being streamed, carried on delta events
     /// as `item_id` (the message id or a tool `call_id`).
     current_item_id: Option<String>,
+    /// Index of the content part currently being streamed, carried on text
+    /// delta/done events as `content_index`.
+    current_content_index: Option<u32>,
 }
 
 /// The stream identity of an output item: a tool `call_id` for tool items, the
@@ -609,6 +613,8 @@ impl CompletionsSink for LedgerSink {
             ResponseEventKind::OutputTextDelta,
             EventBody::Delta {
                 item_id: self.current_item_id.clone().unwrap_or_default(),
+                output_index: self.output_index.saturating_sub(1),
+                content_index: self.current_content_index,
                 delta: text.to_string(),
             },
         )
@@ -638,6 +644,8 @@ impl CompletionsSink for LedgerSink {
             ResponseEventKind::FunctionCallArgumentsDelta,
             EventBody::Delta {
                 item_id: item_id.to_string(),
+                output_index: self.output_index.saturating_sub(1),
+                content_index: None,
                 delta: delta.to_string(),
             },
         )
@@ -656,6 +664,57 @@ impl CompletionsSink for LedgerSink {
                 output_index: index,
                 item_id: item_id.to_string(),
                 arguments: arguments.to_string(),
+            },
+        )
+        .await
+    }
+
+    async fn content_part_added(
+        &mut self,
+        item_id: &str,
+        content_index: u32,
+    ) -> Result<SinkVerdict, SinkError> {
+        self.current_content_index = Some(content_index);
+        let part = serde_json::json!({ "type": "output_text", "text": "" });
+        self.push(
+            ResponseEventKind::ContentPartAdded,
+            EventBody::Part {
+                item_id: item_id.to_string(),
+                output_index: self.output_index.saturating_sub(1),
+                content_index,
+                part,
+            },
+        )
+        .await
+    }
+
+    async fn output_text_done(&mut self, text: &str) -> Result<SinkVerdict, SinkError> {
+        self.push(
+            ResponseEventKind::OutputTextDone,
+            EventBody::Text {
+                item_id: self.current_item_id.clone().unwrap_or_default(),
+                output_index: self.output_index.saturating_sub(1),
+                content_index: self.current_content_index.unwrap_or_default(),
+                text: text.to_string(),
+            },
+        )
+        .await
+    }
+
+    async fn content_part_done(
+        &mut self,
+        item_id: &str,
+        content_index: u32,
+        text: &str,
+    ) -> Result<SinkVerdict, SinkError> {
+        let part = serde_json::json!({ "type": "output_text", "text": text });
+        self.push(
+            ResponseEventKind::ContentPartDone,
+            EventBody::Part {
+                item_id: item_id.to_string(),
+                output_index: self.output_index.saturating_sub(1),
+                content_index,
+                part,
             },
         )
         .await

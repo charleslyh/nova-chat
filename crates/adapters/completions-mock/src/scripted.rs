@@ -169,7 +169,8 @@ impl ScriptedScheduler {
             .or(self.default.as_ref())
     }
 
-    /// Stream text as `output_item.added` → `output_text.delta`* →
+    /// Stream text as `output_item.added` → `content_part.added` →
+    /// `output_text.delta`* → `output_text.done` → `content_part.done` →
     /// `output_item.done`, translating a moved fence into `Superseded`.
     /// Returns the message (with its id) so the outcome carries the same item.
     async fn stream(
@@ -178,12 +179,19 @@ impl ScriptedScheduler {
         sink: &mut dyn CompletionsSink,
     ) -> Result<ResponseItem, SchedulerError> {
         let message = assistant_text_message(text);
+        let item_id = match &message {
+            ResponseItem::Message { id, .. } => id.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
         sink.output_item_added(&message).await?;
+        sink.content_part_added(&item_id, 0).await?;
         for piece in chunk_text(text, chunks) {
             if sink.text_delta(&piece).await?.should_stop() {
                 return Err(SchedulerError::Superseded);
             }
         }
+        sink.output_text_done(text).await?;
+        sink.content_part_done(&item_id, 0, text).await?;
         sink.output_item_done(&message).await?;
         Ok(message)
     }

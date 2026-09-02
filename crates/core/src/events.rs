@@ -21,6 +21,12 @@ pub enum ResponseEventKind {
     FunctionCallArgumentsDelta,
     #[serde(rename = "response.function_call_arguments.done")]
     FunctionCallArgumentsDone,
+    #[serde(rename = "response.content_part.added")]
+    ContentPartAdded,
+    #[serde(rename = "response.output_text.done")]
+    OutputTextDone,
+    #[serde(rename = "response.content_part.done")]
+    ContentPartDone,
     #[serde(rename = "response.completed")]
     Completed,
     #[serde(rename = "response.failed")]
@@ -58,6 +64,9 @@ impl ResponseEventKind {
             ResponseEventKind::OutputItemDone => "response.output_item.done",
             ResponseEventKind::FunctionCallArgumentsDelta => "response.function_call_arguments.delta",
             ResponseEventKind::FunctionCallArgumentsDone => "response.function_call_arguments.done",
+            ResponseEventKind::ContentPartAdded => "response.content_part.added",
+            ResponseEventKind::OutputTextDone => "response.output_text.done",
+            ResponseEventKind::ContentPartDone => "response.content_part.done",
             ResponseEventKind::Completed => "response.completed",
             ResponseEventKind::Failed => "response.failed",
             ResponseEventKind::Incomplete => "response.incomplete",
@@ -91,7 +100,14 @@ pub struct ResponseEvent {
 #[serde(untagged)]
 pub enum EventBody {
     /// `response.output_text.delta` / `response.function_call_arguments.delta`.
-    Delta { item_id: String, delta: String },
+    /// `content_index` is present only for output_text deltas.
+    Delta {
+        item_id: String,
+        output_index: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content_index: Option<u32>,
+        delta: String,
+    },
     /// `response.output_item.added` / `response.output_item.done`.
     Item { output_index: u32, item: Value },
     /// `response.function_call_arguments.done`.
@@ -99,6 +115,20 @@ pub enum EventBody {
         output_index: u32,
         item_id: String,
         arguments: String,
+    },
+    /// `response.output_text.done`.
+    Text {
+        item_id: String,
+        output_index: u32,
+        content_index: u32,
+        text: String,
+    },
+    /// `response.content_part.added` / `response.content_part.done`.
+    Part {
+        item_id: String,
+        output_index: u32,
+        content_index: u32,
+        part: Value,
     },
     /// Lifecycle events carry the full response object as `response`.
     Response { response: Value },
@@ -137,22 +167,94 @@ impl ResponseEvent {
         }
     }
 
-    /// A text or arguments fragment.
-    pub fn delta(
+    /// A text fragment (`response.output_text.delta`).
+    pub fn text_delta(
+        response_id: ResponseId,
+        attempt: Attempt,
+        item_id: String,
+        output_index: u32,
+        content_index: u32,
+        delta: impl Into<String>,
+    ) -> Self {
+        Self {
+            response_id,
+            sequence_number: 0,
+            kind: ResponseEventKind::OutputTextDelta,
+            attempt: Some(attempt),
+            body: EventBody::Delta {
+                item_id,
+                output_index,
+                content_index: Some(content_index),
+                delta: delta.into(),
+            },
+        }
+    }
+
+    /// A tool-argument fragment (`response.function_call_arguments.delta`).
+    pub fn arguments_delta(
+        response_id: ResponseId,
+        attempt: Attempt,
+        item_id: String,
+        output_index: u32,
+        delta: impl Into<String>,
+    ) -> Self {
+        Self {
+            response_id,
+            sequence_number: 0,
+            kind: ResponseEventKind::FunctionCallArgumentsDelta,
+            attempt: Some(attempt),
+            body: EventBody::Delta {
+                item_id,
+                output_index,
+                content_index: None,
+                delta: delta.into(),
+            },
+        }
+    }
+
+    /// The completed text of an output_text part (`response.output_text.done`).
+    pub fn output_text_done(
+        response_id: ResponseId,
+        attempt: Attempt,
+        item_id: String,
+        output_index: u32,
+        content_index: u32,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            response_id,
+            sequence_number: 0,
+            kind: ResponseEventKind::OutputTextDone,
+            attempt: Some(attempt),
+            body: EventBody::Text {
+                item_id,
+                output_index,
+                content_index,
+                text: text.into(),
+            },
+        }
+    }
+
+    /// A content-part boundary (`response.content_part.added` / `.done`).
+    pub fn content_part(
         response_id: ResponseId,
         kind: ResponseEventKind,
         attempt: Attempt,
         item_id: String,
-        delta: impl Into<String>,
+        output_index: u32,
+        content_index: u32,
+        part: Value,
     ) -> Self {
         Self {
             response_id,
             sequence_number: 0,
             kind,
             attempt: Some(attempt),
-            body: EventBody::Delta {
+            body: EventBody::Part {
                 item_id,
-                delta: delta.into(),
+                output_index,
+                content_index,
+                part,
             },
         }
     }
@@ -307,18 +409,26 @@ mod tests {
     #[test]
     fn delta_events_serialise_with_a_delta_field() {
         let id = ResponseId::new(NodeTag::parse("n1").unwrap());
-        let event = ResponseEvent::delta(
-            id,
-            ResponseEventKind::OutputTextDelta,
-            Attempt(1),
-            "msg_1".into(),
-            "hello",
-        );
+        let event = ResponseEvent::text_delta(id, Attempt(1), "msg_1".into(), 0, 0, "hello");
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "response.output_text.delta");
         assert_eq!(json["item_id"], "msg_1");
+        assert_eq!(json["output_index"], 0);
+        assert_eq!(json["content_index"], 0);
         assert_eq!(json["delta"], "hello");
         assert!(json.get("payload").is_none());
+    }
+
+    #[test]
+    fn arguments_delta_has_no_content_index() {
+        let id = ResponseId::new(NodeTag::parse("n1").unwrap());
+        let event = ResponseEvent::arguments_delta(id, Attempt(1), "call_1".into(), 0, "{}");
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "response.function_call_arguments.delta");
+        assert_eq!(json["item_id"], "call_1");
+        assert_eq!(json["output_index"], 0);
+        assert_eq!(json["delta"], "{}");
+        assert!(json.get("content_index").is_none());
     }
 
     #[test]

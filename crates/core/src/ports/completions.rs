@@ -114,6 +114,37 @@ pub trait CompletionsSink: Send {
         Ok(SinkVerdict::Continue)
     }
 
+    /// A content part of a message appears (its text is about to stream).
+    /// `content_index` is the index within the message's `content`.
+    ///
+    /// Default: ignore.
+    async fn content_part_added(
+        &mut self,
+        _item_id: &str,
+        _content_index: u32,
+    ) -> Result<SinkVerdict, SinkError> {
+        Ok(SinkVerdict::Continue)
+    }
+
+    /// The complete text of an output_text part, ending its delta stream.
+    ///
+    /// Default: ignore.
+    async fn output_text_done(&mut self, _text: &str) -> Result<SinkVerdict, SinkError> {
+        Ok(SinkVerdict::Continue)
+    }
+
+    /// A content part is complete — its text is final.
+    ///
+    /// Default: ignore.
+    async fn content_part_done(
+        &mut self,
+        _item_id: &str,
+        _content_index: u32,
+        _text: &str,
+    ) -> Result<SinkVerdict, SinkError> {
+        Ok(SinkVerdict::Continue)
+    }
+
     /// Announce a tool call the model has decided on, in one shot.
     ///
     /// Default: emit `output_item.added` then `output_item.done` carrying the
@@ -254,6 +285,12 @@ pub struct CollectingSink {
     pub arg_deltas: Vec<String>,
     /// Complete arguments announced via `function_call_arguments_done`.
     pub arg_dones: Vec<String>,
+    /// `content_index` values announced via `content_part_added`.
+    pub content_parts_added: Vec<u32>,
+    /// Complete text announced via `output_text_done`.
+    pub text_dones: Vec<String>,
+    /// `content_index` values announced via `content_part_done`.
+    pub content_parts_done: Vec<u32>,
     /// Report a moved fence after this many deltas.
     pub stop_after: Option<usize>,
 }
@@ -320,6 +357,30 @@ impl CompletionsSink for CollectingSink {
         arguments: &str,
     ) -> Result<SinkVerdict, SinkError> {
         self.arg_dones.push(arguments.to_string());
+        Ok(SinkVerdict::Continue)
+    }
+
+    async fn content_part_added(
+        &mut self,
+        _item_id: &str,
+        content_index: u32,
+    ) -> Result<SinkVerdict, SinkError> {
+        self.content_parts_added.push(content_index);
+        Ok(SinkVerdict::Continue)
+    }
+
+    async fn output_text_done(&mut self, text: &str) -> Result<SinkVerdict, SinkError> {
+        self.text_dones.push(text.to_string());
+        Ok(SinkVerdict::Continue)
+    }
+
+    async fn content_part_done(
+        &mut self,
+        _item_id: &str,
+        content_index: u32,
+        _text: &str,
+    ) -> Result<SinkVerdict, SinkError> {
+        self.content_parts_done.push(content_index);
         Ok(SinkVerdict::Continue)
     }
 }

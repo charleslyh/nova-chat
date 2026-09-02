@@ -507,11 +507,12 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let result = ctx
                 .world
                 .event_log
-                .append(ResponseEvent::delta(
+                .append(ResponseEvent::text_delta(
                     id.clone(),
-                    ResponseEventKind::OutputTextDelta,
                     attempt,
                     String::new(),
+                    0,
+                    0,
                     payload.unwrap_or_else(|| "delta".into()),
                 ))
                 .await;

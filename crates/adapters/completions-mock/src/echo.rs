@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use nova_responses_core::{
     assistant_text_message, CompletionsOutcome, CompletionsRequest, CompletionsRequestScheduler,
-    CompletionsSink, FinishReason, SchedulerError, Usage,
+    CompletionsSink, FinishReason, ResponseItem, SchedulerError, Usage,
 };
 
 use crate::chunk_text;
@@ -48,8 +48,13 @@ impl CompletionsRequestScheduler for EchoScheduler {
         };
 
         let message = assistant_text_message(answer.clone());
+        let item_id = match &message {
+            ResponseItem::Message { id, .. } => id.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
 
         sink.output_item_added(&message).await?;
+        sink.content_part_added(&item_id, 0).await?;
         for piece in chunk_text(&answer, self.chunks) {
             if sink.text_delta(&piece).await?.should_stop() {
                 // Stopping here rather than finishing the stream: the remaining
@@ -58,6 +63,8 @@ impl CompletionsRequestScheduler for EchoScheduler {
                 return Err(SchedulerError::Superseded);
             }
         }
+        sink.output_text_done(&answer).await?;
+        sink.content_part_done(&item_id, 0, &answer).await?;
         sink.output_item_done(&message).await?;
 
         let usage = Usage::new(

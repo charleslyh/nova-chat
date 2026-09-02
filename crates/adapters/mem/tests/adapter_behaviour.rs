@@ -57,6 +57,8 @@ fn event(id: &ResponseId, kind: ResponseEventKind, payload: &str) -> ResponseEve
     } else {
         EventBody::Delta {
             item_id: String::new(),
+            output_index: 0,
+            content_index: None,
             delta: payload.to_string(),
         }
     };
