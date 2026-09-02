@@ -1,0 +1,15 @@
+# Node A backed by the real carrier, for L3.
+#
+# The connection string is read from the environment named below; it is never
+# written here.
+node_tag = "node-a"
+listen = "127.0.0.1:18080"
+
+store_backend = "sql"
+database_url_env = "NOVA_TEST_DATABASE_URL"
+
+# With shared storage `is_shared()` returns true, so content reads go direct and
+# chain affinity routing retires automatically.
+[peers]
+node-a = "127.0.0.1:18080"
+node-b = "127.0.0.1:18081"

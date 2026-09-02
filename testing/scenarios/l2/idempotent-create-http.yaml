@@ -1,0 +1,16 @@
+name: idempotent-create-http
+covers: [FR-3, CR-2, INV-2]
+oracles: []
+steps:
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"idem","background":true}'
+    expect_status: 202
+    capture:
+      first_id: id
+  # Same idempotency key twice: the second call must return the original object
+  # rather than create a second response.
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"idem-keyed","background":true}'
+    expect_status: 202

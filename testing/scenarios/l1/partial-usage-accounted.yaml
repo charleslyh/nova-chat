@@ -1,0 +1,19 @@
+name: partial-usage-accounted
+covers: [FR-7, FR-36, CR-11, INV-51]
+oracles: [UsageAccounted, CreatedResponsesTerminal]
+steps:
+  - action: create_response
+    input: "will be cancelled"
+    key: pua-1
+  - action: claim
+  - action: append_delta
+  - action: record_partial_usage
+    input_tokens: 11
+    output_tokens: 4
+  - action: cancel
+  # Tokens already consumed must remain billable after the abort.
+  - action: expect_partial_usage
+    min_total_tokens: 15
+  # Cancelling twice is a conflict, not a silent no-op.
+  - action: cancel
+    expect: invalid_transition

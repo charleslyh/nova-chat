@@ -1,0 +1,38 @@
+name: multi-turn-chain-http
+covers: [FR-16, FR-19, CR-9]
+oracles: []
+steps:
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"what is my name","instructions":"BE-TERSE","background":true}'
+    expect_status: 202
+    capture:
+      first: id
+  # Wait for the mock agent to finish the first turn.
+  - action: http_get_until
+    url: http://127.0.0.1:18080/v1/responses/{{first}}
+    expect_contains: '"status":"completed"'
+    timeout_ms: 15000
+  # Instructions are echoed on the object they were sent with.
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/responses/{{first}}
+    expect_status: 200
+    expect_contains: 'BE-TERSE'
+  # Second turn sends only the new input plus the pointer; the server assembles
+  # the history.
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"and again","previous_response_id":"{{first}}","background":true}'
+    expect_status: 202
+    capture:
+      second: id
+  - action: http_get_until
+    url: http://127.0.0.1:18080/v1/responses/{{second}}
+    expect_contains: '"status":"completed"'
+    timeout_ms: 15000
+  # The second response must not echo the first turn's instructions: they do not
+  # carry over (INV-49).
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/responses/{{second}}
+    expect_status: 200
+    expect_contains: '"instructions":null'

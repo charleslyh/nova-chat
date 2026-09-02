@@ -1,0 +1,276 @@
+//! Stored response records and chain resolution types (D20).
+//!
+//! What is stored: the response's own **items** plus a pointer to the previous
+//! link. What is *not* stored: the incremental event stream.
+
+use serde::{Deserialize, Serialize};
+
+use crate::ids::{Attempt, AgentId, IdempotencyKey, NodeTag, ResponseId, TenantId};
+use crate::protocol::ResponseItem;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseStatus {
+    Queued,
+    InProgress,
+    Completed,
+    Failed,
+    Incomplete,
+    Cancelled,
+}
+
+impl ResponseStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            ResponseStatus::Completed
+                | ResponseStatus::Failed
+                | ResponseStatus::Incomplete
+                | ResponseStatus::Cancelled
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResponseStatus::Queued => "queued",
+            ResponseStatus::InProgress => "in_progress",
+            ResponseStatus::Completed => "completed",
+            ResponseStatus::Failed => "failed",
+            ResponseStatus::Incomplete => "incomplete",
+            ResponseStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Token accounting. Integer typed throughout — never routed through `f64`,
+/// which would silently lose precision on large counts (D22).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl Usage {
+    pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+        }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.input_tokens == 0 && self.output_tokens == 0 && self.total_tokens == 0
+    }
+
+    /// Accumulate across attempts so a mid-flight abort still contributes to
+    /// billing (CR-11 / INV-51).
+    pub fn add(self, other: Usage) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            total_tokens: self.total_tokens.saturating_add(other.total_tokens),
+        }
+    }
+}
+
+/// A persisted response record: the unit of both the ledger and the context
+/// store (they share one row / one transaction — D21 ①).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredResponse {
+    pub response_id: ResponseId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<ResponseId>,
+    pub tenant_id: TenantId,
+    pub model: String,
+
+    /// Echoed on retrieval, **never** fed into chain resolution (INV-49).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+
+    pub input_items: Vec<ResponseItem>,
+    #[serde(default)]
+    pub output_items: Vec<ResponseItem>,
+
+    pub status: ResponseStatus,
+    #[serde(default)]
+    pub usage: Usage,
+
+    pub created_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+
+    /// When false the record is not retained and cannot be referenced as a
+    /// previous link (FR-18).
+    pub stored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+
+    /// Integrity tag over the canonical encoding of the items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_alg: Option<String>,
+
+    /// Host node that owns the in-flight buffer for this response.
+    pub node_tag: NodeTag,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<IdempotencyKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<AgentId>,
+    #[serde(default)]
+    pub attempt: Attempt,
+}
+
+impl StoredResponse {
+    /// Items contributed by this link when walking a chain, in chronological
+    /// order: what went in, then what came out.
+    ///
+    /// Instructions are **absent by construction** — the field is simply not
+    /// consulted here (INV-49).
+    pub fn chain_items(&self) -> impl Iterator<Item = &ResponseItem> {
+        self.input_items.iter().chain(self.output_items.iter())
+    }
+
+    pub fn chain_byte_len(&self) -> usize {
+        self.chain_items().map(ResponseItem::byte_len).sum()
+    }
+
+    /// Whether this record may be used as `previous_response_id` by `tenant`.
+    pub fn is_referencable_by(&self, tenant: &TenantId) -> bool {
+        self.stored && &self.tenant_id == tenant
+    }
+}
+
+/// Bounds for chain resolution. Exceeding any of them is an **error**, never a
+/// silent truncation (INV-41).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainLimits {
+    pub max_depth: usize,
+    pub max_items: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for ChainLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: 50,
+            max_items: 1000,
+            max_bytes: 1024 * 1024,
+        }
+    }
+}
+
+/// Result of walking a chain: history in chronological order.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ResolvedContext {
+    pub items: Vec<ResponseItem>,
+    pub depth: usize,
+    pub bytes: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tenant(s: &str) -> TenantId {
+        TenantId::parse(s).unwrap()
+    }
+
+    fn record(stored: bool, tenant_id: &str) -> StoredResponse {
+        StoredResponse {
+            response_id: ResponseId::new(NodeTag::parse("n1").unwrap()),
+            previous_response_id: None,
+            tenant_id: tenant(tenant_id),
+            model: "m".into(),
+            instructions: Some("secret system prompt".into()),
+            input_items: vec![ResponseItem::user_text("in")],
+            output_items: vec![ResponseItem::assistant_text("out")],
+            status: ResponseStatus::Completed,
+            usage: Usage::new(1, 2),
+            created_at_ms: 0,
+            completed_at_ms: Some(1),
+            stored,
+            expires_at_ms: None,
+            integrity: None,
+            integrity_alg: None,
+            node_tag: NodeTag::parse("n1").unwrap(),
+            idempotency_key: None,
+            owner: None,
+            attempt: Attempt::default(),
+        }
+    }
+
+    #[test]
+    fn chain_items_are_input_then_output() {
+        let rec = record(true, "t1");
+        let items: Vec<_> = rec.chain_items().cloned().collect();
+        assert_eq!(items, vec![
+            ResponseItem::user_text("in"),
+            ResponseItem::assistant_text("out"),
+        ]);
+    }
+
+    #[test]
+    fn chain_items_never_contain_instructions() {
+        // INV-49: the instructions text must not leak into chain output even
+        // though it is stored on the record for echo purposes.
+        let rec = record(true, "t1");
+        let encoded = crate::canonical::canonical_items(
+            &rec.chain_items().cloned().collect::<Vec<_>>(),
+        );
+        assert!(
+            !encoded.contains("secret system prompt"),
+            "instructions leaked into chain items: {encoded}"
+        );
+    }
+
+    #[test]
+    fn referencability_requires_store_and_same_tenant() {
+        assert!(record(true, "t1").is_referencable_by(&tenant("t1")));
+        assert!(!record(false, "t1").is_referencable_by(&tenant("t1")));
+        assert!(!record(true, "t1").is_referencable_by(&tenant("t2")));
+    }
+
+    #[test]
+    fn usage_totals_and_accumulates() {
+        let a = Usage::new(3, 4);
+        assert_eq!(a.total_tokens, 7);
+        let b = a.add(Usage::new(1, 1));
+        assert_eq!(b, Usage { input_tokens: 4, output_tokens: 5, total_tokens: 9 });
+        assert!(Usage::default().is_zero());
+        assert!(!a.is_zero());
+    }
+
+    #[test]
+    fn usage_saturates_instead_of_overflowing() {
+        let max = Usage {
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            total_tokens: u64::MAX,
+        };
+        assert_eq!(max.add(Usage::new(1, 1)), max);
+    }
+
+    #[test]
+    fn terminal_status_set() {
+        for s in [
+            ResponseStatus::Completed,
+            ResponseStatus::Failed,
+            ResponseStatus::Incomplete,
+            ResponseStatus::Cancelled,
+        ] {
+            assert!(s.is_terminal(), "{s:?}");
+        }
+        assert!(!ResponseStatus::Queued.is_terminal());
+        assert!(!ResponseStatus::InProgress.is_terminal());
+    }
+
+    #[test]
+    fn default_chain_limits_match_parameters_doc() {
+        let limits = ChainLimits::default();
+        assert_eq!(limits.max_depth, 50);
+        assert_eq!(limits.max_bytes, 1024 * 1024);
+    }
+}

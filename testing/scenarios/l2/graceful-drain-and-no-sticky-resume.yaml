@@ -1,0 +1,52 @@
+name: graceful-drain-and-no-sticky-resume
+covers: [FR-34, FR-32, FR-30, FR-11, CR-6, INV-12]
+oracles: []
+# Stops node-b. Declared rather than encoded in the filename: the runner orders
+# destructive scenarios last, so this no longer depends on sorting luck.
+destructive: true
+requires_nodes: [18080, 18081, 18082]
+steps:
+  - action: http_get
+    url: http://127.0.0.1:18081/health
+    expect_status: 200
+    expect_contains: '"accepting":true'
+
+  # Created on node-a, which has the agent attached, so node-a is the host and
+  # holds the in-flight event buffer.
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"survive a drain","background":true}'
+    expect_status: 202
+    capture:
+      rid: id
+
+  # Subscribe through node-b, which is a pure forwarder for this response.
+  - action: http_sse_collect
+    url: http://127.0.0.1:18081/v1/responses/{{rid}}?stream=true
+    expect_min_events: 1
+    max_events: 2
+    capture_last_seq: cursor
+
+  # SIGTERM, not SIGKILL: the point is to exercise drain, which is what makes a
+  # rolling deploy cost nothing in flight (D21). A SIGKILL here would verify the
+  # opposite behaviour.
+  - action: graceful_stop
+    port: 18081
+    wait_ms: 4000
+
+  # FR-32: the ingress layer carries no affinity, so the same cursor works through
+  # a *different* node once the previous one is gone — the host is still alive, and
+  # only the host's buffer matters. This is what makes the fleet replaceable; if
+  # subscriptions were pinned to the node that accepted them, every deploy would
+  # break every open stream.
+  - action: http_sse_collect
+    url: http://127.0.0.1:18082/v1/responses/{{rid}}?stream=true&starting_after={{cursor}}
+    expect_min_events: 1
+    max_events: 3
+
+  # Draining is per-node: the others keep accepting, which is what allows a deploy
+  # to roll through without a service-wide outage.
+  - action: http_get
+    url: http://127.0.0.1:18080/health
+    expect_status: 200
+    expect_contains: '"accepting":true'

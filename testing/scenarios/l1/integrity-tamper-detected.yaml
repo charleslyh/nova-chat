@@ -1,0 +1,16 @@
+name: integrity-tamper-detected
+covers: [FR-39, CR-13, INV-44]
+oracles: [IntegrityVerified]
+steps:
+  - action: create_response
+    input: "authentic"
+    key: itd-1
+    label: target
+  - action: expect_integrity_ok
+    target: target
+  # Modify stored content without updating its tag, as a storage-layer
+  # compromise would.
+  - action: tamper_content
+    target: target
+  - action: expect_integrity_mismatch
+    target: target

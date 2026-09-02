@@ -1,0 +1,20 @@
+name: unknown-field-400-http
+covers: [FR-24, FR-27, INV-50]
+oracles: []
+steps:
+  # Strict rejection over the wire, matching upstream behaviour.
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"hi","truncation":"auto"}'
+    expect_status: 400
+    expect_contains: 'truncation'
+  # And a pointed remedy for the field callers most often try.
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"hi","conversation":"conv_1"}'
+    expect_status: 400
+    expect_contains: 'previous_response_id'
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":[{"type":"item_reference","id":"msg_1"}]}'
+    expect_status: 400

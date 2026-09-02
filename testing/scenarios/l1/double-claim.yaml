@@ -1,25 +1,12 @@
 name: double-claim
-covers:
-  - FR-5
-  - CR-1
-  - INV-1
-oracles:
-  - SeqMonotonic
-  - SingleClaimPerAttempt
-  - SubmittedTurnsTerminal
-trace: true
+covers: [FR-4, CR-1, INV-1]
+oracles: [SingleClaimPerAttempt]
 steps:
-  - action: create_session
-  - action: submit_turn
-    text: only-one
-    key: k-dc-1
-    expect: accepted
+  - action: create_response
+    input: "one"
+    key: dc-1
   - action: claim
-    expect: some
+  # Only one response was queued, so a second claim must find nothing rather than
+  # hand the same work out twice.
   - action: claim
     expect: none
-  - action: append_delta
-    payload: a
-    expect_stale: false
-  - action: complete
-    status: done

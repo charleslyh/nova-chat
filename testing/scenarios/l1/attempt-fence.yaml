@@ -1,34 +1,16 @@
 name: attempt-fence
-covers:
-  - FR-5
-  - FR-6
-  - FR-7
-  - CR-3
-  - CR-7
-  - INV-5
-  - INV-6
-  - INV-10
-oracles:
-  - SeqMonotonic
-  - SingleClaimPerAttempt
-  - SubmittedTurnsTerminal
-  - StaleAppendRejected
-trace: true
+covers: [FR-5, FR-6, CR-3, CR-7, INV-5, INV-6]
+oracles: [StaleAppendRejected, SingleClaimPerAttempt, SequenceContiguous]
 steps:
-  - action: create_session
-  - action: submit_turn
-    text: fence-me
-    key: k-fence-1
-    expect: accepted
+  - action: create_response
+    input: "work"
+    key: fence-1
   - action: claim
-    deadline_ms: 1
   - action: append_delta
-    payload: ok
-    expect_stale: false
-  - action: advance_ms
-    by: 10
+    payload: "ok"
+  # Reaping raises the fence; the previous holder is now stale.
   - action: reap
   - action: append_delta
-    payload: zombie
+    payload: "zombie"
     attempt: 1
     expect_stale: true

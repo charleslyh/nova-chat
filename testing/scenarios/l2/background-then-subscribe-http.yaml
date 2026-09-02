@@ -1,0 +1,22 @@
+name: background-then-subscribe-http
+covers: [FR-2, FR-9, FR-10, CR-4, CR-5]
+oracles: []
+steps:
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"subscribe later","background":true}'
+    expect_status: 202
+    capture:
+      rid: id
+  # Attaching after creation must still yield a defined start: sequence 0 is the
+  # `response.created` event.
+  - action: http_sse_collect
+    url: http://127.0.0.1:18080/v1/responses/{{rid}}?stream=true
+    expect_min_events: 1
+    max_events: 3
+    capture_last_seq: cursor
+  # Resuming with the observed cursor must not repeat what was already delivered.
+  - action: http_sse_collect
+    url: http://127.0.0.1:18080/v1/responses/{{rid}}?stream=true&starting_after={{cursor}}
+    expect_min_events: 1
+    max_events: 3

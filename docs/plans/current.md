@@ -1,94 +1,81 @@
-# 当期计划：mem 驱动主框架完备（延后真实 ports）
+# 当期计划 · W 期（Responses 协议子集重构）
 
-> 状态：**展开级**
-> 前置：V1–V9 已完成（验证先行 + Session 流最小闭环，coverage 基线 100%）
-> 设计：[`../design/01-session-stream.md`](../design/01-session-stream.md) · [`../design/02-verification.md`](../design/02-verification.md)
-> 原则：**用 mem 扩展证明主框架能力完备**；真实存储 / 网络适配器 **尽量延后**
-
----
-
-## 0. 本轮定位
-
-| 要证明的 | 不在本轮证明的 |
-|----------|----------------|
-| 主框架在**端口契约**下行为自洽（控制面、不变量、恢复路径） | JetStream / Redis / DB 等真实引擎的性能与故障语义 |
-| mem 是**验证引擎**，缺口按框架语义扩展 | 把 mem 打磨成「准生产集群」本身 |
-
-**判据**：每项交付必须落到 `core` / `ports` 语义 / `gateway` 行为 + L0–L2 Oracle；禁止「只在 mem 私货里开关、框架路径走不到」。
+> 状态：**已完成**
+> 依据：[D20](../architecture/decisions.md#d20-交付边界收口存储与订阅分离) · [D21](../architecture/decisions.md#d21-可靠性分层三类存储的差异化投入) · [D22](../architecture/decisions.md#d22-协议封闭子集与严格拒绝)
+> 上一期（V10–V13）见 §5 归档说明
 
 ---
 
-## 1. 已锁定（继承）
+## 1. 交付项
 
-| 项 | 出处 |
-|----|------|
-| 产品 = Session 可回放消息；gateway POST+SSE | D19 |
-| meta ≠ stream | D11 |
-| 验证先行：Trace + Oracle；L0–L2 mem | D15 · D17 |
-| 真实 ports 接入 **延后**（本轮不选引擎、不上 Docker 存储） | 本计划 |
-
----
-
-## 2. 交付与验收（V10–V13）
-
-| # | 交付 | 框架缺口 | mem / 验证怎么证 | 验收 |
-|---|------|----------|------------------|------|
-| **V10** | **热 miss → 快照 / 冷层恢复闭环** | FR-13/14 · INV-14 | mem：可 trim 热层 + 内存「冷段」；Gap 必须带 hint；gateway/SSE：409 + 客户端改走 snapshot 再 `from_seq` | ✅ L1 `hot-miss-gap` + L2 `hot-miss-recover-http` |
-| **V11** | **开屏契约产品化** | FR-9 · INV-13 | 统一「snapshot → SSE from snapshot_seq」；中途开屏不依赖全量热回放 | ✅ `stream_from_seq` + L1 `mid-snapshot` + L2 `open-screen-mid-http` |
-| **V12** | **只读 Mirror 语义（进程内）** | FR-10 · 读路径 · INV-32 联动 | mem：权威写 + 异步/同步投影到 mirror 视图；mirror **拒写**；双观察者同序 | ✅ `MemMirrorView` + L1 `mirror-dual-read` + L2 `edge-read-mirror` |
-| **V13** | **多接入 / 无粘性拓扑强化** | FR-17 · INV-12 | 多 gateway 共一份 MemWorld（测试夹具内共享）；杀实例后续订；禁止连接级游标 | L2 多 listen + kill + 游标续订；扩展现有 stop-edge |
-
-可选加深（不挡 V10–V13 退出）：
-
-| # | 交付 | 说明 |
-|---|------|------|
-| **V14** | 场景化压力（mem） | 多 Session × 多 Agent × 过载拒绝 + Oracle；**仍不是**生产压测平台 |
-| **V15** | 客户端续订契约文档 / 参考实现 | 固化 `JitteredBackoff` + `(session_id, last_seq)`；SDK 独立成包可再后移 |
+| # | 交付 | 退出标准 | 状态 |
+|---|---|---|---|
+| **W1** | 契约先行：D20/D21/D22 + spec v3 + parameters + invariants | FR/CR/INV/SEC 编号锁定，覆盖率门禁据此统计 | ✅ |
+| **W2** | 协议封闭子集类型层 | 封闭枚举 + 严格拒绝 + 限长限深 + 链接内网拦截 | ✅ |
+| **W3** | core 重写 | 四端口就位；snapshot / StreamChannel / MetaStore 移除 | ✅ |
+| **W4** | 内存适配器重写 | 0 基有界环、单锁走链、HMAC 校验 | ✅ |
+| **W5** | SQL 适配器（新建） | 递归走链、原子领取、孤儿收口、租户清除 | ✅ |
+| **W6** | gateway 重写 | 三种模式、两条转发路径、鉴权、sweeper、优雅停机 | ✅ |
+| **W7** | 验证体系 | **同一套 L0 契约跑两个后端**；L1 29 项、L2 13 项、L3 5 项 | ✅ |
+| **W8** | 改名与清扫 | `nova-responses-*`；门禁硬编码同步 | ✅ |
+| **W9** | 文档收口 | 设计四篇新增 + 协议子集可发布契约 | ✅ |
 
 ---
 
-## 3. 明确延后（ports 接入）
+## 2. 验证现状
 
-以下 **本轮不做**（除非验证发现端口形状必须改，只改 **trait / 错误类型**，不绑实现）：
+```
+just verify l0   → 端口契约（内存 + SQL 共用）
+just verify l1   → 29 场景
+just verify l2   → 13 场景（三对等节点）
+just verify l3   → 5 项 + 契约复用（无数据库时跳过）
+just coverage    → 基线命中 70/82（85%）· CR 全覆盖
+just check-deps  → OK
+```
 
-- Redis / JetStream / 云厂商流存储选型与落地  
-- 跨机真实 Mirror、跨区 RTT、磁盘冷层  
-- 多物理 home 共享存储集群  
-- Docker 依赖的验证门禁（保持 D17）
-
-**允许的「像 ports 的东西」**：仅 mem 内模块（如 `MemHot` / `MemCold` / `MemMirror`），对外仍只暴露现有或微调后的 `StreamChannel` / `SnapshotStore` / `MetaStore`。
-
----
-
-## 4. 工作方式
-
-1. **先改契约与 gateway，再填 mem**——避免适配器私货。  
-2. 每项 V 必须：`covers` + Oracle（或 L0）+ `just verify` 绿。  
-3. `just coverage` 继续作需求仪表盘；新增能力同步基线 ID。  
-4. `sim` 仅冒烟，不进正确性门禁。
+单测 174 项：core 69 · mem 27 · gateway 74（含 48 项 HTTP 契约）· mock-agent 4。
 
 ---
 
-## 5. 退出标准
+## 3. 实现期发现并修复的真实缺陷
 
-- V10–V13 全绿；文档写清「证的是框架契约，不是存储引擎」  
-- 真实 ports 仍可零实现开工：新适配器只需过 **同一 L0 契约套件**  
-- 计划归档本轮后，下一期才进入「选引擎 + 适配器」入口级计划
+记录在案，因为都属于「不写测试就发现不了」的类别：
+
+| # | 缺陷 | 后果 | 修正 |
+|---|---|---|---|
+| 1 | 终态事件被自身 attempt 栅栏拒绝 | **流永不终止**，同步模式必然超时 | 服务端信封事件不带 attempt |
+| 2 | mem 与 sql 对「起点无效」返回不同错误 | 换后端行为漂移 | 统一 `chain_broken`；中间环跨租户才是 `cross_tenant` |
+| 3 | `complete` 经 axum extractor 返回 422 | 违反「一律 400」契约 | 手动解析请求体 |
+| 4 | `check_deps` 被自身注释误伤 | 门禁假阳性 | 只解析依赖段，忽略注释 |
+| 5 | `yaml_seq` 只支持块式数组 | **场景 covers 全部漏统计**，覆盖率失真 | 同时支持行内数组 |
+| 6 | 夹具 teardown 用 SIGTERM | 触发 drain 反而占住端口，下次运行报困惑的 503 | teardown 改 SIGKILL；夹具另设短 drain 预算 |
+| 7 | L2 场景相互污染 | 破坏性场景让后续场景失去可用节点 | 节点职责分工 + `zz-`/`zzz-` 排序前缀 |
 
 ---
 
-## 6. 上一轮摘要（V1–V9，已完成）
+## 4. 下期入口（条件触发，非排期）
 
-验证先行 · gateway/mem 闭环 · Trace/Oracle · FR-17 续订 · INV-32 只读 · 过载/pending_limit · INV-33 退避 · coverage 基线 100%。详见本文件历史提交与 changelog。
+| 入口 | 触发条件 | 预案 |
+|---|---|---|
+| **三层高可用**（在途上共享中间件） | 非计划崩溃失败率 > 0.05%/月 ｜ 生成时长 P99 > 15 分钟 ｜ 合作方明确要求 | 选 Redis Streams（形状匹配）；端口形状即抽象层，只需新增适配器 |
+| **子集扩展** | 调用方提出用例并通过评审 | 先验链闭合性 → 网关先行升级 → 更新 06 文档 |
+| **密钥轮换（多密钥并存）** | 安全策略要求定期轮换 | `alg` 标记已随记录保存，具备识别基础 |
+| **跨地域灾备** | 可用性目标提升至 99.99% | 当前同城多可用区，D8 仍成立 |
+
+**均不预先实现**：无触发条件时的投入无法证明收益。
 
 ---
 
-## 7. 变更日志
+## 5. 上一期（V10–V13）归档说明
 
-| 日期 | 变更 |
-|------|------|
-| 2026-08-27 | **V12**：`MemMirrorView` 拒写投影；edge GET 读 mirror；L1/L2 双读 |
-| 2026-08-27 | **V11**：`stream_from_seq` 开屏契约；append 抬 tip；L1/L2 mid-open |
-| 2026-08-27 | **V10**：mem hot/cold trim + admin `trim_hot`；L1/L2 409→snapshot→续订 |
-| 2026-08-27 | **新当期**：mem 驱动主框架完备；真实 ports 延后；规划 V10–V13 |
-| 2026-08-27 | 结项 V1–V9（见上节摘要） |
+V10–V13 的主要成果为：热层 miss → 冷层归档与 Gap 引导恢复、带 `snapshot_seq` 的开屏契约、跨区只读 Mirror 投影。
+
+这三项**均被 D20 推翻**：
+
+| 原成果 | 现状 | 原因 |
+|---|---|---|
+| 热层冷层 + Gap 引导 | 删除 | 生命周期收敛到单次生成后无界回放需求消失；位点过期改为显式失败且**无恢复路径** |
+| 开屏快照契约 | 删除 | 开屏能力取消（D20 ⑥） |
+| 跨区只读 Mirror | 删除 | 节点改对等；仅保留在途事件的定向转发 |
+
+推导过程保留在 `docs/archive/` 与 ADR 正文中备查——**不删改历史决策正文**是纪律，否则将来无法回答「当初为何那样设计」。

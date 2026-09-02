@@ -1,0 +1,20 @@
+name: chain-broken-explicit
+covers: [FR-18, CR-10, INV-43]
+oracles: [NoSilentContentLoss]
+steps:
+  - action: create_response
+    input: "first"
+    key: cbe-1
+    label: first
+  - action: create_response
+    input: "second"
+    key: cbe-2
+    previous: first
+    label: second
+  # Deleting a link must surface on the next resolution rather than quietly
+  # shortening the context — the latter looks like the model forgetting.
+  - action: delete_response
+    target: first
+  - action: expect_chain_error
+    from: second
+    reason: chain_broken

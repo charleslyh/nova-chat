@@ -1,0 +1,12 @@
+name: unknown-field-rejected
+covers: [FR-24, INV-50]
+oracles: []
+steps:
+  # Strict rejection matches upstream behaviour, so being strict is simultaneously
+  # safer and more compatible — there is no trade-off to make here.
+  - action: expect_protocol_reject
+    body: '{"model":"m","input":"hi","truncation":"auto"}'
+  - action: expect_protocol_reject
+    body: '{"model":"m","input":"hi","tools":[{"type":"web_search"}]}'
+  - action: expect_protocol_accept
+    body: '{"model":"m","input":"hi","store":true,"temperature":0.5}'

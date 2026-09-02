@@ -1,0 +1,19 @@
+name: cross-tenant-404-http
+covers: [FR-13, SEC-2, SEC-5]
+oracles: []
+steps:
+  # A well-formed but non-existent id. Reported as absent rather than as a parse
+  # error or a permission error, so ids cannot be probed (SEC-2).
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/responses/resp_node-a_00000000-0000-0000-0000-000000000000
+    expect_status: 404
+  # SEC-5: a node tag outside the peer registry must not trigger an outbound
+  # request. The tag is attacker-controlled input, so deriving an address from it
+  # would turn every id into an SSRF vector; it is simply not found.
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/responses/resp_node-z_00000000-0000-0000-0000-000000000000
+    expect_status: 404
+  # A malformed id looks identical from outside.
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/responses/not-an-id
+    expect_status: 404

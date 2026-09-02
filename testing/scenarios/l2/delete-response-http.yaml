@@ -1,0 +1,27 @@
+name: delete-response-http
+covers: [FR-21, FR-18]
+oracles: []
+steps:
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"delete me","background":true}'
+    expect_status: 202
+    capture:
+      rid: id
+  - action: http_get_until
+    url: http://127.0.0.1:18080/v1/responses/{{rid}}
+    expect_contains: '"status":"completed"'
+    timeout_ms: 15000
+  - action: http_delete
+    url: http://127.0.0.1:18080/v1/responses/{{rid}}
+    expect_status: 200
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/responses/{{rid}}
+    expect_status: 404
+  # Deleted content is genuinely unusable: chaining onto it now fails explicitly
+  # rather than quietly producing a single-turn prompt.
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"next","previous_response_id":"{{rid}}","background":true}'
+    expect_status: 400
+    expect_contains: 'chain_broken'

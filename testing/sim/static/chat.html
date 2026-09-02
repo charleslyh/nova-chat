@@ -1,393 +1,235 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Nova Sim — Chat</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet" />
-  <style>
-    :root {
-      --ink: #0f1c1a;
-      --muted: #5a6b67;
-      --line: #c5d2ce;
-      --paper: #e8eeec;
-      --panel: #f6f9f8;
-      --home: #0d7377;
-      --user: #1a3a36;
-      --ok: #1b7f4a;
-      --bad: #b42318;
-    }
-    * { box-sizing: border-box; }
-    html, body {
-      margin: 0; height: 100%;
-      font-family: "Outfit", system-ui, sans-serif;
-      color: var(--ink);
-      background:
-        radial-gradient(ellipse 70% 45% at 10% 0%, #d5eae6 0%, transparent 55%),
-        radial-gradient(ellipse 50% 35% at 100% 100%, #efe4da 0%, transparent 50%),
-        var(--paper);
-    }
-    .shell {
-      height: 100%; max-width: 720px; margin: 0 auto;
-      display: grid; grid-template-rows: auto 1fr auto;
-      padding: 0 1rem 1rem;
-    }
-    header {
-      display: flex; align-items: baseline; justify-content: space-between;
-      gap: 0.75rem; padding: 0.85rem 0 0.65rem;
-      border-bottom: 1px solid var(--line);
-    }
-    header h1 { margin: 0; font-size: 1.25rem; letter-spacing: -0.03em; }
-    header a { color: var(--home); text-decoration: none; font-size: 0.85rem; }
-    .status {
-      font-family: "IBM Plex Mono", monospace; font-size: 0.72rem;
-      color: var(--muted); margin-top: 0.35rem;
-    }
-    .status .ok { color: var(--ok); }
-    .status .bad { color: var(--bad); }
-    .messages {
-      overflow: auto; padding: 1rem 0; display: flex; flex-direction: column; gap: 0.75rem;
-    }
-    .bubble {
-      max-width: 88%; padding: 0.65rem 0.85rem; border-radius: 4px;
-      line-height: 1.45; white-space: pre-wrap; word-break: break-word;
-    }
-    .bubble.user {
-      align-self: flex-end; background: var(--user); color: #f4f7f6;
-    }
-    .bubble.assistant {
-      align-self: flex-start; background: #fff; border: 1px solid var(--line);
-    }
-    .bubble.assistant.pending { color: var(--muted); font-style: italic; }
-    .bubble .role {
-      font-size: 0.65rem; letter-spacing: 0.08em; text-transform: uppercase;
-      opacity: 0.7; margin-bottom: 0.25rem;
-    }
-    .composer {
-      display: grid; grid-template-columns: 1fr auto; gap: 0.5rem;
-      padding-top: 0.65rem; border-top: 1px solid var(--line);
-    }
-    textarea {
-      font: inherit; resize: none; min-height: 56px; max-height: 140px;
-      padding: 0.55rem 0.65rem; border: 1px solid var(--line); background: #fff;
-      border-radius: 2px;
-    }
-    button {
-      font: inherit; cursor: pointer; align-self: end;
-      border: 1px solid var(--ink); background: var(--ink); color: #f4f7f6;
-      padding: 0.55rem 1rem; border-radius: 2px; height: 56px;
-    }
-    button.ghost { background: transparent; color: var(--ink); height: auto; padding: 0.28rem 0.55rem; }
-    button:disabled { opacity: 0.45; cursor: not-allowed; }
-    .toolbar { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.5rem; }
-    .empty {
-      margin: auto; text-align: center; color: var(--muted); max-width: 22rem;
-    }
-    .empty p { margin: 0.4rem 0; font-size: 0.95rem; }
-  </style>
+<meta charset="utf-8" />
+<title>nova-responses · multi-turn demo</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+         margin: 0; background: #11141a; color: #dfe4ec; }
+  header { padding: 12px 16px; border-bottom: 1px solid #262c38; }
+  h1 { font-size: 15px; margin: 0 0 4px; }
+  .sub { color: #8b93a3; font-size: 12px; }
+  main { display: grid; grid-template-columns: 1fr 380px; gap: 0; height: calc(100vh - 62px); }
+  #chat { padding: 16px; overflow-y: auto; }
+  aside { border-left: 1px solid #262c38; padding: 16px; overflow-y: auto; background: #0d1015; }
+  .turn { margin-bottom: 14px; }
+  .role { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: #8b93a3; }
+  .user .bubble { border-left: 2px solid #4c7fd4; }
+  .assistant .bubble { border-left: 2px solid #4dab72; }
+  .bubble { padding: 4px 0 4px 10px; white-space: pre-wrap; }
+  .meta { font-size: 11px; color: #6b7280; margin-top: 2px; }
+  form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid #262c38; }
+  input, button { font: inherit; }
+  input { flex: 1; background: #171b22; border: 1px solid #2b323f; color: inherit;
+          padding: 8px 10px; border-radius: 4px; }
+  button { background: #2a3a55; border: 1px solid #3b4d6b; color: #dfe4ec;
+           padding: 8px 14px; border-radius: 4px; cursor: pointer; }
+  button:hover { background: #34486a; }
+  button.ghost { background: transparent; }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+             color: #8b93a3; margin: 0 0 8px; }
+  .kv { display: grid; grid-template-columns: 118px 1fr; gap: 2px 8px; font-size: 12px; }
+  .kv dt { color: #8b93a3; }
+  .kv dd { margin: 0; word-break: break-all; }
+  .note { font-size: 11px; color: #8b93a3; border-top: 1px solid #262c38;
+          margin-top: 14px; padding-top: 10px; }
+  #events { font-size: 11px; color: #8b93a3; max-height: 220px; overflow-y: auto;
+            border-top: 1px solid #262c38; margin-top: 12px; padding-top: 10px; }
+  code { color: #c3cee0; }
+</style>
 </head>
 <body>
-  <div class="shell">
-    <header>
-      <div>
-        <h1>Chat</h1>
-        <div class="status" id="status">未连接</div>
-        <div class="toolbar">
-          <button type="button" class="ghost" id="btn-boot">启动对话环境</button>
-          <button type="button" class="ghost" id="btn-new" disabled>新会话</button>
-        </div>
-      </div>
-      <a href="/">拓扑控制台 →</a>
-    </header>
+<header>
+  <h1>nova-responses · multi-turn demo</h1>
+  <div class="sub">
+    Each turn sends <b>only the new input</b> plus <code>previous_response_id</code>.
+    History is assembled server-side by walking the chain.
+  </div>
+</header>
 
-    <div class="messages" id="messages">
-      <div class="empty" id="empty">
-        <p>先点「启动对话环境」：拉起 home + mock-agent，并打开一条 Session。</p>
-        <p>然后输入消息发 Turn，assistant 的 text_delta 会流式出现在这里。</p>
-      </div>
-    </div>
-
-    <form class="composer" id="form">
-      <textarea id="input" placeholder="发一条消息…" disabled rows="2"></textarea>
-      <button type="submit" id="btn-send" disabled>发送</button>
+<main>
+  <div>
+    <div id="chat"></div>
+    <form id="composer">
+      <input id="input" placeholder="Say something…" autocomplete="off" />
+      <button type="submit">Send</button>
+      <button type="button" class="ghost" id="reset">New chain</button>
     </form>
   </div>
 
-  <script>
-    const state = {
-      regionId: null,
-      listen: null,
-      sessionId: null,
-      lastSeq: 0,
-      es: null,
-      busy: false,
-      assistantEl: null,
-      reconnectAttempt: 0,
-      reconnectTimer: null,
-    };
+  <aside>
+    <h2>Chain state</h2>
+    <dl class="kv">
+      <dt>node</dt><dd id="node">—</dd>
+      <dt>previous_response_id</dt><dd id="prev">— (first turn)</dd>
+      <dt>current response</dt><dd id="cur">—</dd>
+      <dt>cursor</dt><dd id="cursor">—</dd>
+      <dt>turns in chain</dt><dd id="depth">0</dd>
+    </dl>
 
-    // INV-33: min(200ms * 2^n, 30s) * random(0.5, 1.5)
-    function reconnectDelayMs(attempt) {
-      const base = 200;
-      const max = 30_000;
-      const exp = Math.min(base * Math.pow(2, Math.min(attempt, 20)), max);
-      const jitter = 0.5 + Math.random();
-      return Math.round(exp * jitter);
-    }
+    <div class="note">
+      <b>What to watch.</b> The request body never grows: turn 5 sends the same
+      amount as turn 1. The client keeps exactly one identifier, which is the whole
+      point of server-side context retrieval.
+      <br /><br />
+      <b>Reconnects.</b> If the stream drops, it resumes with
+      <code>starting_after=&lt;cursor&gt;</code> — an exclusive cursor, so nothing is
+      replayed and nothing is skipped. If the position has already been evicted the
+      server answers <code>410</code> rather than silently resuming from somewhere
+      else; there is deliberately no recovery path for a transient buffer.
+    </div>
 
-    const $ = (id) => document.getElementById(id);
+    <h2 style="margin-top:14px">Event log</h2>
+    <div id="events"></div>
+  </aside>
+</main>
 
-    function setStatus(html) {
-      $("status").innerHTML = html;
-    }
+<script>
+const base = location.origin;
+let previousId = null;
+let cursor = null;
+let depth = 0;
 
-    async function api(path, opts = {}) {
-      const r = await fetch(path, {
-        headers: { "content-type": "application/json" },
-        ...opts,
-      });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(j.error || r.statusText);
-      return j;
-    }
+const chat = document.getElementById("chat");
+const events = document.getElementById("events");
 
-    function hideEmpty() {
-      const e = $("empty");
-      if (e) e.remove();
-    }
+function setText(id, value) { document.getElementById(id).textContent = value; }
 
-    function addBubble(role, text, pending = false) {
-      hideEmpty();
-      const el = document.createElement("div");
-      el.className = "bubble " + role + (pending ? " pending" : "");
-      el.innerHTML = `<div class="role">${role}</div><div class="body"></div>`;
-      el.querySelector(".body").textContent = text;
-      $("messages").appendChild(el);
-      $("messages").scrollTop = $("messages").scrollHeight;
-      return el;
-    }
+function logEvent(line) {
+  const div = document.createElement("div");
+  div.textContent = line;
+  events.appendChild(div);
+  events.scrollTop = events.scrollHeight;
+}
 
-    function setBusy(busy) {
-      state.busy = busy;
-      $("btn-send").disabled = busy || !state.sessionId;
-      $("input").disabled = busy || !state.sessionId;
-      $("btn-new").disabled = !state.listen;
-    }
+function addTurn(role, text, meta) {
+  const wrap = document.createElement("div");
+  wrap.className = `turn ${role}`;
+  wrap.innerHTML =
+    `<div class="role">${role}</div><div class="bubble"></div><div class="meta"></div>`;
+  wrap.querySelector(".bubble").textContent = text;
+  wrap.querySelector(".meta").textContent = meta || "";
+  chat.appendChild(wrap);
+  chat.scrollTop = chat.scrollHeight;
+  return wrap;
+}
 
-    function closeStream() {
-      if (state.reconnectTimer) {
-        clearTimeout(state.reconnectTimer);
-        state.reconnectTimer = null;
-      }
-      if (state.es) {
-        state.es.close();
-        state.es = null;
-      }
-    }
+document.getElementById("reset").addEventListener("click", () => {
+  // Starting a new chain simply means forgetting the pointer. Nothing is deleted
+  // server-side; that is what DELETE is for.
+  previousId = null;
+  cursor = null;
+  depth = 0;
+  chat.replaceChildren();
+  events.replaceChildren();
+  setText("prev", "— (first turn)");
+  setText("cur", "—");
+  setText("cursor", "—");
+  setText("depth", "0");
+});
 
-    function scheduleReconnect() {
-      if (!state.listen || !state.sessionId) return;
-      if (state.reconnectTimer) return;
-      const ms = reconnectDelayMs(state.reconnectAttempt);
-      state.reconnectAttempt += 1;
-      setStatus(`<span class="bad">SSE 断开</span> · ${ms}ms 后重连 (attempt ${state.reconnectAttempt})`);
-      state.reconnectTimer = setTimeout(() => {
-        state.reconnectTimer = null;
-        openStream();
-      }, ms);
-    }
+document.getElementById("composer").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const input = document.getElementById("input");
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
 
-    function openStream() {
-      closeStream();
-      if (!state.listen || !state.sessionId) return;
-      const from = Math.max(1, state.lastSeq + 1);
-      const url = `http://${state.listen}/v1/sessions/${state.sessionId}/stream?from_seq=${from}`;
-      const es = new EventSource(url);
-      state.es = es;
-      es.onopen = () => {
-        state.reconnectAttempt = 0;
-        if (!state.busy) setStatus(statusLine("idle"));
-      };
-      es.onmessage = (ev) => {
-        if (ev.lastEventId) state.lastSeq = Number(ev.lastEventId) || state.lastSeq;
-        let data;
-        try { data = JSON.parse(ev.data); } catch { return; }
-        if (data.error) {
-          setStatus(`<span class="bad">stream: ${data.error}</span>`);
-          return;
-        }
-        const kind = data.kind;
-        const payload = data.payload || "";
-        if (kind === "text_delta") {
-          if (!state.assistantEl) {
-            state.assistantEl = addBubble("assistant", "", true);
-          }
-          state.assistantEl.classList.remove("pending");
-          const body = state.assistantEl.querySelector(".body");
-          body.textContent += payload;
-          $("messages").scrollTop = $("messages").scrollHeight;
-        } else if (kind === "turn_done" || kind === "turn_failed") {
-          if (state.assistantEl) {
-            state.assistantEl.classList.remove("pending");
-            const body = state.assistantEl.querySelector(".body");
-            // Prefer final assistant_text on turn_done when present.
-            if (payload) body.textContent = payload;
-          } else if (payload) {
-            addBubble("assistant", payload);
-          }
-          state.assistantEl = null;
-          setBusy(false);
-          setStatus(statusLine("idle"));
-        } else if (kind === "session_idle") {
-          setBusy(false);
-          setStatus(statusLine("idle"));
-        } else if (kind === "session_busy" || kind === "turn_begin") {
-          setStatus(statusLine("busy"));
-        }
-      };
-      es.onerror = () => {
-        // Close so the browser does not fight our INV-33 backoff.
-        if (state.es) {
-          state.es.close();
-          state.es = null;
-        }
-        scheduleReconnect();
-      };
-    }
+  addTurn("user", text, previousId ? `chained onto ${previousId}` : "first turn");
 
-    function statusLine(phase) {
-      const sid = state.sessionId ? state.sessionId.slice(0, 8) + "…" : "—";
-      const phaseHtml = phase === "busy"
-        ? `<span class="ok">生成中</span>`
-        : phase === "idle"
-          ? `<span class="ok">就绪</span>`
-          : phase;
-      return `${phaseHtml} · ${state.regionId || "?"} @ ${state.listen || "—"} · session ${sid}`;
-    }
+  // The entire request body. Note the absence of any history.
+  const body = { model: "demo-model", input: text, background: true };
+  if (previousId) body.previous_response_id = previousId;
 
-    async function ensureEnv() {
-      setStatus("准备环境…");
-      let snap = await api("/api/state");
-      if (!snap.regions || snap.regions.length === 0) {
-        await api("/api/preset/two-region", { method: "POST", body: "{}" });
-        snap = await api("/api/state");
-      }
-      let home = (snap.regions || []).find((r) => r.role === "home");
-      if (!home) throw new Error("没有 home 区域");
-      if (!home.healthy) {
-        await api(`/api/regions/${home.id}/start`, { method: "POST", body: "{}" });
-        snap = await api("/api/state");
-        home = (snap.regions || []).find((r) => r.id === home.id);
-      }
-      if (!home.agents || home.agents.length === 0) {
-        await api(`/api/regions/${home.id}/agents`, {
-          method: "POST",
-          body: JSON.stringify({ tokens: 12 }),
-        });
-        snap = await api("/api/state");
-        home = (snap.regions || []).find((r) => r.id === home.id);
-      }
-      state.regionId = home.id;
-      state.listen = home.listen;
-      return home;
-    }
-
-    async function loadSnapshotOpenScreen() {
-      // FR-9 / INV-13: GET snapshot → SSE from stream_from_seq (max(snapshot_seq, 1))
-      const r = await fetch(`http://${state.listen}/v1/sessions/${state.sessionId}/snapshot`);
-      if (!r.ok) {
-        state.lastSeq = 0;
-        return;
-      }
-      const s = await r.json();
-      $("messages").innerHTML = "";
-      for (const b of s.bubbles || []) {
-        if (b.role === "user" || b.role === "assistant") {
-          addBubble(b.role, b.text || "");
-        }
-      }
-      hideEmpty();
-      const snapSeq = Number(s.snapshot_seq || 0);
-      const from = Math.max(1, snapSeq);
-      state.lastSeq = from - 1;
-      if (Array.isArray(s.running) && s.running.length > 0) {
-        state.assistantEl = addBubble("assistant", "…", true);
-        setBusy(true);
-      }
-    }
-
-    async function newSession() {
-      await ensureEnv();
-      closeStream();
-      state.lastSeq = 0;
-      state.assistantEl = null;
-      const j = await api("/api/sessions", {
-        method: "POST",
-        body: JSON.stringify({ region_id: state.regionId }),
-      });
-      state.sessionId = j.session_id;
-      $("messages").innerHTML = "";
-      hideEmpty();
-      await loadSnapshotOpenScreen();
-      openStream();
-      if (!state.busy) setBusy(false);
-      setStatus(statusLine(state.busy ? "busy" : "idle"));
-      $("input").focus();
-    }
-
-    $("btn-boot").onclick = async () => {
-      try {
-        $("btn-boot").disabled = true;
-        await newSession();
-      } catch (e) {
-        setStatus(`<span class="bad">${e.message}</span>`);
-      } finally {
-        $("btn-boot").disabled = false;
-      }
-    };
-
-    $("btn-new").onclick = async () => {
-      try {
-        await newSession();
-      } catch (e) {
-        setStatus(`<span class="bad">${e.message}</span>`);
-      }
-    };
-
-    $("form").onsubmit = async (ev) => {
-      ev.preventDefault();
-      const text = $("input").value.trim();
-      if (!text || state.busy || !state.sessionId) return;
-      addBubble("user", text);
-      $("input").value = "";
-      state.assistantEl = addBubble("assistant", "…", true);
-      setBusy(true);
-      setStatus(statusLine("busy"));
-      try {
-        if (!state.es) openStream();
-        await api(`/api/sessions/${state.sessionId}/turns`, {
-          method: "POST",
-          body: JSON.stringify({ text, region_id: state.regionId }),
-        });
-      } catch (e) {
-        if (state.assistantEl) {
-          state.assistantEl.classList.remove("pending");
-          state.assistantEl.querySelector(".body").textContent = "错误: " + e.message;
-        }
-        state.assistantEl = null;
-        setBusy(false);
-        setStatus(`<span class="bad">${e.message}</span>`);
-      }
-    };
-
-    $("input").addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        $("form").requestSubmit();
-      }
+  let created;
+  try {
+    const resp = await fetch(`${base}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
     });
-  </script>
+    created = await resp.json();
+    if (!resp.ok) {
+      // Failures are explicit and typed: a broken chain, an unstored link or a
+      // rejected field all arrive with a distinct code rather than degrading to
+      // a silent single-turn prompt.
+      addTurn("assistant", `error: ${created?.error?.type} — ${created?.error?.message}`, "");
+      return;
+    }
+  } catch (err) {
+    addTurn("assistant", `network error: ${err}`, "");
+    return;
+  }
+
+  depth += 1;
+  setText("cur", created.id);
+  setText("depth", String(depth));
+  setText("node", created.id.split("_")[1] || "—");
+  logEvent(`→ created ${created.id}`);
+
+  const bubble = addTurn("assistant", "", `response ${created.id}`);
+  const target = bubble.querySelector(".bubble");
+
+  // Subscribe. `starting_after` is omitted on a fresh stream so sequence 0 (the
+  // `response.created` event) is included — 0 is a real cursor value, which is
+  // why "from the beginning" is expressed by omitting the parameter rather than
+  // by passing 0.
+  const url = new URL(`${base}/v1/responses/${created.id}`);
+  url.searchParams.set("stream", "true");
+  if (cursor !== null) url.searchParams.set("starting_after", String(cursor));
+
+  const source = new EventSource(url);
+  let streamed = "";
+
+  source.addEventListener("response.output_text.delta", (ev) => {
+    const data = JSON.parse(ev.data);
+    streamed += data.payload || "";
+    target.textContent = streamed;
+    cursor = data.sequence_number;
+    setText("cursor", String(cursor));
+  });
+
+  for (const name of ["response.created", "response.in_progress"]) {
+    source.addEventListener(name, (ev) => {
+      const data = JSON.parse(ev.data);
+      cursor = data.sequence_number;
+      setText("cursor", String(cursor));
+      logEvent(`  ${name} #${data.sequence_number}`);
+    });
+  }
+
+  for (const name of ["response.completed", "response.failed", "response.incomplete"]) {
+    source.addEventListener(name, async (ev) => {
+      const data = JSON.parse(ev.data);
+      logEvent(`  ${name} #${data.sequence_number}`);
+      source.close();
+
+      // The stored object is the source of truth for what was produced — it was
+      // submitted by the execution side, not reassembled from the deltas above.
+      const resp = await fetch(`${base}/v1/responses/${created.id}`);
+      if (resp.ok) {
+        const full = await resp.json();
+        const finalText = full.output?.[0]?.content?.[0]?.text;
+        if (finalText) target.textContent = finalText;
+        bubble.querySelector(".meta").textContent =
+          `${full.status} · ${full.usage?.total_tokens ?? 0} tokens`;
+      }
+
+      // Advance the chain: the next turn only needs this identifier.
+      previousId = created.id;
+      setText("prev", previousId);
+      // A new response has its own event stream, so the cursor restarts.
+      cursor = null;
+      setText("cursor", "—");
+    });
+  }
+
+  source.addEventListener("error", () => {
+    logEvent(`  stream interrupted; resume with starting_after=${cursor}`);
+    source.close();
+  });
+});
+</script>
 </body>
 </html>

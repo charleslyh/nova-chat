@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/adapters/mem",
+    "crates/adapters/sql",
     "crates/gateway",
     "testing/conformance",
     "testing/harness",
@@ -17,8 +18,9 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-nova-sessions-core = { path = "crates/core" }
+nova-responses-core = { path = "crates/core" }
 adapters-mem = { path = "crates/adapters/mem" }
+adapters-sql = { path = "crates/adapters/sql" }
 conformance = { path = "testing/conformance" }
 harness = { path = "testing/harness" }
 async-trait = "0.1"
@@ -38,3 +40,24 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# Content integrity (D20 ⑧ / INV-44): canonicalisation + tamper detection.
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+unicode-normalization = "0.1"
+# SSRF defence in depth for image/file reference URLs (SEC-6).
+url = "2"
+# Production carrier for the context store and ledger (D21).
+#
+# `macros` is enabled only to get `sqlx::migrate!`, which embeds the migration
+# files at compile time and needs no database. The actual constraint from D17 is
+# that we do **not** use the `query!`/`query_as!` compile-time checking macros,
+# since those require a reachable DATABASE_URL during the build. All statements
+# in this workspace use the runtime `sqlx::query()` API with bound parameters.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "json",
+    "migrate",
+    "macros",
+] }

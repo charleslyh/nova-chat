@@ -1,0 +1,22 @@
+name: sequential-responses
+covers: [FR-1, FR-4, FR-8, CR-5, CR-6, INV-11]
+oracles: [SequenceContiguous, CreatedResponsesTerminal, NoSilentContentLoss]
+steps:
+  - action: create_response
+    input: "first"
+    key: seq-1
+  - action: claim
+  - action: append_delta
+    payload: "he"
+  - action: append_delta
+    payload: "llo"
+  - action: complete
+    output_text: "hello"
+    input_tokens: 4
+    output_tokens: 2
+  - action: create_response
+    input: "second"
+    key: seq-2
+  - action: claim
+  - action: append_delta
+  - action: complete

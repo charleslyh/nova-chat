@@ -1,0 +1,12 @@
+name: cancel-cross-tenant-denied
+covers: [SEC-2, FR-7]
+oracles: []
+steps:
+  - action: create_response
+    input: "mine"
+    key: cctd-1
+  # Reported as missing rather than forbidden: a 403 would confirm the id exists.
+  - action: cancel
+    tenant: tenant-intruder
+    expect: not_found
+  - action: cancel

@@ -1,0 +1,19 @@
+name: idempotent-create
+covers: [FR-3, CR-2, INV-2]
+oracles: [IdempotentSameResponse, SequenceContiguous]
+steps:
+  - action: create_response
+    input: "hello"
+    key: same-key
+  - action: create_response
+    input: "hello"
+    key: same-key
+    expect: duplicate
+  # Far later in scenario time: the gate has no TTL window, so even a very late
+  # retry must be refused rather than creating a second response.
+  - action: advance_ms
+    by: 86400000
+  - action: create_response
+    input: "hello"
+    key: same-key
+    expect: duplicate

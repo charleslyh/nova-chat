@@ -2,10 +2,10 @@
 name = "adapters-mem"
 version.workspace = true
 edition.workspace = true
-description = "In-memory adapters for nova-sessions-core protocols"
+description = "In-memory adapters for nova-responses-core ports"
 
 [dependencies]
-nova-sessions-core = { workspace = true }
+nova-responses-core = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }

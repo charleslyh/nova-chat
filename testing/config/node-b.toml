@@ -1,0 +1,12 @@
+node_tag = "node-b"
+listen = "127.0.0.1:18081"
+
+store_backend = "mem"
+
+# Short fixture budget; see node-a.toml.
+drain_timeout_ms = 3000
+
+[peers]
+node-a = "127.0.0.1:18080"
+node-b = "127.0.0.1:18081"
+node-c = "127.0.0.1:18082"

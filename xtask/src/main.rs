@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
             procs(&action).await?;
             println!("procs {action}");
         }
-        Cmd::Coverage => coverage()?,
+        Cmd::Coverage => coverage().await?,
         Cmd::Unittest => unittest()?,
         Cmd::CheckDeps => check_deps()?,
         Cmd::Deploy { action } => deploy(&action)?,
@@ -74,6 +74,17 @@ async fn verify(level: &str) -> Result<()> {
             eprintln!("ok");
             println!("verify l2 OK");
         }
+        "l3" => {
+            println!("verify l3");
+            // Skipped rather than failed when no database is configured, so a
+            // machine without infrastructure can still run everything else (D17).
+            let names = harness::run_l3_dir(Path::new("testing/scenarios/l3")).await?;
+            if names.is_empty() {
+                println!("verify l3 SKIPPED (no database configured)");
+            } else {
+                println!("verify l3 OK ({} checks)", names.len());
+            }
+        }
         other => bail!("unknown level {other}"),
     }
     Ok(())
@@ -85,25 +96,27 @@ async fn procs(action: &str) -> Result<()> {
     match action {
         "up" => {
             procs_down(&run_dir)?;
-            // sim / 残留进程可能占着同端口；先清掉再起 L2 夹具
+            // A leftover sim or gateway may still hold these ports; clear them
+            // before starting the L2 fixture.
             kill_listeners(&[18080, 18081, 18082])?;
-            start_bin(
-                "nova-sessions-gateway",
-                &["--config", "testing/config/home.toml"],
-                run_dir.join("home.pid"),
-            )?;
-            start_bin(
-                "nova-sessions-gateway",
-                &["--config", "testing/config/edge-b.toml"],
-                run_dir.join("edge-b.pid"),
-            )?;
+            // Three peer nodes: every node can create, and every node runs its
+            // own sweeper. There is no authority node any more.
+            for (tag, port) in [("node-a", 18080), ("node-b", 18081), ("node-c", 18082)] {
+                start_bin(
+                    "nova-responses-gateway",
+                    &["--config", &format!("testing/config/{tag}.toml")],
+                    run_dir.join(format!("{tag}.pid")),
+                )?;
+                let _ = port;
+            }
             start_bin(
                 "mock-agent",
-                &["--home", "127.0.0.1:18080"],
+                &["--gateway", "127.0.0.1:18080"],
                 run_dir.join("agent.pid"),
             )?;
             wait_port("127.0.0.1:18080", Duration::from_secs(20)).await?;
             wait_port("127.0.0.1:18081", Duration::from_secs(20)).await?;
+            wait_port("127.0.0.1:18082", Duration::from_secs(20)).await?;
         }
         "down" => {
             procs_down(&run_dir)?;
@@ -115,11 +128,30 @@ async fn procs(action: &str) -> Result<()> {
 }
 
 fn procs_down(run_dir: &Path) -> Result<()> {
-    for name in ["home.pid", "edge-b.pid", "edge-c.pid", "agent.pid", "worker.pid"] {
+    for name in [
+        "node-a.pid",
+        "node-b.pid",
+        "node-c.pid",
+        "agent.pid",
+        "worker.pid",
+    ] {
         kill_pidfile(&run_dir.join(name))?;
     }
     Ok(())
 }
+
+/// Fixture-only secrets for the local L2 harness.
+///
+/// Passed as environment variables rather than written into the config files,
+/// because that is the only channel the service reads them from (SEC-4). These
+/// values are for verification and must never appear in a deployment.
+const FIXTURE_ENV: &[(&str, &str)] = &[
+    // Required whenever peers are configured: without it, node-to-node forwards
+    // cannot be authenticated and the internal tenant header would have to be
+    // trusted blindly.
+    ("NOVA_INTERNAL_TOKEN", "l2-fixture-internal-token"),
+    ("NOVA_INTEGRITY_KEY", "l2-fixture-integrity-key-0123456789"),
+];
 
 fn start_bin(bin: &str, args: &[&str], pidfile: PathBuf) -> Result<()> {
     let status = Command::new("cargo")
@@ -129,7 +161,11 @@ fn start_bin(bin: &str, args: &[&str], pidfile: PathBuf) -> Result<()> {
         bail!("build {bin} failed");
     }
     let exe = PathBuf::from(format!("target/debug/{bin}"));
-    let child = Command::new(&exe)
+    let mut cmd = Command::new(&exe);
+    for (key, value) in FIXTURE_ENV {
+        cmd.env(key, value);
+    }
+    let child = cmd
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -147,8 +183,10 @@ fn kill_pidfile(path: &Path) -> Result<()> {
     }
     if let Ok(pid_str) = std::fs::read_to_string(path) {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            // SIGKILL for the same reason as `kill_listeners`: teardown must not
+            // depend on drain completing.
             let _ = Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
+                .args(["-KILL", &pid.to_string()])
                 .status();
         }
     }
@@ -156,6 +194,13 @@ fn kill_pidfile(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Free the fixture ports unconditionally.
+///
+/// Uses SIGKILL deliberately. SIGTERM would start graceful drain, and a node
+/// holding an in-flight response that can never complete (no agent attached)
+/// would then linger for the whole drain budget and keep the port bound — which
+/// is exactly how a previous run left node-b occupied and made the next run fail
+/// with a confusing 503. Teardown has to be deterministic.
 fn kill_listeners(ports: &[u16]) -> Result<()> {
     for port in ports {
         let out = Command::new("lsof")
@@ -166,11 +211,11 @@ fn kill_listeners(ports: &[u16]) -> Result<()> {
             continue;
         }
         for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
-            let _ = Command::new("kill").args(["-TERM", pid]).status();
+            let _ = Command::new("kill").args(["-KILL", pid]).status();
         }
     }
-    // brief settle
-    std::thread::sleep(Duration::from_millis(200));
+    // Brief settle so the port is actually released before we rebind.
+    std::thread::sleep(Duration::from_millis(300));
     Ok(())
 }
 
@@ -281,33 +326,71 @@ fn is_test_case_line(line: &str) -> bool {
     rest.contains(" ... ")
 }
 
-fn coverage() -> Result<()> {
+async fn coverage() -> Result<()> {
     use std::collections::{BTreeMap, BTreeSet};
 
+    // Baseline follows `docs/requirements/spec.md` v3. Keep in step with that
+    // document: an id here that no longer exists there would silently demand
+    // coverage for a requirement that was withdrawn.
     let baseline: BTreeSet<&str> = [
-        "FR-1", "FR-2", "FR-3", "FR-4", "FR-5", "FR-6", "FR-7", "FR-8", "FR-9", "FR-10",
-        "FR-11", "FR-12", "FR-13", "FR-14", "FR-15", "FR-16", "FR-17", "FR-18",
-        "CR-1", "CR-2", "CR-3", "CR-4", "CR-5", "CR-6", "CR-7", "CR-8",
-        "INV-1", "INV-2", "INV-5", "INV-6", "INV-10", "INV-11", "INV-12", "INV-13", "INV-14",
-        "INV-15", "INV-16", "INV-29", "INV-30", "INV-32", "INV-33", "INV-34", "INV-35",
+        // Lifecycle.
+        "FR-1", "FR-2", "FR-3", "FR-4", "FR-5", "FR-6", "FR-7", "FR-8",
+        // Streaming and resumption.
+        "FR-9", "FR-10", "FR-11", "FR-12", "FR-13", "FR-14",
+        // Storage and context.
+        "FR-15", "FR-16", "FR-17", "FR-18", "FR-19", "FR-20", "FR-21", "FR-22",
+        // Protocol subset.
+        "FR-23", "FR-24", "FR-25", "FR-26", "FR-27", "FR-28",
+        // Ingress and routing.
+        "FR-29", "FR-30", "FR-31", "FR-32", "FR-33",
+        // Reliability.
+        "FR-34", "FR-35", "FR-36", "FR-37", "FR-38", "FR-39",
+        // Correctness.
+        "CR-1", "CR-2", "CR-3", "CR-4", "CR-5", "CR-6", "CR-7", "CR-8", "CR-9", "CR-10",
+        "CR-11", "CR-12", "CR-13",
+        // Invariants still in force.
+        "INV-1", "INV-2", "INV-5", "INV-6", "INV-11", "INV-12", "INV-16", "INV-29", "INV-30",
+        "INV-32", "INV-33", "INV-34", "INV-35", "INV-40", "INV-41", "INV-42", "INV-43",
+        "INV-44", "INV-45", "INV-46", "INV-47", "INV-49", "INV-50", "INV-51", "INV-52",
+        // Security.
+        "SEC-2", "SEC-3", "SEC-5", "SEC-6", "SEC-7",
     ]
     .into_iter()
     .collect();
 
-    // L0 conformance suite (always on).
-    let mut covered: BTreeSet<String> = [
-        "INV-11", "CR-5", "INV-15", "CR-4", "CR-1", "CR-2", "INV-1", "INV-2", "CR-3", "CR-7",
-        "INV-5", "INV-6", "FR-3", "FR-4", "FR-5", "FR-6", "FR-7", "INV-16", "INV-33",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
+    // L0 coverage is obtained by **running the contract and asking what it
+    // substantiated**, not from a literal list maintained alongside it.
+    //
+    // The previous shape kept a third hard-coded copy of these ids here, so
+    // deleting an assertion left the reported figure untouched — the gate could
+    // not observe its own coverage shrinking. Now a removed case immediately
+    // lowers the number, and a skipped optional port contributes nothing.
+    let l0 = conformance::run_mem_suite().await;
+    let mut covered: BTreeSet<String> = l0.covered().into_iter().map(str::to_string).collect();
+
+    // Static gates substantiate requirements too, and they report what they
+    // cover rather than having it restated here.
+    for id in check_protocol_spec_is_publishable()? {
+        covered.insert((*id).to_string());
+    }
+
+    if !l0.skipped.is_empty() {
+        println!("  l0 skipped    {} case(s):", l0.skipped.len());
+        for (case, reason) in &l0.skipped {
+            println!("    - {case}: {reason}");
+        }
+    }
 
     let mut scenario_covers: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut l1 = 0usize;
     let mut l2 = 0usize;
+    let mut l3 = 0usize;
 
-    for (label, dir) in [("l1", "testing/scenarios/l1"), ("l2", "testing/scenarios/l2")] {
+    for (label, dir) in [
+        ("l1", "testing/scenarios/l1"),
+        ("l2", "testing/scenarios/l2"),
+        ("l3", "testing/scenarios/l3"),
+    ] {
         let path = Path::new(dir);
         if !path.exists() {
             continue;
@@ -320,6 +403,15 @@ fn coverage() -> Result<()> {
         files.sort();
         for f in files {
             let text = std::fs::read_to_string(&f)?;
+            // Comment-only files are migration tombstones; the runners skip them,
+            // so counting them here would overstate the suite size.
+            if text
+                .lines()
+                .map(str::trim)
+                .all(|line| line.is_empty() || line.starts_with('#'))
+            {
+                continue;
+            }
             let name = yaml_scalar(&text, "name").unwrap_or_else(|| {
                 f.file_stem().unwrap().to_string_lossy().into_owned()
             });
@@ -337,16 +429,32 @@ fn coverage() -> Result<()> {
                 covered.insert(r.clone());
             }
             scenario_covers.insert(format!("{label}/{name}"), refs);
-            if label == "l1" {
-                l1 += 1;
-            } else {
-                l2 += 1;
+            match label {
+                "l1" => l1 += 1,
+                "l2" => l2 += 1,
+                _ => l3 += 1,
             }
         }
     }
 
-    // 当期完整压力平台仍不做；INV-33 已由 core 退避库覆盖。
-    let deferred: BTreeSet<&str> = BTreeSet::new();
+    // Requirements whose verification is intentionally deferred. Listing them
+    // here keeps them visible in the report instead of quietly missing.
+    //
+    // FR-13/FR-14/FR-30/FR-31/FR-32 and SEC-5 are HTTP-level routing and
+    // ownership properties covered by the gateway's own contract tests rather
+    // than by declarative scenarios; FR-34 (graceful drain) needs a real signal,
+    // so it lives at L2.
+    // Only FR-31 remains genuinely deferred: it asserts that a *shared* store
+    // removes node-to-node content forwarding, which cannot be observed without a
+    // real database. It is verified by L3 (`sql-shared-store-no-forward`) and is
+    // therefore covered whenever a database is configured.
+    //
+    // FR-23 moved to `check-deps` (the published spec is gated mechanically),
+    // FR-32 into the drain scenario, SEC-5 into cross-tenant-404-http, and INV-34
+    // into the L0 durability-order case. Each had been listed here while actually
+    // being verifiable — which is the failure mode this list is most prone to:
+    // once an id is written down as deferred, nobody re-examines it.
+    let deferred: BTreeSet<&str> = ["FR-31"].into_iter().collect();
 
     let covered_baseline: BTreeSet<_> = covered
         .iter()
@@ -376,8 +484,21 @@ fn coverage() -> Result<()> {
 
     let pct = covered_baseline.len() * 100 / baseline.len();
 
+    let backend_cases = conformance::cases()
+        .iter()
+        .filter(|c| matches!(c.scope, conformance::CaseScope::Backend))
+        .count();
+    let protocol_cases = conformance::cases()
+        .iter()
+        .filter(|c| matches!(c.scope, conformance::CaseScope::Protocol))
+        .count();
+
     println!("coverage");
-    println!("  scenarios     {l1} L1 · {l2} L2");
+    println!(
+        "  l0 cases      {} ran ({backend_cases} backend · {protocol_cases} protocol)",
+        l0.passed.len()
+    );
+    println!("  scenarios     {l1} L1 · {l2} L2 · {l3} L3");
     println!(
         "  baseline hit  {}/{} ({}%)",
         covered_baseline.len(),
@@ -476,16 +597,41 @@ fn yaml_scalar(text: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Read a YAML sequence, accepting both block and inline (flow) form.
+///
+/// Supporting only block form made this silently return nothing for
+/// `covers: [FR-1, CR-2]`, so scenarios appeared to cover nothing and the report
+/// understated real coverage. A parser used for a gate must not fail quietly on
+/// valid input.
 fn yaml_seq(text: &str, key: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_list = false;
     let header = format!("{key}:");
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed == header {
-            in_list = true;
-            continue;
+
+        // Inline form: `key: [a, b, c]`
+        if let Some(rest) = trimmed.strip_prefix(&header) {
+            let rest = rest.trim();
+            if let Some(inner) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                for item in inner.split(',') {
+                    let item = item.trim().trim_matches('"');
+                    if !item.is_empty() {
+                        out.push(item.to_string());
+                    }
+                }
+                continue;
+            }
+            if rest.is_empty() {
+                in_list = true;
+                continue;
+            }
         }
+
+        // Block form:
+        //   key:
+        //     - a
+        //     - b
         if in_list {
             if let Some(item) = trimmed.strip_prefix("- ") {
                 out.push(item.trim().trim_matches('"').to_string());
@@ -499,13 +645,161 @@ fn yaml_seq(text: &str, key: &str) -> Vec<String> {
     out
 }
 
-fn check_deps() -> Result<()> {
-    let core = std::fs::read_to_string("crates/core/Cargo.toml")?;
-    if core.contains("adapters-mem") || core.contains("nova-sessions-gateway") {
-        bail!("nova-sessions-core must not depend on adapters or gateway");
+/// Collect dependency names from a Cargo.toml, ignoring comments.
+///
+/// Matching raw file text would flag a crate for merely *explaining* in a
+/// comment why it does not depend on something — which is exactly what happened
+/// the first time this gate was tightened.
+fn declared_dependencies(text: &str) -> Vec<String> {
+    let mut deps = Vec::new();
+    let mut in_deps = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            in_deps = trimmed.contains("dependencies");
+            continue;
+        }
+        if in_deps {
+            if let Some((name, _)) = trimmed.split_once('=') {
+                deps.push(name.trim().trim_matches('"').to_string());
+            }
+        }
     }
-    println!("check-deps OK");
+    deps
+}
+
+/// Enforce that the domain crate depends on no adapter and no ingress crate
+/// (D14).
+///
+/// **This gate is only as good as the names below.** Because it works by name
+/// matching, a rename that misses this function turns the check into a no-op that
+/// passes forever without reporting anything — hence the self-check at the end.
+fn check_deps() -> Result<()> {
+    const FORBIDDEN_IN_CORE: &[&str] = &[
+        "adapters-mem",
+        "adapters-sql",
+        "nova-responses-gateway",
+        "harness",
+        "conformance",
+    ];
+
+    let core = std::fs::read_to_string("crates/core/Cargo.toml")?;
+    let core_deps = declared_dependencies(&core);
+    for forbidden in FORBIDDEN_IN_CORE {
+        if core_deps.iter().any(|d| d == forbidden) {
+            bail!("nova-responses-core must not depend on `{forbidden}`");
+        }
+    }
+
+    // Guard against the gate silently rotting: the crate it protects must still
+    // carry the name assumed above. Without this, a rename would make the loop
+    // pass vacuously.
+    if !core.contains("name = \"nova-responses-core\"") {
+        bail!(
+            "check-deps is out of date: crates/core is no longer `nova-responses-core`, \
+             so the forbidden-dependency list above may no longer match reality"
+        );
+    }
+
+    // The two adapters are alternatives, not layers.
+    let sql_deps = declared_dependencies(&std::fs::read_to_string(
+        "crates/adapters/sql/Cargo.toml",
+    )?);
+    if sql_deps.iter().any(|d| d == "adapters-mem") {
+        bail!("adapters-sql must not depend on adapters-mem");
+    }
+    let mem_deps = declared_dependencies(&std::fs::read_to_string(
+        "crates/adapters/mem/Cargo.toml",
+    )?);
+    if mem_deps.iter().any(|d| d == "adapters-sql") {
+        bail!("adapters-mem must not depend on adapters-sql");
+    }
+
+    // L0 must stay buildable without a database driver (D17).
+    let conformance_deps = declared_dependencies(&std::fs::read_to_string(
+        "testing/conformance/Cargo.toml",
+    )?);
+    for forbidden in ["adapters-sql", "sqlx"] {
+        if conformance_deps.iter().any(|d| d == forbidden) {
+            bail!(
+                "conformance must not depend on `{forbidden}`: L0 has to build without a \
+                 database driver (D17). Feed the sql backend through `run_suite` from the \
+                 L3 runner instead."
+            );
+        }
+    }
+
+    let spec_covers = check_protocol_spec_is_publishable()?;
+
+    println!("check-deps OK ({} gated requirement(s))", spec_covers.len());
     Ok(())
+}
+
+/// FR-23: the protocol subset must ship as a publishable spec that names the
+/// upstream revision it tracks.
+///
+/// Checked mechanically because the failure is silent: the code enforces a subset
+/// either way, and a spec that has drifted still *reads* as authoritative. An
+/// integrator following a stale document gets 400s that the document says are
+/// impossible.
+fn check_protocol_spec_is_publishable() -> Result<&'static [&'static str]> {
+    let path = Path::new("docs/design/06-protocol-subset.md");
+    let spec = std::fs::read_to_string(path)
+        .with_context(|| format!("{} is the deliverable for FR-23", path.display()))?;
+
+    // Must state which upstream revision it was derived from, otherwise "aligned
+    // with the official protocol" is unfalsifiable.
+    if !spec.contains("openai-openapi") {
+        bail!(
+            "{} must name the upstream specification it tracks (FR-23); without a \
+             revision, a reader cannot tell whether the subset is current",
+            path.display()
+        );
+    }
+    let has_revision = spec
+        .lines()
+        .any(|l| l.contains("修订") || l.to_ascii_lowercase().contains("revision"));
+    if !has_revision {
+        bail!(
+            "{} must pin an upstream revision date (FR-23)",
+            path.display()
+        );
+    }
+
+    // Every parameter the code rejects by name must appear in the document, so the
+    // published rejection list cannot fall behind the enforced one.
+    let request = std::fs::read_to_string("crates/core/src/protocol/request.rs")?;
+    for param in ["conversation", "context_management", "prompt"] {
+        if !request.contains(param) {
+            bail!(
+                "`{param}` is documented as rejected but no longer appears in \
+                 request.rs; the published subset would overstate what is enforced"
+            );
+        }
+        if !spec.contains(param) {
+            bail!(
+                "`{param}` is rejected by request.rs but absent from {} (FR-23); \
+                 integrators would hit an undocumented 400",
+                path.display()
+            );
+        }
+    }
+
+    // The item types the code refuses must likewise be listed.
+    for item in ["item_reference", "reasoning"] {
+        if !spec.contains(item) {
+            bail!(
+                "item type `{item}` is outside the subset but not documented in {} \
+                 (FR-23)",
+                path.display()
+            );
+        }
+    }
+
+    Ok(&["FR-23", "FR-27"])
 }
 
 fn deploy(action: &str) -> Result<()> {

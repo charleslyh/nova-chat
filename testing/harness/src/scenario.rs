@@ -1,13 +1,18 @@
-//! L1 YAML scenarios: steps (A/B) + Trace + Oracles (C).
+//! L1 YAML scenarios: drive the ports directly, record a Trace, judge with Oracles.
+//!
+//! L1 deliberately bypasses HTTP so a failure localises to the domain layer.
+//! The HTTP contract is covered at L2.
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
 use adapters_mem::MemWorld;
-use nova_sessions_core::{
-    AgentId, Attempt, EventKind, IdempotencyKey, MetaStore, SessionLock, SessionSnapshot,
-    SnapshotError, SnapshotStore, StreamChannel, StreamError, StreamEvent, SubmitOutcome,
-    TurnStatus,
+use anyhow::{bail, Context, Result};
+use nova_responses_core::protocol::{CreateResponseRequest, InputLimits};
+use nova_responses_core::{
+    canonical_items, AgentId, Attempt, ChainLimits, ContextError, ContextStore, CreateOutcome,
+    EventLogError, IdempotencyKey, NodeTag, ResponseEvent, ResponseEventKind, ResponseEventLog,
+    ResponseId, ResponseItem, ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
 };
 use serde::Deserialize;
 
@@ -32,103 +37,224 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Step {
-    CreateSession,
-    SubmitTurn {
-        text: String,
+    CreateResponse {
+        input: String,
         key: String,
-        /// accepted | duplicate | busy
+        #[serde(default = "default_true")]
+        store: bool,
+        /// `last` refers to the previously created response; otherwise a label.
+        #[serde(default)]
+        previous: Option<String>,
+        #[serde(default)]
+        tenant: Option<String>,
+        #[serde(default)]
+        instructions: Option<String>,
+        /// Label for later reference.
+        #[serde(default)]
+        label: Option<String>,
+        /// accepted | duplicate | overloaded | read_only
         #[serde(default)]
         expect: Option<String>,
-        /// if false, skip turn_begin append (default: append only on accepted)
-        #[serde(default)]
-        append_begin: Option<bool>,
     },
     Claim {
-        #[serde(default)]
-        deadline_ms: Option<u64>,
-        /// some | none (default some)
+        /// some | none
         #[serde(default)]
         expect: Option<String>,
     },
-    ClaimAndComplete {
-        tokens: Option<usize>,
-    },
     AppendDelta {
+        #[serde(default)]
         payload: Option<String>,
         #[serde(default)]
-        expect_stale: bool,
-        /// if set, use this attempt instead of last claimed
         attempt: Option<u64>,
-    },
-    Reap,
-    TrimEarliest {
-        new_earliest: u64,
-    },
-    ResumeFrom {
-        from_seq: u64,
-        expect_min_events: usize,
-    },
-    ExpectNoGap {
-        from_seq: u64,
-    },
-    ExpectGap {
-        from_seq: u64,
-        /// Optional: assert Gap.hint equals this string.
         #[serde(default)]
-        expect_hint: Option<String>,
-    },
-    ExpectLock {
-        state: String,
+        expect_stale: bool,
     },
     Complete {
-        status: Option<String>,
+        #[serde(default = "default_true")]
+        ok: bool,
+        #[serde(default)]
+        output_text: Option<String>,
+        #[serde(default)]
+        input_tokens: u64,
+        #[serde(default)]
+        output_tokens: u64,
+    },
+    Cancel {
+        #[serde(default)]
+        tenant: Option<String>,
+        /// ok | not_found | invalid_transition
+        #[serde(default)]
+        expect: Option<String>,
+    },
+    Reap,
+    ReclaimOrphans {
+        #[serde(default)]
+        expect_min: usize,
+    },
+    ResumeStartingAfter {
+        #[serde(default)]
+        starting_after: Option<u64>,
+        #[serde(default)]
+        expect_min_events: usize,
+        #[serde(default)]
+        expect_first_sequence: Option<u64>,
+    },
+    ExpectExpired {
+        #[serde(default)]
+        starting_after: Option<u64>,
+    },
+    CloseLog {
+        retain_ms: u64,
+    },
+    SweepEventLogs {
+        now_ms: u64,
+    },
+    ResolveChain {
+        #[serde(default)]
+        from: Option<String>,
+        #[serde(default)]
+        tenant: Option<String>,
+        #[serde(default)]
+        expect_depth: Option<usize>,
+        #[serde(default)]
+        expect_items: Option<usize>,
+        #[serde(default)]
+        expect_absent_text: Option<String>,
+        #[serde(default)]
+        max_depth: Option<usize>,
+        #[serde(default)]
+        max_bytes: Option<usize>,
+    },
+    ExpectChainError {
+        #[serde(default)]
+        from: Option<String>,
+        #[serde(default)]
+        tenant: Option<String>,
+        /// chain_broken | not_stored | cross_tenant | chain_too_long | chain_too_large | unavailable
+        reason: String,
+        #[serde(default)]
+        max_depth: Option<usize>,
+        #[serde(default)]
+        max_bytes: Option<usize>,
+    },
+    DeleteResponse {
+        #[serde(default)]
+        target: Option<String>,
+        #[serde(default)]
+        tenant: Option<String>,
+        #[serde(default = "default_true")]
+        expect_deleted: bool,
+    },
+    PurgeTenant {
+        #[serde(default)]
+        tenant: Option<String>,
+        #[serde(default)]
+        expect_min: u64,
+    },
+    SweepExpiredContent {
+        now_ms: u64,
+        #[serde(default)]
+        expect_removed: Option<u64>,
+    },
+    SetExpiry {
+        #[serde(default)]
+        target: Option<String>,
+        expires_at_ms: u64,
+    },
+    ExpectIntegrityOk {
+        #[serde(default)]
+        target: Option<String>,
+    },
+    TamperContent {
+        #[serde(default)]
+        target: Option<String>,
+    },
+    ExpectIntegrityMismatch {
+        #[serde(default)]
+        target: Option<String>,
+    },
+    RecordPartialUsage {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    ExpectPartialUsage {
+        min_total_tokens: u64,
+    },
+    ExpectProtocolReject {
+        body: String,
+    },
+    ExpectProtocolAccept {
+        body: String,
+    },
+    SetReadOnly {
+        enabled: bool,
+    },
+    SetPendingLimit {
+        limit: usize,
+    },
+    SetStoreUnavailable {
+        enabled: bool,
     },
     AdvanceMs {
         by: u64,
     },
-    SnapshotPut {
-        snapshot_seq: u64,
-        /// ok | stale
-        #[serde(default)]
-        expect: Option<String>,
-    },
-    SnapshotGet {
-        #[serde(default)]
-        expect_seq: Option<u64>,
-        #[serde(default)]
-        expect_none: bool,
-    },
-    /// FR-14: after trim, cold must retain archived events.
-    ExpectColdMin {
-        min_events: usize,
-    },
-    /// INV-32: toggle MemWorld read-only degrade.
-    SetReadOnly {
-        enabled: bool,
-    },
-    /// FR-18: set global Pending+Claimed limit.
-    SetPendingLimit {
-        limit: usize,
-    },
-    /// V12: project authority → mirror (preserve seq).
-    MirrorSync,
-    /// V12: authority vs mirror event seq lists must match.
-    ObserveBoth {
-        from_seq: u64,
-    },
-    /// V12: mirror append must be read-only.
-    MirrorAppend {
-        #[serde(default)]
-        expect: Option<String>,
-    },
-    /// V12: mirror snapshot put must be read-only.
-    MirrorSnapshotPut {
-        snapshot_seq: u64,
-        #[serde(default)]
-        expect: Option<String>,
-    },
+}
+
+/// Mutable scenario state.
+struct Ctx {
+    world: MemWorld,
+    node_tag: NodeTag,
+    now_ms: u64,
+    default_tenant: TenantId,
+    labels: HashMap<String, ResponseId>,
+    last: Option<ResponseId>,
+    last_attempt: Option<Attempt>,
+}
+
+impl Ctx {
+    fn new() -> Self {
+        Self {
+            world: MemWorld::new(),
+            node_tag: NodeTag::parse("node-a").expect("static tag"),
+            now_ms: 1_000,
+            default_tenant: TenantId::parse("tenant-a").expect("static tenant"),
+            labels: HashMap::new(),
+            last: None,
+            last_attempt: None,
+        }
+    }
+
+    fn tenant(&self, spec: &Option<String>) -> Result<TenantId> {
+        match spec {
+            None => Ok(self.default_tenant.clone()),
+            Some(raw) => TenantId::parse(raw).map_err(|e| anyhow::anyhow!("tenant `{raw}`: {e}")),
+        }
+    }
+
+    fn resolve(&self, spec: &Option<String>) -> Result<ResponseId> {
+        match spec.as_deref() {
+            None | Some("last") => self
+                .last
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("no response created yet")),
+            Some(label) => self
+                .labels
+                .get(label)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown label `{label}`")),
+        }
+    }
+
+    fn chain_limits(&self, max_depth: Option<usize>, max_bytes: Option<usize>) -> ChainLimits {
+        let base = ChainLimits::default();
+        ChainLimits {
+            max_depth: max_depth.unwrap_or(base.max_depth),
+            max_bytes: max_bytes.unwrap_or(base.max_bytes),
+            ..base
+        }
+    }
 }
 
 pub async fn run_l1_dir(dir: &Path) -> Result<Vec<String>> {
@@ -146,622 +272,703 @@ pub async fn run_l1_dir(dir: &Path) -> Result<Vec<String>> {
         let name = run_one(&p)
             .await
             .with_context(|| format!("scenario {}", p.display()))?;
-        names.push(name);
+        if !name.is_empty() {
+            names.push(name);
+        }
     }
     Ok(names)
 }
 
 async fn run_one(path: &Path) -> Result<String> {
     let text = std::fs::read_to_string(path)?;
+    if is_blank_scenario(&text) {
+        eprintln!("  {} ... skipped (no content)", path.display());
+        return Ok(String::new());
+    }
     let sc: ScenarioFile = serde_yaml::from_str(&text)?;
     let name = sc.name.clone();
     eprint!("  {name} ... ");
+
     let mut trace = if sc.trace {
         Trace::with_jsonl_file(&sc.name, Path::new("testing/reports/traces"))?
     } else {
         Trace::new(&sc.name)
     };
-
-    let world = MemWorld::new();
-    let mut session = None;
-    let mut last_turn = None;
-    let mut last_attempt: Option<Attempt> = None;
-    let mut now_ms = 1_000u64;
+    let mut ctx = Ctx::new();
 
     for step in sc.steps {
-        match step {
-            Step::CreateSession => {
-                let id = world.meta.create_session().await?;
-                trace.push(TraceEvent::SessionCreated {
-                    session_id: id.0,
-                    at_ms: now_ms,
-                });
-                session = Some(id);
-            }
-            Step::SubmitTurn {
-                text,
-                key,
-                expect,
-                append_begin,
-            } => {
-                let sid = session.expect("session");
-                let out = world
-                    .meta
-                    .submit_turn(sid, text.clone(), IdempotencyKey(key.clone()), now_ms)
-                    .await?;
-                let (turn_id, outcome) = match &out {
-                    SubmitOutcome::Accepted { turn_id } => (*turn_id, "accepted"),
-                    SubmitOutcome::Duplicate { turn_id } => (*turn_id, "duplicate"),
-                    SubmitOutcome::Busy => (nova_sessions_core::TurnId(uuid::Uuid::nil()), "busy"),
-                    SubmitOutcome::ReadOnly => {
-                        (nova_sessions_core::TurnId(uuid::Uuid::nil()), "read_only")
-                    }
-                    SubmitOutcome::Overloaded => {
-                        (nova_sessions_core::TurnId(uuid::Uuid::nil()), "overloaded")
-                    }
-                };
-                if let Some(want) = &expect {
-                    if want != outcome {
-                        bail!("{}: submit expect {want} got {outcome}", sc.name);
-                    }
-                } else if outcome == "busy" {
-                    bail!("{}: unexpected busy", sc.name);
-                } else if outcome == "overloaded" {
-                    bail!("{}: unexpected overloaded", sc.name);
-                } else if outcome == "read_only" {
-                    bail!("{}: unexpected read_only", sc.name);
-                }
-                trace.push(TraceEvent::TurnSubmitted {
-                    session_id: sid.0,
-                    turn_id: turn_id.0,
-                    key,
-                    outcome: outcome.into(),
-                    at_ms: now_ms,
-                });
-                let do_append = append_begin.unwrap_or(outcome == "accepted");
-                if do_append && outcome == "accepted" {
-                    let seq = world
-                        .stream
-                        .append(StreamEvent {
-                            session_id: sid,
-                            seq: 0,
-                            kind: EventKind::TurnBegin,
-                            turn_id: Some(turn_id),
-                            attempt: None,
-                            payload: text,
-                        })
-                        .await?;
-                    trace.push(TraceEvent::StreamAppended {
-                        session_id: sid.0,
-                        turn_id: Some(turn_id.0),
-                        attempt: None,
-                        seq,
-                        kind: "turn_begin".into(),
-                        at_ms: now_ms,
-                    });
-                    last_turn = Some(turn_id);
-                } else if outcome == "duplicate" || outcome == "accepted" {
-                    last_turn = Some(turn_id);
-                }
-                trace.push(TraceEvent::MockState {
-                    component: "meta".into(),
-                    detail: format!("lock={:?}", world.meta.lock(sid).await?),
-                    at_ms: now_ms,
-                });
-            }
-            Step::Claim {
-                deadline_ms,
-                expect,
-            } => {
-                let sid = session.expect("session");
-                let agent = AgentId::new();
-                let dl = deadline_ms.unwrap_or(60_000);
-                let want = expect.as_deref().unwrap_or("some");
-                let got = world.meta.claim_turn(agent, now_ms, dl).await?;
-                match (want, got) {
-                    ("some", Some(c)) => {
-                        last_attempt = Some(c.attempt);
-                        let turn_id = c.turn.turn_id;
-                        last_turn = Some(turn_id);
-                        trace.push(TraceEvent::TurnClaimed {
-                            session_id: sid.0,
-                            turn_id: turn_id.0,
-                            agent_id: agent.0,
-                            attempt: c.attempt.0,
-                            at_ms: now_ms,
-                        });
-                    }
-                    ("none", None) => {
-                        trace.push(TraceEvent::MockState {
-                            component: "meta".into(),
-                            detail: "claim=none".into(),
-                            at_ms: now_ms,
-                        });
-                    }
-                    ("some", None) => bail!("{}: expected claim some, got none", sc.name),
-                    ("none", Some(_)) => bail!("{}: expected claim none, got some", sc.name),
-                    (other, _) => bail!("{}: unknown claim expect {other}", sc.name),
-                }
-            }
-            Step::ClaimAndComplete { tokens } => {
-                let sid = session.expect("session");
-                let turn_id = last_turn.expect("turn");
-                let agent = AgentId::new();
-                let c = world
-                    .meta
-                    .claim_turn(agent, now_ms, 60_000)
-                    .await?
-                    .expect("claim");
-                last_attempt = Some(c.attempt);
-                trace.push(TraceEvent::TurnClaimed {
-                    session_id: sid.0,
-                    turn_id: turn_id.0,
-                    agent_id: agent.0,
-                    attempt: c.attempt.0,
-                    at_ms: now_ms,
-                });
-                let n = tokens.unwrap_or(3);
-                for i in 0..n {
-                    let seq = world
-                        .stream
-                        .append(StreamEvent {
-                            session_id: sid,
-                            seq: 0,
-                            kind: EventKind::TextDelta,
-                            turn_id: Some(turn_id),
-                            attempt: Some(c.attempt),
-                            payload: format!("t{i}"),
-                        })
-                        .await?;
-                    trace.push(TraceEvent::StreamAppended {
-                        session_id: sid.0,
-                        turn_id: Some(turn_id.0),
-                        attempt: Some(c.attempt.0),
-                        seq,
-                        kind: "text_delta".into(),
-                        at_ms: now_ms,
-                    });
-                }
-                let seq = world
-                    .stream
-                    .append(StreamEvent {
-                        session_id: sid,
-                        seq: 0,
-                        kind: EventKind::TurnDone,
-                        turn_id: Some(turn_id),
-                        attempt: Some(c.attempt),
-                        payload: "done".into(),
-                    })
-                    .await?;
-                trace.push(TraceEvent::StreamAppended {
-                    session_id: sid.0,
-                    turn_id: Some(turn_id.0),
-                    attempt: Some(c.attempt.0),
-                    seq,
-                    kind: "turn_done".into(),
-                    at_ms: now_ms,
-                });
-                world
-                    .meta
-                    .complete_turn(turn_id, c.attempt, TurnStatus::Done)
-                    .await?;
-                trace.push(TraceEvent::TurnTerminal {
-                    turn_id: turn_id.0,
-                    status: "done".into(),
-                    at_ms: now_ms,
-                });
-            }
-            Step::AppendDelta {
-                payload,
-                expect_stale,
-                attempt,
-            } => {
-                let sid = session.expect("session");
-                let turn_id = last_turn.expect("turn");
-                let att = match attempt {
-                    Some(a) => Attempt(a),
-                    None => last_attempt.expect("attempt"),
-                };
-                let res = world
-                    .stream
-                    .append(StreamEvent {
-                        session_id: sid,
-                        seq: 0,
-                        kind: EventKind::TextDelta,
-                        turn_id: Some(turn_id),
-                        attempt: Some(att),
-                        payload: payload.unwrap_or_else(|| "x".into()),
-                    })
-                    .await;
-                match res {
-                    Ok(seq) => {
-                        if expect_stale {
-                            bail!("{}: expected stale append", sc.name);
-                        }
-                        trace.push(TraceEvent::StreamAppended {
-                            session_id: sid.0,
-                            turn_id: Some(turn_id.0),
-                            attempt: Some(att.0),
-                            seq,
-                            kind: "text_delta".into(),
-                            at_ms: now_ms,
-                        });
-                    }
-                    Err(StreamError::StaleAttempt) => {
-                        trace.push(TraceEvent::StreamAppendRejected {
-                            session_id: sid.0,
-                            turn_id: Some(turn_id.0),
-                            attempt: Some(att.0),
-                            reason: "stale_attempt".into(),
-                            at_ms: now_ms,
-                        });
-                        if !expect_stale {
-                            bail!("{}: unexpected stale append", sc.name);
-                        }
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            Step::Reap => {
-                let aborted = world.meta.reap(now_ms, 90_000).await?;
-                for (tid, att, sid) in &aborted {
-                    trace.push(TraceEvent::FaultInjected {
-                        kind: "reap".into(),
-                        target: format!("turn={}", tid.0),
-                        at_ms: now_ms,
-                    });
-                    let _ = world
-                        .stream
-                        .append(StreamEvent {
-                            session_id: *sid,
-                            seq: 0,
-                            kind: EventKind::AttemptAborted,
-                            turn_id: Some(*tid),
-                            attempt: None,
-                            payload: "reaped".into(),
-                        })
-                        .await;
-                    trace.push(TraceEvent::TurnTerminal {
-                        turn_id: tid.0,
-                        status: "aborted".into(),
-                        at_ms: now_ms,
-                    });
-                    let _ = att;
-                }
-                if let Some(sid) = session {
-                    trace.push(TraceEvent::MockState {
-                        component: "meta".into(),
-                        detail: format!("lock={:?} reaped={}", world.meta.lock(sid).await?, aborted.len()),
-                        at_ms: now_ms,
-                    });
-                }
-            }
-            Step::TrimEarliest { new_earliest } => {
-                let sid = session.expect("session");
-                world.stream.test_trim_earliest(sid, new_earliest);
-                world.mirror.project_trim(sid, new_earliest);
-                trace.push(TraceEvent::StreamTrimmed {
-                    session_id: sid.0,
-                    new_earliest,
-                    at_ms: now_ms,
-                });
-                trace.push(TraceEvent::FaultInjected {
-                    kind: "trim_hot".into(),
-                    target: format!("earliest={new_earliest}"),
-                    at_ms: now_ms,
-                });
-            }
-            Step::ResumeFrom {
-                from_seq,
-                expect_min_events,
-            } => {
-                let sid = session.expect("session");
-                let evs = world.stream.read_from(sid, from_seq, 10_000).await?;
-                trace.push(TraceEvent::StreamRead {
-                    session_id: sid.0,
-                    from_seq,
-                    count: evs.len(),
-                    gap: false,
-                    at_ms: now_ms,
-                });
-                if evs.len() < expect_min_events {
-                    bail!(
-                        "{}: resume expected >= {expect_min_events} got {}",
-                        sc.name,
-                        evs.len()
-                    );
-                }
-            }
-            Step::ExpectNoGap { from_seq } => {
-                let sid = session.expect("session");
-                match world.stream.read_from(sid, from_seq, 1).await {
-                    Ok(evs) => {
-                        trace.push(TraceEvent::StreamRead {
-                            session_id: sid.0,
-                            from_seq,
-                            count: evs.len(),
-                            gap: false,
-                            at_ms: now_ms,
-                        });
-                    }
-                    Err(StreamError::Gap(_)) => {
-                        trace.push(TraceEvent::StreamRead {
-                            session_id: sid.0,
-                            from_seq,
-                            count: 0,
-                            gap: true,
-                            at_ms: now_ms,
-                        });
-                        bail!("{}: unexpected gap at from_seq={from_seq}", sc.name);
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            Step::ExpectGap { from_seq, expect_hint } => {
-                let sid = session.expect("session");
-                match world.stream.read_from(sid, from_seq, 1).await {
-                    Ok(evs) => {
-                        trace.push(TraceEvent::StreamRead {
-                            session_id: sid.0,
-                            from_seq,
-                            count: evs.len(),
-                            gap: false,
-                            at_ms: now_ms,
-                        });
-                        bail!(
-                            "{}: expected gap at from_seq={from_seq}, got {} events",
-                            sc.name,
-                            evs.len()
-                        );
-                    }
-                    Err(StreamError::Gap(g)) => {
-                        trace.push(TraceEvent::StreamRead {
-                            session_id: sid.0,
-                            from_seq,
-                            count: 0,
-                            gap: true,
-                            at_ms: now_ms,
-                        });
-                        if let Some(want) = expect_hint {
-                            if g.hint != want {
-                                bail!(
-                                    "{}: gap hint want {want:?} got {:?}",
-                                    sc.name,
-                                    g.hint
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            Step::ExpectLock { state } => {
-                let sid = session.expect("session");
-                let lock = world.meta.lock(sid).await?;
-                let want = match state.as_str() {
-                    "idle" => SessionLock::Idle,
-                    "busy" => SessionLock::Busy,
-                    other => bail!("unknown lock state {other}"),
-                };
-                trace.push(TraceEvent::MockState {
-                    component: "meta".into(),
-                    detail: format!("lock={lock:?} expect={want:?}"),
-                    at_ms: now_ms,
-                });
-                if lock != want {
-                    bail!("{}: lock want {want:?} got {lock:?}", sc.name);
-                }
-            }
-            Step::Complete { status } => {
-                let turn_id = last_turn.expect("turn");
-                let att = last_attempt.expect("attempt");
-                let to = match status.as_deref().unwrap_or("done") {
-                    "done" => TurnStatus::Done,
-                    "failed" => TurnStatus::Failed,
-                    other => bail!("unknown complete status {other}"),
-                };
-                world.meta.complete_turn(turn_id, att, to).await?;
-                trace.push(TraceEvent::TurnTerminal {
-                    turn_id: turn_id.0,
-                    status: format!("{to:?}").to_lowercase(),
-                    at_ms: now_ms,
-                });
-            }
-            Step::AdvanceMs { by } => {
-                now_ms = now_ms.saturating_add(by);
-                trace.push(TraceEvent::Clock { now_ms });
-                continue; // skip the default +1 clock at end of loop
-            }
-            Step::SnapshotPut {
-                snapshot_seq,
-                expect,
-            } => {
-                let sid = session.expect("session");
-                let snap = SessionSnapshot {
-                    session_id: sid,
-                    snapshot_seq,
-                    bubbles: vec![],
-                    running: vec![],
-                };
-                let want = expect.as_deref().unwrap_or("ok");
-                let res = world.snapshot.put(snap).await;
-                match (want, res) {
-                    ("ok", Ok(())) => {
-                        trace.push(TraceEvent::MockState {
-                            component: "snapshot".into(),
-                            detail: format!("put seq={snapshot_seq} ok"),
-                            at_ms: now_ms,
-                        });
-                    }
-                    ("stale", Err(_)) => {
-                        trace.push(TraceEvent::MockState {
-                            component: "snapshot".into(),
-                            detail: format!("put seq={snapshot_seq} stale"),
-                            at_ms: now_ms,
-                        });
-                    }
-                    ("ok", Err(e)) => bail!("{}: snapshot put expected ok: {e}", sc.name),
-                    ("stale", Ok(())) => {
-                        bail!("{}: snapshot put expected stale", sc.name)
-                    }
-                    (other, _) => bail!("{}: unknown snapshot expect {other}", sc.name),
-                }
-            }
-            Step::SnapshotGet {
-                expect_seq,
-                expect_none,
-            } => {
-                let sid = session.expect("session");
-                let got = world.snapshot.get(sid).await?;
-                if expect_none {
-                    if got.is_some() {
-                        bail!("{}: snapshot expected none", sc.name);
-                    }
-                } else if let Some(seq) = expect_seq {
-                    let Some(s) = got else {
-                        bail!("{}: snapshot expected seq={seq}, got none", sc.name);
-                    };
-                    if s.snapshot_seq != seq {
-                        bail!(
-                            "{}: snapshot_seq want {seq} got {}",
-                            sc.name,
-                            s.snapshot_seq
-                        );
-                    }
-                }
-                trace.push(TraceEvent::MockState {
-                    component: "snapshot".into(),
-                    detail: format!("get expect_seq={expect_seq:?} none={expect_none}"),
-                    at_ms: now_ms,
-                });
-            }
-            Step::ExpectColdMin { min_events } => {
-                let sid = session.expect("session");
-                let n = world.stream.cold_len(sid);
-                trace.push(TraceEvent::MockState {
-                    component: "stream_cold".into(),
-                    detail: format!("cold_len={n} min={min_events}"),
-                    at_ms: now_ms,
-                });
-                if n < min_events {
-                    bail!(
-                        "{}: cold_len={n} want >= {min_events} (history must survive trim)",
-                        sc.name
-                    );
-                }
-            }
-            Step::SetReadOnly { enabled } => {
-                world.meta.set_read_only(enabled);
-                trace.push(TraceEvent::MockState {
-                    component: "meta".into(),
-                    detail: format!("read_only={enabled}"),
-                    at_ms: now_ms,
-                });
-            }
-            Step::SetPendingLimit { limit } => {
-                world.meta.set_pending_limit(limit);
-                trace.push(TraceEvent::MockState {
-                    component: "meta".into(),
-                    detail: format!("pending_limit={limit}"),
-                    at_ms: now_ms,
-                });
-            }
-            Step::MirrorSync => {
-                let sid = session.expect("session");
-                world.sync_mirror(sid).await;
-                trace.push(TraceEvent::MockState {
-                    component: "mirror".into(),
-                    detail: "sync_from_authority".into(),
-                    at_ms: now_ms,
-                });
-            }
-            Step::ObserveBoth { from_seq } => {
-                let sid = session.expect("session");
-                let auth = world.stream.read_from(sid, from_seq, 10_000).await?;
-                let mir = world.mirror.read_from(sid, from_seq, 10_000).await?;
-                let a_seqs: Vec<_> = auth.iter().map(|e| e.seq).collect();
-                let m_seqs: Vec<_> = mir.iter().map(|e| e.seq).collect();
-                trace.push(TraceEvent::MockState {
-                    component: "mirror".into(),
-                    detail: format!("observe_both auth={a_seqs:?} mir={m_seqs:?}"),
-                    at_ms: now_ms,
-                });
-                if a_seqs != m_seqs {
-                    bail!(
-                        "{}: FR-10 dual observers diverged auth={a_seqs:?} mir={m_seqs:?}",
-                        sc.name
-                    );
-                }
-            }
-            Step::MirrorAppend { expect } => {
-                let sid = session.expect("session");
-                let want = expect.as_deref().unwrap_or("read_only");
-                let res = world
-                    .mirror
-                    .append(StreamEvent {
-                        session_id: sid,
-                        seq: 0,
-                        kind: EventKind::TextDelta,
-                        turn_id: None,
-                        attempt: None,
-                        payload: "mirror-write".into(),
-                    })
-                    .await;
-                match (want, res) {
-                    ("read_only", Err(StreamError::ReadOnly)) => {
-                        trace.push(TraceEvent::MockState {
-                            component: "mirror".into(),
-                            detail: "append read_only".into(),
-                            at_ms: now_ms,
-                        });
-                    }
-                    ("read_only", other) => {
-                        bail!("{}: mirror append want read_only got {other:?}", sc.name)
-                    }
-                    (other, _) => bail!("{}: unknown mirror_append expect {other}", sc.name),
-                }
-            }
-            Step::MirrorSnapshotPut {
-                snapshot_seq,
-                expect,
-            } => {
-                let sid = session.expect("session");
-                let want = expect.as_deref().unwrap_or("read_only");
-                let res = world
-                    .mirror
-                    .put(SessionSnapshot {
-                        session_id: sid,
-                        snapshot_seq,
-                        bubbles: vec![],
-                        running: vec![],
-                    })
-                    .await;
-                match (want, res) {
-                    ("read_only", Err(SnapshotError::ReadOnly)) => {
-                        trace.push(TraceEvent::MockState {
-                            component: "mirror".into(),
-                            detail: "snapshot_put read_only".into(),
-                            at_ms: now_ms,
-                        });
-                    }
-                    ("read_only", other) => {
-                        bail!(
-                            "{}: mirror snapshot_put want read_only got {other:?}",
-                            sc.name
-                        )
-                    }
-                    (other, _) => {
-                        bail!("{}: unknown mirror_snapshot_put expect {other}", sc.name)
-                    }
-                }
-            }
-        }
-        now_ms += 1;
-        trace.push(TraceEvent::Clock { now_ms });
+        exec(&mut ctx, &mut trace, &sc.name, step).await?;
+        ctx.now_ms += 1;
+        trace.push(TraceEvent::Clock { now_ms: ctx.now_ms });
     }
 
     let _ = sc.covers;
     run_oracles(&trace, &sc.oracles)?;
     eprintln!("ok");
     Ok(name)
+}
+
+async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<()> {
+    match step {
+        Step::CreateResponse {
+            input,
+            key,
+            store,
+            previous,
+            tenant,
+            instructions,
+            label,
+            expect,
+        } => {
+            let tenant_id = ctx.tenant(&tenant)?;
+            let previous_id = match &previous {
+                None => None,
+                Some(spec) => Some(ctx.resolve(&Some(spec.clone()))?),
+            };
+            let id = ResponseId::new(ctx.node_tag.clone());
+            let record = StoredResponse {
+                response_id: id.clone(),
+                previous_response_id: previous_id.clone(),
+                tenant_id: tenant_id.clone(),
+                model: "test-model".into(),
+                instructions: instructions.clone(),
+                input_items: vec![ResponseItem::user_text(input)],
+                output_items: vec![],
+                status: ResponseStatus::Queued,
+                usage: Usage::default(),
+                created_at_ms: ctx.now_ms,
+                completed_at_ms: None,
+                stored: store,
+                expires_at_ms: None,
+                integrity: None,
+                integrity_alg: None,
+                node_tag: ctx.node_tag.clone(),
+                idempotency_key: Some(IdempotencyKey(key.clone())),
+                owner: None,
+                attempt: Attempt::default(),
+            };
+
+            let outcome = ctx
+                .world
+                .ledger
+                .create(record.clone(), IdempotencyKey(key.clone()), ctx.now_ms)
+                .await?;
+            let (resulting_id, label_str) = match &outcome {
+                CreateOutcome::Accepted { response_id } => (response_id.clone(), "accepted"),
+                CreateOutcome::Duplicate { response_id } => (response_id.clone(), "duplicate"),
+                CreateOutcome::ReadOnly => (id.clone(), "read_only"),
+                CreateOutcome::Overloaded => (id.clone(), "overloaded"),
+            };
+            if let Some(want) = &expect {
+                if want != label_str {
+                    bail!("{sc}: create expected {want}, got {label_str}");
+                }
+            } else if label_str != "accepted" {
+                bail!("{sc}: unexpected create outcome {label_str}");
+            }
+
+            trace.push(TraceEvent::ResponseCreated {
+                response_id: resulting_id.to_string(),
+                key,
+                outcome: label_str.into(),
+                store,
+                previous: previous_id.as_ref().map(|v| v.to_string()),
+                at_ms: ctx.now_ms,
+            });
+
+            if label_str == "accepted" {
+                if store {
+                    ctx.world.context.put(record).await?;
+                    trace.push(TraceEvent::ContentStored {
+                        response_id: resulting_id.to_string(),
+                        stored: true,
+                        at_ms: ctx.now_ms,
+                    });
+                }
+                let seq = ctx
+                    .world
+                    .event_log
+                    .append(ResponseEvent {
+                        response_id: resulting_id.clone(),
+                        sequence_number: 0,
+                        kind: ResponseEventKind::Created,
+                        attempt: None,
+                        payload: String::new(),
+                    })
+                    .await?;
+                trace.push(TraceEvent::EventAppended {
+                    response_id: resulting_id.to_string(),
+                    attempt: None,
+                    sequence_number: seq,
+                    kind: ResponseEventKind::Created.as_str().into(),
+                    at_ms: ctx.now_ms,
+                });
+            }
+
+            if let Some(label) = label {
+                ctx.labels.insert(label, resulting_id.clone());
+            }
+            ctx.last = Some(resulting_id);
+        }
+
+        Step::Claim { expect } => {
+            let agent = AgentId::new();
+            let claimed = ctx
+                .world
+                .ledger
+                .claim(agent, ctx.now_ms, 60_000)
+                .await?;
+            let want = expect.as_deref().unwrap_or("some");
+            match (want, claimed) {
+                ("none", None) => {}
+                ("none", Some(c)) => bail!("{sc}: expected nothing claimable, got {}", c.record.response_id),
+                ("some", None) => bail!("{sc}: expected a claimable response"),
+                ("some", Some(c)) => {
+                    trace.push(TraceEvent::ResponseClaimed {
+                        response_id: c.record.response_id.to_string(),
+                        agent_id: agent.0,
+                        attempt: c.attempt.0,
+                        at_ms: ctx.now_ms,
+                    });
+                    let seq = ctx
+                        .world
+                        .event_log
+                        .append(ResponseEvent {
+                            response_id: c.record.response_id.clone(),
+                            sequence_number: 0,
+                            kind: ResponseEventKind::InProgress,
+                            attempt: Some(c.attempt),
+                            payload: String::new(),
+                        })
+                        .await?;
+                    trace.push(TraceEvent::EventAppended {
+                        response_id: c.record.response_id.to_string(),
+                        attempt: Some(c.attempt.0),
+                        sequence_number: seq,
+                        kind: ResponseEventKind::InProgress.as_str().into(),
+                        at_ms: ctx.now_ms,
+                    });
+                    ctx.last = Some(c.record.response_id.clone());
+                    ctx.last_attempt = Some(c.attempt);
+                }
+                (other, _) => bail!("{sc}: unknown claim expectation `{other}`"),
+            }
+        }
+
+        Step::AppendDelta {
+            payload,
+            attempt,
+            expect_stale,
+        } => {
+            let id = ctx.resolve(&None)?;
+            let attempt = attempt
+                .map(Attempt)
+                .or(ctx.last_attempt)
+                .unwrap_or(Attempt(1));
+            let result = ctx
+                .world
+                .event_log
+                .append(ResponseEvent {
+                    response_id: id.clone(),
+                    sequence_number: 0,
+                    kind: ResponseEventKind::OutputTextDelta,
+                    attempt: Some(attempt),
+                    payload: payload.unwrap_or_else(|| "delta".into()),
+                })
+                .await;
+            match (expect_stale, result) {
+                (true, Err(EventLogError::StaleAttempt)) => {
+                    trace.push(TraceEvent::EventAppendRejected {
+                        response_id: id.to_string(),
+                        attempt: Some(attempt.0),
+                        reason: "stale_attempt".into(),
+                        at_ms: ctx.now_ms,
+                    });
+                }
+                (true, other) => bail!("{sc}: expected stale attempt rejection, got {other:?}"),
+                (false, Ok(seq)) => {
+                    trace.push(TraceEvent::EventAppended {
+                        response_id: id.to_string(),
+                        attempt: Some(attempt.0),
+                        sequence_number: seq,
+                        kind: ResponseEventKind::OutputTextDelta.as_str().into(),
+                        at_ms: ctx.now_ms,
+                    });
+                }
+                (false, Err(e)) => bail!("{sc}: append failed unexpectedly: {e}"),
+            }
+        }
+
+        Step::Complete {
+            ok,
+            output_text,
+            input_tokens,
+            output_tokens,
+        } => {
+            let id = ctx.resolve(&None)?;
+            let attempt = ctx
+                .last_attempt
+                .ok_or_else(|| anyhow::anyhow!("{sc}: complete without a claim"))?;
+            let status = if ok {
+                ResponseStatus::Completed
+            } else {
+                ResponseStatus::Failed
+            };
+            let usage = Usage::new(input_tokens, output_tokens);
+            let record = ctx
+                .world
+                .ledger
+                .get(&id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("{sc}: response vanished"))?;
+
+            ctx.world
+                .ledger
+                .complete(&id, attempt, status, usage, ctx.now_ms)
+                .await?;
+
+            // Output items are supplied here, not derived from the deltas above
+            // (INV-48).
+            if record.stored {
+                let items = vec![ResponseItem::assistant_text(
+                    output_text.clone().unwrap_or_else(|| "answer".into()),
+                )];
+                ctx.world
+                    .context
+                    .append_output(&record.tenant_id, &id, items, usage, status, ctx.now_ms)
+                    .await?;
+            }
+
+            // Server-emitted envelope: no attempt, so the fence cannot reject the
+            // very event announcing the transition.
+            let seq = ctx
+                .world
+                .event_log
+                .append(ResponseEvent {
+                    response_id: id.clone(),
+                    sequence_number: 0,
+                    kind: if ok {
+                        ResponseEventKind::Completed
+                    } else {
+                        ResponseEventKind::Failed
+                    },
+                    attempt: None,
+                    payload: String::new(),
+                })
+                .await?;
+            trace.push(TraceEvent::EventAppended {
+                response_id: id.to_string(),
+                attempt: None,
+                sequence_number: seq,
+                kind: if ok {
+                    ResponseEventKind::Completed.as_str().into()
+                } else {
+                    ResponseEventKind::Failed.as_str().to_string()
+                },
+                at_ms: ctx.now_ms,
+            });
+            trace.push(TraceEvent::ResponseTerminal {
+                response_id: id.to_string(),
+                status: status.as_str().into(),
+                at_ms: ctx.now_ms,
+            });
+        }
+
+        Step::Cancel { tenant, expect } => {
+            let id = ctx.resolve(&None)?;
+            let tenant_id = ctx.tenant(&tenant)?;
+            let result = ctx.world.ledger.cancel(&tenant_id, &id, ctx.now_ms).await;
+            let want = expect.as_deref().unwrap_or("ok");
+            match (want, result) {
+                ("ok", Ok(())) => {
+                    trace.push(TraceEvent::ResponseTerminal {
+                        response_id: id.to_string(),
+                        status: "cancelled".into(),
+                        at_ms: ctx.now_ms,
+                    });
+                }
+                ("not_found", Err(nova_responses_core::LedgerError::NotFound)) => {}
+                (
+                    "invalid_transition",
+                    Err(nova_responses_core::LedgerError::InvalidTransition(_)),
+                ) => {}
+                (want, got) => bail!("{sc}: cancel expected {want}, got {got:?}"),
+            }
+        }
+
+        Step::Reap => {
+            let aborted = ctx.world.ledger.reap(ctx.now_ms, 0).await?;
+            for claim in &aborted {
+                trace.push(TraceEvent::ResponseTerminal {
+                    response_id: claim.response_id.to_string(),
+                    status: "failed".into(),
+                    at_ms: ctx.now_ms,
+                });
+            }
+            trace.push(TraceEvent::MockState {
+                component: "ledger".into(),
+                detail: format!("reaped={}", aborted.len()),
+                at_ms: ctx.now_ms,
+            });
+        }
+
+        Step::ReclaimOrphans { expect_min } => {
+            let reclaimed = ctx
+                .world
+                .ledger
+                .reclaim_orphans(&ctx.node_tag, ctx.now_ms)
+                .await?;
+            if reclaimed.len() < expect_min {
+                bail!(
+                    "{sc}: expected at least {expect_min} orphans reclaimed, got {}",
+                    reclaimed.len()
+                );
+            }
+            for claim in &reclaimed {
+                trace.push(TraceEvent::ResponseTerminal {
+                    response_id: claim.response_id.to_string(),
+                    status: "failed".into(),
+                    at_ms: ctx.now_ms,
+                });
+            }
+            trace.push(TraceEvent::OrphanReclaimed {
+                node_tag: ctx.node_tag.to_string(),
+                count: reclaimed.len(),
+                at_ms: ctx.now_ms,
+            });
+        }
+
+        Step::ResumeStartingAfter {
+            starting_after,
+            expect_min_events,
+            expect_first_sequence,
+        } => {
+            let id = ctx.resolve(&None)?;
+            let batch = ctx
+                .world
+                .event_log
+                .read_after(&id, starting_after, 1000, 0)
+                .await?;
+            trace.push(TraceEvent::EventRead {
+                response_id: id.to_string(),
+                starting_after,
+                count: batch.len(),
+                expired: false,
+                at_ms: ctx.now_ms,
+            });
+            if batch.len() < expect_min_events {
+                bail!(
+                    "{sc}: expected at least {expect_min_events} events after {starting_after:?}, got {}",
+                    batch.len()
+                );
+            }
+            if let Some(want) = expect_first_sequence {
+                let got = batch.first().map(|e| e.sequence_number);
+                if got != Some(want) {
+                    bail!("{sc}: expected first sequence {want}, got {got:?}");
+                }
+            }
+        }
+
+        Step::ExpectExpired { starting_after } => {
+            let id = ctx.resolve(&None)?;
+            match ctx
+                .world
+                .event_log
+                .read_after(&id, starting_after, 10, 0)
+                .await
+            {
+                Err(EventLogError::Expired) => {
+                    trace.push(TraceEvent::EventRead {
+                        response_id: id.to_string(),
+                        starting_after,
+                        count: 0,
+                        expired: true,
+                        at_ms: ctx.now_ms,
+                    });
+                }
+                other => bail!("{sc}: expected an expiry error, got {other:?}"),
+            }
+        }
+
+        Step::CloseLog { retain_ms } => {
+            let id = ctx.resolve(&None)?;
+            ctx.world
+                .event_log
+                .close(&id, ctx.now_ms, retain_ms)
+                .await?;
+        }
+
+        Step::SweepEventLogs { now_ms } => {
+            let swept = ctx.world.event_log.sweep_expired(now_ms).await?;
+            trace.push(TraceEvent::MockState {
+                component: "event_log".into(),
+                detail: format!("swept={swept}"),
+                at_ms: ctx.now_ms,
+            });
+        }
+
+        Step::ResolveChain {
+            from,
+            tenant,
+            expect_depth,
+            expect_items,
+            expect_absent_text,
+            max_depth,
+            max_bytes,
+        } => {
+            let id = ctx.resolve(&from)?;
+            let tenant_id = ctx.tenant(&tenant)?;
+            let limits = ctx.chain_limits(max_depth, max_bytes);
+            let resolved = ctx
+                .world
+                .context
+                .resolve_chain(&tenant_id, &id, limits)
+                .await
+                .map_err(|e| anyhow::anyhow!("{sc}: chain resolution failed: {e}"))?;
+            trace.push(TraceEvent::ChainResolved {
+                response_id: id.to_string(),
+                depth: resolved.depth,
+                items: resolved.items.len(),
+                bytes: resolved.bytes,
+                at_ms: ctx.now_ms,
+            });
+            if let Some(want) = expect_depth {
+                if resolved.depth != want {
+                    bail!("{sc}: expected chain depth {want}, got {}", resolved.depth);
+                }
+            }
+            if let Some(want) = expect_items {
+                if resolved.items.len() != want {
+                    bail!(
+                        "{sc}: expected {want} chain items, got {}",
+                        resolved.items.len()
+                    );
+                }
+            }
+            if let Some(absent) = expect_absent_text {
+                let encoded = canonical_items(&resolved.items);
+                if encoded.contains(&absent) {
+                    bail!("{sc}: `{absent}` must not appear in chain output: {encoded}");
+                }
+            }
+        }
+
+        Step::ExpectChainError {
+            from,
+            tenant,
+            reason,
+            max_depth,
+            max_bytes,
+        } => {
+            let id = ctx.resolve(&from)?;
+            let tenant_id = ctx.tenant(&tenant)?;
+            let limits = ctx.chain_limits(max_depth, max_bytes);
+            let result = ctx
+                .world
+                .context
+                .resolve_chain(&tenant_id, &id, limits)
+                .await;
+            let matched = match (&reason[..], &result) {
+                ("chain_broken", Err(ContextError::ChainBroken(_))) => true,
+                ("not_stored", Err(ContextError::NotStored)) => true,
+                ("cross_tenant", Err(ContextError::CrossTenant)) => true,
+                ("chain_too_long", Err(ContextError::ChainTooLong { .. })) => true,
+                ("chain_too_large", Err(ContextError::ChainTooLarge { .. })) => true,
+                ("unavailable", Err(ContextError::Unavailable)) => true,
+                _ => false,
+            };
+            if !matched {
+                bail!("{sc}: expected chain error `{reason}`, got {result:?}");
+            }
+            trace.push(TraceEvent::ChainRejected {
+                response_id: id.to_string(),
+                reason,
+                at_ms: ctx.now_ms,
+            });
+        }
+
+        Step::DeleteResponse {
+            target,
+            tenant,
+            expect_deleted,
+        } => {
+            let id = ctx.resolve(&target)?;
+            let tenant_id = ctx.tenant(&tenant)?;
+            let deleted = ctx.world.context.delete(&tenant_id, &id).await?;
+            if deleted != expect_deleted {
+                bail!("{sc}: expected deleted={expect_deleted}, got {deleted}");
+            }
+        }
+
+        Step::PurgeTenant { tenant, expect_min } => {
+            let tenant_id = ctx.tenant(&tenant)?;
+            let removed = ctx.world.context.delete_by_tenant(&tenant_id).await?;
+            if removed < expect_min {
+                bail!("{sc}: expected at least {expect_min} purged, got {removed}");
+            }
+        }
+
+        Step::SweepExpiredContent {
+            now_ms,
+            expect_removed,
+        } => {
+            let removed = ctx.world.context.sweep_expired(now_ms, 500).await?;
+            if let Some(want) = expect_removed {
+                if removed != want {
+                    bail!("{sc}: expected {want} records swept, got {removed}");
+                }
+            }
+        }
+
+        Step::SetExpiry {
+            target,
+            expires_at_ms,
+        } => {
+            let id = ctx.resolve(&target)?;
+            let mut record = ctx
+                .world
+                .ledger
+                .get(&id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("{sc}: unknown response"))?;
+            record.expires_at_ms = Some(expires_at_ms);
+            ctx.world.context.put(record).await?;
+        }
+
+        Step::ExpectIntegrityOk { target } => {
+            let id = ctx.resolve(&target)?;
+            let tenant_id = ctx.default_tenant.clone();
+            let ok = ctx.world.context.get(&tenant_id, &id).await.is_ok();
+            trace.push(TraceEvent::IntegrityChecked {
+                response_id: id.to_string(),
+                ok,
+                at_ms: ctx.now_ms,
+            });
+            if !ok {
+                bail!("{sc}: integrity check failed unexpectedly");
+            }
+        }
+
+        Step::TamperContent { target } => {
+            let id = ctx.resolve(&target)?;
+            let tampered = ctx
+                .world
+                .context
+                .tamper_for_test(&id, vec![ResponseItem::assistant_text("forged")]);
+            if !tampered {
+                bail!("{sc}: nothing to tamper with");
+            }
+            trace.push(TraceEvent::FaultInjected {
+                kind: "tamper_content".into(),
+                target: id.to_string(),
+                at_ms: ctx.now_ms,
+            });
+        }
+
+        Step::ExpectIntegrityMismatch { target } => {
+            let id = ctx.resolve(&target)?;
+            let tenant_id = ctx.default_tenant.clone();
+            match ctx.world.context.get(&tenant_id, &id).await {
+                Err(ContextError::IntegrityMismatch) => {}
+                other => bail!("{sc}: expected an integrity mismatch, got {other:?}"),
+            }
+        }
+
+        Step::RecordPartialUsage {
+            input_tokens,
+            output_tokens,
+        } => {
+            let id = ctx.resolve(&None)?;
+            let attempt = ctx.last_attempt.unwrap_or(Attempt(1));
+            let usage = Usage::new(input_tokens, output_tokens);
+            ctx.world
+                .ledger
+                .record_partial_usage(&id, attempt, usage)
+                .await?;
+            trace.push(TraceEvent::PartialUsageRecorded {
+                response_id: id.to_string(),
+                attempt: attempt.0,
+                total_tokens: usage.total_tokens,
+                at_ms: ctx.now_ms,
+            });
+        }
+
+        Step::ExpectPartialUsage { min_total_tokens } => {
+            let id = ctx.resolve(&None)?;
+            let total = ctx.world.ledger.total_usage(&id);
+            if total.total_tokens < min_total_tokens {
+                bail!(
+                    "{sc}: expected at least {min_total_tokens} tokens booked, got {}",
+                    total.total_tokens
+                );
+            }
+        }
+
+        Step::ExpectProtocolReject { body } => {
+            let parsed: Result<CreateResponseRequest, _> = serde_json::from_str(&body);
+            let rejected = match parsed {
+                Err(_) => true,
+                Ok(req) => req.validate(&InputLimits::default()).is_err(),
+            };
+            if !rejected {
+                bail!("{sc}: payload should have been rejected: {body}");
+            }
+            trace.push(TraceEvent::ProtocolRejected {
+                reason: "outside_subset".into(),
+                at_ms: ctx.now_ms,
+            });
+        }
+
+        Step::ExpectProtocolAccept { body } => {
+            let req: CreateResponseRequest = serde_json::from_str(&body)
+                .map_err(|e| anyhow::anyhow!("{sc}: supported payload rejected: {e}"))?;
+            req.validate(&InputLimits::default())
+                .map_err(|e| anyhow::anyhow!("{sc}: supported payload failed validation: {e}"))?;
+        }
+
+        Step::SetReadOnly { enabled } => {
+            ctx.world.ledger.set_read_only(enabled);
+            trace.push(TraceEvent::MockState {
+                component: "ledger".into(),
+                detail: format!("read_only={enabled}"),
+                at_ms: ctx.now_ms,
+            });
+        }
+
+        Step::SetPendingLimit { limit } => {
+            ctx.world.ledger.set_pending_limit(limit);
+            trace.push(TraceEvent::MockState {
+                component: "ledger".into(),
+                detail: format!("pending_limit={limit}"),
+                at_ms: ctx.now_ms,
+            });
+        }
+
+        Step::SetStoreUnavailable { enabled } => {
+            ctx.world.store.set_unavailable(enabled);
+            trace.push(TraceEvent::FaultInjected {
+                kind: "store_unavailable".into(),
+                target: format!("{enabled}"),
+                at_ms: ctx.now_ms,
+            });
+        }
+
+        Step::AdvanceMs { by } => {
+            ctx.now_ms += by;
+            trace.push(TraceEvent::Clock { now_ms: ctx.now_ms });
+        }
+    }
+    Ok(())
+}
+
+/// Whether a scenario file carries no actual content.
+///
+/// Comment-only files exist during migrations as tombstones for scenarios that
+/// were withdrawn; treating them as parse errors would block the whole run for
+/// no benefit.
+fn is_blank_scenario(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .all(|line| line.is_empty() || line.starts_with('#'))
 }

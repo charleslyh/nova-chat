@@ -1,7 +1,7 @@
 //! L2 multi-process scenarios: HTTP API + shared Trace + simple var capture.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -20,6 +20,21 @@ struct ScenarioFile {
     oracles: Vec<String>,
     #[serde(default = "default_true")]
     trace: bool,
+    /// Whether this scenario leaves a node unusable (stopped or killed).
+    ///
+    /// Declared here rather than encoded in the filename. The suite previously
+    /// relied on `zz-` / `zzz-` prefixes to keep such scenarios last, which meant
+    /// a correctly named new scenario could still be stranded by an unluckily
+    /// sorted one — and nothing would explain why it failed. The runner now
+    /// orders by this flag, so the ordering requirement is enforced instead of
+    /// merely documented.
+    #[serde(default)]
+    destructive: bool,
+    /// Nodes this scenario needs to be serving. Checked before the steps run so a
+    /// scenario stranded by an earlier one reports *that* instead of failing on
+    /// an unrelated assertion further down.
+    #[serde(default)]
+    requires_nodes: Vec<u16>,
     #[serde(default)]
     steps: Vec<Step>,
 }
@@ -70,14 +85,36 @@ enum Step {
         max_events: Option<usize>,
         #[serde(default = "default_sse_timeout")]
         timeout_ms: u64,
-        /// Var name for last event id; also sets `{name}_next` = last+1.
+        /// Var name for the last `sequence_number` received; also sets
+        /// `{name}_next` = last + 1 for use as an inclusive resume point.
+        ///
+        /// The SSE `id:` field carries the sequence number, so a reconnect can
+        /// resume purely from what the client observed (INV-12).
         #[serde(default)]
         capture_last_seq: Option<String>,
     },
-    /// Kill whatever is listening on a TCP port (L2 fixture teardown mid-scenario).
+    HttpDelete {
+        url: String,
+        #[serde(default)]
+        expect_status: Option<u16>,
+    },
+    /// Kill whatever is listening on a TCP port (abrupt failure).
     KillListener {
         port: u16,
     },
+    /// Send SIGTERM and wait, so graceful drain can actually be observed.
+    ///
+    /// Distinct from `KillListener` on purpose: drain is the mechanism that makes
+    /// rolling deploys free, and a SIGKILL would bypass it entirely (D21).
+    GracefulStop {
+        port: u16,
+        #[serde(default = "default_drain_wait")]
+        wait_ms: u64,
+    },
+}
+
+fn default_drain_wait() -> u64 {
+    3_000
 }
 
 fn default_timeout() -> u64 {
@@ -104,17 +141,40 @@ pub async fn run_l2_dir(dir: &Path) -> Result<Vec<String>> {
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("yaml"))
         .collect();
     paths.sort();
+
+    // Non-destructive scenarios first, destructive ones last, each group keeping
+    // filename order for reproducibility. Reading the flag needs a parse, so a
+    // malformed file surfaces here rather than midway through the run.
+    let mut ordered: Vec<(bool, PathBuf)> = Vec::new();
     for p in paths {
+        let text = std::fs::read_to_string(&p)?;
+        if is_blank_scenario(&text) {
+            eprintln!("  {} ... skipped (no content)", p.display());
+            continue;
+        }
+        let sc: ScenarioFile = serde_yaml::from_str(&text)
+            .with_context(|| format!("parsing {}", p.display()))?;
+        ordered.push((sc.destructive, p));
+    }
+    ordered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    for (_, p) in ordered {
         let name = run_one(&p)
             .await
             .with_context(|| format!("l2 scenario {}", p.display()))?;
-        names.push(name);
+        if !name.is_empty() {
+            names.push(name);
+        }
     }
     Ok(names)
 }
 
 async fn run_one(path: &Path) -> Result<String> {
     let text = std::fs::read_to_string(path)?;
+    if is_blank_scenario(&text) {
+        eprintln!("  {} ... skipped (no content)", path.display());
+        return Ok(String::new());
+    }
     let sc: ScenarioFile = serde_yaml::from_str(&text)?;
     let name = sc.name.clone();
     eprint!("  {name} ... ");
@@ -125,6 +185,18 @@ async fn run_one(path: &Path) -> Result<String> {
     };
     let mut now_ms = 1u64;
     let mut vars: HashMap<String, String> = HashMap::new();
+
+    for port in &sc.requires_nodes {
+        let addr = format!("127.0.0.1:{port}");
+        if tokio::net::TcpStream::connect(&addr).await.is_err() {
+            bail!(
+                "{}: requires a node on {addr}, but nothing is listening. A destructive \
+                 scenario ran earlier and the fixture is not restarted between scenarios; \
+                 mark the scenario that stops this node with `destructive: true`.",
+                sc.name
+            );
+        }
+    }
 
     for step in sc.steps {
         match step {
@@ -259,6 +331,18 @@ async fn run_one(path: &Path) -> Result<String> {
                     at_ms: now_ms,
                 });
             }
+            Step::HttpDelete { url, expect_status } => {
+                let url = subst(&url, &vars);
+                let resp = http_delete(&url).await?;
+                check_status(&sc.name, "DELETE", &url, &resp, expect_status)?;
+                trace.push(TraceEvent::ApiCall {
+                    method: "DELETE".into(),
+                    url: url.clone(),
+                    status_ok: http_status(&resp).map(|s| s < 400).unwrap_or(false),
+                    detail: http_status(&resp).map(|s| s.to_string()).unwrap_or_default(),
+                    at_ms: now_ms,
+                });
+            }
             Step::KillListener { port } => {
                 kill_listener(port)?;
                 trace.push(TraceEvent::FaultInjected {
@@ -267,6 +351,15 @@ async fn run_one(path: &Path) -> Result<String> {
                     at_ms: now_ms,
                 });
                 tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Step::GracefulStop { port, wait_ms } => {
+                signal_listener(port, "TERM")?;
+                trace.push(TraceEvent::DrainStarted {
+                    node_tag: format!("port:{port}"),
+                    in_flight: 0,
+                    at_ms: now_ms,
+                });
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
             }
         }
         now_ms += 1;
@@ -346,23 +439,38 @@ fn apply_capture(
     Ok(())
 }
 
+/// Abrupt termination: models an unplanned crash.
+///
+/// Uses SIGKILL specifically. Sending SIGTERM here would invoke graceful drain
+/// and the scenario would then verify the *opposite* of what it intends.
 fn kill_listener(port: u16) -> Result<()> {
+    signal_listener(port, "KILL")
+}
+
+/// Send a signal to whatever is listening on `port`.
+fn signal_listener(port: u16, signal: &str) -> Result<()> {
     use std::process::Command;
     let out = Command::new("lsof")
         .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
         .output()
         .with_context(|| format!("lsof port {port}"))?;
     if !out.status.success() {
-        // nothing listening is fine for this step's intent
+        // Nothing listening: the step's intent is already satisfied.
         return Ok(());
     }
     for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
-        let st = Command::new("kill").args(["-TERM", pid]).status()?;
+        let st = Command::new("kill")
+            .args([&format!("-{signal}"), pid])
+            .status()?;
         if !st.success() {
-            bail!("kill -TERM {pid} failed");
+            bail!("kill -{signal} {pid} failed");
         }
     }
     Ok(())
+}
+
+async fn http_delete(url: &str) -> Result<String> {
+    http("DELETE", url, None).await
 }
 
 async fn http(method: &str, url: &str, body: Option<&str>) -> Result<String> {
@@ -474,4 +582,15 @@ async fn sse_collect(url: &str, max_events: usize, timeout: Duration) -> Result<
         }
     }
     Ok((ids, bodies))
+}
+
+/// Whether a scenario file carries no actual content.
+///
+/// Comment-only files exist during migrations as tombstones for scenarios that
+/// were withdrawn; treating them as parse errors would block the whole run for
+/// no benefit.
+fn is_blank_scenario(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .all(|line| line.is_empty() || line.starts_with('#'))
 }

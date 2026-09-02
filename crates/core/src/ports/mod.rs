@@ -1,15 +1,17 @@
-//! Domain protocols (traits). Implementations live in `crates/adapters/*` (e.g. `adapters-mem`).
+//! Domain ports (traits). Implementations live in `crates/adapters/*`.
 
 mod clock;
-mod meta;
+mod context;
+mod event_log;
+mod integrity;
+mod ledger;
 mod metrics;
-mod snapshot;
-mod stream;
 
 pub use clock::Clock;
-pub use meta::{
-    ClaimedTurn, MetaError, MetaStore, SessionLock, SubmitOutcome, TurnRecord, TurnStatus,
+pub use context::{ContextError, ContextStore};
+pub use event_log::{EventLogError, ResponseEventLog};
+pub use integrity::{ContentIntegrity, IntegrityError};
+pub use ledger::{
+    AbortedClaim, ClaimedResponse, CreateOutcome, LedgerError, ResponseLedger,
 };
 pub use metrics::MetricsSink;
-pub use snapshot::{SnapshotError, SnapshotStore};
-pub use stream::{StreamChannel, StreamError, StreamGap};

@@ -1,11 +1,21 @@
 [package]
-name = "nova-sessions-core"
+name = "nova-responses-core"
 version.workspace = true
 edition.workspace = true
-description = "Session domain types and protocols (traits)"
+description = "Response domain types, protocol subset and port traits"
 
 [dependencies]
 async-trait = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+# NFC normalisation for stable content fingerprints (INV-44).
+unicode-normalization = { workspace = true }
+# https-only + private-range rejection for reference URLs (SEC-6).
+url = { workspace = true }
+# Integrity primitives live here rather than in each adapter so the mem and sql
+# backends cannot drift apart on the signing scheme.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }

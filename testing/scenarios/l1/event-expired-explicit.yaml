@@ -1,0 +1,22 @@
+name: event-expired-explicit
+covers: [FR-12, CR-4, CR-10, INV-40]
+oracles: [ExpiredIsExplicit, SequenceContiguous]
+steps:
+  - action: create_response
+    input: "ephemeral"
+    key: exp-1
+  - action: claim
+  - action: append_delta
+  - action: complete
+  - action: close_log
+    retain_ms: 1000
+  # Past the retention window but still inside the tombstone window, so the
+  # answer is a precise "expired" rather than the weaker "unknown". Both are
+  # explicit; expired additionally tells the caller the id was real.
+  - action: sweep_event_logs
+    now_ms: 5000
+  # Every cursor now reports expiry: no partial data, and deliberately no
+  # recovery path — subscription is a transient capability, not history access.
+  - action: expect_expired
+  - action: expect_expired
+    starting_after: 1

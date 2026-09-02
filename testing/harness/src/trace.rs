@@ -11,48 +11,91 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TraceEvent {
-    SessionCreated {
-        session_id: Uuid,
-        at_ms: u64,
-    },
-    TurnSubmitted {
-        session_id: Uuid,
-        turn_id: Uuid,
+    ResponseCreated {
+        response_id: String,
         key: String,
         outcome: String,
+        store: bool,
+        previous: Option<String>,
         at_ms: u64,
     },
-    TurnClaimed {
-        session_id: Uuid,
-        turn_id: Uuid,
+    ResponseClaimed {
+        response_id: String,
         agent_id: Uuid,
         attempt: u64,
         at_ms: u64,
     },
-    StreamAppended {
-        session_id: Uuid,
-        turn_id: Option<Uuid>,
+    EventAppended {
+        response_id: String,
         attempt: Option<u64>,
-        seq: u64,
+        sequence_number: u64,
         kind: String,
         at_ms: u64,
     },
-    StreamRead {
-        session_id: Uuid,
-        from_seq: u64,
+    EventRead {
+        response_id: String,
+        starting_after: Option<u64>,
         count: usize,
-        gap: bool,
+        expired: bool,
         at_ms: u64,
     },
-    StreamTrimmed {
-        session_id: Uuid,
-        new_earliest: u64,
-        at_ms: u64,
-    },
-    StreamAppendRejected {
-        session_id: Uuid,
-        turn_id: Option<Uuid>,
+    EventAppendRejected {
+        response_id: String,
         attempt: Option<u64>,
+        reason: String,
+        at_ms: u64,
+    },
+    ResponseTerminal {
+        response_id: String,
+        status: String,
+        at_ms: u64,
+    },
+    /// Chain resolution succeeded, with the shape of what it returned.
+    ChainResolved {
+        response_id: String,
+        depth: usize,
+        items: usize,
+        bytes: usize,
+        at_ms: u64,
+    },
+    /// Chain resolution refused. `reason` is the error code, never a payload.
+    ChainRejected {
+        response_id: String,
+        reason: String,
+        at_ms: u64,
+    },
+    ContentStored {
+        response_id: String,
+        stored: bool,
+        at_ms: u64,
+    },
+    IntegrityChecked {
+        response_id: String,
+        ok: bool,
+        at_ms: u64,
+    },
+    CapacityRejected {
+        scope: String,
+        detail: String,
+        at_ms: u64,
+    },
+    OrphanReclaimed {
+        node_tag: String,
+        count: usize,
+        at_ms: u64,
+    },
+    PartialUsageRecorded {
+        response_id: String,
+        attempt: u64,
+        total_tokens: u64,
+        at_ms: u64,
+    },
+    DrainStarted {
+        node_tag: String,
+        in_flight: usize,
+        at_ms: u64,
+    },
+    ProtocolRejected {
         reason: String,
         at_ms: u64,
     },
@@ -61,11 +104,6 @@ pub enum TraceEvent {
         url: String,
         status_ok: bool,
         detail: String,
-        at_ms: u64,
-    },
-    TurnTerminal {
-        turn_id: Uuid,
-        status: String,
         at_ms: u64,
     },
     MockState {

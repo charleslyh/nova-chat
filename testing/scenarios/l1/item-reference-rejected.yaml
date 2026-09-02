@@ -1,0 +1,13 @@
+name: item-reference-rejected
+covers: [FR-25, SEC-3, INV-50, INV-52]
+oracles: []
+steps:
+  # `item_reference` can name an arbitrary historical item and would therefore
+  # bypass the per-hop tenant check performed while walking a chain. Rejecting it
+  # is a security property, not merely a scope decision.
+  - action: expect_protocol_reject
+    body: '{"model":"m","input":[{"type":"item_reference","id":"msg_1"}]}'
+  - action: expect_protocol_reject
+    body: '{"model":"m","input":[{"type":"reasoning","summary":[]}]}'
+  - action: expect_protocol_accept
+    body: '{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ok"}]}]}'

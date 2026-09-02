@@ -1,0 +1,15 @@
+name: chain-cross-tenant-denied
+covers: [SEC-2, SEC-3, CR-9, INV-42]
+oracles: [ChainBounded]
+steps:
+  - action: create_response
+    input: "theirs"
+    key: cct-1
+    tenant: tenant-b
+    label: theirs
+  # A foreign anchor is reported exactly like a missing one, so the field cannot
+  # be used to probe whether an id exists.
+  - action: expect_chain_error
+    from: theirs
+    tenant: tenant-a
+    reason: chain_broken

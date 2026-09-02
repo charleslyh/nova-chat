@@ -1,16 +1,17 @@
 [package]
-name = "nova-sessions-gateway"
+name = "nova-responses-gateway"
 version.workspace = true
 edition.workspace = true
-description = "HTTP(S) gateway for Session streaming (POST + SSE)"
+description = "HTTP gateway for the Responses protocol subset (create + SSE)"
 
 [[bin]]
-name = "nova-sessions-gateway"
+name = "nova-responses-gateway"
 path = "src/main.rs"
 
 [dependencies]
-nova-sessions-core = { workspace = true }
+nova-responses-core = { workspace = true }
 adapters-mem = { workspace = true }
+adapters-sql = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
@@ -18,6 +19,7 @@ futures = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+subtle = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tower-http = { workspace = true }

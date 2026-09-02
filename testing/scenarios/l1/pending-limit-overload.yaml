@@ -1,36 +1,19 @@
 name: pending-limit-overload
-covers:
-  - FR-18
-  - INV-29
-  - CR-8
-  - INV-30
-oracles:
-  - SeqMonotonic
-  - SingleClaimPerAttempt
-  - SubmittedTurnsTerminal
-trace: true
+covers: [FR-33, INV-29, INV-30]
+oracles: [IdempotentSameResponse, NoSilentContentLoss]
 steps:
-  # 全局在途阈值：已有 1 个 Pending/Claimed 时，另一 Session 提交应 Overloaded（非 session busy）
   - action: set_pending_limit
     limit: 1
-  - action: create_session
-  - action: submit_turn
-    text: first-inflight
-    key: k-pl-1
-    expect: accepted
-  - action: create_session
-  - action: submit_turn
-    text: should-overload
-    key: k-pl-2
+  - action: create_response
+    input: "first"
+    key: ovl-1
+  - action: create_response
+    input: "second"
+    key: ovl-2
     expect: overloaded
-  - action: claim_and_complete
-    tokens: 2
-  - action: create_session
-  - action: submit_turn
-    text: after-drain
-    key: k-pl-3
-    expect: accepted
-  - action: claim_and_complete
-    tokens: 1
+  # Raising the limit restores service: the rejection left nothing inconsistent.
   - action: set_pending_limit
-    limit: 10000
+    limit: 10
+  - action: create_response
+    input: "third"
+    key: ovl-3

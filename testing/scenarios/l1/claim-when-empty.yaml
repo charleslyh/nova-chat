@@ -1,12 +1,6 @@
 name: claim-when-empty
-covers:
-  - CR-1
-oracles:
-  - SeqMonotonic
-trace: true
+covers: [FR-4]
+oracles: []
 steps:
-  - action: create_session
   - action: claim
     expect: none
-  - action: expect_lock
-    state: idle

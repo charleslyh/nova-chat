@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use nova_sessions_core::MetricsSink;
+use nova_responses_core::MetricsSink;
 use parking_lot::Mutex;
 
 pub struct MemMetrics {

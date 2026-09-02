@@ -1,19 +1,8 @@
-use async_trait::async_trait;
-use crate::{SessionId, SessionSnapshot};
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum SnapshotError {
-    #[error("stale snapshot_seq")]
-    StaleSeq,
-    #[error("read only")]
-    ReadOnly,
-    #[error("internal: {0}")]
-    Internal(String),
-}
-
-#[async_trait]
-pub trait SnapshotStore: Send + Sync {
-    async fn put(&self, snap: SessionSnapshot) -> Result<(), SnapshotError>;
-    async fn get(&self, session_id: SessionId) -> Result<Option<SessionSnapshot>, SnapshotError>;
-}
+//! REMOVED: SnapshotStore
+//!
+//! D20 ⑥ removed open-screen restoration entirely.
+//!
+//! This file is no longer part of the module tree and is not compiled.
+//! It is kept only as a tombstone so a stray `mod` declaration cannot
+//! resurrect code that references types which no longer exist.
+//! Safe to delete.

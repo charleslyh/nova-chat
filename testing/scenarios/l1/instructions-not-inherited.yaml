@@ -1,0 +1,24 @@
+name: instructions-not-inherited
+covers: [FR-19, INV-49]
+oracles: [ChainBounded]
+steps:
+  - action: create_response
+    input: "first"
+    key: ins-1
+    instructions: "SPEAK-LIKE-A-PIRATE"
+    label: first
+  - action: claim
+  - action: complete
+    output_text: "arr"
+  - action: create_response
+    input: "second"
+    key: ins-2
+    previous: first
+    label: second
+  # The previous turn's instructions must not reappear in assembled context.
+  # Leaking them would show up as "the caller changed the system prompt but the
+  # old one is still in effect" — extremely hard to diagnose from the outside.
+  - action: resolve_chain
+    from: second
+    expect_depth: 2
+    expect_absent_text: "SPEAK-LIKE-A-PIRATE"

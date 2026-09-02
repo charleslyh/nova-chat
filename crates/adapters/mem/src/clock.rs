@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use nova_sessions_core::Clock;
+use nova_responses_core::Clock;
 use tokio::sync::Notify;
 
 pub struct MemClock {

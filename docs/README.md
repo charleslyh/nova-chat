@@ -1,97 +1,96 @@
-# nova-sessions 文档
+# 文档地图
 
-Session 级可回放消息服务（Nova 子服务）：建会话 · 异步 Turn · 跨 Turn 流式观测与续订。
+> 服务：**nova-responses** — 对齐 OpenAI Responses 协议封闭子集的生成服务
 
 ---
 
-## 文档地图
+## 先读这三条边界
 
-```mermaid
-%%{init: {"flowchart": {"curve": "basis", "rankSpacing": 75, "nodeSpacing": 28}}}%%
-flowchart LR
-    R["requirements/<br/>要什么"] --> A["architecture/<br/>怎么定的"]
-    A --> D["design/<br/>怎么做"]
-    P["plans/<br/>怎么推进"] --> D
-    AR["archive/<br/>冻结历史"] -.不引用.-> R
+| # | 命题 | 出处 |
+|---|---|---|
+| 1 | **存储与订阅分离**：持有生成条目用于拼接上下文；不提供会话线程级订阅与开屏还原 | [D20](./architecture/decisions.md#d20-交付边界收口存储与订阅分离) |
+| 2 | **协议是封闭子集**：子集外一律 400，不静默忽略；严进同时更安全更兼容 | [D22](./architecture/decisions.md#d22-协议封闭子集与严格拒绝) |
+| 3 | **可靠性分层**：内容库与账本上真库高可用；在途缓冲留进程内存 + 四项缓解 | [D21](./architecture/decisions.md#d21-可靠性分层三类存储的差异化投入) |
+
+---
+
+## 阅读顺序
+
+```
+requirements/spec.md          需求与编号基线（FR / CR / SEC）
+        ↓
+requirements/parameters.md    量化锚点与容量模型
+        ↓
+architecture/decisions.md     D20 / D21 / D22 → D11(RESTATED) → D14/D15/D17
+        ↓
+architecture/invariants.md    不变量（违反即某条 CR 不成立）
+        ↓
+design/01-responses-api.md    对外契约与实现依据
 ```
 
-| 目录 | 角色 |
-|------|------|
-| [`requirements/`](./requirements/) | 需求与参数（v2，Session 流） |
-| [`architecture/`](./architecture/) | ADR、不变量、推导文 |
-| [`design/`](./design/) | 正式设计 + 少量草稿 |
-| [`plans/`](./plans/) | 当期推进与验收 |
-| [`archive/`](./archive/) | **冻结**；不得作为实现依据 |
+---
+
+## 目录
+
+### 需求
+
+| 文档 | 内容 |
+|---|---|
+| [`requirements/spec.md`](./requirements/spec.md) | v3.0 · FR-1~39 / CR-1~13 / SR / OR / SEC-1~10 · 范围界定 |
+| [`requirements/parameters.md`](./requirements/parameters.md) | v3.0 · 业务锚点 → 导出量 → SLO · **崩溃损失率量化** |
+
+### 架构
+
+| 文档 | 内容 |
+|---|---|
+| [`architecture/decisions.md`](./architecture/decisions.md) | ADR。**不删改正文**，变更用 `SUPERSEDED BY` 追溯 |
+| [`architecture/invariants.md`](./architecture/invariants.md) | v3.0 · 不变量与「不可抽象清单」 |
+| [`architecture/README.md`](./architecture/README.md) | 组件速览 |
+| [`architecture/arc.md`](./architecture/arc.md) | 早期推导，已由 D20–D22 收口 |
+
+### 设计
+
+| 文档 | 内容 |
+|---|---|
+| [`design/01-responses-api.md`](./design/01-responses-api.md) | 端点、事件、`starting_after`、两条转发路径、状态码 |
+| [`design/02-verification.md`](./design/02-verification.md) | L0–L3、裁判清单、场景矩阵 |
+| [`design/03-context-chain.md`](./design/03-context-chain.md) | 数据模型、走链（内存单锁 vs SQL 递归）、上限、链亲和退役 |
+| [`design/04-content-integrity.md`](./design/04-content-integrity.md) | 规范化、HMAC、密钥生命周期 |
+| [`design/05-reliability.md`](./design/05-reliability.md) | 故障语义分层、四项缓解、升级触发条件 |
+| [`design/06-protocol-subset.md`](./design/06-protocol-subset.md) | **对外可发布契约** |
+| [`design/drafts/security.md`](./design/drafts/security.md) | 安全检查清单 |
+
+### 计划
+
+[`plans/current.md`](./plans/current.md) · [`plans/README.md`](./plans/README.md)
 
 ---
 
-## 清单
+## 写作纪律
 
-### requirements/
-
-| 文档 | 内容 |
-|------|------|
-| [`spec.md`](./requirements/spec.md) | FR / CR / 范围界定 |
-| [`parameters.md`](./requirements/parameters.md) | 锚点、SLO、适用区间 |
-
-### architecture/
-
-| 文档 | 内容 |
-|------|------|
-| [`README.md`](./architecture/README.md) | 现行架构速览 |
-| [`decisions.md`](./architecture/decisions.md) | ADR（D19 为产品范围） |
-| [`invariants.md`](./architecture/invariants.md) | 不可违反条目 |
-| [`arc.md`](./architecture/arc.md) | 推导文（非实现依据） |
-
-### design/
-
-| 文档 | 内容 |
-|------|------|
-| [`01-session-stream.md`](./design/01-session-stream.md) | ✅ 实现依据：gateway + 流 |
-| [`02-verification.md`](./design/02-verification.md) | ✅ Trace + Oracle 验证 |
-| [`drafts/stream-channel-adapters.md`](./design/drafts/stream-channel-adapters.md) | Redis vs JetStream 选型 |
-| [`drafts/security.md`](./design/drafts/security.md) | 鉴权后续素材 |
-
-### plans/
-
-| 文档 | 内容 |
-|------|------|
-| [`README.md`](./plans/README.md) | 迭代表 |
-| [`current.md`](./plans/current.md) | 当期展开级 |
+| 规则 | 理由 |
+|---|---|
+| 需求不引用设计 | 需求描述可观察行为，引用设计会锁死实现 |
+| 设计引用 FR/CR/INV 编号 | 使每条设计可追溯到需求 |
+| ADR 正文不删改，用 `SUPERSEDED BY` | 保留「为何曾这样决定」，否则重复踩坑 |
+| **归档内容不被现行文档引用** | 归档前须先把结论提取进正文 |
+| mermaid 统一 `%%{init: {"flowchart": {"curve": "basis"}}}%%` | 渲染一致 |
 
 ---
 
-## 阅读路径
+## 术语
 
-| 目的 | 顺序 |
-|------|------|
-| 首次了解 | `requirements/spec.md` → `architecture/README.md` → `design/01-session-stream.md` |
-| 质疑决策 | `architecture/decisions.md`（先看索引里 ✅ 生效项） |
-| 实现 / 验收 | `design/01` + `plans/current.md` → `just verify` / `just sim` |
+刻意不使用「A 类 / B 类数据」这类分类：本服务在任何代码路径上都不做此判断。统一使用：
 
----
+| 术语 | 含义 |
+|---|---|
+| **生成**（Response） | 一次模型调用的生命周期与结果对象；对外唯一主资源 |
+| **条目**（Item） | 生成的输入或输出单元；协议封闭子集的成员 |
+| **事件流** | 生成期间的增量事件；序号 0 基连续 |
+| **在途事件缓冲** | 承载事件流的进程内有界环；不持久化 |
+| **上下文库** | 持久化生成条目，支撑走链拼接 |
+| **上下文链** | 由 `previous_response_id` 连成的生成序列 |
+| **宿主节点** | 持有某次生成在途缓冲的网关进程 |
+| **执行端** | 领取生成、写事件、终态提交输出条目的组件 |
 
-## 核心约束
-
-| # | 约束 | 出处 |
-|---|------|------|
-| 1 | 主资源是 **Session**；Turn = 一轮生成 | D19 |
-| 2 | 服务身份是 **`nova-sessions-gateway`**（产品名 nova-sessions） | D19 |
-| 3 | 游标 `(session_id, last_seq)`；无 sticky | INV-12 |
-| 4 | meta ≠ stream | D11 |
-| 5 | 热 miss 明确报错；有效 Session 可订 | INV-14 |
-| 6 | attempt fence | INV-5/6 |
-| 7 | 一期 POST+SSE 同进程 | D19 |
-| 8 | L0–L2 不依赖 Docker | D17 |
-
----
-
-## 纪律
-
-| 规则 | 说明 |
-|------|------|
-| 需求不引用设计 | `requirements/` 自闭环 |
-| 设计引用 FR/CR/INV | 可追溯验收 |
-| ADR 不删改正文 | 用 `SUPERSEDED BY` |
-| 归档不被现行引用 | 需结论时先提取到现行文档 |
-| 图样 | `%%{init: {"flowchart": {"curve": "basis"}}}%%` |
+> 完整渲染事件历史（transcript）**不是本服务的概念**：不定义、不存储、不判断。由调用方从实时流自行构建并持有。

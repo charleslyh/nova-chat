@@ -1,0 +1,31 @@
+name: chain-multi-turn
+covers: [FR-15, FR-16, CR-9, INV-41]
+oracles: [ChainBounded, NoSilentContentLoss, SequenceContiguous]
+steps:
+  - action: create_response
+    input: "turn one"
+    key: chain-1
+    label: first
+  - action: claim
+  - action: complete
+    output_text: "answer one"
+  - action: create_response
+    input: "turn two"
+    key: chain-2
+    previous: first
+    label: second
+  - action: claim
+  - action: complete
+    output_text: "answer two"
+  - action: create_response
+    input: "turn three"
+    key: chain-3
+    previous: second
+    label: third
+  # Three links. The first two contributed input + output; the third has only
+  # produced its input so far, hence 5 items rather than 6 — resolution reflects
+  # actual state, it does not wait for or invent a pending output.
+  - action: resolve_chain
+    from: third
+    expect_depth: 3
+    expect_items: 5

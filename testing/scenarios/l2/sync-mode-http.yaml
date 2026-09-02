@@ -1,0 +1,12 @@
+name: sync-mode-http
+covers: [FR-2, FR-8]
+oracles: []
+steps:
+  # No `background`: the request waits for a terminal event and returns the
+  # complete object. All three delivery modes share one internal event stream, so
+  # this is the same path as streaming, only awaited server-side.
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"sync please"}'
+    expect_status: 200
+    expect_contains: '"status":"completed"'

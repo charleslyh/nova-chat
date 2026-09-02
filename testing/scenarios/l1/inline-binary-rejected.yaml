@@ -1,0 +1,10 @@
+name: inline-binary-rejected
+covers: [FR-26, SEC-7, INV-50]
+oracles: []
+steps:
+  - action: expect_protocol_reject
+    body: '{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]}'
+  # References are supported, and being short is exactly what keeps the 1 MiB
+  # chain byte budget meaningful.
+  - action: expect_protocol_accept
+    body: '{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_image","file_id":"file_123"}]}]}'

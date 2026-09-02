@@ -1,0 +1,17 @@
+name: chain-bytes-limit
+covers: [FR-17, CR-9, INV-41]
+oracles: [ChainBounded]
+steps:
+  - action: create_response
+    input: "some reasonably long input text"
+    key: cbl-1
+    label: a
+  - action: create_response
+    input: "another reasonably long input text"
+    key: cbl-2
+    previous: a
+    label: b
+  - action: expect_chain_error
+    from: b
+    max_bytes: 8
+    reason: chain_too_large

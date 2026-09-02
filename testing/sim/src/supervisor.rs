@@ -1,4 +1,8 @@
-//! Process supervisor for nova-sessions regions & mock agents.
+//! Process supervisor for peer gateway nodes and mock agents.
+//!
+//! Nodes are equivalent: each can create, each runs its own sweeper, and there is
+//! no authority node (D20). What used to be a home/edge topology is now a flat
+//! peer set, and the only remaining directed hop is for in-flight events.
 
 use std::collections::HashMap;
 use std::fs;
@@ -13,6 +17,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+/// Console-only credentials, passed via the environment because that is the only
+/// channel the service accepts them from (SEC-4). Never for deployment.
+const FIXTURE_ENV: &[(&str, &str)] = &[
+    ("NOVA_INTERNAL_TOKEN", "sim-internal-token"),
+    ("NOVA_INTEGRITY_KEY", "sim-integrity-key-0123456789"),
+];
+
 
 pub type SharedSim = Arc<Mutex<SimSupervisor>>;
 
@@ -125,7 +137,7 @@ impl SimSupervisor {
     }
 
     pub fn ensure_bins() -> Result<()> {
-        for pkg in ["nova-sessions-gateway", "mock-agent"] {
+        for pkg in ["nova-responses-gateway", "mock-agent"] {
             let st = Command::new("cargo").args(["build", "-p", pkg]).status()?;
             if !st.success() {
                 bail!("build {pkg} failed");
@@ -219,7 +231,11 @@ impl SimSupervisor {
             return Ok(());
         }
         let exe = self.root.join("target/debug/nova-sessions-gateway");
-        let child = Command::new(&exe)
+        let mut cmd = Command::new(&exe);
+    for (key, value) in FIXTURE_ENV {
+        cmd.env(key, value);
+    }
+    let child = cmd
             .args(["--config", rt.config_path.to_str().unwrap()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -269,7 +285,11 @@ impl SimSupervisor {
         };
         let aid = Uuid::new_v4().to_string();
         let exe = self.root.join("target/debug/mock-agent");
-        let child = Command::new(&exe)
+        let mut cmd = Command::new(&exe);
+    for (key, value) in FIXTURE_ENV {
+        cmd.env(key, value);
+    }
+    let child = cmd
             .args([
                 "--home",
                 &home,

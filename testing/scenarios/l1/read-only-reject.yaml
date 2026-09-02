@@ -1,28 +1,15 @@
 name: read-only-reject
-covers:
-  - INV-32
-oracles:
-  - SeqMonotonic
-trace: true
+covers: [FR-33, INV-32]
+oracles: [NoSilentContentLoss]
 steps:
-  - action: create_session
   - action: set_read_only
     enabled: true
-  - action: submit_turn
-    text: should-fail
-    key: k-ro-1
+  - action: create_response
+    input: "blocked"
+    key: ro-1
     expect: read_only
-  # reads still ok
-  - action: snapshot_put
-    snapshot_seq: 1
-    expect: ok
-  - action: snapshot_get
-    expect_seq: 1
   - action: set_read_only
     enabled: false
-  - action: submit_turn
-    text: after-ro
-    key: k-ro-2
-    expect: accepted
-  - action: claim_and_complete
-    tokens: 2
+  - action: create_response
+    input: "allowed"
+    key: ro-2

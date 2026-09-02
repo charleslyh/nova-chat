@@ -1,0 +1,31 @@
+name: resume-starting-after
+# FR-11 ("no connection stickiness") was claimed here and moved to the L2
+# no-sticky scenario: an in-process run has no connections to switch between, so
+# this scenario cannot substantiate it.
+covers: [FR-9, FR-10, CR-4, CR-5, INV-11, INV-12]
+oracles: [SequenceContiguous, ExpiredIsExplicit]
+steps:
+  - action: create_response
+    input: "stream me"
+    key: resume-1
+  - action: claim
+  - action: append_delta
+    payload: "a"
+  - action: append_delta
+    payload: "b"
+  - action: append_delta
+    payload: "c"
+  # From the very beginning: sequence 0 must be included.
+  - action: resume_starting_after
+    expect_min_events: 5
+    expect_first_sequence: 0
+  # Exclusive cursor: starting_after=0 must skip event 0. This is why the cursor
+  # is optional rather than a sentinel value.
+  - action: resume_starting_after
+    starting_after: 0
+    expect_min_events: 4
+    expect_first_sequence: 1
+  - action: resume_starting_after
+    starting_after: 3
+    expect_min_events: 1
+    expect_first_sequence: 4

@@ -2,10 +2,42 @@
 
 > ## ⚠️ 草稿，需补充后方可作为实现依据
 >
-> 产品范围已收口为 Session 流（[D19](../../architecture/decisions.md#d19-产品范围为-session-流式-api单门面)）。本文保留长连接鉴权素材；**一期不实现完整鉴权**（见 [`../../plans/current.md`](../../plans/current.md)）。补齐后将作为正式设计移出本目录。
+> 产品范围已收口为 **Responses 协议子集的生成服务**（[D20](../../architecture/decisions.md#d20-交付边界收口存储与订阅分离) / [D22](../../architecture/decisions.md#d22-协议封闭子集与严格拒绝)）。
+> 本文保留长连接鉴权素材；**一期已实现的部分见下表**，其余补齐后移出本目录。
 >
-> | 缺口 / 冲突 | 说明 | 处置 |
-> |------------|------|------|
+> ### 一期已实现（不在本文草稿范围内）
+>
+> | 项 | 实现位置 | 支撑 |
+> |---|---|---|
+> | Bearer → 租户解析 | `gateway/src/auth.rs` | SEC-1 |
+> | **越权返回「不存在」而非「禁止访问」** | 同上 + `error.rs` | SEC-2 |
+> | **走链逐环校验租户** | `ContextStore::resolve_chain` | SEC-3 |
+> | **密钥仅从环境变量读取**；启用校验但缺失时启动即失败 | `core/src/integrity_hmac.rs` | SEC-4 |
+> | **节点间转发白名单**（`peers`），标签不在表内直接 404 且不外发请求 | `gateway/src/routing.rs` | SEC-5 |
+> | **引用链接内网拦截**（仅 https + 私有段拒绝） | `core/src/protocol/url_guard.rs` | SEC-6 |
+> | **请求体限长限深** | `core/src/protocol/limits.rs` | SEC-7 |
+> | **数据访问一律参数绑定**（含递归走链的深度上限） | `adapters/sql/src/context.rs` | SEC-8 |
+> | 日志脱敏（不记原文 / 密钥 / 连接串） | 全局 | SEC-9 |
+> | **内部租户头需内部令牌方可采信** | `gateway/src/auth.rs` | SEC-5 |
+>
+> ### 仍为草稿的缺口
+>
+> | 缺口 | 说明 | 处置 |
+> |---|---|---|
+> | 授权对象用语 | 正文多处仍写 `task_id` / `session_id` | 升格时改为 **`response_id`** |
+> | `EventSource` 无法带 Authorization 头 | 正文 §2 的一次性 ticket 方案仍有效且**尚未实现** | 升格时实现 |
+> | 长连接期间的权限撤销 | 正文 §4；当前订阅生命周期为单次生成（分钟级），风险显著低于原小时级会话 | 按新生命周期重估 |
+> | 出口脱敏 | 正文 §6 | 与调用方约定后实现 |
+> | 多密钥并存 / 轮换 | 当前单密钥；`alg` 标记已具备识别基础 | 条件触发 |
+> | ~~匹配器 DSL 沙箱~~ | D1 已废止，无 DSL 执行入口 | **不再适用** |
+> | ~~跨区域授权~~ | 节点已对等，无权威区/边缘区 | **不再适用** |
+>
+> 相关需求：SEC-1~SEC-10 · 不变量：[`invariants.md`](../../architecture/invariants.md)
+> 正式契约：[`../01-responses-api.md`](../01-responses-api.md) · [`../06-protocol-subset.md`](../06-protocol-subset.md)
+>
+> 本文仍有价值的核心：**长连接期间的权限撤销**、**`EventSource` 无法携带 Authorization 头**。
+
+------------|------|------|
 > | ~~匹配器 DSL 沙箱~~ | D1 已废止；无 DSL 执行入口 | **不再适用** |
 > | 授权对象用语 | 正文多处仍写 `task_id` | 升格时改为 **`session_id`**（及 Turn 写路径） |
 > | 「Realtime Gateway」 | 部署措辞 | 升格时改为 **`nova-sessions` 订路径** |

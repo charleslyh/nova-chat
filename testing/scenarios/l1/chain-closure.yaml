@@ -1,0 +1,12 @@
+name: chain-closure
+covers: [FR-28, CR-12, INV-47]
+oracles: [ChainClosure]
+steps:
+  # Every item type the service can emit must parse back as input. Without this
+  # our own chain would break on the next turn, with no external caller involved.
+  - action: expect_protocol_accept
+    body: '{"model":"m","input":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"emitted"}]}]}'
+  - action: expect_protocol_accept
+    body: '{"model":"m","input":[{"type":"function_call","call_id":"c1","name":"tool","arguments":"{}"}]}'
+  - action: expect_protocol_accept
+    body: '{"model":"m","input":[{"type":"function_call_output","call_id":"c1","output":"result"}]}'
