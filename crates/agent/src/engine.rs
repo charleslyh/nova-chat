@@ -192,6 +192,7 @@ impl Agent {
                 id.clone(),
                 ResponseEventKind::InProgress,
                 attempt,
+                record.to_response_value(),
             ))
             .await;
 
@@ -227,6 +228,7 @@ impl Agent {
             attempt,
             stopped: false,
             output_index: 0,
+            current_item_id: None,
         };
 
         loop {
@@ -464,7 +466,7 @@ impl Agent {
             ResponseStatus::Incomplete => ResponseEventKind::Incomplete,
             _ => ResponseEventKind::Completed,
         };
-        self.close_stream(id, kind, now_ms).await;
+        self.close_stream(id, tenant, kind, now_ms).await;
         info!(response = %id, "completed");
         Executed::Completed
     }
@@ -478,7 +480,6 @@ impl Agent {
         reason: &str,
         now_ms: u64,
     ) -> Executed {
-        let _ = tenant;
         if let Err(e) = self
             .deps
             .ledger
@@ -489,7 +490,7 @@ impl Agent {
             return Executed::Failed;
         }
         debug!(response = %id, reason, "failed");
-        self.close_stream(id, ResponseEventKind::Failed, now_ms)
+        self.close_stream(id, tenant, ResponseEventKind::Failed, now_ms)
             .await;
         Executed::Failed
     }
@@ -498,16 +499,29 @@ impl Agent {
     async fn close_stream(
         &self,
         id: &ResponseId,
+        tenant: &TenantId,
         kind: ResponseEventKind,
         now_ms: u64,
     ) {
         // `attempt: None` on purpose. The fence was already checked by the ledger
         // transition; checking it again here would reject the very event that
         // announces the transition, and the stream would never terminate.
+        //
+        // The terminal record is read back so the event's `response` object
+        // reflects the finished state. A store miss (store=false, or an
+        // unavailable store) falls back to a minimal envelope.
+        let response = match self.deps.context.get(tenant, id).await {
+            Ok(Some(record)) => record.to_response_value(),
+            _ => serde_json::json!({
+                "id": id.to_string(),
+                "object": "response",
+                "status": kind.as_str().strip_prefix("response.").unwrap_or(kind.as_str()),
+            }),
+        };
         let _ = self
             .deps
             .event_log
-            .append(ResponseEvent::lifecycle(id.clone(), kind))
+            .append(ResponseEvent::lifecycle(id.clone(), kind, response))
             .await;
         let _ = self
             .deps
@@ -527,6 +541,20 @@ struct LedgerSink {
     /// Index of the output item currently being streamed, mirroring the
     /// `output_index` of the OpenAI `response.output_item.*` events.
     output_index: u32,
+    /// Id of the output item currently being streamed, carried on delta events
+    /// as `item_id` (the message id or a tool `call_id`).
+    current_item_id: Option<String>,
+}
+
+/// The stream identity of an output item: a tool `call_id` for tool items, the
+/// message id otherwise (empty when absent — the scheduler assigns one via
+/// [`assistant_text_message`]).
+fn item_id_of(item: &ResponseItem) -> String {
+    match item {
+        ResponseItem::FunctionCall { call_id, .. }
+        | ResponseItem::FunctionCallOutput { call_id, .. } => call_id.clone(),
+        ResponseItem::Message { id, .. } => id.clone().unwrap_or_default(),
+    }
 }
 
 impl LedgerSink {
@@ -580,6 +608,7 @@ impl CompletionsSink for LedgerSink {
         self.push(
             ResponseEventKind::OutputTextDelta,
             EventBody::Delta {
+                item_id: self.current_item_id.clone().unwrap_or_default(),
                 delta: text.to_string(),
             },
         )
@@ -589,6 +618,7 @@ impl CompletionsSink for LedgerSink {
     async fn output_item_added(&mut self, item: &ResponseItem) -> Result<SinkVerdict, SinkError> {
         let index = self.output_index;
         self.output_index += 1;
+        self.current_item_id = Some(item_id_of(item));
         self.push_item(ResponseEventKind::OutputItemAdded, index, item)
             .await
     }
@@ -601,12 +631,13 @@ impl CompletionsSink for LedgerSink {
 
     async fn function_call_arguments_delta(
         &mut self,
-        _item_id: &str,
+        item_id: &str,
         delta: &str,
     ) -> Result<SinkVerdict, SinkError> {
         self.push(
             ResponseEventKind::FunctionCallArgumentsDelta,
             EventBody::Delta {
+                item_id: item_id.to_string(),
                 delta: delta.to_string(),
             },
         )

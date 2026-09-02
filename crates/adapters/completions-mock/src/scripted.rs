@@ -21,8 +21,8 @@
 
 use async_trait::async_trait;
 use nova_responses_core::{
-    CompletionsOutcome, CompletionsRequest, CompletionsRequestScheduler, CompletionsSink,
-    FinishReason, SchedulerError, ToolCall, Usage,
+    assistant_text_message, CompletionsOutcome, CompletionsRequest, CompletionsRequestScheduler,
+    CompletionsSink, FinishReason, ResponseItem, SchedulerError, ToolCall, Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -169,18 +169,23 @@ impl ScriptedScheduler {
             .or(self.default.as_ref())
     }
 
-    /// Stream text, translating a moved fence into `Superseded`.
+    /// Stream text as `output_item.added` → `output_text.delta`* →
+    /// `output_item.done`, translating a moved fence into `Superseded`.
+    /// Returns the message (with its id) so the outcome carries the same item.
     async fn stream(
         text: &str,
         chunks: usize,
         sink: &mut dyn CompletionsSink,
-    ) -> Result<(), SchedulerError> {
+    ) -> Result<ResponseItem, SchedulerError> {
+        let message = assistant_text_message(text);
+        sink.output_item_added(&message).await?;
         for piece in chunk_text(text, chunks) {
             if sink.text_delta(&piece).await?.should_stop() {
                 return Err(SchedulerError::Superseded);
             }
         }
-        Ok(())
+        sink.output_item_done(&message).await?;
+        Ok(message)
     }
 
     fn usage(request: &CompletionsRequest, output: &str) -> Usage {
@@ -213,14 +218,18 @@ impl CompletionsRequestScheduler for ScriptedScheduler {
 
         match script {
             Script::Text { text, chunks } => {
-                Self::stream(text, *chunks, sink).await?;
-                Ok(CompletionsOutcome::text(text, Self::usage(request, text)))
+                let message = Self::stream(text, *chunks, sink).await?;
+                Ok(CompletionsOutcome {
+                    items: vec![message],
+                    finish: FinishReason::Stop,
+                    usage: Self::usage(request, text),
+                })
             }
 
             Script::Truncated { text, chunks } => {
-                Self::stream(text, *chunks, sink).await?;
+                let message = Self::stream(text, *chunks, sink).await?;
                 Ok(CompletionsOutcome {
-                    items: CompletionsOutcome::text(text, Usage::default()).items,
+                    items: vec![message],
                     usage: Self::usage(request, text),
                     finish: FinishReason::Length,
                 })

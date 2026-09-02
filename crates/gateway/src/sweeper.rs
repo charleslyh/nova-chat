@@ -41,12 +41,19 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
 
     for claim in aborted {
         // Partial usage is booked by the ledger itself during reaping, so a
-        // crash between the two cannot lose it (INV-51).
+        // crash between the two cannot lose it (INV-51). The reap path has no
+        // tenant handle, so the terminal event carries a minimal response object.
+        let response = serde_json::json!({
+            "id": claim.response_id.to_string(),
+            "object": "response",
+            "status": "failed",
+        });
         let _ = state
             .event_log
             .append(ResponseEvent::lifecycle(
                 claim.response_id.clone(),
                 ResponseEventKind::Failed,
+                response,
             ))
             .await;
         let _ = state

@@ -245,7 +245,11 @@ pub async fn create(
     }
 
     // First event, so a subscriber attaching immediately sees a defined start.
-    let created = ResponseEvent::lifecycle(response_id.clone(), ResponseEventKind::Created);
+    let created = ResponseEvent::lifecycle(
+        response_id.clone(),
+        ResponseEventKind::Created,
+        record.to_response_value(),
+    );
     if let Err(e) = state.event_log.append(created).await {
         let (status, code, message) = map_event_log_error(&e);
         return api_error(status, code, message);
@@ -439,12 +443,27 @@ pub async fn cancel(
         return map_ledger_error(&e);
     }
 
+    let record = state.context.get(&tenant, &response_id).await.ok().flatten();
+
     // Terminal event, then close the buffer so its retention window starts.
+    // The cancelled record is read back so the event's `response` object shows
+    // the terminal `cancelled` status.
+    let response = record
+        .as_ref()
+        .map(|r| r.to_response_value())
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "id": response_id.to_string(),
+                "object": "response",
+                "status": "cancelled",
+            })
+        });
     let _ = state
         .event_log
         .append(ResponseEvent::lifecycle(
             response_id.clone(),
             ResponseEventKind::Failed,
+            response,
         ))
         .await;
     let _ = state
@@ -453,9 +472,9 @@ pub async fn cancel(
         .await;
     state.metrics.incr("responses_cancelled", 1).await;
 
-    match state.context.get(&tenant, &response_id).await {
-        Ok(Some(record)) => Json(response_object(&record, &[])).into_response(),
-        Ok(None) => (
+    match record {
+        Some(record) => Json(response_object(&record, &[])).into_response(),
+        None => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "id": response_id.to_string(),
@@ -464,7 +483,6 @@ pub async fn cancel(
             })),
         )
             .into_response(),
-        Err(e) => map_context_error(&e),
     }
 }
 
@@ -515,21 +533,5 @@ pub async fn delete(
 /// `instructions` is echoed here — that is its only role. It is never part of
 /// `input`/`output` items and never enters a chain (INV-49).
 pub fn response_object(record: &StoredResponse, _resolved: &[ResponseItem]) -> Value {
-    serde_json::json!({
-        "id": record.response_id.to_string(),
-        "object": "response",
-        "created_at": record.created_at_ms / 1000,
-        "status": record.status.as_str(),
-        "model": record.model,
-        "previous_response_id": record.previous_response_id.as_ref().map(|v| v.to_string()),
-        "instructions": record.instructions,
-        "store": record.stored,
-        "input": record.input_items,
-        "output": record.output_items,
-        "usage": {
-            "input_tokens": record.usage.input_tokens,
-            "output_tokens": record.usage.output_tokens,
-            "total_tokens": record.usage.total_tokens,
-        },
-    })
+    record.to_response_value()
 }

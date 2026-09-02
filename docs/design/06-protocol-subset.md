@@ -166,15 +166,23 @@
 
 事件名：`response.created` / `response.in_progress` / `response.output_text.delta` / `response.output_item.added` / `response.output_item.done` / `response.function_call_arguments.delta` / `response.function_call_arguments.done` / `response.completed` / `response.failed` / `response.incomplete`。
 
-工具调用的流式序列与上游一致：
+流式序列与上游一致，分文本回答与工具调用两类：
+
+**文本回答**
+
+1. `response.output_item.added`（`message`，`item` 承载条目，含 `id`）
+2. `response.output_text.delta`（`delta` 为增量，`item_id` 为 message 的 `id`，可多次）
+3. `response.output_item.done`（`message`）
+
+**工具调用**
 
 1. `response.output_item.added`（`function_call`，参数为空）
-2. `response.function_call_arguments.delta`（参数增量，可多次）
-3. `response.function_call_arguments.done`（参数完整）
+2. `response.function_call_arguments.delta`（`delta` 为参数增量，`item_id` 为 `call_id`，可多次）
+3. `response.function_call_arguments.done`（`arguments` 为完整参数，`item_id` 为 `call_id`）
 4. `response.output_item.done`（`function_call` 完成）
 5. 工具执行后：`response.output_item.added` / `response.output_item.done`（`function_call_output`）
 
-`output_item.*` 事件的 `payload` 承载对应条目的 JSON；`function_call_arguments.delta` 的 `payload` 为参数增量，`function_call_arguments.done` 的 `payload` 为完整参数。
+事件对象字段：`type`、`sequence_number`，以及按类型分发的 `delta` / `item` / `arguments`；`output_index` 标注条目在 `output` 数组的位置，`item_id` 把增量关联到条目。`response_id` 与 `attempt` 是内部字段，不出现在线上。
 
 游标字段 `sequence_number`，**0 基连续**。SSE `id:` 承载该值，故 `Last-Event-ID` 可直接用于续订。
 

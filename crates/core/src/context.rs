@@ -4,6 +4,7 @@
 //! link. What is *not* stored: the incremental event stream.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::ids::{Attempt, AgentId, IdempotencyKey, NodeTag, ResponseId, TenantId};
 use crate::protocol::ResponseItem;
@@ -166,6 +167,30 @@ impl StoredResponse {
     /// Whether this record may be used as `previous_response_id` by `tenant`.
     pub fn is_referencable_by(&self, tenant: &TenantId) -> bool {
         self.stored && &self.tenant_id == tenant
+    }
+
+    /// The OpenAI-shaped response object, embedded in lifecycle events and
+    /// returned by `GET`. Only protocol fields are exposed — the internal
+    /// bookkeeping (`tenant_id`, `node_tag`, `attempt`, `context`, …) never
+    /// leaves the node.
+    pub fn to_response_value(&self) -> Value {
+        serde_json::json!({
+            "id": self.response_id.to_string(),
+            "object": "response",
+            "created_at": self.created_at_ms / 1000,
+            "status": self.status.as_str(),
+            "model": self.model,
+            "previous_response_id": self.previous_response_id.as_ref().map(|v| v.to_string()),
+            "instructions": self.instructions,
+            "store": self.stored,
+            "input": self.input_items,
+            "output": self.output_items,
+            "usage": {
+                "input_tokens": self.usage.input_tokens,
+                "output_tokens": self.usage.output_tokens,
+                "total_tokens": self.usage.total_tokens,
+            },
+        })
     }
 }
 

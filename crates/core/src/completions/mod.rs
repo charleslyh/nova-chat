@@ -34,7 +34,7 @@ mod outcome;
 mod request;
 mod translate;
 
-pub use outcome::{CompletionsOutcome, FinishReason, ToolCall};
+pub use outcome::{assistant_text_message, CompletionsOutcome, FinishReason, ToolCall};
 pub use request::{
     AssistantToolCall, CompletionsContent, CompletionsMessage, CompletionsRequest,
     RequestProvenance, ToolSpec,

@@ -91,7 +91,7 @@ pub struct ResponseEvent {
 #[serde(untagged)]
 pub enum EventBody {
     /// `response.output_text.delta` / `response.function_call_arguments.delta`.
-    Delta { delta: String },
+    Delta { item_id: String, delta: String },
     /// `response.output_item.added` / `response.output_item.done`.
     Item { output_index: u32, item: Value },
     /// `response.function_call_arguments.done`.
@@ -100,19 +100,22 @@ pub enum EventBody {
         item_id: String,
         arguments: String,
     },
-    /// Lifecycle events carry no extra fields.
+    /// Lifecycle events carry the full response object as `response`.
+    Response { response: Value },
+    /// No kind-specific fields. Kept for tests that construct bare events.
     Empty {},
 }
 
 impl ResponseEvent {
-    /// Lifecycle envelope (created / in_progress / completed / failed / incomplete).
-    pub fn lifecycle(response_id: ResponseId, kind: ResponseEventKind) -> Self {
+    /// Lifecycle envelope (created / in_progress / completed / failed /
+    /// incomplete), carrying the full response object.
+    pub fn lifecycle(response_id: ResponseId, kind: ResponseEventKind, response: Value) -> Self {
         Self {
             response_id,
             sequence_number: 0,
             kind,
             attempt: None,
-            body: EventBody::Empty {},
+            body: EventBody::Response { response },
         }
     }
 
@@ -123,13 +126,14 @@ impl ResponseEvent {
         response_id: ResponseId,
         kind: ResponseEventKind,
         attempt: Attempt,
+        response: Value,
     ) -> Self {
         Self {
             response_id,
             sequence_number: 0,
             kind,
             attempt: Some(attempt),
-            body: EventBody::Empty {},
+            body: EventBody::Response { response },
         }
     }
 
@@ -138,6 +142,7 @@ impl ResponseEvent {
         response_id: ResponseId,
         kind: ResponseEventKind,
         attempt: Attempt,
+        item_id: String,
         delta: impl Into<String>,
     ) -> Self {
         Self {
@@ -145,7 +150,10 @@ impl ResponseEvent {
             sequence_number: 0,
             kind,
             attempt: Some(attempt),
-            body: EventBody::Delta { delta: delta.into() },
+            body: EventBody::Delta {
+                item_id,
+                delta: delta.into(),
+            },
         }
     }
 
@@ -269,6 +277,11 @@ mod tests {
         let event = ResponseEvent::lifecycle(
             ResponseId::new(NodeTag::parse("n1").unwrap()),
             ResponseEventKind::Created,
+            serde_json::json!({
+                "id": "resp_test",
+                "object": "response",
+                "status": "queued",
+            }),
         );
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["sequence_number"], 0);
@@ -286,14 +299,24 @@ mod tests {
             json.get("payload").is_none(),
             "legacy generic `payload` field must be gone: {json}"
         );
+        // Lifecycle events carry the full response object as `response`.
+        assert_eq!(json["response"]["id"], "resp_test");
+        assert_eq!(json["response"]["status"], "queued");
     }
 
     #[test]
     fn delta_events_serialise_with_a_delta_field() {
         let id = ResponseId::new(NodeTag::parse("n1").unwrap());
-        let event = ResponseEvent::delta(id, ResponseEventKind::OutputTextDelta, Attempt(1), "hello");
+        let event = ResponseEvent::delta(
+            id,
+            ResponseEventKind::OutputTextDelta,
+            Attempt(1),
+            "msg_1".into(),
+            "hello",
+        );
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "response.output_text.delta");
+        assert_eq!(json["item_id"], "msg_1");
         assert_eq!(json["delta"], "hello");
         assert!(json.get("payload").is_none());
     }

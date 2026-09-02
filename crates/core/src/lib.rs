@@ -19,8 +19,8 @@ mod reconnect;
 
 pub use canonical::{canonical_items, canonical_json, canonical_output_text, nfc};
 pub use completions::{
-    CompletionsMessage, CompletionsOutcome, CompletionsRequest, FinishReason, RequestProvenance,
-    ToolCall, ToolSpec,
+    assistant_text_message, CompletionsMessage, CompletionsOutcome, CompletionsRequest,
+    FinishReason, RequestProvenance, ToolCall, ToolSpec,
 };
 pub use context::{
     ChainLimits, ResolvedContext, ResponseStatus, StoredResponse, Usage,

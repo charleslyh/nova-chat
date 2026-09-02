@@ -425,6 +425,11 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                     .append(ResponseEvent::lifecycle(
                         resulting_id.clone(),
                         ResponseEventKind::Created,
+                        serde_json::json!({
+                            "id": resulting_id.to_string(),
+                            "object": "response",
+                            "status": "queued",
+                        }),
                     ))
                     .await?;
                 trace.push(TraceEvent::EventAppended {
@@ -468,6 +473,11 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                             c.record.response_id.clone(),
                             ResponseEventKind::InProgress,
                             c.attempt,
+                            serde_json::json!({
+                                "id": c.record.response_id.to_string(),
+                                "object": "response",
+                                "status": "in_progress",
+                            }),
                         ))
                         .await?;
                     trace.push(TraceEvent::EventAppended {
@@ -501,6 +511,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                     id.clone(),
                     ResponseEventKind::OutputTextDelta,
                     attempt,
+                    String::new(),
                     payload.unwrap_or_else(|| "delta".into()),
                 ))
                 .await;
@@ -579,6 +590,11 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                     } else {
                         ResponseEventKind::Failed
                     },
+                    serde_json::json!({
+                        "id": id.to_string(),
+                        "object": "response",
+                        "status": status.as_str(),
+                    }),
                 ))
                 .await?;
             trace.push(TraceEvent::EventAppended {

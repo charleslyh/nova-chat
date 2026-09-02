@@ -3,8 +3,8 @@
 
 use async_trait::async_trait;
 use nova_responses_core::{
-    CompletionsOutcome, CompletionsRequest, CompletionsRequestScheduler, CompletionsSink,
-    SchedulerError, Usage,
+    assistant_text_message, CompletionsOutcome, CompletionsRequest, CompletionsRequestScheduler,
+    CompletionsSink, FinishReason, SchedulerError, Usage,
 };
 
 use crate::chunk_text;
@@ -47,6 +47,9 @@ impl CompletionsRequestScheduler for EchoScheduler {
             format!("echo: {last}")
         };
 
+        let message = assistant_text_message(answer.clone());
+
+        sink.output_item_added(&message).await?;
         for piece in chunk_text(&answer, self.chunks) {
             if sink.text_delta(&piece).await?.should_stop() {
                 // Stopping here rather than finishing the stream: the remaining
@@ -55,19 +58,26 @@ impl CompletionsRequestScheduler for EchoScheduler {
                 return Err(SchedulerError::Superseded);
             }
         }
+        sink.output_item_done(&message).await?;
 
         let usage = Usage::new(
             request.approx_input_chars() as u64 / 4,
             answer.len() as u64 / 4,
         );
-        Ok(CompletionsOutcome::text(answer, usage))
+        Ok(CompletionsOutcome {
+            items: vec![message],
+            finish: FinishReason::Stop,
+            usage,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nova_responses_core::{CollectingSink, CompletionsMessage, RequestProvenance};
+    use nova_responses_core::{
+        CollectingSink, CompletionsMessage, RequestProvenance, ResponseItem,
+    };
 
     fn request(messages: Vec<CompletionsMessage>) -> CompletionsRequest {
         CompletionsRequest {
@@ -93,6 +103,15 @@ mod tests {
             .expect("execute");
 
         assert_eq!(sink.streamed(), "echo: hi there");
+        // The message is announced as output_item.added/done, with a stable id
+        // that the text deltas carry as item_id.
+        assert_eq!(sink.added.len(), 1);
+        assert_eq!(sink.done.len(), 1);
+        assert_eq!(sink.added[0], sink.done[0]);
+        assert!(matches!(
+            &sink.added[0],
+            ResponseItem::Message { id: Some(id), .. } if id.starts_with("msg_")
+        ));
         // Streamed text and the submitted answer agree because this executor
         // chooses to make them agree — not because one is derived from the other.
         assert_eq!(

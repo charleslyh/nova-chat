@@ -52,16 +52,37 @@ pub struct CompletionsOutcome {
     pub finish: FinishReason,
 }
 
+/// An assistant text message with a freshly generated item id.
+///
+/// The id is generated here — not in the sink — so the streamed
+/// `output_item.added` / `output_text.delta` and the submitted outcome carry the
+/// *same* id (one id per produced message, matching the provider).
+pub fn assistant_text_message(text: impl Into<String>) -> ResponseItem {
+    let text = text.into();
+    ResponseItem::Message {
+        role: Role::Assistant,
+        content: vec![ContentPart::OutputText { text: text.clone() }],
+        id: Some(format!("msg_{:x}", stable_id(&text))),
+        status: None,
+    }
+}
+
+/// A content-derived id, stable across runs, so a deterministic scheduler stays
+/// deterministic (the CI-oracle property) without reaching for a random source.
+fn stable_id(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
 impl CompletionsOutcome {
     /// A plain text answer.
     pub fn text(text: impl Into<String>, usage: Usage) -> Self {
         Self {
-            items: vec![ResponseItem::Message {
-                role: Role::Assistant,
-                content: vec![ContentPart::OutputText { text: text.into() }],
-                id: None,
-                status: None,
-            }],
+            items: vec![assistant_text_message(text)],
             usage,
             finish: FinishReason::Stop,
         }
@@ -73,13 +94,14 @@ impl CompletionsOutcome {
     /// an error, and must be storable as such — treating it as a failure would
     /// leave the response non-terminal and the caller waiting.
     pub fn refusal(reason: impl Into<String>, usage: Usage) -> Self {
+        let reason = reason.into();
         Self {
             items: vec![ResponseItem::Message {
                 role: Role::Assistant,
                 content: vec![ContentPart::Refusal {
-                    refusal: reason.into(),
+                    refusal: reason.clone(),
                 }],
-                id: None,
+                id: Some(format!("msg_{:x}", stable_id(&reason))),
                 status: None,
             }],
             usage,

@@ -83,6 +83,7 @@ fn event(id: &ResponseId, kind: ResponseEventKind, payload: &str) -> ResponseEve
         EventBody::Empty {}
     } else {
         EventBody::Delta {
+            item_id: String::new(),
             delta: payload.to_string(),
         }
     };

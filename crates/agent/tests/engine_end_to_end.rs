@@ -741,7 +741,7 @@ async fn tool_calls_stream_incrementally_to_the_subscriber() {
         .iter()
         .filter(|ev| ev.kind == ResponseEventKind::FunctionCallArgumentsDelta)
         .map(|ev| match &ev.body {
-            EventBody::Delta { delta } => delta.clone(),
+            EventBody::Delta { delta, .. } => delta.clone(),
             _ => String::new(),
         })
         .collect();

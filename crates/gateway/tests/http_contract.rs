@@ -343,6 +343,8 @@ async fn background_create_returns_immediately_then_streams() {
     let text = h.sse_text(&format!("/v1/responses/{id}?stream=true")).await;
     assert!(text.contains("event: response.created"), "got: {text}");
     assert!(text.contains("\"sequence_number\":0"), "got: {text}");
+    // `response.created` embeds the response object with the queued status.
+    assert!(text.contains("\"status\":\"queued\""), "got: {text}");
 }
 
 #[tokio::test]
@@ -650,6 +652,9 @@ async fn terminal_event_uses_the_protocol_name() {
     let text = h.sse_text(&format!("/v1/responses/{id}?stream=true")).await;
     assert!(text.contains("event: response.output_text.delta"), "got: {text}");
     assert!(text.contains("event: response.completed"), "got: {text}");
+    // `response.completed` embeds the finished response object (status + output).
+    assert!(text.contains("\"status\":\"completed\""), "got: {text}");
+    assert!(text.contains("\"output\""), "got: {text}");
 }
 
 #[tokio::test]
