@@ -29,6 +29,13 @@ CREATE TABLE IF NOT EXISTS responses (
 
     input_items           JSONB       NOT NULL DEFAULT '[]'::jsonb,
     output_items          JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    -- Materialised history (D24): a flat copy of every ancestor's items. No
+    -- source tag — deletion is record-level, not content-level, so nothing ever
+    -- needs to strip a single ancestor out again.
+    context               JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    -- How many ancestors contributed to `context`. Kept separate because a flat
+    -- item list cannot recover the turn count (one turn may hold several items).
+    context_depth         BIGINT      NOT NULL DEFAULT 0,
     usage                 JSONB       NOT NULL DEFAULT '{}'::jsonb,
     -- Usage booked against abandoned attempts, keyed by attempt (INV-51).
     partial_usage         JSONB       NOT NULL DEFAULT '{}'::jsonb,

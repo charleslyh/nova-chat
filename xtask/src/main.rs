@@ -109,11 +109,7 @@ async fn procs(action: &str) -> Result<()> {
                 )?;
                 let _ = port;
             }
-            start_bin(
-                "mock-agent",
-                &["--gateway", "127.0.0.1:18080"],
-                run_dir.join("agent.pid"),
-            )?;
+            // No execution process to start: each node runs its own engine (D23).
             wait_port("127.0.0.1:18080", Duration::from_secs(20)).await?;
             wait_port("127.0.0.1:18081", Duration::from_secs(20)).await?;
             wait_port("127.0.0.1:18082", Duration::from_secs(20)).await?;
@@ -650,6 +646,32 @@ fn yaml_seq(text: &str, key: &str) -> Vec<String> {
 /// Matching raw file text would flag a crate for merely *explaining* in a
 /// comment why it does not depend on something — which is exactly what happened
 /// the first time this gate was tightened.
+/// Dependencies declared in one specific section.
+///
+/// [`declared_dependencies`] deliberately matches every `*dependencies*` table,
+/// which is right for "must never appear anywhere" rules. It is wrong for rules
+/// about production dependencies only — a test-only `tokio` would trip them.
+fn declared_dependencies_in_section(text: &str, section: &str) -> Vec<String> {
+    let mut deps = Vec::new();
+    let mut in_section = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            in_section = trimmed == section;
+            continue;
+        }
+        if in_section {
+            if let Some((name, _)) = trimmed.split_once('=') {
+                deps.push(name.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    deps
+}
+
 fn declared_dependencies(text: &str) -> Vec<String> {
     let mut deps = Vec::new();
     let mut in_deps = false;
@@ -722,6 +744,36 @@ fn check_deps() -> Result<()> {
     let conformance_deps = declared_dependencies(&std::fs::read_to_string(
         "testing/conformance/Cargo.toml",
     )?);
+    // The mock scheduler adapter must stay model-free and IO-free: its whole
+    // purpose is to let integration tests run with no provider. An HTTP client
+    // here would mean a test could silently start making real calls.
+    let mock_sched = std::fs::read_to_string("crates/adapters/completions-mock/Cargo.toml")?;
+    let mock_sched_deps = declared_dependencies(&mock_sched);
+    for forbidden in ["reqwest", "hyper", "adapters-sql", "sqlx", "nova-agent"] {
+        if mock_sched_deps.iter().any(|d| d == forbidden) {
+            bail!(
+                "adapters-completions-mock must not depend on `{forbidden}`: it exists so \
+                 tests need neither a provider nor a database"
+            );
+        }
+    }
+
+    // The execution-side worker faces our gateway, not a provider. A dependency on
+    // a concrete scheduler adapter would invert that: the loop would then know
+    // which provider it serves, and swapping one would mean changing the loop.
+    let agent = std::fs::read_to_string("crates/agent/Cargo.toml")?;
+    for forbidden in ["reqwest", "hyper", "axum", "sqlx"] {
+        if declared_dependencies_in_section(&agent, "[dependencies]")
+            .iter()
+            .any(|d| d == forbidden)
+        {
+            bail!(
+                "nova-agent must not depend on `{forbidden}`: the work loop is kept IO-free so \
+                 the whole claim/stream/submit path can be tested without a socket"
+            );
+        }
+    }
+
     for forbidden in ["adapters-sql", "sqlx"] {
         if conformance_deps.iter().any(|d| d == forbidden) {
             bail!(
@@ -732,9 +784,61 @@ fn check_deps() -> Result<()> {
         }
     }
 
+    check_execution_is_internal()?;
     let spec_covers = check_protocol_spec_is_publishable()?;
 
     println!("check-deps OK ({} gated requirement(s))", spec_covers.len());
+    Ok(())
+}
+
+/// D23: execution is in-process, never a protocol.
+///
+/// Guards against the pull endpoints returning. They were not merely redundant —
+/// they allowed a worker attached to one node to claim another node's generation,
+/// whose increments then landed in the wrong process heap while subscribers were
+/// routed to the owning node and saw silence. Reintroducing them would reopen a
+/// defect that produced no error on any path.
+fn check_execution_is_internal() -> Result<()> {
+    let routes = std::fs::read_to_string("crates/gateway/src/routes/mod.rs")?;
+    if routes.contains("/v1/agent/") && routes.contains(".route(\"/v1/agent/") {
+        bail!(
+            "an /v1/agent/* route is registered again. Execution is in-process (D23): a \
+             generation is run by the node that created it, because that node holds its \
+             in-flight event buffer. A pull endpoint lets another node claim it, and the \
+             resulting silence on the subscriber's stream raises no error anywhere."
+        );
+    }
+
+    // The ledger's claim must stay node-scoped. Without the parameter the constraint
+    // has nowhere to live, and a shared ledger hands work across nodes again.
+    let ledger_port = std::fs::read_to_string("crates/core/src/ports/ledger.rs")?;
+    if !ledger_port.contains("node: &NodeTag") {
+        bail!(
+            "ResponseLedger::claim no longer takes a NodeTag. Claiming must be scoped to \
+             the owning node (FR-4 / D23); the in-memory backend used to make this hold \
+             by accident, which is exactly why it needs to be explicit."
+        );
+    }
+
+    // And the sql implementation must actually filter on it.
+    //
+    // Scoped to the claim statement, not the whole file: the first version of this
+    // check searched the file and was satisfied by the explanatory comment that
+    // mentions the predicate — so removing the predicate itself passed the gate. A
+    // gate that its own documentation can satisfy checks nothing.
+    let sql_ledger = std::fs::read_to_string("crates/adapters/sql/src/ledger.rs")?;
+    // Two facts that cannot be satisfied by prose: the predicate as it appears in the
+    // WHERE clause, and the bind that supplies it.
+    let has_predicate = sql_ledger.contains("WHERE status = 'queued' AND node_tag = $3");
+    let has_bind = sql_ledger.contains(".bind(node.as_str())");
+    if !(has_predicate && has_bind) {
+        bail!(
+            "the sql claim statement no longer filters by node_tag. With a shared ledger \
+             this hands node-b's generation to node-a, whose increments land in the wrong \
+             process — subscribers see the created event and then nothing, with no error."
+        );
+    }
+
     Ok(())
 }
 

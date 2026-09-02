@@ -1,0 +1,19 @@
+# Model behaviour that keeps generations in flight indefinitely.
+#
+# node-c is the fixture's failure node. Under the pull protocol it produced
+# permanently in-flight work by simply having no agent attached — an absence, which
+# is a fragile thing to build tests on, and which also meant node-c exercised no
+# execution code whatsoever.
+#
+# The same condition is now stated positively: node-c executes, and its scheduler
+# hangs. Closer to the real failure it stands in for — a provider that accepts the
+# request and then never answers — and it keeps the admission slot occupied, which is
+# what `pending-limit-http` and `node-down-abrupt` both depend on.
+#
+# Note `hang`, not `stall`: `stall` reports the deadline exceeded and therefore
+# reaches a terminal state promptly, freeing the slot. An overload condition could
+# never be observed with it.
+
+rules:
+  - when: !any
+    then: !hang

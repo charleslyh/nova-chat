@@ -123,7 +123,12 @@ pub async fn create(
 
     // Resolve history *before* creating anything: a broken chain must not leave
     // a half-created response behind.
-    let mut resolved_items: Vec<ResponseItem> = Vec::new();
+    //
+    // The resolved history is snapshotted onto the new record (D24): from here on
+    // this response carries its full context, so a later deletion of one of its
+    // ancestors cannot strand it.
+    let mut snapshot: Vec<ResponseItem> = Vec::new();
+    let mut snapshot_depth: usize = 0;
     if let Some(previous_raw) = &request.previous_response_id {
         let previous = match parse_id(previous_raw) {
             Ok(id) => id,
@@ -144,7 +149,10 @@ pub async fn create(
                     .metrics
                     .incr("chain_resolved_depth", resolved.depth as u64)
                     .await;
-                resolved_items = resolved.items;
+                // Materialise the whole history as a flat copy, plus how many
+                // turns it spans (D24).
+                snapshot = resolved.items;
+                snapshot_depth = resolved.depth;
             }
             Err(e) => return map_context_error(&e),
         }
@@ -195,6 +203,8 @@ pub async fn create(
         idempotency_key: Some(idempotency_key.clone()),
         owner: None,
         attempt: Attempt::default(),
+        context: snapshot,
+        context_depth: snapshot_depth,
     };
 
     match state
@@ -249,6 +259,11 @@ pub async fn create(
 
     state.metrics.incr("responses_created", 1).await;
 
+    // Hand it to this node's execution engine. In process, and on this node
+    // specifically: this is the node holding the in-flight event buffer, so it is
+    // the only one whose increments subscribers will be routed to (FR-4 / D23).
+    state.notify_work();
+
     // Three delivery modes over one internal event stream.
     if request.stream {
         return open_stream(state.event_log.clone(), response_id, None).await;
@@ -256,7 +271,7 @@ pub async fn create(
     if request.background {
         return (
             StatusCode::ACCEPTED,
-            Json(response_object(&record, &resolved_items)),
+            Json(response_object(&record, &[])),
         )
             .into_response();
     }

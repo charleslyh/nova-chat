@@ -133,20 +133,27 @@ impl ResponseLedger for SqlResponseLedger {
 
     async fn claim(
         &self,
+        node: &NodeTag,
         agent_id: AgentId,
         now_ms: u64,
         exec_ttl_ms: u64,
     ) -> Result<Option<ClaimedResponse>, LedgerError> {
         self.guard_writable()?;
         // `FOR UPDATE SKIP LOCKED` inside the sub-select makes selection and
-        // transition a single atomic step, so two agents can never both win
+        // transition a single atomic step, so two callers can never both win
         // (INV-1). Attempt is incremented in the same statement (INV-5).
+        //
+        // `node_tag = $3` is load-bearing, not an optimisation: a response is
+        // executed by the node holding its in-flight buffer (FR-4 / D23). Without
+        // this predicate a shared ledger hands node-b's work to node-a, whose
+        // increments then land in the wrong process heap — the subscriber routes to
+        // node-b and sees `Created` and nothing else, with no error anywhere.
         let sql = format!(
             "UPDATE responses SET status = 'in_progress', attempt = attempt + 1, \
                     owner = $1, exec_deadline_ms = $2 \
               WHERE response_id = ( \
                     SELECT response_id FROM responses \
-                     WHERE status = 'queued' \
+                     WHERE status = 'queued' AND node_tag = $3 \
                      ORDER BY created_at_ms \
                      LIMIT 1 \
                      FOR UPDATE SKIP LOCKED ) \
@@ -156,6 +163,7 @@ impl ResponseLedger for SqlResponseLedger {
         let row = sqlx::query(&sql)
             .bind(agent_id.to_string())
             .bind(deadline as i64)
+            .bind(node.as_str())
             .fetch_optional(&self.pool)
             .await
             .map_err(to_ledger_error)?;

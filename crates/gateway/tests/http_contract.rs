@@ -33,6 +33,109 @@ use crate::state::AppState;
 struct Harness {
     base: String,
     client: reqwest::Client,
+    /// Kept so a test can run execution in process.
+    ///
+    /// Execution is no longer an HTTP protocol (D23): a generation is run by the
+    /// node that created it. These tests therefore drive the engine directly
+    /// instead of impersonating an external worker over `/v1/agent/*`.
+    world: adapters_mem::MemWorld,
+    node_tag: nova_responses_core::NodeTag,
+}
+
+/// Records the request it was handed, so a test can assert on the context the
+/// server assembled.
+///
+/// Replaces what `/v1/agent/claim` used to reveal. The property is unchanged —
+/// history is assembled server-side and handed to the execution side complete — but
+/// the boundary moved in process (D23), so the assertion moves with it.
+struct CapturingScheduler {
+    seen: std::sync::Arc<std::sync::Mutex<Option<nova_responses_core::CompletionsRequest>>>,
+}
+
+#[async_trait::async_trait]
+impl nova_responses_core::CompletionsRequestScheduler for CapturingScheduler {
+    fn name(&self) -> &str {
+        "capturing-test"
+    }
+
+    async fn schedule(
+        &self,
+        request: &nova_responses_core::CompletionsRequest,
+        _sink: &mut dyn nova_responses_core::CompletionsSink,
+    ) -> Result<nova_responses_core::CompletionsOutcome, nova_responses_core::SchedulerError> {
+        *self.seen.lock().expect("lock") = Some(request.clone());
+        Ok(nova_responses_core::CompletionsOutcome::text(
+            "ok",
+            nova_responses_core::Usage::new(1, 1),
+        ))
+    }
+}
+
+/// Produces an item that cannot be stored.
+struct InvalidOutcomeScheduler;
+
+#[async_trait::async_trait]
+impl nova_responses_core::CompletionsRequestScheduler for InvalidOutcomeScheduler {
+    fn name(&self) -> &str {
+        "invalid-test"
+    }
+
+    async fn schedule(
+        &self,
+        _request: &nova_responses_core::CompletionsRequest,
+        _sink: &mut dyn nova_responses_core::CompletionsSink,
+    ) -> Result<nova_responses_core::CompletionsOutcome, nova_responses_core::SchedulerError> {
+        // A message with no content. Note what is no longer expressible: the previous
+        // version of this test posted a `reasoning` item as raw JSON, but the item
+        // enum is closed, so an out-of-subset type cannot be constructed at all. That
+        // half of INV-47 is now enforced by the type system and asserted by the L0
+        // `chain-closure` case.
+        Ok(nova_responses_core::CompletionsOutcome {
+            items: vec![nova_responses_core::ResponseItem::Message {
+                role: nova_responses_core::Role::Assistant,
+                content: vec![],
+                id: None,
+                status: None,
+            }],
+            usage: nova_responses_core::Usage::new(1, 1),
+            finish: nova_responses_core::FinishReason::Stop,
+        })
+    }
+}
+
+/// Streams one thing and submits another.
+///
+/// Deliberately asymmetric: the whole point of INV-48 is that stored output is
+/// **submitted**, never reassembled from the delta stream. A scheduler whose
+/// streamed text always equalled its final answer could not tell the two apart, so
+/// the assertion would hold even for an implementation that derived one from the
+/// other.
+struct DivergentScheduler {
+    deltas: Vec<String>,
+    output_text: String,
+}
+
+#[async_trait::async_trait]
+impl nova_responses_core::CompletionsRequestScheduler for DivergentScheduler {
+    fn name(&self) -> &str {
+        "divergent-test"
+    }
+
+    async fn schedule(
+        &self,
+        _request: &nova_responses_core::CompletionsRequest,
+        sink: &mut dyn nova_responses_core::CompletionsSink,
+    ) -> Result<nova_responses_core::CompletionsOutcome, nova_responses_core::SchedulerError> {
+        for d in &self.deltas {
+            if sink.text_delta(d).await?.should_stop() {
+                return Err(nova_responses_core::SchedulerError::Superseded);
+            }
+        }
+        Ok(nova_responses_core::CompletionsOutcome::text(
+            self.output_text.clone(),
+            nova_responses_core::Usage::new(5, 7),
+        ))
+    }
 }
 
 async fn start() -> Harness {
@@ -50,6 +153,7 @@ async fn start() -> Harness {
     let cfg = Arc::new(Config::from_raw(raw).expect("validate"));
 
     let world = adapters_mem::MemWorld::new();
+    let world_handle = world.clone();
     let keys = Arc::new(auth::KeyTable::parse("").expect("keys"));
     let app_state = AppState {
         cfg,
@@ -61,6 +165,7 @@ async fn start() -> Harness {
         keys,
         http: reqwest::Client::new(),
         accepting: Arc::new(AtomicBool::new(true)),
+        work_ready: Arc::new(tokio::sync::Notify::new()),
     };
 
     let app = routes::router(app_state);
@@ -77,6 +182,8 @@ async fn start() -> Harness {
     Harness {
         base: format!("http://{addr}"),
         client: reqwest::Client::new(),
+        world: world_handle,
+        node_tag: nova_responses_core::NodeTag::parse("node-a").expect("static tag"),
     }
 }
 
@@ -161,58 +268,49 @@ impl Harness {
         out
     }
 
-    /// Drive one response to completion the way a real execution side would.
-    async fn run_agent_turn(&self, deltas: &[&str], output_text: &str) -> String {
-        let agent = uuid::Uuid::new_v4().to_string();
-        let resp = self
-            .client
-            .post(format!("{}/v1/agent/claim", self.base))
-            .json(&json!({ "agent_id": agent }))
-            .send()
-            .await
-            .expect("claim");
-        assert_eq!(resp.status(), reqwest::StatusCode::OK, "expected a claimable response");
-        let claimed: Value = resp.json().await.expect("claim body");
-        let response_id = claimed["response_id"].as_str().expect("response_id").to_string();
-        let attempt = claimed["attempt"].as_u64().expect("attempt");
+    /// Build an engine over this harness's ports with a caller-supplied scheduler.
+    fn engine_with(
+        &self,
+        scheduler: Arc<dyn nova_responses_core::CompletionsRequestScheduler>,
+    ) -> nova_agent::Agent {
+        nova_agent::Agent::new(
+            nova_agent::AgentDeps {
+                ledger: self.world.ledger.clone(),
+                event_log: self.world.event_log.clone(),
+                context: self.world.context.clone(),
+                scheduler,
+                tools: Arc::new(nova_responses_core::NoopToolExecutor),
+                node_tag: self.node_tag.clone(),
+            },
+            nova_agent::AgentConfig::default(),
+        )
+    }
 
-        for delta in deltas {
-            let (status, _) = self
-                .post(
-                    "/v1/agent/append",
-                    json!({
-                        "response_id": response_id,
-                        "attempt": attempt,
-                        "kind": "response.output_text.delta",
-                        "payload": delta,
-                    }),
-                )
-                .await;
-            assert_eq!(status, reqwest::StatusCode::OK, "append should succeed");
-        }
+    /// Drive the oldest queued response to completion, in process.
+    ///
+    /// `deltas` are streamed; `output_text` is what gets submitted. They differ on
+    /// purpose — see [`DivergentScheduler`].
+    async fn run_agent_turn(&self, deltas: &[&str], output_text: &str) {
+        let engine = nova_agent::Agent::new(
+            nova_agent::AgentDeps {
+                ledger: self.world.ledger.clone(),
+                event_log: self.world.event_log.clone(),
+                context: self.world.context.clone(),
+                scheduler: Arc::new(DivergentScheduler {
+                    deltas: deltas.iter().map(|d| d.to_string()).collect(),
+                    output_text: output_text.to_string(),
+                }),
+                tools: Arc::new(nova_responses_core::NoopToolExecutor),
+                node_tag: self.node_tag.clone(),
+            },
+            nova_agent::AgentConfig::default(),
+        );
 
-        let resp = self
-            .client
-            .post(format!("{}/v1/agent/complete", self.base))
-            .json(&json!({
-                "response_id": response_id,
-                "attempt": attempt,
-                "ok": true,
-                // Output is submitted explicitly, never derived from the deltas
-                // above (INV-48).
-                "output": [{
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{ "type": "output_text", "text": output_text }],
-                }],
-                "input_tokens": 5,
-                "output_tokens": 7,
-            }))
-            .send()
-            .await
-            .expect("complete");
-        assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
-        response_id
+        assert_eq!(
+            engine.run_once(2_000).await,
+            nova_agent::Executed::Completed,
+            "the turn must complete; every caller of this helper depends on it"
+        );
     }
 }
 
@@ -301,19 +399,24 @@ async fn multi_turn_chain_assembles_history_server_side() {
     assert_eq!(status, reqwest::StatusCode::ACCEPTED);
     assert_eq!(second["previous_response_id"], first_id);
 
-    // The execution side receives the full history, assembled by the server.
-    let agent = uuid::Uuid::new_v4().to_string();
-    let (_, claimed) = h.post("/v1/agent/claim", json!({ "agent_id": agent })).await;
-    let input = claimed["input"].as_array().expect("input array");
+    // The execution side receives the full history, assembled by the server. The
+    // caller sent only the new input plus a pointer — that is the whole point of
+    // `previous_response_id`.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let engine = h.engine_with(Arc::new(CapturingScheduler { seen: seen.clone() }));
+    assert_eq!(engine.run_once(3_000).await, nova_agent::Executed::Completed);
+
+    let request = seen.lock().expect("lock").clone().expect("a request was built");
     assert_eq!(
-        input.len(),
+        request.messages.len(),
         3,
-        "expected first input + first output + second input, got {input:#?}"
+        "expected first input + first output + second input, got {:#?}",
+        request.messages
     );
-    let rendered = serde_json::to_string(input).unwrap();
-    assert!(rendered.contains("first question"));
-    assert!(rendered.contains("first answer"));
-    assert!(rendered.contains("second question"));
+    let rendered = serde_json::to_string(&request.messages).expect("render");
+    assert!(rendered.contains("first question"), "got: {rendered}");
+    assert!(rendered.contains("first answer"), "got: {rendered}");
+    assert!(rendered.contains("second question"), "got: {rendered}");
 }
 
 #[tokio::test]
@@ -347,17 +450,23 @@ async fn instructions_are_echoed_but_never_inherited() {
         )
         .await;
 
-    let agent = uuid::Uuid::new_v4().to_string();
-    let (_, claimed) = h.post("/v1/agent/claim", json!({ "agent_id": agent })).await;
-    // Not carried over: neither as an item nor as the instructions field.
-    let rendered = serde_json::to_string(&claimed["input"]).unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let engine = h.engine_with(Arc::new(CapturingScheduler { seen: seen.clone() }));
+    assert_eq!(engine.run_once(3_000).await, nova_agent::Executed::Completed);
+    let request = seen.lock().expect("lock").clone().expect("a request was built");
+
+    // Not carried over: neither inside a message nor as a leading system message.
+    let rendered = serde_json::to_string(&request.messages).expect("render");
     assert!(
         !rendered.contains("SPEAK-LIKE-A-PIRATE"),
-        "previous instructions leaked into chain input: {rendered}"
+        "previous instructions leaked into this turn's context: {rendered}"
     );
     assert!(
-        claimed["instructions"].is_null(),
-        "this turn set no instructions, so none should be delivered"
+        !request
+            .messages
+            .iter()
+            .any(|m| m.role_name() == "system"),
+        "this turn set no instructions, so no system message may be sent: {rendered}"
     );
 }
 
@@ -598,29 +707,43 @@ async fn cancel_moves_to_terminal_and_emits_a_failure_event() {
 }
 
 #[tokio::test]
-async fn chain_closure_violation_is_refused_at_complete() {
+async fn an_unusable_outcome_fails_the_response_instead_of_storing_it() {
+    // Was `chain_closure_violation_is_refused_at_complete`, which posted a
+    // `reasoning` item as raw JSON to `/v1/agent/complete`. Two things changed:
+    // execution is no longer an HTTP protocol (D23), and the item enum is closed, so
+    // an out-of-subset type can no longer be constructed at all — that half of
+    // INV-47 is now enforced by the type system and asserted by the L0
+    // `chain-closure` case.
+    //
+    // What remains reachable, and therefore worth asserting here, is the outcome
+    // that *looks* storable and is not. It must fail the response rather than be
+    // recorded as a successful empty answer.
     let h = start().await;
-    h.post(
-        "/v1/responses",
-        json!({ "model": "m", "input": "hi", "background": true }),
-    )
-    .await;
-    let agent = uuid::Uuid::new_v4().to_string();
-    let (_, claimed) = h.post("/v1/agent/claim", json!({ "agent_id": agent })).await;
-    let response_id = claimed["response_id"].as_str().unwrap();
-    let attempt = claimed["attempt"].as_u64().unwrap();
-
-    // An output item type the input validator would refuse: accepting it would
-    // silently break our own chain on the next turn (INV-47).
-    let (status, _) = h
-        .post_raw(
-            "/v1/agent/complete",
-            &format!(
-                r#"{{"response_id":"{response_id}","attempt":{attempt},"ok":true,"output":[{{"type":"reasoning","summary":[]}}]}}"#
-            ),
+    let (_, body) = h
+        .post(
+            "/v1/responses",
+            json!({ "model": "m", "input": "hi", "background": true }),
         )
         .await;
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    let id = body["id"].as_str().expect("id").to_string();
+
+    let engine = h.engine_with(Arc::new(InvalidOutcomeScheduler));
+    assert_eq!(
+        engine.run_once(2_000).await,
+        nova_agent::Executed::Failed,
+        "an unusable outcome must not complete the response"
+    );
+
+    let (status, after) = h.get(&format!("/v1/responses/{id}")).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        after["status"], "failed",
+        "the caller must be told it failed, not handed an empty success"
+    );
+    assert!(
+        after["output"].as_array().map(|a| a.is_empty()).unwrap_or(true),
+        "nothing may be stored from a refused outcome: {after:#?}"
+    );
 }
 
 #[tokio::test]

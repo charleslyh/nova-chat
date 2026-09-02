@@ -112,6 +112,8 @@ pub(crate) fn record_from_row(row: &PgRow) -> Result<StoredResponse, SqlError> {
             )),
         },
         attempt: Attempt(row.try_get::<i64, _>("attempt")? as u64),
+        context: items_from_json(row.try_get("context")?)?,
+        context_depth: row.try_get::<i64, _>("context_depth")? as usize,
     })
 }
 
@@ -120,4 +122,4 @@ pub(crate) fn record_from_row(row: &PgRow) -> Result<StoredResponse, SqlError> {
 pub(crate) const RECORD_COLUMNS: &str = "response_id, previous_response_id, tenant_id, model, \
      status, stored, node_tag, attempt, owner, idempotency_key, instructions, \
      input_items, output_items, usage, integrity, integrity_alg, \
-     created_at_ms, completed_at_ms, expires_at_ms";
+     created_at_ms, completed_at_ms, expires_at_ms, context, context_depth";

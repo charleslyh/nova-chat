@@ -10,8 +10,9 @@ steps:
     url: http://127.0.0.1:18082/v1/responses
     body: '{"model":"m","input":"first","background":true}'
     expect_status: 202
-  # Node-c has no agent attached, so the first response stays in flight and the
-  # second must be refused with a retryable status.
+  # node-c's scheduler hangs, so the first generation stays in flight and keeps its
+  # admission slot. The second must be refused with a retryable status rather than
+  # being queued without bound.
   - action: http_post
     url: http://127.0.0.1:18082/v1/responses
     body: '{"model":"m","input":"second","background":true}'

@@ -1,20 +1,38 @@
-name: chain-broken-explicit
-covers: [FR-18, CR-10, INV-43]
+name: chain-delete-head-is-surgical
+covers: [FR-21, CR-10, INV-43]
 oracles: [NoSilentContentLoss]
 steps:
   - action: create_response
-    input: "first"
+    input: "first question"
     key: cbe-1
     label: first
+  - action: claim
+  - action: complete
+    output_text: "first answer"
+
   - action: create_response
-    input: "second"
+    input: "second question"
     key: cbe-2
     previous: first
     label: second
-  # Deleting a link must surface on the next resolution rather than quietly
-  # shortening the context — the latter looks like the model forgetting.
+  - action: claim
+  - action: complete
+    output_text: "second answer"
+
+  # Deleting the head link is record-level (D24): the deleted response itself
+  # becomes unresolvable, but the descendant's snapshot — a flat copy taken at
+  # create time — keeps the full history, deleted link included. This is "remove
+  # the record", not "erase the inherited copy".
   - action: delete_response
     target: first
+
+  # The deleted link itself can no longer be resolved.
   - action: expect_chain_error
-    from: second
+    from: first
     reason: chain_broken
+
+  # The descendant still resolves with the full two-turn history intact.
+  - action: resolve_chain
+    from: second
+    expect_depth: 2
+    expect_items: 4

@@ -46,6 +46,8 @@ fn record(
         idempotency_key: None,
         owner: None,
         attempt: Attempt::default(),
+        context: Vec::new(),
+        context_depth: 0,
     }
 }
 
@@ -62,13 +64,23 @@ fn event(id: &ResponseId, kind: ResponseEventKind, payload: &str) -> ResponseEve
 async fn seed_chain(world: &MemWorld, depth: usize, tenant_id: &str) -> Vec<ResponseId> {
     let mut ids = Vec::new();
     let mut previous: Option<ResponseId> = None;
+    // Materialised history (D24): each link snapshots everything before it as a
+    // flat copy, so resolution never walks `previous_response_id`. This mirrors
+    // what the gateway does at create time.
+    let mut history: Vec<ResponseItem> = Vec::new();
     for _ in 0..depth {
         let id = ResponseId::new(tag());
-        world
-            .context
-            .put(record(&id, previous.as_ref(), tenant_id, true))
-            .await
-            .unwrap();
+        let mut rec = record(&id, previous.as_ref(), tenant_id, true);
+        rec.context = history.clone();
+        rec.context_depth = ids.len();
+        let own: Vec<ResponseItem> = rec
+            .input_items
+            .iter()
+            .chain(rec.output_items.iter())
+            .cloned()
+            .collect();
+        world.context.put(rec).await.unwrap();
+        history.extend(own);
         previous = Some(id.clone());
         ids.push(id);
     }
@@ -282,15 +294,10 @@ async fn chain_never_includes_instructions() {
 }
 
 #[tokio::test]
-async fn deep_chain_resolves_under_one_lock_acquisition() {
-    // The single-lock property is structural, not observable from outside: the
-    // body of `resolve_chain` contains no `.await`, so the borrow checker keeps
-    // the guard alive across the whole traversal. If someone later introduces an
-    // await point per hop, the guard would have to be dropped and re-taken and
-    // this code would no longer compile as written.
-    //
-    // What this test does add is that a deep chain resolves correctly and in
-    // bounded time — the regression that per-hop locking would cause.
+async fn deep_snapshot_resolves_in_one_read() {
+    // History is materialised (D24): resolving a 50-link chain is a single record
+    // read, not a 50-hop walk. The old per-hop-lock regression this test guarded
+    // against no longer exists, because there is no traversal to lock.
     let world = MemWorld::new();
     let ids = seed_chain(&world, 50, "t1").await;
     let resolved = world
@@ -339,31 +346,11 @@ async fn chain_rejects_depth_and_byte_overruns_instead_of_truncating() {
     );
 }
 
-#[tokio::test]
-async fn chain_stops_at_a_cross_tenant_link() {
-    let world = MemWorld::new();
-    let foreign = ResponseId::new(tag());
-    world
-        .context
-        .put(record(&foreign, None, "other", true))
-        .await
-        .unwrap();
-    let mine = ResponseId::new(tag());
-    world
-        .context
-        .put(record(&mine, Some(&foreign), "t1", true))
-        .await
-        .unwrap();
-
-    // Detected on the second hop, and fatal — not skipped (INV-42).
-    assert_eq!(
-        world
-            .context
-            .resolve_chain(&tenant("t1"), &mine, ChainLimits::default())
-            .await,
-        Err(ContextError::CrossTenant)
-    );
-}
+// Cross-tenant detection moved to create time (D24). A snapshot is built by
+// resolving the `previous` response's own snapshot, and that resolution already
+// checks the tenant — so a foreign link can never be materialised into a
+// snapshot. Resolution therefore no longer walks far enough to observe one, and
+// `CrossTenant` is no longer produced here.
 
 #[tokio::test]
 async fn foreign_anchor_is_indistinguishable_from_a_missing_one() {
@@ -391,7 +378,10 @@ async fn foreign_anchor_is_indistinguishable_from_a_missing_one() {
 }
 
 #[tokio::test]
-async fn unstored_link_cannot_be_referenced() {
+async fn an_unstored_anchor_cannot_be_resolved() {
+    // `NotStored` now means the *anchor itself* was created with `store: false`,
+    // not that some upstream link was. The snapshot contains only stored items by
+    // construction, so there is no upstream unstored link to walk into.
     let world = MemWorld::new();
     let unstored = ResponseId::new(tag());
     world
@@ -399,35 +389,55 @@ async fn unstored_link_cannot_be_referenced() {
         .put(record(&unstored, None, "t1", false))
         .await
         .unwrap();
-    let next = ResponseId::new(tag());
-    world
-        .context
-        .put(record(&next, Some(&unstored), "t1", true))
-        .await
-        .unwrap();
     assert_eq!(
         world
             .context
-            .resolve_chain(&tenant("t1"), &next, ChainLimits::default())
+            .resolve_chain(&tenant("t1"), &unstored, ChainLimits::default())
             .await,
         Err(ContextError::NotStored)
     );
 }
 
 #[tokio::test]
-async fn missing_link_reports_chain_broken() {
+async fn deleting_an_ancestor_does_not_strand_descendants() {
+    // The property the materialised snapshot exists for (D24). Delete the middle
+    // link of a three-link chain; the downstream link must still resolve, with its
+    // own and the oldest link's content intact but the deleted turn stripped.
     let world = MemWorld::new();
-    let ghost = ResponseId::new(tag());
-    let head = ResponseId::new(tag());
+    let ids = seed_chain(&world, 3, "t1").await;
+
     world
         .context
-        .put(record(&head, Some(&ghost), "t1", true))
+        .delete(&tenant("t1"), &ids[1])
         .await
-        .unwrap();
+        .expect("delete middle link");
+
+    let resolved = world
+        .context
+        .resolve_chain(&tenant("t1"), ids.last().unwrap(), ChainLimits::default())
+        .await
+        .expect("downstream must still resolve");
+
+    // The snapshot is a flat copy, so deletion is record-level only (D24): the
+    // downstream link still resolves with the *full* history, including the
+    // deleted turn's content. "Remove from the conversation" removes the record,
+    // not the inherited copy.
+    assert_eq!(resolved.depth, 3, "the snapshot keeps every link it inherited");
+    assert_eq!(resolved.items.len(), 6);
+
+    let encoded = nova_responses_core::canonical_items(&resolved.items);
+    for id in &ids {
+        assert!(
+            encoded.contains(&format!("in-{}", id.uuid())),
+            "every link's content must survive deletion, including the deleted one: {encoded}"
+        );
+    }
+
+    // But the deleted response itself is no longer resolvable as an anchor.
     assert!(matches!(
         world
             .context
-            .resolve_chain(&tenant("t1"), &head, ChainLimits::default())
+            .resolve_chain(&tenant("t1"), &ids[1], ChainLimits::default())
             .await,
         Err(ContextError::ChainBroken(_))
     ));
@@ -533,7 +543,7 @@ async fn partial_usage_survives_cancellation() {
 
     let claimed = world
         .ledger
-        .claim(nova_responses_core::AgentId::new(), 0, 60_000)
+        .claim(&tag(), nova_responses_core::AgentId::new(), 0, 60_000)
         .await
         .unwrap()
         .expect("claimable");
@@ -582,7 +592,7 @@ async fn stale_attempt_cannot_append_after_reaping() {
         .await
         .unwrap();
     let agent = nova_responses_core::AgentId::new();
-    let claimed = world.ledger.claim(agent, 0, 60_000).await.unwrap().unwrap();
+    let claimed = world.ledger.claim(&tag(), agent, 0, 60_000).await.unwrap().unwrap();
 
     let mut ev = event(&id, ResponseEventKind::OutputTextDelta, "a");
     ev.attempt = Some(claimed.attempt);

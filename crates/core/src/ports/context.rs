@@ -13,7 +13,11 @@ pub enum ContextError {
     /// no items and cannot be chained (FR-18).
     #[error("referenced response was not stored")]
     NotStored,
-    /// A link in the chain is missing or has expired.
+    /// The addressed anchor does not exist or belongs to another tenant.
+    ///
+    /// With materialised history (D24) there is no walk, so a *missing link* can
+    /// never be encountered — only a missing *anchor*. Reported identically for
+    /// "absent" and "foreign" so ids cannot be probed (SEC-2).
     #[error("chain broken at {0}")]
     ChainBroken(String),
     #[error("chain exceeds depth limit {limit}")]
@@ -76,12 +80,18 @@ pub trait ContextStore: Send + Sync {
         response_id: &ResponseId,
     ) -> Result<Option<StoredResponse>, ContextError>;
 
-    /// Walk backwards from `from` and return history in chronological order.
+    /// Return the context visible to `from`, in chronological order.
+    ///
+    /// History is **materialised** (D24): `from` carries a flat copy of every
+    /// ancestor's items, so this reads `from.context` plus `from`'s own items
+    /// instead of walking `previous_response_id`. A downstream response therefore
+    /// never depends on its ancestors still existing.
     ///
     /// Contract:
-    /// - tenant is verified on **every** hop (INV-42)
-    /// - links with `stored == false` are rejected, not skipped
-    /// - exceeding depth or bytes is an error, never a truncation (INV-41)
+    /// - tenant is verified (INV-42)
+    /// - `store == false` is rejected, not skipped
+    /// - exceeding depth, item count or bytes is an error, never a truncation
+    ///   (INV-41)
     /// - the result contains **only items**; no link's `instructions` are ever
     ///   included (INV-49)
     async fn resolve_chain(
@@ -91,7 +101,15 @@ pub trait ContextStore: Send + Sync {
         limits: ChainLimits,
     ) -> Result<ResolvedContext, ContextError>;
 
+    /// Delete one response's record.
+    ///
     /// Returns whether a record was removed.
+    ///
+    /// Deletion is **record-level** (D24): the response's own record is removed,
+    /// and nothing else changes. Downstream responses survive and keep resolving,
+    /// with the full history they inherited — including this response's content —
+    /// because that history was copied into their snapshot at create time.
+    /// "Remove from the conversation" removes the record, not the inherited copy.
     async fn delete(
         &self,
         tenant: &TenantId,

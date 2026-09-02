@@ -28,6 +28,12 @@ pub struct AppState {
     /// Cleared on SIGTERM so creation is refused while in-flight work drains
     /// (FR-34). Reads and subscriptions keep serving.
     pub accepting: Arc<AtomicBool>,
+    /// Wakes the execution engine after a generation is accepted.
+    ///
+    /// A notification rather than a poll interval: sync mode waits for a terminal
+    /// state, so polling latency would be added directly to every caller's
+    /// first-token time.
+    pub work_ready: Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -37,6 +43,11 @@ impl AppState {
 
     pub fn stop_accepting(&self) {
         self.accepting.store(false, Ordering::SeqCst);
+    }
+
+    /// Signal that this node has work to run.
+    pub fn notify_work(&self) {
+        self.work_ready.notify_one();
     }
 
     pub async fn now_ms(&self) -> u64 {

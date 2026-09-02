@@ -1,9 +1,14 @@
 //! Route registration.
 //!
 //! Gone with D20: every `/v1/sessions/*` endpoint and `/v1/admin/trim_hot`.
+//!
+//! Gone with D23: `/v1/agent/claim`, `/heartbeat`, `/append`, `/complete`.
+//! Execution is no longer a protocol — a generation is run by the node that created
+//! it, in process. The pull protocol let a worker attached to one node claim
+//! another node's generation, whose increments then landed in the wrong process
+//! heap while subscribers were routed to the owning node and saw silence.
 
 pub mod admin;
-pub mod agent;
 pub mod responses;
 
 use axum::routing::{get, post};
@@ -26,11 +31,6 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/read_only", post(admin::set_read_only))
         .route("/v1/admin/pending_limit", post(admin::set_pending_limit))
         .route("/v1/tenants/{tenant}/purge", post(admin::purge_tenant))
-        // Execution side.
-        .route("/v1/agent/claim", post(agent::claim))
-        .route("/v1/agent/heartbeat", post(agent::heartbeat))
-        .route("/v1/agent/append", post(agent::append))
-        .route("/v1/agent/complete", post(agent::complete))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

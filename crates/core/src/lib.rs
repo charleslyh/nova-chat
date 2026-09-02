@@ -7,6 +7,7 @@
 //!   replaying events (INV-48)
 
 mod canonical;
+pub mod completions;
 mod context;
 mod error;
 mod events;
@@ -17,6 +18,10 @@ pub mod protocol;
 mod reconnect;
 
 pub use canonical::{canonical_items, canonical_json, canonical_output_text, nfc};
+pub use completions::{
+    CompletionsMessage, CompletionsOutcome, CompletionsRequest, FinishReason, RequestProvenance,
+    ToolCall, ToolSpec,
+};
 pub use context::{
     ChainLimits, ResolvedContext, ResponseStatus, StoredResponse, Usage,
 };
@@ -29,7 +34,8 @@ pub use protocol::{ContentPart, ResponseItem, Role};
 pub use reconnect::JitteredBackoff;
 
 pub use ports::{
-    AbortedClaim, ClaimedResponse, Clock, ContentIntegrity, ContextError, ContextStore,
-    CreateOutcome, EventLogError, IntegrityError, LedgerError, MetricsSink, ResponseEventLog,
-    ResponseLedger,
+    validate_outcome, AbortedClaim, ClaimedResponse, Clock, CollectingSink, ContentIntegrity,
+    ContextError, ContextStore, CompletionsRequestScheduler, CompletionsSink, CreateOutcome,
+    EventLogError, IntegrityError, LedgerError, MetricsSink, NoopToolExecutor, ResponseEventLog,
+    ResponseLedger, SchedulerError, SinkError, SinkVerdict, ToolError, ToolExecutor,
 };

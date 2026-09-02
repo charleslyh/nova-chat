@@ -98,7 +98,7 @@ pub fn canonical_output_text<'a, I: IntoIterator<Item = &'a str>>(deltas: I) -> 
 
 指标 `integrity_mismatch` 应配告警：单次失配可能是硬件问题，连续失配意味着存储层被篡改。
 
-### 5.1 走链时逐环校验
+### 5.1 快照固化时校验
 
 `resolve_chain` 对每一环调用 `verify`。代价是每次拼接多算 N 次 HMAC（数 KB 内容约微秒级，见 `parameters.md` §5.1），换取的是**被篡改的历史不会进入模型上下文**。
 
@@ -110,6 +110,6 @@ pub fn canonical_output_text<'a, I: IntoIterator<Item = &'a str>>(deltas: I) -> 
 |---|---|
 | 规范化 + HMAC（数 KB） | < 1ms（微秒量级） |
 | 每次生成签名次数 | 2（创建时 + 终态时） |
-| 每次走链校验次数 | 链深度 |
+| 每次快照固化校验 | 1（单次解析前驱快照） |
 
 在 70/s 峰值下可忽略。这也是为何默认开启：默认关闭会让「有校验」变成例外而非常态。

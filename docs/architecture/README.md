@@ -45,7 +45,7 @@ flowchart LR
 |---|---|---|
 | `ResponseEventLog` | per-response 有界环、`starting_after` 读取、终态关闭 | **无 Gap / 无 read_from / 无冷层** |
 | `ResponseLedger` | 生命周期、原子领取、幂等、孤儿收口、部分用量 | **无会话锁 / 无 Busy 结果** |
-| `ContextStore` | 条目持久化、走链解析、`is_shared()`、探活 | 走链结果**绝不含 instructions** |
+| `ContextStore` | 条目持久化、快照读取与记录级删除、`is_shared()`、探活 | 快照结果**绝不含 instructions** |
 | `ContentIntegrity` | 签名 / 常数时间校验 | 仅防篡改，非不可否认性 |
 | `Clock` / `MetricsSink` | 原样保留 | — |
 

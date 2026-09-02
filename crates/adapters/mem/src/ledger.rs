@@ -102,6 +102,7 @@ impl ResponseLedger for MemResponseLedger {
 
     async fn claim(
         &self,
+        node: &NodeTag,
         agent_id: AgentId,
         now_ms: u64,
         exec_ttl_ms: u64,
@@ -109,15 +110,24 @@ impl ResponseLedger for MemResponseLedger {
         self.guard_writable()?;
         let mut g = self.store.lock();
         // Pop-and-verify in one lock: the check and the transition are a single
-        // atomic step, so two agents cannot both win (INV-1).
-        loop {
+        // atomic step, so two callers cannot both win (INV-1).
+        //
+        // Responses belonging to another node are skipped but **put back**, not
+        // dropped: only their own node may execute them (FR-4), and discarding
+        // them here would strand them forever.
+        let mut deferred: Vec<ResponseId> = Vec::new();
+        let claimed = loop {
             let Some(id) = g.queued.pop_front() else {
-                return Ok(None);
+                break None;
             };
             let Some(rec) = g.records.get_mut(&id) else {
                 continue; // deleted meanwhile
             };
             if rec.status != ResponseStatus::Queued {
+                continue;
+            }
+            if rec.node_tag != *node {
+                deferred.push(id);
                 continue;
             }
             let attempt = rec.attempt.next();
@@ -127,12 +137,19 @@ impl ResponseLedger for MemResponseLedger {
             let deadline = now_ms.saturating_add(exec_ttl_ms);
             let record = rec.clone();
             g.heartbeats.insert(agent_id, now_ms);
-            return Ok(Some(ClaimedResponse {
+            break Some(ClaimedResponse {
                 record,
                 attempt,
                 exec_deadline_ms: deadline,
-            }));
+            });
+        };
+
+        // Restore the other nodes' work at the front, preserving relative order so
+        // the oldest still comes first on their own next poll.
+        for id in deferred.into_iter().rev() {
+            g.queued.push_front(id);
         }
+        Ok(claimed)
     }
 
     async fn heartbeat(&self, agent_id: AgentId, now_ms: u64) -> Result<(), LedgerError> {

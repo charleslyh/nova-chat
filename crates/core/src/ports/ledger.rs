@@ -59,11 +59,31 @@ pub trait ResponseLedger: Send + Sync {
         now_ms: u64,
     ) -> Result<CreateOutcome, LedgerError>;
 
+    /// Take the next queued response **belonging to `node`** for execution.
+    ///
     /// Single-point conditional update (INV-1): the check and the transition to
-    /// claimed happen in one atomic operation, so concurrent agents cannot both
-    /// succeed.
+    /// claimed happen in one atomic operation, so two concurrent callers cannot
+    /// both succeed on the same response.
+    ///
+    /// # Why `node` is a parameter and not an implementation detail
+    ///
+    /// A response is executed by the node that created it (FR-4 / D23), because
+    /// that node — and only that node — holds its in-flight event buffer. The
+    /// buffer is a `VecDeque` in one process's heap by deliberate design (D21), so
+    /// there is no shared endpoint another node could append to.
+    ///
+    /// Handing node-b's response to node-a therefore produces a response whose
+    /// increments land in the wrong process: the subscriber, routing by the node
+    /// tag inside the id, is sent to node-b and sees only `Created` — never any
+    /// output, and never an error either. Silent, and indistinguishable from a
+    /// model that simply produced nothing.
+    ///
+    /// This was a real defect once the ledger became shared: the per-node ledger
+    /// of the in-memory backend had made the constraint hold automatically, so
+    /// nothing expressed it. Implementations **must** filter by `node`.
     async fn claim(
         &self,
+        node: &NodeTag,
         agent_id: AgentId,
         now_ms: u64,
         exec_ttl_ms: u64,

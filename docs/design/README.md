@@ -18,7 +18,7 @@
 
 | # | 文档 | 产出 |
 |---|------|------|
-| **01** | [`01-session-stream.md`](./01-session-stream.md) | gateway、流端口、Meta、Agent/reaper |
+| — | [`01-session-stream.md`](./01-session-stream.md) | **历史**：Session/Turn/快照/热冷层/镜像，D20 已移除，不描述当前系统 |
 | **02** | [`02-verification.md`](./02-verification.md) | Trace + Oracle；验证先行 |
 
 ## 草稿

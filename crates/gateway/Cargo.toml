@@ -12,6 +12,8 @@ path = "src/main.rs"
 nova-responses-core = { workspace = true }
 adapters-mem = { workspace = true }
 adapters-sql = { workspace = true }
+nova-agent = { workspace = true }
+adapters-completions-mock = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
@@ -26,3 +28,6 @@ tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }

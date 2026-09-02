@@ -4,11 +4,11 @@ members = [
     "crates/core",
     "crates/adapters/mem",
     "crates/adapters/sql",
+    "crates/adapters/completions-mock",
+    "crates/agent",
     "crates/gateway",
     "testing/conformance",
     "testing/harness",
-    "testing/mock-agent",
-    "testing/sim",
     "xtask",
 ]
 
@@ -21,6 +21,8 @@ license = "MIT"
 nova-responses-core = { path = "crates/core" }
 adapters-mem = { path = "crates/adapters/mem" }
 adapters-sql = { path = "crates/adapters/sql" }
+adapters-completions-mock = { path = "crates/adapters/completions-mock" }
+nova-agent = { path = "crates/agent" }
 conformance = { path = "testing/conformance" }
 harness = { path = "testing/harness" }
 async-trait = "0.1"

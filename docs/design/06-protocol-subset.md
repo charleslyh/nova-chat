@@ -14,6 +14,34 @@
 
 ---
 
+## 0.1 术语对照（与 OpenAI 官方对齐）
+
+为避免与 OpenAI 官方文档沟通时产生分歧，本文档与代码统一使用 OpenAI 官方命名。关键术语对应如下：
+
+| 本文档/代码术语 | OpenAI 官方 | 取值 |
+|---|---|---|
+| 响应（Response） | Response | `POST /v1/responses` 创建的对象 |
+| 条目（Item） | Response Item | `message` / `function_call` / `function_call_output` |
+| 内容片段（Content Part） | Content Part | `input_text` / `output_text` / `refusal` / `input_image` / `input_file` |
+| 角色（Role） | Role | `user` / `assistant` / `system` / `developer` |
+| 条目状态 | Item Status | `in_progress` / `completed` / `incomplete` |
+| 响应状态 | Response Status | `queued` / `in_progress` / `completed` / `failed` / `incomplete` / `cancelled` |
+| 上一响应 | `previous_response_id` | 串联多轮上下文 |
+| 用量 | Usage | `input_tokens` / `output_tokens` / `total_tokens` |
+| 事件 | Streaming Event | `response.created` / `response.output_text.delta` / `response.output_item.added` / … |
+| 游标 | `sequence_number` / `starting_after` | 0 基连续，SSE `id:` 承载 |
+
+> **内部概念，无 OpenAI 对应**——以下术语仅在本服务内部使用，不出现在对外协议里，讨论时请勿与 OpenAI 术语混用：
+
+| 内部术语 | 含义 |
+|---|---|
+| 物化快照（materialised snapshot） | 创建时把祖先条目扁平拷贝进 `context`（D24） |
+| 在途缓冲（in-flight buffer） | 本进程内有界的事件环形缓冲，瞬态 |
+| 栅栏（fence / attempt） | 防止并发或过期写入的尝试号 |
+| 领取（claim） | 执行端从 ledger 认领本节点待执行响应 |
+
+---
+
 ## 1. 支持的请求参数
 
 | 参数 | 类型 | 默认 | 说明 |
@@ -136,7 +164,17 @@
 
 ## 6. 事件与续订
 
-事件名：`response.created` / `response.in_progress` / `response.output_text.delta` / `response.completed` / `response.failed` / `response.incomplete`。
+事件名：`response.created` / `response.in_progress` / `response.output_text.delta` / `response.output_item.added` / `response.output_item.done` / `response.function_call_arguments.delta` / `response.function_call_arguments.done` / `response.completed` / `response.failed` / `response.incomplete`。
+
+工具调用的流式序列与上游一致：
+
+1. `response.output_item.added`（`function_call`，参数为空）
+2. `response.function_call_arguments.delta`（参数增量，可多次）
+3. `response.function_call_arguments.done`（参数完整）
+4. `response.output_item.done`（`function_call` 完成）
+5. 工具执行后：`response.output_item.added` / `response.output_item.done`（`function_call_output`）
+
+`output_item.*` 事件的 `payload` 承载对应条目的 JSON；`function_call_arguments.delta` 的 `payload` 为参数增量，`function_call_arguments.done` 的 `payload` 为完整参数。
 
 游标字段 `sequence_number`，**0 基连续**。SSE `id:` 承载该值，故 `Last-Event-ID` 可直接用于续订。
 

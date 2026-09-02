@@ -1,0 +1,83 @@
+name: chain-delete-middle-link-blast-radius
+covers: [FR-21, FR-18, CR-10, INV-43]
+oracles: [NoSilentContentLoss]
+# What a deletion costs, stated exactly.
+#
+# History is materialised as a flat copy (D24): each response snapshots the whole
+# conversation that led up to it. Deleting a middle link is therefore
+# record-level — the deleted response's own record is gone and can no longer be
+# addressed, but every downstream snapshot keeps the full inherited history,
+# including the deleted turn's content. "Remove from the conversation" removes the
+# record, not the copy that later turns inherited.
+#
+# What this scenario pins is the **blast radius**: which records stay addressable.
+steps:
+  # A → B → C
+  - action: create_response
+    input: "turn A"
+    key: cdm-a
+    label: a
+  - action: claim
+  - action: complete
+    output_text: "answer A"
+
+  - action: create_response
+    input: "turn B"
+    key: cdm-b
+    previous: a
+    label: b
+  - action: claim
+  - action: complete
+    output_text: "answer B"
+
+  - action: create_response
+    input: "turn C"
+    key: cdm-c
+    previous: b
+    label: c
+  - action: claim
+  - action: complete
+    output_text: "answer C"
+
+  # Baseline: the whole chain resolves, three links, six items.
+  - action: resolve_chain
+    from: c
+    expect_depth: 3
+    expect_items: 6
+
+  # Remove the middle link only.
+  - action: delete_response
+    target: b
+
+  # C still resolves with the full three-turn history — the snapshot was copied at
+  # create time, so removing B's record does not strip it from C's snapshot.
+  - action: resolve_chain
+    from: c
+    expect_depth: 3
+    expect_items: 6
+
+  # C's own record is untouched.
+  - action: expect_stored
+    target: c
+    exists: true
+    expect_items: 2
+
+  # A is untouched and still chainable.
+  - action: expect_stored
+    target: a
+    exists: true
+    expect_items: 2
+  - action: resolve_chain
+    from: a
+    expect_depth: 1
+    expect_items: 2
+
+  # B is genuinely gone as a record — it can no longer be addressed.
+  - action: expect_stored
+    target: b
+    exists: false
+
+  # A second delete reports "nothing removed" rather than succeeding vacuously.
+  - action: delete_response
+    target: b
+    expect_deleted: false

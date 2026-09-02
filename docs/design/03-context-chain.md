@@ -1,6 +1,6 @@
 # 设计 03 · 上下文链
 
-> 依据：FR-15~19, CR-9, INV-41/42/43/46/49 · [D20](../architecture/decisions.md#d20-交付边界收口存储与订阅分离)
+> 依据：FR-15~19, CR-9, INV-41/42/43/46/49 · [D20](../architecture/decisions.md#d20-交付边界收口存储与订阅分离) · [D24](../architecture/decisions.md#d24-上下文物化每个生成保存完整上下文快照)
 
 ---
 
@@ -11,13 +11,15 @@
 | 列 | 用途 |
 |---|---|
 | `response_id` PK | `resp_{node}_{uuid}` |
-| `previous_response_id` | 链指针 |
-| `tenant_id` | 逐环校验依据 |
+| `previous_response_id` | 元数据指针，供回显；**不再参与上下文读取**（D24） |
+| `tenant_id` | 创建时校验依据 |
 | `stored` | `false` 时不含条目、不可被引用 |
-| `instructions` | 供查询回显；**走链时不选取此列** |
-| `input_items` / `output_items` JSONB | 条目 |
+| `instructions` | 供查询回显；**不进入快照** |
+| `input_items` / `output_items` JSONB | 本环节自身的条目 |
+| `context` JSONB | **物化历史**：创建时可见的完整上下文，扁平的条目副本 |
+| `context_depth` BIGINT | 祖先环数（扁平列表无法从条目数反推轮数） |
 | `usage` / `partial_usage` JSONB | 终态用量 / 按 attempt 记录的作废用量 |
-| `integrity` / `integrity_alg` | 防篡改标签 |
+| `integrity` / `integrity_alg` | 防篡改标签（覆盖 `input_items`/`output_items`，不覆盖 `context`） |
 | `node_tag` | 孤儿收口范围 |
 | `expires_at_ms` | 过期清理 |
 
@@ -25,65 +27,41 @@
 
 ---
 
-## 2. 走链解析
+## 2. 快照读取（D24）
 
-### 2.1 为什么是走链而非全量物化
+### 2.1 为什么物化而非走链
 
-| 方案 | 每环存储 | 30 天总量 | 单环删除 |
+历史对话读多写少，且删除中间环节后对话仍须继续。链式（走链）方案下删除一环即断链；全量物化让每个环节自包含，删除中间环节只是删掉那条记录，下游快照里继承的副本原样保留。
+
+| 方案 | 每环存储 | 读取 | 删除中间环后对话 |
 |---|---|---|---|
-| **走链** | 仅自身条目 + 指针 | ≈ 135 GB | **有效**——内容只存一份 |
-| 全量物化 | 完整历史 | ≈ 740 GB | **无效**——同一段内容在后续每环重复存在 |
+| 走链（旧，D20 原方案） | 自身条目 + 指针 | O(链长)，回溯 | 断裂 |
+| **物化（D24）** | 完整历史，扁平副本 | O(1)，读快照 | **继续** |
 
-决定性理由不是容量，而是**删除权无法履行**：全量物化下删除一环，其内容仍存在于后续每一环中。
+D20 否决物化的理由是「删除权无法履行」——那以 DELETE 语义为「合规抹除」为前提。D24 把语义定为「从对话移除」后，该理由不再成立（详见 D24）。
 
-代价是读放大：写 `O(1)`、读 `O(链长)`，故必须配深度上限。
+### 2.2 创建时固化快照
 
-### 2.2 内存实现：单次加锁完成整条遍历
+创建带 `previous_response_id` 的环节时，解析 `previous` 的完整上下文（其快照 + 其自身条目），**作为扁平副本固化**到新环节的 `context`，并以 `context_depth` 记录祖先环数。这一步同时承担所有断裂检查：
+
+| 断裂 | 创建时行为 |
+|---|---|
+| `previous` 缺失或跨租户 | `chain_broken`（同形，防标识探测 SEC-2） |
+| `previous` 的 `store=false` | `not_stored` |
+| 深度/条目/字节超限 | `chain_too_long` / `chain_too_large` |
+
+快照一旦固化即自洽，读取 O(1) 且不可能失败于断裂。这改变了 `CrossTenant` 与「链中环缺失」的检测位置——它们不再由读取产生。
+
+### 2.3 读取
 
 ```rust
-let g = self.store.lock();          // 一次
-while let Some(id) = cursor { … }   // 整条遍历都在锁内
+// 单次读：快照（祖先历史的扁平副本） + 本环节自身条目
+let mut items = record.context.clone();
+items.extend(record.chain_items());
+let depth = record.context_depth + 1;
 ```
 
-**每环一次加锁是本设计最易踩的性能坑**：50 深的链会变成 50 次锁往返，落在每个带链请求的关键路径上。
-
-该性质由结构保证而非纪律保证：`resolve_chain` 函数体内**没有 `.await`**，借用检查器因此让守卫存活于整段遍历。若将来有人插入 await 点，代码将无法按原样编译。
-
-### 2.3 SQL 实现：递归单查询
-
-```sql
-WITH RECURSIVE chain AS (
-    SELECT response_id, previous_response_id, tenant_id, stored,
-           input_items, output_items, 1 AS depth
-      FROM responses
-     WHERE response_id = $1 AND tenant_id = $2
-    UNION ALL
-    SELECT r.response_id, r.previous_response_id, r.tenant_id, r.stored,
-           r.input_items, r.output_items, c.depth + 1
-      FROM responses r
-      JOIN chain c ON r.response_id = c.previous_response_id
-     WHERE c.depth < $3
-)
-SELECT … FROM chain ORDER BY depth DESC;   -- depth 降序 = 时间正序
-```
-
-**这是选 PostgreSQL 系的决定性理由**：把走链从 N 次往返压成一次查询。深度 50 时是 1 跳 vs 50 跳。
-
-两处易错细节：
-
-1. **深度上限、租户、起点全部绑定参数**（`$1/$2/$3`），无字符串拼接（SEC-8）
-2. **递归项不过滤 `tenant_id` 与 `stored`**。若在递归里过滤，跨租户或未存储的环会表现为「链自然结束」——即静默截断。改为选出后在应用层逐环判定，才能给出精确错误（INV-42/43）
-3. **不选取 `instructions` 列**（INV-49）
-
-### 2.4 起点与中间环的区别对待
-
-| 位置 | 情形 | 错误 | 理由 |
-|---|---|---|---|
-| 起点 | 缺失 / 跨租户 | `chain_broken` | 起点是调用方提供的值，两者同形以防标识探测（SEC-2） |
-| 中间环 | 跨租户 | `cross_tenant` | 数据内部关系异常，精确报错有助排障 |
-| 任意环 | `store: false` | `not_stored` | 该环确实属于本租户，只是无内容——告知真实原因 |
-
-两个后端必须一致，这条由 L0 契约 `assert_context_conformance` 强制。
+**不再有回溯遍历**，因此也无需 SQL 的 `WITH RECURSIVE`——那曾是选 PostgreSQL 系的决定性理由，现已不再需要。读取读快照，任何后端都一样。
 
 ---
 
@@ -97,29 +75,27 @@ SELECT … FROM chain ORDER BY depth DESC;   -- depth 降序 = 时间正序
 
 **禁止静默截断**（INV-41）。静默截断的后果是上下文被无声裁掉、输出质量下降且不可复现——比明确失败糟糕得多。
 
-1 MiB 上限之所以有效，依赖「图片文件仅接受引用」这一协议约束（见 [06](./06-protocol-subset.md) §3.1）。若将来放开内联二进制，此上限必须重估。
+上限在**创建时固化快照前**检查：快照超限即拒绝创建，读取时快照已是合规尺寸。1 MiB 上限之所以有效，依赖「图片文件仅接受引用」这一协议约束（见 [06](./06-protocol-subset.md) §3.1）。若将来放开内联二进制，此上限必须重估。
 
 ---
 
-## 4. `instructions` 不参与走链
+## 4. `instructions` 不参与快照
 
 已核实上游语义：`instructions` 是插入上下文最前的 system/developer 消息，**不是条目**，在响应对象上独立回显；**与 `previous_response_id` 一起使用时不被继承**。
 
 由此产生硬约束：
 
 - 按生成单独存储，供 `GET` 回显
-- **绝不进入走链输出**
-- 完整性签名也不覆盖它——它是元数据而非内容，让标签依赖一个从不参与拼接的字段没有意义
+- **绝不进入快照**
+- 完整性签名也不覆盖它——它是元数据而非内容
 
-违反后果：调用方换了系统提示却仍受旧指令影响。这类问题从外部几乎无法归因。
-
-实现上由 `StoredResponse::chain_items()` 保证——该方法只迭代 `input_items` 与 `output_items`，根本不读 `instructions` 字段。
+实现上由 `StoredResponse::chain_items()` 保证——该方法只迭代 `input_items` 与 `output_items`，根本不读 `instructions` 字段；`context` 由各环节的 `chain_items` 固化，故也天然不含 `instructions`。
 
 ---
 
 ## 5. 链亲和路由及其退役条件
 
-**仅在上下文库非共享时需要。** 带 `previous_response_id` 的创建请求被导向该链所属节点，使走链全程本地完成。
+**仅在上下文库非共享时需要。** 带 `previous_response_id` 的创建请求被导向该链所属节点，使快照固化的解析全程本地完成。
 
 ```rust
 pub fn route_chain_affinity(state: &AppState, previous: &ResponseId) -> Route {
@@ -141,9 +117,15 @@ pub fn route_chain_affinity(state: &AppState, previous: &ResponseId) -> Route {
 | 项 | 默认 | 性质 |
 |---|---|---|
 | 内容保留期 | 30 天 | **配置项**（OR-5） |
-| 单条删除 | `DELETE /v1/responses/{id}` | 删除后不可再被引用为上一环 |
+| 单条删除 | `DELETE /v1/responses/{id}` | **记录级删除**（D24）：只删该环的记录；下游快照里继承的副本原样保留 |
 | 租户清除 | `POST /v1/tenants/{t}/purge` | 需管理凭据；分批执行避免长事务 |
 | 过期清理 | sweeper 每 2s，单批 ≤ 500 | 走 `expires_at_ms` 部分索引 |
+
+### 6.1 记录级删除，而非内容级抹除
+
+删除一环只移除该环自身的记录，不做任何级联写。下游环节的快照是在创建时复制的**独立副本**，因此被删环节的消失不影响它们解析——它们仍携带完整的历史，包括被删环节的内容。
+
+这正符合「从对话移除」（而非「合规抹除」）的语义：删的是「这条 response 记录」，不是「这条内容在所有继承它的轮次里的副本」。正因为删除永不追溯剔除，快照才不需要 `source` 标记，可以退化为扁平列表。
 
 内存实现用 `BTreeMap<(deadline, id)>` 作过期索引，按 deadline 有序，`take_while` 到第一个未到期项即停——只触碰真正要删的记录，不全表扫描。
 
@@ -156,7 +138,7 @@ pub fn route_chain_affinity(state: &AppState, previous: &ResponseId) -> Route {
 三道防线，任一失效都会导致泄露：
 
 1. **查询与删除**：`tenant_id` 进入 SQL 谓词，跨租户读与不存在同形
-2. **走链**：**逐环**校验（INV-42），遇跨租户环立即中断，不跳过继续
+2. **快照固化**：创建时解析 `previous` 校验租户（INV-42），跨租户即拒——故快照里不可能出现跨租户段
 3. **协议层**：拒绝 `item_reference`（INV-52），因为它能按标识引用任意条目从而绕过第 2 道
 
 第 3 道容易被忽略——它是协议层面的防线，而非存储层面的。

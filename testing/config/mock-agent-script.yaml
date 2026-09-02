@@ -1,0 +1,59 @@
+# Model behaviour for L2 scenarios, declared rather than obtained from a model.
+#
+# Each rule is matched against the last user text. The failure modes below are the
+# reason this file exists: a refusal, a truncation, a stall and a malformed tool
+# call are all routine in production, and none can be provoked on demand from a
+# real provider. Without this, the code paths handling them are the least tested
+# in the system.
+
+rules:
+  # Ordinary answer, streamed in several pieces.
+  - when: !contains "hello"
+    then: !text
+      text: "Hello. How can I help?"
+      chunks: 4
+
+  # The model declines. A completed turn, not an error — the response must reach a
+  # terminal state and the refusal must be readable afterwards.
+  - when: !contains "secret"
+    then: !refuse
+      reason: "I can't help with that."
+
+  # Output ceiling reached. Succeeded at the transport level and still partial:
+  # storing it as complete would corrupt every later turn built on it.
+  - when: !contains "essay"
+    then: !truncated
+      text: "It was the best of times, it was the wor"
+      chunks: 3
+
+  # Arguments pass through verbatim, including deliberately malformed JSON, so the
+  # caller's parsing is exercised rather than assumed.
+  - when: !contains "weather"
+    then: !tool_call
+      name: "get_weather"
+      arguments: '{"city":"Paris","unit":"celsius"}'
+      call_id: "call_weather_1"
+
+  # Transient provider failure: a fresh attempt could succeed.
+  - when: !contains "flaky"
+    then: !fail
+      message: "provider returned 503"
+
+  # Permanent failure: retrying sends the identical request and gets the identical
+  # rejection, so the attempt must fail outright.
+  - when: !contains "badmodel"
+    then: !reject
+      message: "unknown model"
+
+  # Starts answering, then hangs past the deadline. Partial output exists but the
+  # attempt must not complete.
+  - when: !contains "stall"
+    then: !stall
+      before: "Let me think about"
+
+# Anything unmatched. Present so the L2 fixture can run arbitrary scenarios; unit
+# tests deliberately omit a default so an unmatched input fails loudly instead of
+# quietly answering something.
+default: !text
+  text: "I don't have an answer for that."
+  chunks: 2

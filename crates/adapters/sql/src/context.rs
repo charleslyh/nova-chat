@@ -1,22 +1,20 @@
 //! PostgreSQL context store.
 //!
-//! The reason this backend is a Postgres-family database rather than anything
-//! else: `WITH RECURSIVE` collapses chain resolution from N round trips into a
-//! single query. At depth 50 that is the difference between one network hop and
-//! fifty on the critical path of every chained request.
+//! History is materialised (D24): resolution is a single row read, not a walk.
+//! The `WITH RECURSIVE` machinery an earlier revision required is gone — a
+//! response carries its whole context, so resolution no longer traverses
+//! `previous_response_id` at all.
 
 use async_trait::async_trait;
 use nova_responses_core::{
     canonical_items, ChainLimits, ContentIntegrity, ContextError, ContextStore, ResolvedContext,
     ResponseId, ResponseItem, ResponseStatus, StoredResponse, TenantId, Usage,
 };
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use std::sync::Arc;
 
 use crate::error::to_context_error;
-use crate::row::{
-    items_from_json, items_to_json, record_from_row, status_to_str, usage_to_json, RECORD_COLUMNS,
-};
+use crate::row::{items_to_json, record_from_row, status_to_str, usage_to_json, RECORD_COLUMNS};
 
 pub struct SqlContextStore {
     pool: PgPool,
@@ -72,9 +70,10 @@ impl ContextStore for SqlContextStore {
         self.sign(&mut record)?;
         let sql = "INSERT INTO responses (\
                 response_id, previous_response_id, tenant_id, model, status, stored, node_tag, \
-                attempt, owner, idempotency_key, instructions, input_items, output_items, usage, \
+                attempt, owner, idempotency_key, instructions, input_items, output_items, context, \
+                context_depth, usage, \
                 integrity, integrity_alg, created_at_ms, completed_at_ms, expires_at_ms) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) \
              ON CONFLICT (response_id) DO UPDATE SET \
                 status = EXCLUDED.status, \
                 stored = EXCLUDED.stored, \
@@ -83,6 +82,8 @@ impl ContextStore for SqlContextStore {
                 instructions = EXCLUDED.instructions, \
                 input_items = EXCLUDED.input_items, \
                 output_items = EXCLUDED.output_items, \
+                context = EXCLUDED.context, \
+                context_depth = EXCLUDED.context_depth, \
                 usage = EXCLUDED.usage, \
                 integrity = EXCLUDED.integrity, \
                 integrity_alg = EXCLUDED.integrity_alg, \
@@ -102,6 +103,8 @@ impl ContextStore for SqlContextStore {
             .bind(record.instructions.as_deref())
             .bind(items_to_json(&record.input_items))
             .bind(items_to_json(&record.output_items))
+            .bind(items_to_json(&record.context))
+            .bind(record.context_depth as i64)
             .bind(usage_to_json(&record.usage))
             .bind(record.integrity.as_deref())
             .bind(record.integrity_alg.as_deref())
@@ -191,106 +194,58 @@ impl ContextStore for SqlContextStore {
         from: &ResponseId,
         limits: ChainLimits,
     ) -> Result<ResolvedContext, ContextError> {
-        // Every value is a bound parameter — including the depth bound — so no
-        // part of this statement is ever built by string concatenation (SEC-8).
-        //
-        // Note what the recursive term does *not* filter on: tenant and stored.
-        // Filtering there would make a cross-tenant or unstored link look like
-        // the chain simply ending, i.e. a silent truncation. Instead both are
-        // selected and judged per hop below, which yields a precise error
-        // (INV-42 / INV-43). `instructions` is not selected at all — it must
-        // never reach chain output (INV-49).
-        let sql = "WITH RECURSIVE chain AS ( \
-                SELECT response_id, previous_response_id, tenant_id, stored, \
-                       input_items, output_items, 1 AS depth \
-                  FROM responses \
-                 WHERE response_id = $1 AND tenant_id = $2 \
-                UNION ALL \
-                SELECT r.response_id, r.previous_response_id, r.tenant_id, r.stored, \
-                       r.input_items, r.output_items, c.depth + 1 \
-                  FROM responses r \
-                  JOIN chain c ON r.response_id = c.previous_response_id \
-                 WHERE c.depth < $3 \
-             ) \
-             SELECT response_id, previous_response_id, tenant_id, stored, \
-                    input_items, output_items, depth \
-               FROM chain ORDER BY depth DESC";
-
-        let rows = sqlx::query(sql)
+        // History is materialised (D24): a single row read, not a recursive walk.
+        // The `WITH RECURSIVE` machinery this used to require is gone — resolution
+        // no longer depends on the continued existence of ancestors.
+        let sql = format!(
+            "SELECT {RECORD_COLUMNS} FROM responses WHERE response_id = $1 AND tenant_id = $2"
+        );
+        let row = sqlx::query(&sql)
             .bind(from.to_string())
             .bind(tenant.as_str())
-            .bind(limits.max_depth as i32)
-            .fetch_all(&self.pool)
+            .fetch_optional(&self.pool)
             .await
             .map_err(to_context_error)?;
 
-        if rows.is_empty() {
-            // The anchor is absent, or belongs to another tenant. Reported as a
-            // broken chain rather than as a missing resource, because
-            // `previous_response_id` is a request *field*, not the addressed
-            // resource — and this keeps the mem and sql backends identical.
+        let Some(row) = row else {
+            // The anchor is absent or foreign. Reported as a broken chain rather
+            // than a miss: `previous_response_id` is a request field, not the
+            // addressed resource — and this keeps mem and sql identical.
             return Err(ContextError::ChainBroken(from.to_string()));
+        };
+
+        let record = record_from_row(&row).map_err(|e| ContextError::Internal(e.to_string()))?;
+        if !record.stored {
+            return Err(ContextError::NotStored);
         }
+        self.verify(&record)?;
 
-        // Rows arrive deepest-first, i.e. chronological order already.
-        let mut items: Vec<ResponseItem> = Vec::new();
-        let mut bytes = 0usize;
-        let mut deepest = 0usize;
-        let mut expected_previous: Option<String> = None;
+        // Flat materialised history (D24): the ancestors' snapshot plus this
+        // response's own items.
+        let mut items = record.context.clone();
+        items.extend(record.chain_items().cloned());
 
-        for row in &rows {
-            let depth: i32 = row.try_get("depth").map_err(to_context_error)?;
-            deepest = deepest.max(depth as usize);
-
-            let row_tenant: String = row.try_get("tenant_id").map_err(to_context_error)?;
-            if row_tenant != tenant.as_str() {
-                return Err(ContextError::CrossTenant);
-            }
-            let stored: bool = row.try_get("stored").map_err(to_context_error)?;
-            if !stored {
-                return Err(ContextError::NotStored);
-            }
-
-            let inputs = items_from_json(row.try_get("input_items").map_err(to_context_error)?)
-                .map_err(|e| ContextError::Internal(e.to_string()))?;
-            let outputs = items_from_json(row.try_get("output_items").map_err(to_context_error)?)
-                .map_err(|e| ContextError::Internal(e.to_string()))?;
-
-            for item in inputs.into_iter().chain(outputs.into_iter()) {
-                bytes = bytes.saturating_add(item.byte_len());
-                if bytes > limits.max_bytes {
-                    return Err(ContextError::ChainTooLarge {
-                        limit: limits.max_bytes,
-                    });
-                }
-                items.push(item);
-                if items.len() > limits.max_items {
-                    return Err(ContextError::ChainTooLong {
-                        limit: limits.max_items,
-                    });
-                }
-            }
-            expected_previous = row
-                .try_get::<Option<String>, _>("previous_response_id")
-                .map_err(to_context_error)?;
+        let depth = record.context_depth.saturating_add(1);
+        if depth > limits.max_depth {
+            return Err(ContextError::ChainTooLong {
+                limit: limits.max_depth,
+            });
         }
-
-        // The last row walked is the oldest link. If it still points at a
-        // predecessor, that predecessor was unreachable: either it does not
-        // exist, or the depth bound cut the walk short. Distinguish the two so
-        // the caller gets an accurate error rather than a truncated context.
-        if let Some(missing) = expected_previous {
-            if deepest >= limits.max_depth {
-                return Err(ContextError::ChainTooLong {
-                    limit: limits.max_depth,
-                });
-            }
-            return Err(ContextError::ChainBroken(missing));
+        if items.len() > limits.max_items {
+            return Err(ContextError::ChainTooLong {
+                limit: limits.max_items,
+            });
+        }
+        let bytes: usize = items.iter().map(ResponseItem::byte_len).sum();
+        if bytes > limits.max_bytes {
+            return Err(ContextError::ChainTooLarge {
+                limit: limits.max_bytes,
+            });
         }
 
         Ok(ResolvedContext {
             items,
-            depth: deepest,
+            depth,
             bytes,
         })
     }
@@ -300,14 +255,19 @@ impl ContextStore for SqlContextStore {
         tenant: &TenantId,
         response_id: &ResponseId,
     ) -> Result<bool, ContextError> {
-        let affected = sqlx::query("DELETE FROM responses WHERE response_id = $1 AND tenant_id = $2")
+        // Record-level deletion only (D24). Descendants carry their own flat copy
+        // of the history, so removing this row does not touch them — "remove from
+        // the conversation" does not mean "erase from every snapshot that inherited
+        // it". No cascade, no transaction needed.
+        let deleted = sqlx::query("DELETE FROM responses WHERE response_id = $1 AND tenant_id = $2")
             .bind(response_id.to_string())
             .bind(tenant.as_str())
             .execute(&self.pool)
             .await
             .map_err(to_context_error)?
             .rows_affected();
-        Ok(affected > 0)
+
+        Ok(deleted > 0)
     }
 
     async fn delete_by_tenant(&self, tenant: &TenantId) -> Result<u64, ContextError> {

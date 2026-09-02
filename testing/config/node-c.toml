@@ -3,6 +3,12 @@ listen = "127.0.0.1:18082"
 
 store_backend = "mem"
 
+# Failure node. Its scheduler hangs, so generations created here stay in flight —
+# the condition previously produced by attaching no agent at all. Stated positively
+# now, and closer to the real failure: a model that starts answering and then hangs.
+scheduler = "scripted"
+scheduler_script = "testing/config/hanging-script.yaml"
+
 # Short fixture budget; see node-a.toml.
 drain_timeout_ms = 3000
 

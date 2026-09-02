@@ -27,6 +27,20 @@ pub enum StoreBackend {
     Sql,
 }
 
+/// Which `CompletionsRequestScheduler` answers this node's work.
+///
+/// Selected by configuration rather than by a compile-time feature so one binary
+/// can serve both verification and production. A real provider is added as another
+/// adapter and another variant here; nothing else changes (D23 ⑤).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerKind {
+    /// Echoes the last user message. Verification only.
+    Echo,
+    /// Answers from a YAML script. Verification only; requires `scheduler_script`.
+    Scripted,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
@@ -39,6 +53,22 @@ pub struct RawConfig {
 
     #[serde(default = "default_backend")]
     pub store_backend: StoreBackend,
+
+    /// Which scheduler answers this node's generations.
+    #[serde(default = "default_scheduler")]
+    pub scheduler: SchedulerKind,
+
+    /// Script path, required when `scheduler = "scripted"`.
+    #[serde(default)]
+    pub scheduler_script: Option<String>,
+
+    /// Concurrent executions on this node.
+    ///
+    /// Bounds *this process*: a backlog of queued generations must not spawn one
+    /// outbound call each. Provider-side limits are the scheduler's business — the
+    /// two are different concerns and must not be conflated (D23).
+    #[serde(default = "default_max_concurrent_executions")]
+    pub max_concurrent_executions: usize,
 
     /// Name of the environment variable holding the database URL — not the URL.
     #[serde(default = "default_database_url_env")]
@@ -112,6 +142,14 @@ pub struct RawConfig {
 fn default_backend() -> StoreBackend {
     StoreBackend::Mem
 }
+fn default_scheduler() -> SchedulerKind {
+    SchedulerKind::Echo
+}
+
+fn default_max_concurrent_executions() -> usize {
+    8
+}
+
 fn default_database_url_env() -> String {
     "NOVA_DATABASE_URL".into()
 }
@@ -180,6 +218,9 @@ pub struct Config {
     pub listen: String,
     pub peers: BTreeMap<NodeTag, String>,
     pub store_backend: StoreBackend,
+    pub scheduler: SchedulerKind,
+    pub scheduler_script: Option<String>,
+    pub max_concurrent_executions: usize,
     pub database_url_env: String,
     pub api_keys_env: String,
     pub internal_token_env: String,
@@ -240,6 +281,9 @@ impl Config {
             listen: raw.listen,
             peers,
             store_backend: raw.store_backend,
+            scheduler: raw.scheduler,
+            scheduler_script: raw.scheduler_script,
+            max_concurrent_executions: raw.max_concurrent_executions.max(1),
             database_url_env: raw.database_url_env,
             api_keys_env: raw.api_keys_env,
             internal_token_env: raw.internal_token_env,
@@ -272,6 +316,22 @@ impl Config {
     /// then report "not found" and **never** synthesise an address (SEC-5).
     pub fn peer_addr(&self, tag: &NodeTag) -> Option<&str> {
         self.peers.get(tag).map(String::as_str)
+    }
+
+    /// Reject a scheduler configuration that cannot answer anything.
+    ///
+    /// Checked at startup: `scripted` without a script would start cleanly and then
+    /// fail every single generation, which reads as a model outage rather than as a
+    /// configuration mistake.
+    pub fn validate_scheduler(&self) -> Result<(), String> {
+        match self.scheduler {
+            SchedulerKind::Scripted if self.scheduler_script.is_none() => Err(
+                "scheduler = \"scripted\" requires `scheduler_script`; without it every \
+                 generation would fail and look like a provider outage"
+                    .to_string(),
+            ),
+            _ => Ok(()),
+        }
     }
 
     pub fn is_local(&self, tag: &NodeTag) -> bool {

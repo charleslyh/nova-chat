@@ -3,6 +3,18 @@
 version = 4
 
 [[package]]
+name = "adapters-completions-mock"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "nova-responses-core",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+]
+
+[[package]]
 name = "adapters-mem"
 version = "0.1.0"
 dependencies = [
@@ -1101,17 +1113,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "mock-agent"
+name = "nova-agent"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "clap",
- "reqwest",
+ "adapters-completions-mock",
+ "adapters-mem",
+ "async-trait",
+ "nova-responses-core",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -1126,6 +1139,7 @@ dependencies = [
  "sha2",
  "subtle",
  "thiserror",
+ "tokio",
  "unicode-normalization",
  "url",
  "uuid",
@@ -1135,12 +1149,15 @@ dependencies = [
 name = "nova-responses-gateway"
 version = "0.1.0"
 dependencies = [
+ "adapters-completions-mock",
  "adapters-mem",
  "adapters-sql",
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "futures",
+ "nova-agent",
  "nova-responses-core",
  "reqwest",
  "serde",
@@ -1769,23 +1786,6 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest",
  "rand_core 0.6.4",
-]
-
-[[package]]
-name = "sim"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

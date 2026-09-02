@@ -174,6 +174,9 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
     eprint!("  sql-multi-turn-chain ... ");
     let mut previous: Option<ResponseId> = None;
     let mut ids = Vec::new();
+    // Materialised history (D24): each link snapshots everything before it as a
+    // flat copy, so resolution is a single row read rather than a recursive walk.
+    let mut history: Vec<ResponseItem> = Vec::new();
     for turn in 0..5 {
         // Note the node tag varies: with shared storage a chain may span nodes,
         // which is exactly what chain affinity existed to prevent.
@@ -199,8 +202,12 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
             idempotency_key: None,
             owner: None,
             attempt: Attempt::default(),
+            context: history.clone(),
+            context_depth: turn as usize,
         };
+        let own: Vec<ResponseItem> = record.chain_items().cloned().collect();
         ports.context.put(record).await.context("put")?;
+        history.extend(own);
         previous = Some(id.clone());
         ids.push(id);
     }
@@ -209,13 +216,13 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
         .context
         .resolve_chain(&tenant, ids.last().unwrap(), ChainLimits::default())
         .await
-        .context("recursive chain resolution")?;
-    assert_eq!(resolved.depth, 5, "recursive walk must return every link");
+        .context("snapshot resolution")?;
+    assert_eq!(resolved.depth, 5, "snapshot must carry every link");
     assert_eq!(resolved.items.len(), 10);
     let encoded = nova_responses_core::canonical_items(&resolved.items);
     assert!(
         !encoded.contains("L3-INSTRUCTIONS"),
-        "the recursive query must not select the instructions column (INV-49)"
+        "the snapshot must not carry the instructions column (INV-49)"
     );
     // Chronological order.
     assert!(
@@ -251,6 +258,8 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
         idempotency_key: None,
         owner: None,
         attempt: Attempt::default(),
+        context: Vec::new(),
+        context_depth: 0,
     };
     ports
         .ledger
@@ -314,6 +323,8 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
         idempotency_key: None,
         owner: None,
         attempt: Attempt::default(),
+        context: Vec::new(),
+        context_depth: 0,
     };
     ports.context.put(rec.clone()).await?;
     assert_eq!(ports.context.sweep_expired(8_999, 100).await?, 0);
@@ -350,6 +361,8 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
             idempotency_key: None,
             owner: None,
             attempt: Attempt::default(),
+            context: Vec::new(),
+            context_depth: 0,
         })
         .await?;
 

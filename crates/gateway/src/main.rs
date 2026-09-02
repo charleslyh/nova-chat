@@ -5,6 +5,7 @@
 
 mod auth;
 mod config;
+mod execution;
 mod error;
 mod routes;
 mod routing;
@@ -142,6 +143,13 @@ async fn main() -> Result<()> {
         bail!("context store is not reachable at startup: {e}");
     }
 
+    // Same reasoning for the scheduler: a misconfigured one would start cleanly and
+    // fail every generation, which reads as a provider outage.
+    if let Err(e) = cfg.validate_scheduler() {
+        bail!("{e}");
+    }
+    let scheduler = build_scheduler(&cfg)?;
+
     let state = AppState {
         cfg: cfg.clone(),
         ledger: ledger.clone(),
@@ -152,6 +160,7 @@ async fn main() -> Result<()> {
         keys,
         http: reqwest::Client::new(),
         accepting: Arc::new(AtomicBool::new(true)),
+        work_ready: Arc::new(tokio::sync::Notify::new()),
     };
 
     // Orphan reclaim (INV-45): anything non-terminal owned by this node lost its
@@ -175,6 +184,9 @@ async fn main() -> Result<()> {
         sweeper::spawn(state.clone());
     }
 
+    // This node executes its own generations (D23).
+    execution::spawn(state.clone(), scheduler);
+
     let app = routes::router(state.clone());
 
     // Readiness marker for the local process harness.
@@ -187,6 +199,7 @@ async fn main() -> Result<()> {
         node_tag = cfg.node_tag.as_str(),
         %addr,
         backend = ?cfg.store_backend,
+        scheduler = ?cfg.scheduler,
         context_store_shared = context.is_shared(),
         "nova-responses-gateway listening"
     );
@@ -198,4 +211,33 @@ async fn main() -> Result<()> {
 
     info!("shutdown complete");
     Ok(())
+}
+
+/// Build the configured scheduler.
+///
+/// The only place a concrete provider is named. Adding a real one means adding an
+/// arm here plus an adapter crate — the execution loop and the request translation
+/// are untouched (D23 ⑤).
+fn build_scheduler(
+    cfg: &config::Config,
+) -> anyhow::Result<std::sync::Arc<dyn nova_responses_core::CompletionsRequestScheduler>> {
+    use config::SchedulerKind;
+
+    Ok(match cfg.scheduler {
+        SchedulerKind::Echo => std::sync::Arc::new(
+            adapters_completions_mock::EchoScheduler::new(8),
+        ),
+        SchedulerKind::Scripted => {
+            let path = cfg
+                .scheduler_script
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("scheduler_script is required"))?;
+            let src = std::fs::read_to_string(path)
+                .with_context(|| format!("reading scheduler script {path}"))?;
+            std::sync::Arc::new(
+                adapters_completions_mock::ScriptedScheduler::from_yaml(&src)
+                    .with_context(|| format!("parsing scheduler script {path}"))?,
+            )
+        }
+    })
 }

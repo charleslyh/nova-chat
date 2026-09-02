@@ -14,8 +14,8 @@ use nova_responses_core::protocol::{CreateResponseRequest, InputLimits, Response
 use nova_responses_core::{
     canonical_items, AgentId, Attempt, ChainLimits, ContentIntegrity, ContextError, ContextStore,
     CreateOutcome, EventLogError, IdempotencyKey, LedgerError, NodeTag, ResponseEvent,
-    ResponseEventKind, ResponseEventLog, ResponseId, ResponseLedger, ResponseStatus,
-    StoredResponse, TenantId, Usage,
+    ResponseEventKind, ResponseEventLog, ResponseId, ResponseLedger, ResponseStatus, StoredResponse,
+    TenantId, Usage,
 };
 
 /// The set of ports under test. Backend-agnostic by construction.
@@ -73,6 +73,8 @@ fn record(
         idempotency_key: None,
         owner: None,
         attempt: Attempt::default(),
+        context: Vec::new(),
+        context_depth: 0,
     }
 }
 
@@ -199,7 +201,7 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
     let agent = AgentId::new();
     let claimed = ports
         .ledger
-        .claim(agent, 2_000, 60_000)
+        .claim(&ports.node_tag, agent, 2_000, 60_000)
         .await
         .expect("claim")
         .expect("something claimable");
@@ -383,6 +385,7 @@ pub async fn assert_orphan_reclaim_conformance(ports: &PortSet) {
 
     // A different node's work is untouched.
     let other_tag = NodeTag::parse("other-node").expect("tag");
+    let other_tag_for_cleanup = other_tag.clone();
     let theirs = ResponseId::new(other_tag.clone());
     let mut theirs_rec = record(ports, &theirs, None, &tenant, true, ResponseStatus::Queued);
     theirs_rec.node_tag = other_tag;
@@ -402,6 +405,18 @@ pub async fn assert_orphan_reclaim_conformance(ports: &PortSet) {
         ResponseStatus::Queued,
         "reclaim must be scoped to the calling node"
     );
+
+    // Release it before returning.
+    //
+    // Now that claiming is node-scoped (FR-4), a later case cannot drain another
+    // node's queue — so a record left queued here would permanently occupy part of
+    // the process-wide admission budget, and the overload case would measure this
+    // case's residue instead of its own work.
+    ports
+        .ledger
+        .reclaim_orphans(&other_tag_for_cleanup, 7_000)
+        .await
+        .expect("release the other node's queued work");
 }
 
 // ------------------------------------------------------------------ context
@@ -461,8 +476,13 @@ pub async fn assert_context_conformance(ports: &PortSet) {
     assert_eq!(with_output.output_items.len(), 1);
     assert_eq!(with_output.usage.total_tokens, 3);
 
-    // Build a three-link chain.
+    // Build a three-link chain, materialising history the way the gateway does at
+    // create time (D24): each link snapshots everything before it as a flat copy.
     let mut ids = vec![solo.clone()];
+    let mut history: Vec<ResponseItem> = {
+        let solo_rec = store.get(&tenant, &solo).await.unwrap().unwrap();
+        solo_rec.chain_items().cloned().collect::<Vec<_>>()
+    };
     for _ in 0..2 {
         let id = ports.new_id();
         let mut rec = record(
@@ -474,7 +494,13 @@ pub async fn assert_context_conformance(ports: &PortSet) {
             ResponseStatus::Completed,
         );
         rec.output_items = vec![ResponseItem::assistant_text("a")];
+        rec.context = history.clone();
+        // `ids` still holds the ancestors built so far (including `solo`), so its
+        // length is exactly how many turns this link inherits.
+        rec.context_depth = ids.len();
+        let own: Vec<ResponseItem> = rec.chain_items().cloned().collect();
         store.put(rec).await.expect("put");
+        history.extend(own);
         ids.push(id);
     }
 
@@ -561,27 +587,12 @@ pub async fn assert_context_conformance(ports: &PortSet) {
         Err(ContextError::ChainBroken(_))
     ));
 
-    // A foreign link *inside* the chain is a distinct, fatal condition.
-    let crossing = ports.new_id();
-    store
-        .put(record(
-            ports,
-            &crossing,
-            Some(&theirs),
-            &tenant,
-            true,
-            ResponseStatus::Completed,
-        ))
-        .await
-        .expect("put");
-    assert_eq!(
-        store
-            .resolve_chain(&tenant, &crossing, ChainLimits::default())
-            .await,
-        Err(ContextError::CrossTenant)
-    );
+    // Cross-tenant detection moved to create time (D24): a snapshot is built by
+    // resolving the `previous` response's own snapshot, and that resolution already
+    // checks the tenant — so a foreign link can never be materialised, and
+    // resolution no longer walks far enough to observe one.
 
-    // An unstored link cannot be chained (FR-18).
+    // An unstored anchor cannot be resolved (FR-18).
     let unstored = ports.new_id();
     store
         .put(record(
@@ -594,38 +605,47 @@ pub async fn assert_context_conformance(ports: &PortSet) {
         ))
         .await
         .expect("put");
-    let after_unstored = ports.new_id();
-    store
-        .put(record(
-            ports,
-            &after_unstored,
-            Some(&unstored),
-            &tenant,
-            true,
-            ResponseStatus::Completed,
-        ))
-        .await
-        .expect("put");
     assert_eq!(
         store
-            .resolve_chain(&tenant, &after_unstored, ChainLimits::default())
+            .resolve_chain(&tenant, &unstored, ChainLimits::default())
             .await,
         Err(ContextError::NotStored)
     );
 
-    // Deletion, and its effect on chaining.
+    // Deletion is surgical (D24): the deleted link is stripped from every
+    // downstream snapshot, and descendants themselves survive — the property the
+    // snapshot exists to provide.
     assert!(store.delete(&tenant, &solo).await.expect("delete"));
     assert!(!store
         .delete(&tenant, &solo)
         .await
         .expect("second delete is a no-op"));
-    // Deleting a link must break the chain loudly rather than quietly shorten it.
+
+    // Resolving the deleted link itself is a broken anchor.
     assert!(matches!(
         store
-            .resolve_chain(&tenant, ids.last().unwrap(), ChainLimits::default())
+            .resolve_chain(&tenant, &solo, ChainLimits::default())
             .await,
         Err(ContextError::ChainBroken(_))
     ));
+
+    // A descendant still resolves, with the full inherited history intact —
+    // deletion is record-level, not content-level (D24): "remove from the
+    // conversation" removes the record, the flat copy it contributed lives on.
+    let after_delete = store
+        .resolve_chain(&tenant, ids.last().unwrap(), ChainLimits::default())
+        .await
+        .expect("descendant must survive the deletion");
+    assert_eq!(
+        after_delete.depth, 3,
+        "the snapshot keeps every link it inherited, including the deleted head"
+    );
+    assert_eq!(after_delete.items.len(), 6);
+    let encoded_after = canonical_items(&after_delete.items);
+    assert!(
+        encoded_after.contains(&format!("in-{}", solo.uuid())),
+        "the deleted link's content must remain in the descendant's snapshot: {encoded_after}"
+    );
 
     // Expiry sweep only removes what is due.
     let expiring = ports.new_id();
@@ -828,6 +848,126 @@ pub fn assert_reconnect_backoff() {
     assert!(hi.as_millis() <= 30_000 * 2);
 }
 
+// ------------------------------------------------------------- claim locality
+
+/// FR-4 / D23: a response is only ever executed by the node that created it.
+///
+/// This is the assertion whose absence allowed a real defect to ship. With the
+/// in-memory backend each node holds its own ledger, so the constraint held
+/// automatically and nothing expressed it. Once D21 made the ledger shared, the
+/// selection had no node predicate — and node-b's work could be handed to node-a.
+///
+/// The consequence is invisible rather than loud: increments land in node-a's
+/// in-flight buffer, while a subscriber routes by the node tag inside the id and
+/// is sent to node-b. It sees `Created` and then nothing, forever, with no error
+/// raised anywhere. Indistinguishable from a model that produced no output.
+pub async fn assert_claim_locality(ports: &PortSet) {
+    let tenant = fresh_tenant("locality");
+
+    // Drain this node's queue so the assertion is about what follows.
+    loop {
+        let Some(c) = ports
+            .ledger
+            .claim(&ports.node_tag, AgentId(uuid::Uuid::new_v4()), 1_000, 30_000)
+            .await
+            .expect("drain claim")
+        else {
+            break;
+        };
+        ports
+            .ledger
+            .complete(
+                &c.record.response_id,
+                c.attempt,
+                ResponseStatus::Completed,
+                Usage::default(),
+                1_000,
+            )
+            .await
+            .expect("drain complete");
+    }
+
+    // A response owned by a *different* node.
+    let other_node = NodeTag::parse("node-zz").expect("static tag");
+    let foreign_id = ResponseId::new(other_node.clone());
+    let mut foreign = record(ports, &foreign_id, None, &tenant, true, ResponseStatus::Queued);
+    foreign.node_tag = other_node.clone();
+    ports
+        .ledger
+        .create(foreign, fresh_key(), 1_000)
+        .await
+        .expect("create foreign");
+
+    assert!(
+        ports
+            .ledger
+            .claim(&ports.node_tag, AgentId(uuid::Uuid::new_v4()), 1_100, 30_000)
+            .await
+            .expect("claim")
+            .is_none(),
+        "this node claimed a response belonging to `{}`. Its increments would go to \
+         this node's in-flight buffer while subscribers are routed to the owning \
+         node — they would see the created event and then silence (FR-4).",
+        other_node.as_str()
+    );
+
+    // The foreign response must still be claimable by its owner: skipping it may
+    // not consume it, or it would be stranded in the queue forever.
+    let by_owner = ports
+        .ledger
+        .claim(&other_node, AgentId(uuid::Uuid::new_v4()), 1_200, 30_000)
+        .await
+        .expect("claim by owner")
+        .expect("the owning node must still be able to claim its own work");
+    assert_eq!(
+        by_owner.record.response_id, foreign_id,
+        "skipping another node's work must defer it, not discard it"
+    );
+
+    // And this node can still claim its own.
+    let mine = ports.new_id();
+    ports
+        .ledger
+        .create(
+            record(ports, &mine, None, &tenant, true, ResponseStatus::Queued),
+            fresh_key(),
+            1_300,
+        )
+        .await
+        .expect("create local");
+    let claimed = ports
+        .ledger
+        .claim(&ports.node_tag, AgentId(uuid::Uuid::new_v4()), 1_400, 30_000)
+        .await
+        .expect("claim local")
+        .expect("a node must be able to claim work it owns");
+    assert_eq!(claimed.record.response_id, mine);
+    assert_eq!(
+        claimed.attempt.0, 1,
+        "a first claim must produce attempt 1, otherwise the fence cannot tell a \
+         retry from the original"
+    );
+
+    // Drive both claims to a terminal state before returning.
+    //
+    // Not tidiness: the admission counter is process-wide, so in-flight work left
+    // behind here would silently consume another case's capacity budget. The
+    // overload case then measures this case's leftovers instead of its own work.
+    for c in [&by_owner, &claimed] {
+        ports
+            .ledger
+            .complete(
+                &c.record.response_id,
+                c.attempt,
+                ResponseStatus::Completed,
+                Usage::default(),
+                1_500,
+            )
+            .await
+            .expect("release claimed work");
+    }
+}
+
 // ------------------------------------------------------------ overload safety
 
 /// CR-8: refusing work under pressure must not corrupt anything.
@@ -862,7 +1002,7 @@ pub async fn assert_overload_integrity(ports: &PortSet) {
     loop {
         let Some(c) = ports
             .ledger
-            .claim(AgentId(uuid::Uuid::new_v4()), 1_000, 30_000)
+            .claim(&ports.node_tag, AgentId(uuid::Uuid::new_v4()), 1_000, 30_000)
             .await
             .expect("drain claim")
         else {
@@ -935,9 +1075,10 @@ pub async fn assert_overload_integrity(ports: &PortSet) {
     let mut claim_handles = Vec::new();
     for _ in 0..RACERS {
         let ledger = ports.ledger.clone();
+        let node = ports.node_tag.clone();
         claim_handles.push(tokio::spawn(async move {
             ledger
-                .claim(AgentId(uuid::Uuid::new_v4()), 2_100, 30_000)
+                .claim(&node, AgentId(uuid::Uuid::new_v4()), 2_100, 30_000)
                 .await
         }));
     }
@@ -1086,7 +1227,7 @@ pub async fn assert_output_provenance(ports: &PortSet) {
         .expect("create");
     let claimed = ports
         .ledger
-        .claim(AgentId(uuid::Uuid::new_v4()), 1_100, 30_000)
+        .claim(&ports.node_tag, AgentId(uuid::Uuid::new_v4()), 1_100, 30_000)
         .await
         .expect("claim")
         .expect("something was queued");
@@ -1235,9 +1376,10 @@ pub async fn assert_concurrency_conformance(ports: &PortSet) {
     let mut handles = Vec::new();
     for _ in 0..RACERS {
         let ledger = ports.ledger.clone();
+        let node = ports.node_tag.clone();
         handles.push(tokio::spawn(async move {
             ledger
-                .claim(AgentId(uuid::Uuid::new_v4()), 1_100, 30_000)
+                .claim(&node, AgentId(uuid::Uuid::new_v4()), 1_100, 30_000)
                 .await
         }));
     }
@@ -1457,6 +1599,12 @@ pub fn cases() -> &'static [ContractCase] {
             asserts: "assert_integrity_conformance",
         },
         ContractCase {
+            name: "claim-locality",
+            covers: &["FR-4"],
+            scope: CaseScope::Backend,
+            asserts: "assert_claim_locality",
+        },
+        ContractCase {
             name: "overload-integrity",
             covers: &["CR-8", "FR-33", "INV-29"],
             scope: CaseScope::Backend,
@@ -1560,6 +1708,7 @@ async fn run_case(ports: &PortSet, case: &ContractCase) -> CaseOutcome {
             Some(integrity) => assert_integrity_conformance(integrity.clone()).await,
             None => return CaseOutcome::Skipped("backend supplies no ContentIntegrity port"),
         },
+        "claim-locality" => assert_claim_locality(ports).await,
         "overload-integrity" => assert_overload_integrity(ports).await,
         "output-provenance" => assert_output_provenance(ports).await,
         "durability-order" => assert_durability_order(ports).await,

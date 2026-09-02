@@ -8,6 +8,10 @@ listen = "127.0.0.1:18080"
 
 store_backend = "mem"
 
+# Echoes the last user message, reproducing the previous mock-agent behaviour so
+# existing scenarios keep working unchanged.
+scheduler = "echo"
+
 # Fixture value. Production defaults to 10 minutes so in-flight generations can
 # finish; here a node may hold work that never completes (no agent attached), and
 # a long budget would keep the port bound and strand the next run.

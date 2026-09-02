@@ -1,0 +1,22 @@
+[package]
+name = "nova-agent"
+version.workspace = true
+edition.workspace = true
+description = "Chat-completions execution as tasks and pluggable executors"
+
+[dependencies]
+nova-responses-core = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+# Model-free schedulers, so the whole loop is exercised without a provider.
+adapters-completions-mock = { workspace = true }
+# Substrate for driving the engine end to end without a database.
+adapters-mem = { workspace = true }
+uuid = { workspace = true }

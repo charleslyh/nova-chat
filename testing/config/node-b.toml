@@ -3,6 +3,10 @@ listen = "127.0.0.1:18081"
 
 store_backend = "mem"
 
+# Echoes the last user message, reproducing the previous mock-agent behaviour so
+# existing scenarios keep working unchanged.
+scheduler = "echo"
+
 # Short fixture budget; see node-a.toml.
 drain_timeout_ms = 3000
 

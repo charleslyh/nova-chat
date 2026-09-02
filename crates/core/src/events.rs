@@ -12,6 +12,14 @@ pub enum ResponseEventKind {
     InProgress,
     #[serde(rename = "response.output_text.delta")]
     OutputTextDelta,
+    #[serde(rename = "response.output_item.added")]
+    OutputItemAdded,
+    #[serde(rename = "response.output_item.done")]
+    OutputItemDone,
+    #[serde(rename = "response.function_call_arguments.delta")]
+    FunctionCallArgumentsDelta,
+    #[serde(rename = "response.function_call_arguments.done")]
+    FunctionCallArgumentsDone,
     #[serde(rename = "response.completed")]
     Completed,
     #[serde(rename = "response.failed")]
@@ -24,7 +32,10 @@ impl ResponseEventKind {
     /// INV-16: coalescible events may drop intermediate states; envelope events
     /// never may.
     pub fn coalescible(self) -> bool {
-        matches!(self, ResponseEventKind::OutputTextDelta)
+        matches!(
+            self,
+            ResponseEventKind::OutputTextDelta | ResponseEventKind::FunctionCallArgumentsDelta
+        )
     }
 
     /// Terminal events start the retention window (INV-40).
@@ -42,6 +53,10 @@ impl ResponseEventKind {
             ResponseEventKind::Created => "response.created",
             ResponseEventKind::InProgress => "response.in_progress",
             ResponseEventKind::OutputTextDelta => "response.output_text.delta",
+            ResponseEventKind::OutputItemAdded => "response.output_item.added",
+            ResponseEventKind::OutputItemDone => "response.output_item.done",
+            ResponseEventKind::FunctionCallArgumentsDelta => "response.function_call_arguments.delta",
+            ResponseEventKind::FunctionCallArgumentsDone => "response.function_call_arguments.done",
             ResponseEventKind::Completed => "response.completed",
             ResponseEventKind::Failed => "response.failed",
             ResponseEventKind::Incomplete => "response.incomplete",
@@ -57,12 +72,16 @@ impl ResponseEventKind {
 /// derive the stored output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseEvent {
+    /// Not on the wire: the response id lives in the SSE URL, and OpenAI's event
+    /// objects do not repeat it.
+    #[serde(skip_serializing)]
     pub response_id: ResponseId,
     /// 0-based, contiguous within a single response (INV-11).
     pub sequence_number: u64,
     #[serde(rename = "type")]
     pub kind: ResponseEventKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Not on the wire: the attempt fence is an internal concurrency control.
+    #[serde(default, skip_serializing)]
     pub attempt: Option<Attempt>,
     #[serde(default)]
     pub payload: String,
@@ -82,6 +101,22 @@ mod tests {
                 ResponseEventKind::OutputTextDelta,
                 "\"response.output_text.delta\"",
             ),
+            (
+                ResponseEventKind::OutputItemAdded,
+                "\"response.output_item.added\"",
+            ),
+            (
+                ResponseEventKind::OutputItemDone,
+                "\"response.output_item.done\"",
+            ),
+            (
+                ResponseEventKind::FunctionCallArgumentsDelta,
+                "\"response.function_call_arguments.delta\"",
+            ),
+            (
+                ResponseEventKind::FunctionCallArgumentsDone,
+                "\"response.function_call_arguments.done\"",
+            ),
             (ResponseEventKind::Completed, "\"response.completed\""),
             (ResponseEventKind::Failed, "\"response.failed\""),
             (ResponseEventKind::Incomplete, "\"response.incomplete\""),
@@ -97,11 +132,15 @@ mod tests {
     }
 
     #[test]
-    fn only_delta_is_coalescible() {
+    fn only_incremental_events_are_coalescible() {
         assert!(ResponseEventKind::OutputTextDelta.coalescible());
+        assert!(ResponseEventKind::FunctionCallArgumentsDelta.coalescible());
         for kind in [
             ResponseEventKind::Created,
             ResponseEventKind::InProgress,
+            ResponseEventKind::OutputItemAdded,
+            ResponseEventKind::OutputItemDone,
+            ResponseEventKind::FunctionCallArgumentsDone,
             ResponseEventKind::Completed,
             ResponseEventKind::Failed,
             ResponseEventKind::Incomplete,
@@ -118,6 +157,10 @@ mod tests {
         assert!(!ResponseEventKind::Created.is_terminal());
         assert!(!ResponseEventKind::InProgress.is_terminal());
         assert!(!ResponseEventKind::OutputTextDelta.is_terminal());
+        assert!(!ResponseEventKind::OutputItemAdded.is_terminal());
+        assert!(!ResponseEventKind::OutputItemDone.is_terminal());
+        assert!(!ResponseEventKind::FunctionCallArgumentsDelta.is_terminal());
+        assert!(!ResponseEventKind::FunctionCallArgumentsDone.is_terminal());
     }
 
     #[test]
@@ -133,5 +176,13 @@ mod tests {
         assert_eq!(json["sequence_number"], 0);
         assert_eq!(json["type"], "response.created");
         assert!(json.get("seq").is_none(), "legacy field name must be gone");
+        assert!(
+            json.get("response_id").is_none(),
+            "internal id must not leak onto the wire: {json}"
+        );
+        assert!(
+            json.get("attempt").is_none(),
+            "internal fence must not leak onto the wire: {json}"
+        );
     }
 }

@@ -1,5 +1,0 @@
-region = "edge-c"
-role = "edge"
-listen = "127.0.0.1:18082"
-home_upstream = "127.0.0.1:18080"
-run_reaper = false

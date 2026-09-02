@@ -139,6 +139,24 @@ enum Step {
         #[serde(default)]
         max_bytes: Option<usize>,
     },
+    /// Whether a response's stored content is still retrievable.
+    ///
+    /// Exists to pin the **blast radius** of a deletion. Without it the suite only
+    /// verified that a chain breaks, never what survives — so a change that widened
+    /// deletion to cascade downstream, or that made a downstream response
+    /// unreadable, would have passed unnoticed.
+    ExpectStored {
+        #[serde(default)]
+        target: Option<String>,
+        #[serde(default)]
+        tenant: Option<String>,
+        /// Expected presence.
+        exists: bool,
+        /// Optional: item count, to catch content being emptied in place rather
+        /// than the record being removed.
+        #[serde(default)]
+        expect_items: Option<usize>,
+    },
     DeleteResponse {
         #[serde(default)]
         target: Option<String>,
@@ -325,6 +343,20 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 None => None,
                 Some(spec) => Some(ctx.resolve(&Some(spec.clone()))?),
             };
+            // Materialise history exactly as the gateway does (D24): resolve the
+            // previous response's full context and snapshot it as a flat copy, so a
+            // later deletion of an ancestor cannot strand this response.
+            let mut snapshot: Vec<ResponseItem> = Vec::new();
+            let mut snapshot_depth: usize = 0;
+            if let Some(prev) = &previous_id {
+                let resolved = ctx
+                    .world
+                    .context
+                    .resolve_chain(&tenant_id, prev, ChainLimits::default())
+                    .await?;
+                snapshot = resolved.items;
+                snapshot_depth = resolved.depth;
+            }
             let id = ResponseId::new(ctx.node_tag.clone());
             let record = StoredResponse {
                 response_id: id.clone(),
@@ -346,6 +378,8 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 idempotency_key: Some(IdempotencyKey(key.clone())),
                 owner: None,
                 attempt: Attempt::default(),
+                context: snapshot,
+                context_depth: snapshot_depth,
             };
 
             let outcome = ctx
@@ -416,7 +450,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let claimed = ctx
                 .world
                 .ledger
-                .claim(agent, ctx.now_ms, 60_000)
+                .claim(&ctx.node_tag, agent, ctx.now_ms, 60_000)
                 .await?;
             let want = expect.as_deref().unwrap_or("some");
             match (want, claimed) {
@@ -786,6 +820,34 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 reason,
                 at_ms: ctx.now_ms,
             });
+        }
+
+        Step::ExpectStored {
+            target,
+            tenant,
+            exists,
+            expect_items,
+        } => {
+            let id = ctx.resolve(&target)?;
+            let tenant_id = ctx.tenant(&tenant)?;
+            let found = ctx.world.context.get(&tenant_id, &id).await?;
+            match (exists, &found) {
+                (true, None) => bail!(
+                    "{sc}: expected {id} to still be stored, but it is gone. A deletion \
+                     must remove exactly what was asked for — widening it to neighbouring \
+                     links destroys content the caller never asked to delete."
+                ),
+                (false, Some(_)) => {
+                    bail!("{sc}: expected {id} to be absent, but it is still stored")
+                }
+                _ => {}
+            }
+            if let (Some(want), Some(record)) = (expect_items, &found) {
+                let got = record.input_items.len() + record.output_items.len();
+                if got != want {
+                    bail!("{sc}: expected {want} stored items on {id}, got {got}");
+                }
+            }
         }
 
         Step::DeleteResponse {

@@ -17,9 +17,10 @@
 | `POST` | `/v1/tenants/{tenant}/purge` | 租户级批量清除（需管理凭据） | FR-21 |
 | `GET` | `/health` | 探活（含上下文库状态与 accepting 标志） | OR-3 |
 | `POST` | `/v1/admin/{read_only,pending_limit}` | 运行时降级与过载阈值 | INV-32, FR-33 |
-| `POST` | `/v1/agent/{claim,heartbeat,append,complete}` | 执行端 | FR-4~6, FR-20 |
+**已删除**：
 
-**已删除**：全部 `/v1/sessions/*` 与 `/v1/admin/trim_hot`（随会话资源与冷层一并移除）。
+- 全部 `/v1/sessions/*` 与 `/v1/admin/trim_hot` —— 随会话资源与冷层一并移除（D20）。
+- `/v1/agent/{claim,heartbeat,append,complete}` —— 外部执行端拉取协议。D23 起生成由**创建它的节点**在进程内执行（生成者与在途缓冲持有者恒等），该协议不再存在。执行侧的 FR-4~6 仍有效，只是由进程内 `ExecutionEngine` 满足，而非任何 HTTP 端点。
 
 ---
 
@@ -149,7 +150,9 @@ flowchart LR
 
 ### 6.2 为何一律 400 而非 422
 
-axum 的 `Json<T>` 提取器对反序列化失败返回 `422`。为守住「一律 400」契约，请求体先以 `Json<Value>` 接收再手动解析。`/v1/agent/complete` 同样处理——那里正是链闭合性违规必须被精确报告的地方。
+axum 的 `Json<T>` 提取器对反序列化失败返回 `422`。为守住「一律 400」契约，请求体先以 `Json<Value>` 接收再手动解析。
+
+> D23 起不再有 `/v1/agent/complete` 端点。链闭合性（INV-47）现由进程内执行引擎在提交前校验（`nova_agent` 的 `validate_outcome`），仍是同一道闸——只是从「网关拒绝外来写入」变为「引擎拒绝不可存的结果」。
 
 ---
 

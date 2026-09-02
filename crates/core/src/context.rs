@@ -121,6 +121,32 @@ pub struct StoredResponse {
     pub owner: Option<AgentId>,
     #[serde(default)]
     pub attempt: Attempt,
+
+    /// The full context this response inherited, as a flat copy of every
+    /// ancestor's items in chronological order.
+    ///
+    /// This is the **materialised history** (D24): instead of walking
+    /// `previous_response_id` on every read, each response carries the whole
+    /// conversation that led up to it. A later response therefore never depends
+    /// on its ancestors still existing — deleting a middle response removes only
+    /// that response's own record; the flat copy lives on inside every
+    /// descendant, exactly as "remove from the conversation" (rather than
+    /// "erase from the conversation") requires.
+    ///
+    /// It is flat on purpose: there is no source tag, because nothing ever needs
+    /// to strip a single ancestor out again. Deletion is record-level, not
+    /// content-level.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<ResponseItem>,
+
+    /// How many ancestors contributed to `context`.
+    ///
+    /// Kept separate because a flat list cannot recover this — one turn may hold
+    /// any number of items (a tool-call turn contributes several), so the count
+    /// of items is not the count of turns. It backs the `ChainTooLong` check at
+    /// create time and the `depth` reported by `resolve_chain`.
+    #[serde(default)]
+    pub context_depth: usize,
 }
 
 impl StoredResponse {
@@ -162,7 +188,7 @@ impl Default for ChainLimits {
     }
 }
 
-/// Result of walking a chain: history in chronological order.
+/// Result of resolving a response's context: history in chronological order.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResolvedContext {
     pub items: Vec<ResponseItem>,
@@ -199,6 +225,8 @@ mod tests {
             idempotency_key: None,
             owner: None,
             attempt: Attempt::default(),
+            context: Vec::new(),
+            context_depth: 0,
         }
     }
 

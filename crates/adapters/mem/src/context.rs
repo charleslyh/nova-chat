@@ -187,69 +187,46 @@ impl ContextStore for MemContextStore {
     ) -> Result<ResolvedContext, ContextError> {
         self.guard_available()?;
 
-        // The whole traversal happens under **one** lock acquisition.
-        // Re-locking per hop is the single easiest performance mistake in this
-        // design: a 50-deep chain would otherwise mean 50 lock round-trips on
-        // the critical path of every chained request.
+        // History is materialised (D24): one record read, not a walk. The lock is
+        // still held for the whole read so the snapshot cannot change underneath.
         let g = self.store.lock();
 
-        let mut chain: Vec<&StoredResponse> = Vec::new();
-        let mut cursor = Some(from.clone());
-        let mut bytes = 0usize;
-        let mut items_count = 0usize;
-
-        while let Some(id) = cursor {
-            let is_anchor = chain.is_empty();
-            if chain.len() >= limits.max_depth {
-                return Err(ContextError::ChainTooLong {
-                    limit: limits.max_depth,
-                });
-            }
-            let Some(record) = g.records.get(&id) else {
-                // Missing link: report, never silently degrade to a single turn
-                // (INV-43) — that would look like the model forgetting context.
-                return Err(ContextError::ChainBroken(id.to_string()));
-            };
-            // Tenant is checked on **every** hop (INV-42). The anchor is treated
-            // differently on purpose: it is a value the caller supplied, so a
-            // foreign anchor is an invalid request field (`ChainBroken`), and
-            // reporting it identically to "absent" avoids confirming that the id
-            // exists. A foreign link *inside* the chain is a data-integrity
-            // problem and gets its own error.
-            if &record.tenant_id != tenant {
-                return Err(if is_anchor {
-                    ContextError::ChainBroken(id.to_string())
-                } else {
-                    ContextError::CrossTenant
-                });
-            }
-            if !record.stored {
-                return Err(ContextError::NotStored);
-            }
-            bytes = bytes.saturating_add(record.chain_byte_len());
-            if bytes > limits.max_bytes {
-                return Err(ContextError::ChainTooLarge {
-                    limit: limits.max_bytes,
-                });
-            }
-            items_count += record.input_items.len() + record.output_items.len();
-            if items_count > limits.max_items {
-                return Err(ContextError::ChainTooLong {
-                    limit: limits.max_items,
-                });
-            }
-            self.verify(record)?;
-            cursor = record.previous_response_id.clone();
-            chain.push(record);
+        let Some(record) = g.records.get(from) else {
+            // The anchor is a value the caller supplied. Reporting "broken" rather
+            // than "absent" avoids confirming existence across tenants, but it is
+            // the same fatal outcome — no silent single-turn fallback (INV-43).
+            return Err(ContextError::ChainBroken(from.to_string()));
+        };
+        if &record.tenant_id != tenant {
+            return Err(ContextError::ChainBroken(from.to_string()));
         }
+        if !record.stored {
+            return Err(ContextError::NotStored);
+        }
+        self.verify(record)?;
 
-        let depth = chain.len();
-        // Walked newest-first; reverse for chronological order.
-        let items: Vec<ResponseItem> = chain
-            .into_iter()
-            .rev()
-            .flat_map(|record| record.chain_items().cloned())
-            .collect();
+        // History is a flat materialised copy (D24): the ancestors' snapshot plus
+        // this response's own items. No walk, no segmentation.
+        let mut items = record.context.clone();
+        items.extend(record.chain_items().cloned());
+
+        let depth = record.context_depth.saturating_add(1);
+        if depth > limits.max_depth {
+            return Err(ContextError::ChainTooLong {
+                limit: limits.max_depth,
+            });
+        }
+        if items.len() > limits.max_items {
+            return Err(ContextError::ChainTooLong {
+                limit: limits.max_items,
+            });
+        }
+        let bytes: usize = items.iter().map(ResponseItem::byte_len).sum();
+        if bytes > limits.max_bytes {
+            return Err(ContextError::ChainTooLarge {
+                limit: limits.max_bytes,
+            });
+        }
 
         Ok(ResolvedContext {
             items,
@@ -269,6 +246,10 @@ impl ContextStore for MemContextStore {
             None => Ok(false),
             Some(rec) if &rec.tenant_id != tenant => Ok(false),
             Some(_) => {
+                // Record-level deletion only (D24): descendants hold their own flat
+                // copy of the history, so removing this response does not touch them.
+                // "Remove from the conversation" does not mean "erase from every
+                // snapshot that inherited it" — that would be erasure, not removal.
                 g.remove_record(response_id);
                 Ok(true)
             }
