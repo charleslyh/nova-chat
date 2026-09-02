@@ -13,9 +13,9 @@ use nova_agent::{Agent, AgentConfig, AgentDeps, Executed};
 use nova_responses_core::protocol::{ContentPart, ResponseItem, Role};
 use nova_responses_core::{
     Attempt, CompletionsMessage, CompletionsOutcome, CompletionsRequest, CompletionsRequestScheduler,
-    CompletionsSink, ContextStore, IdempotencyKey, NodeTag, NoopToolExecutor, ResponseEventKind,
-    ResponseEventLog, ResponseId, ResponseLedger, ResponseStatus, SchedulerError, StoredResponse,
-    TenantId, ToolCall, ToolError, ToolExecutor, Usage,
+    CompletionsSink, ContextStore, EventBody, IdempotencyKey, NodeTag, NoopToolExecutor,
+    ResponseEventKind, ResponseEventLog, ResponseId, ResponseLedger, ResponseStatus, SchedulerError,
+    StoredResponse, TenantId, ToolCall, ToolError, ToolExecutor, Usage,
 };
 
 const NODE: &str = "node-a";
@@ -740,14 +740,18 @@ async fn tool_calls_stream_incrementally_to_the_subscriber() {
     let deltas: Vec<String> = events
         .iter()
         .filter(|ev| ev.kind == ResponseEventKind::FunctionCallArgumentsDelta)
-        .map(|ev| ev.payload.clone())
+        .map(|ev| match &ev.body {
+            EventBody::Delta { delta } => delta.clone(),
+            _ => String::new(),
+        })
         .collect();
     assert_eq!(deltas, vec!["{\"ci", "ty\":\"P", "aris\"}"]);
     assert_eq!(deltas.concat(), r#"{"city":"Paris"}"#);
 
     // The tool result is announced as its own item.
     let result_added = events.iter().any(|ev| {
-        ev.kind == ResponseEventKind::OutputItemAdded && ev.payload.contains("20")
+        ev.kind == ResponseEventKind::OutputItemAdded
+            && matches!(&ev.body, EventBody::Item { item, .. } if item.to_string().contains("20"))
     });
     assert!(result_added, "the function_call_output must be streamed too");
 }

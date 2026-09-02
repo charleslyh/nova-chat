@@ -44,13 +44,10 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
         // crash between the two cannot lose it (INV-51).
         let _ = state
             .event_log
-            .append(ResponseEvent {
-                response_id: claim.response_id.clone(),
-                sequence_number: 0,
-                kind: ResponseEventKind::Failed,
-                attempt: None,
-                payload: "reaped".into(),
-            })
+            .append(ResponseEvent::lifecycle(
+                claim.response_id.clone(),
+                ResponseEventKind::Failed,
+            ))
             .await;
         let _ = state
             .event_log

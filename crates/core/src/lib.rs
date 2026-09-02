@@ -26,7 +26,7 @@ pub use context::{
     ChainLimits, ResolvedContext, ResponseStatus, StoredResponse, Usage,
 };
 pub use error::DomainError;
-pub use events::{ResponseEvent, ResponseEventKind};
+pub use events::{EventBody, ResponseEvent, ResponseEventKind};
 pub use ids::{AgentId, Attempt, IdError, IdempotencyKey, NodeTag, ResponseId, TenantId};
 pub use integrity_hmac::{HmacSha256Integrity, ALG as INTEGRITY_ALG, KEY_ENV as INTEGRITY_KEY_ENV};
 /// Re-exported for convenience: items are the unit both ports traffic in.

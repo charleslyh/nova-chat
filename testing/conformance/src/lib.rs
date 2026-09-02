@@ -13,7 +13,7 @@ use std::sync::Arc;
 use nova_responses_core::protocol::{CreateResponseRequest, InputLimits, ResponseItem};
 use nova_responses_core::{
     canonical_items, AgentId, Attempt, ChainLimits, ContentIntegrity, ContextError, ContextStore,
-    CreateOutcome, EventLogError, IdempotencyKey, LedgerError, NodeTag, ResponseEvent,
+    CreateOutcome, EventBody, EventLogError, IdempotencyKey, LedgerError, NodeTag, ResponseEvent,
     ResponseEventKind, ResponseEventLog, ResponseId, ResponseLedger, ResponseStatus, StoredResponse,
     TenantId, Usage,
 };
@@ -79,12 +79,19 @@ fn record(
 }
 
 fn event(id: &ResponseId, kind: ResponseEventKind, payload: &str) -> ResponseEvent {
+    let body = if payload.is_empty() {
+        EventBody::Empty {}
+    } else {
+        EventBody::Delta {
+            delta: payload.to_string(),
+        }
+    };
     ResponseEvent {
         response_id: id.clone(),
         sequence_number: 0,
         kind,
         attempt: None,
-        payload: payload.into(),
+        body,
     }
 }
 

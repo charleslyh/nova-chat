@@ -1,6 +1,7 @@
 //! Stream event names aligned with the upstream protocol (D22).
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::ids::{Attempt, ResponseId};
 
@@ -64,27 +65,127 @@ impl ResponseEventKind {
     }
 }
 
-/// A single event in one response's stream.
-///
-/// `payload` is free-form and may carry render-only material (tool progress,
-/// reasoning summaries, UI hints). That is safe precisely because stored items
-/// travel a **separate** write path (INV-48) — nothing here is ever replayed to
-/// derive the stored output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A single event in one response's stream, serialised to the OpenAI Responses
+/// wire shape: `type`, `sequence_number`, plus kind-specific fields (`delta`,
+/// `item`, `arguments`). `response_id` and `attempt` never leave the process.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ResponseEvent {
-    /// Not on the wire: the response id lives in the SSE URL, and OpenAI's event
-    /// objects do not repeat it.
-    #[serde(skip_serializing)]
+    /// Not on the wire: the response id lives in the SSE URL.
+    #[serde(skip)]
     pub response_id: ResponseId,
     /// 0-based, contiguous within a single response (INV-11).
     pub sequence_number: u64,
     #[serde(rename = "type")]
     pub kind: ResponseEventKind,
     /// Not on the wire: the attempt fence is an internal concurrency control.
-    #[serde(default, skip_serializing)]
+    #[serde(skip)]
     pub attempt: Option<Attempt>,
-    #[serde(default)]
-    pub payload: String,
+    /// Kind-specific fields, flattened onto the event object.
+    #[serde(flatten)]
+    pub body: EventBody,
+}
+
+/// The kind-specific fields of a streaming event, matching the OpenAI Responses
+/// event objects.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum EventBody {
+    /// `response.output_text.delta` / `response.function_call_arguments.delta`.
+    Delta { delta: String },
+    /// `response.output_item.added` / `response.output_item.done`.
+    Item { output_index: u32, item: Value },
+    /// `response.function_call_arguments.done`.
+    Arguments {
+        output_index: u32,
+        item_id: String,
+        arguments: String,
+    },
+    /// Lifecycle events carry no extra fields.
+    Empty {},
+}
+
+impl ResponseEvent {
+    /// Lifecycle envelope (created / in_progress / completed / failed / incomplete).
+    pub fn lifecycle(response_id: ResponseId, kind: ResponseEventKind) -> Self {
+        Self {
+            response_id,
+            sequence_number: 0,
+            kind,
+            attempt: None,
+            body: EventBody::Empty {},
+        }
+    }
+
+    /// A lifecycle envelope that still carries the attempt fence — used for
+    /// `in_progress`, the one lifecycle event emitted before a terminal
+    /// transition has already checked the fence.
+    pub fn lifecycle_with_attempt(
+        response_id: ResponseId,
+        kind: ResponseEventKind,
+        attempt: Attempt,
+    ) -> Self {
+        Self {
+            response_id,
+            sequence_number: 0,
+            kind,
+            attempt: Some(attempt),
+            body: EventBody::Empty {},
+        }
+    }
+
+    /// A text or arguments fragment.
+    pub fn delta(
+        response_id: ResponseId,
+        kind: ResponseEventKind,
+        attempt: Attempt,
+        delta: impl Into<String>,
+    ) -> Self {
+        Self {
+            response_id,
+            sequence_number: 0,
+            kind,
+            attempt: Some(attempt),
+            body: EventBody::Delta { delta: delta.into() },
+        }
+    }
+
+    /// A whole output item.
+    pub fn item(
+        response_id: ResponseId,
+        kind: ResponseEventKind,
+        attempt: Attempt,
+        output_index: u32,
+        item: Value,
+    ) -> Self {
+        Self {
+            response_id,
+            sequence_number: 0,
+            kind,
+            attempt: Some(attempt),
+            body: EventBody::Item { output_index, item },
+        }
+    }
+
+    /// Completed arguments for a function call.
+    pub fn arguments(
+        response_id: ResponseId,
+        attempt: Attempt,
+        output_index: u32,
+        item_id: String,
+        arguments: String,
+    ) -> Self {
+        Self {
+            response_id,
+            sequence_number: 0,
+            kind: ResponseEventKind::FunctionCallArgumentsDone,
+            attempt: Some(attempt),
+            body: EventBody::Arguments {
+                output_index,
+                item_id,
+                arguments,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -165,13 +266,10 @@ mod tests {
 
     #[test]
     fn event_serialises_with_protocol_field_names() {
-        let event = ResponseEvent {
-            response_id: ResponseId::new(NodeTag::parse("n1").unwrap()),
-            sequence_number: 0,
-            kind: ResponseEventKind::Created,
-            attempt: None,
-            payload: String::new(),
-        };
+        let event = ResponseEvent::lifecycle(
+            ResponseId::new(NodeTag::parse("n1").unwrap()),
+            ResponseEventKind::Created,
+        );
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["sequence_number"], 0);
         assert_eq!(json["type"], "response.created");
@@ -184,5 +282,55 @@ mod tests {
             json.get("attempt").is_none(),
             "internal fence must not leak onto the wire: {json}"
         );
+        assert!(
+            json.get("payload").is_none(),
+            "legacy generic `payload` field must be gone: {json}"
+        );
+    }
+
+    #[test]
+    fn delta_events_serialise_with_a_delta_field() {
+        let id = ResponseId::new(NodeTag::parse("n1").unwrap());
+        let event = ResponseEvent::delta(id, ResponseEventKind::OutputTextDelta, Attempt(1), "hello");
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "response.output_text.delta");
+        assert_eq!(json["delta"], "hello");
+        assert!(json.get("payload").is_none());
+    }
+
+    #[test]
+    fn item_events_serialise_with_output_index_and_nested_item() {
+        let id = ResponseId::new(NodeTag::parse("n1").unwrap());
+        let item = serde_json::json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "get_weather",
+            "arguments": ""
+        });
+        let event = ResponseEvent::item(id, ResponseEventKind::OutputItemAdded, Attempt(1), 0, item);
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "response.output_item.added");
+        assert_eq!(json["output_index"], 0);
+        assert_eq!(json["item"]["type"], "function_call");
+        assert_eq!(json["item"]["call_id"], "call_1");
+        assert!(json.get("payload").is_none());
+    }
+
+    #[test]
+    fn arguments_events_serialise_with_output_index_and_item_id() {
+        let id = ResponseId::new(NodeTag::parse("n1").unwrap());
+        let event = ResponseEvent::arguments(
+            id,
+            Attempt(1),
+            0,
+            "call_1".into(),
+            r#"{"city":"Paris"}"#.into(),
+        );
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "response.function_call_arguments.done");
+        assert_eq!(json["output_index"], 0);
+        assert_eq!(json["item_id"], "call_1");
+        assert_eq!(json["arguments"], r#"{"city":"Paris"}"#);
+        assert!(json.get("payload").is_none());
     }
 }

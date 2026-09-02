@@ -7,9 +7,9 @@
 
 use adapters_mem::{MemWorld, MemWorldConfig};
 use nova_responses_core::{
-    Attempt, ChainLimits, ContextError, ContextStore, EventLogError, IdempotencyKey, NodeTag,
-    ResponseEvent, ResponseEventKind, ResponseEventLog, ResponseId, ResponseItem, ResponseLedger,
-    ResponseStatus, StoredResponse, TenantId, Usage,
+    Attempt, ChainLimits, ContextError, ContextStore, EventBody, EventLogError, IdempotencyKey,
+    NodeTag, ResponseEvent, ResponseEventKind, ResponseEventLog, ResponseId, ResponseItem,
+    ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
 };
 
 fn tag() -> NodeTag {
@@ -52,12 +52,19 @@ fn record(
 }
 
 fn event(id: &ResponseId, kind: ResponseEventKind, payload: &str) -> ResponseEvent {
+    let body = if payload.is_empty() {
+        EventBody::Empty {}
+    } else {
+        EventBody::Delta {
+            delta: payload.to_string(),
+        }
+    };
     ResponseEvent {
         response_id: id.clone(),
         sequence_number: 0,
         kind,
         attempt: None,
-        payload: payload.into(),
+        body,
     }
 }
 

@@ -54,7 +54,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nova_responses_core::{
     validate_outcome, AgentId, Attempt, ClaimedResponse, CompletionsRequest,
-    CompletionsRequestScheduler, CompletionsSink, ContextStore, FinishReason, NodeTag,
+    CompletionsRequestScheduler, CompletionsSink, ContextStore, EventBody, FinishReason, NodeTag,
     RequestProvenance, ResponseEvent, ResponseEventKind, ResponseEventLog, ResponseId,
     ResponseItem, ResponseLedger, ResponseStatus, SchedulerError, SinkError, SinkVerdict,
     TenantId, ToolExecutor, ToolSpec, Usage,
@@ -188,13 +188,11 @@ impl Agent {
         let _ = self
             .deps
             .event_log
-            .append(ResponseEvent {
-                response_id: id.clone(),
-                sequence_number: 0,
-                kind: ResponseEventKind::InProgress,
-                attempt: Some(attempt),
-                payload: String::new(),
-            })
+            .append(ResponseEvent::lifecycle_with_attempt(
+                id.clone(),
+                ResponseEventKind::InProgress,
+                attempt,
+            ))
             .await;
 
         // History is materialised onto the record as a flat copy (D24): read the
@@ -228,6 +226,7 @@ impl Agent {
             response_id: id.clone(),
             attempt,
             stopped: false,
+            output_index: 0,
         };
 
         loop {
@@ -508,13 +507,7 @@ impl Agent {
         let _ = self
             .deps
             .event_log
-            .append(ResponseEvent {
-                response_id: id.clone(),
-                sequence_number: 0,
-                kind,
-                attempt: None,
-                payload: String::new(),
-            })
+            .append(ResponseEvent::lifecycle(id.clone(), kind))
             .await;
         let _ = self
             .deps
@@ -531,10 +524,17 @@ struct LedgerSink {
     response_id: ResponseId,
     attempt: Attempt,
     stopped: bool,
+    /// Index of the output item currently being streamed, mirroring the
+    /// `output_index` of the OpenAI `response.output_item.*` events.
+    output_index: u32,
 }
 
 impl LedgerSink {
-    async fn push(&mut self, kind: ResponseEventKind, payload: String) -> Result<SinkVerdict, SinkError> {
+    async fn push(
+        &mut self,
+        kind: ResponseEventKind,
+        body: EventBody,
+    ) -> Result<SinkVerdict, SinkError> {
         if self.stopped {
             return Ok(SinkVerdict::Stop);
         }
@@ -547,7 +547,7 @@ impl LedgerSink {
                 sequence_number: 0,
                 kind,
                 attempt: Some(self.attempt),
-                payload,
+                body,
             })
             .await
         {
@@ -560,14 +560,16 @@ impl LedgerSink {
         }
     }
 
-    /// Push an output-item event, carrying the item itself as the JSON payload.
+    /// Push an output-item event, carrying the item nested as `item`.
     async fn push_item(
         &mut self,
         kind: ResponseEventKind,
+        output_index: u32,
         item: &ResponseItem,
     ) -> Result<SinkVerdict, SinkError> {
-        let payload = serde_json::to_string(item).unwrap_or_default();
-        self.push(kind, payload).await
+        let item = serde_json::to_value(item).unwrap_or_default();
+        self.push(kind, EventBody::Item { output_index, item })
+            .await
     }
 }
 
@@ -575,17 +577,25 @@ impl LedgerSink {
 impl CompletionsSink for LedgerSink {
     async fn text_delta(&mut self, text: &str) -> Result<SinkVerdict, SinkError> {
         let _ = &self.ledger;
-        self.push(ResponseEventKind::OutputTextDelta, text.to_string())
-            .await
+        self.push(
+            ResponseEventKind::OutputTextDelta,
+            EventBody::Delta {
+                delta: text.to_string(),
+            },
+        )
+        .await
     }
 
     async fn output_item_added(&mut self, item: &ResponseItem) -> Result<SinkVerdict, SinkError> {
-        self.push_item(ResponseEventKind::OutputItemAdded, item)
+        let index = self.output_index;
+        self.output_index += 1;
+        self.push_item(ResponseEventKind::OutputItemAdded, index, item)
             .await
     }
 
     async fn output_item_done(&mut self, item: &ResponseItem) -> Result<SinkVerdict, SinkError> {
-        self.push_item(ResponseEventKind::OutputItemDone, item)
+        let index = self.output_index.saturating_sub(1);
+        self.push_item(ResponseEventKind::OutputItemDone, index, item)
             .await
     }
 
@@ -594,16 +604,29 @@ impl CompletionsSink for LedgerSink {
         _item_id: &str,
         delta: &str,
     ) -> Result<SinkVerdict, SinkError> {
-        self.push(ResponseEventKind::FunctionCallArgumentsDelta, delta.to_string())
-            .await
+        self.push(
+            ResponseEventKind::FunctionCallArgumentsDelta,
+            EventBody::Delta {
+                delta: delta.to_string(),
+            },
+        )
+        .await
     }
 
     async fn function_call_arguments_done(
         &mut self,
-        _item_id: &str,
+        item_id: &str,
         arguments: &str,
     ) -> Result<SinkVerdict, SinkError> {
-        self.push(ResponseEventKind::FunctionCallArgumentsDone, arguments.to_string())
-            .await
+        let index = self.output_index.saturating_sub(1);
+        self.push(
+            ResponseEventKind::FunctionCallArgumentsDone,
+            EventBody::Arguments {
+                output_index: index,
+                item_id: item_id.to_string(),
+                arguments: arguments.to_string(),
+            },
+        )
+        .await
     }
 }

@@ -422,13 +422,10 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 let seq = ctx
                     .world
                     .event_log
-                    .append(ResponseEvent {
-                        response_id: resulting_id.clone(),
-                        sequence_number: 0,
-                        kind: ResponseEventKind::Created,
-                        attempt: None,
-                        payload: String::new(),
-                    })
+                    .append(ResponseEvent::lifecycle(
+                        resulting_id.clone(),
+                        ResponseEventKind::Created,
+                    ))
                     .await?;
                 trace.push(TraceEvent::EventAppended {
                     response_id: resulting_id.to_string(),
@@ -467,13 +464,11 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                     let seq = ctx
                         .world
                         .event_log
-                        .append(ResponseEvent {
-                            response_id: c.record.response_id.clone(),
-                            sequence_number: 0,
-                            kind: ResponseEventKind::InProgress,
-                            attempt: Some(c.attempt),
-                            payload: String::new(),
-                        })
+                        .append(ResponseEvent::lifecycle_with_attempt(
+                            c.record.response_id.clone(),
+                            ResponseEventKind::InProgress,
+                            c.attempt,
+                        ))
                         .await?;
                     trace.push(TraceEvent::EventAppended {
                         response_id: c.record.response_id.to_string(),
@@ -502,13 +497,12 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let result = ctx
                 .world
                 .event_log
-                .append(ResponseEvent {
-                    response_id: id.clone(),
-                    sequence_number: 0,
-                    kind: ResponseEventKind::OutputTextDelta,
-                    attempt: Some(attempt),
-                    payload: payload.unwrap_or_else(|| "delta".into()),
-                })
+                .append(ResponseEvent::delta(
+                    id.clone(),
+                    ResponseEventKind::OutputTextDelta,
+                    attempt,
+                    payload.unwrap_or_else(|| "delta".into()),
+                ))
                 .await;
             match (expect_stale, result) {
                 (true, Err(EventLogError::StaleAttempt)) => {
@@ -578,17 +572,14 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let seq = ctx
                 .world
                 .event_log
-                .append(ResponseEvent {
-                    response_id: id.clone(),
-                    sequence_number: 0,
-                    kind: if ok {
+                .append(ResponseEvent::lifecycle(
+                    id.clone(),
+                    if ok {
                         ResponseEventKind::Completed
                     } else {
                         ResponseEventKind::Failed
                     },
-                    attempt: None,
-                    payload: String::new(),
-                })
+                ))
                 .await?;
             trace.push(TraceEvent::EventAppended {
                 response_id: id.to_string(),

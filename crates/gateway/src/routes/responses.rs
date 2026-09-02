@@ -245,13 +245,7 @@ pub async fn create(
     }
 
     // First event, so a subscriber attaching immediately sees a defined start.
-    let created = ResponseEvent {
-        response_id: response_id.clone(),
-        sequence_number: 0,
-        kind: ResponseEventKind::Created,
-        attempt: None,
-        payload: String::new(),
-    };
+    let created = ResponseEvent::lifecycle(response_id.clone(), ResponseEventKind::Created);
     if let Err(e) = state.event_log.append(created).await {
         let (status, code, message) = map_event_log_error(&e);
         return api_error(status, code, message);
@@ -448,13 +442,10 @@ pub async fn cancel(
     // Terminal event, then close the buffer so its retention window starts.
     let _ = state
         .event_log
-        .append(ResponseEvent {
-            response_id: response_id.clone(),
-            sequence_number: 0,
-            kind: ResponseEventKind::Failed,
-            attempt: None,
-            payload: "cancelled".into(),
-        })
+        .append(ResponseEvent::lifecycle(
+            response_id.clone(),
+            ResponseEventKind::Failed,
+        ))
         .await;
     let _ = state
         .event_log
