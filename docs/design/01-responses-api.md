@@ -20,7 +20,7 @@
 **已删除**：
 
 - 全部 `/v1/sessions/*` 与 `/v1/admin/trim_hot` —— 随会话资源与冷层一并移除（D20）。
-- `/v1/agent/{claim,heartbeat,append,complete}` —— 外部执行端拉取协议。D23 起生成由**创建它的节点**在进程内执行（生成者与在途缓冲持有者恒等），该协议不再存在。执行侧的 FR-4~6 仍有效，只是由进程内 `ExecutionEngine` 满足，而非任何 HTTP 端点。
+- `/v1/agent/{claim,heartbeat,append,complete}` —— 外部执行端拉取协议。D25 起生成由**独立执行进程 `nova-agentd`** 经 `ResponseLedger` 端口直连共享账本领活（claim 全局），该 HTTP 协议不再存在。执行侧的 FR-4~6 仍有效，由执行工作循环满足，而非任何 HTTP 端点。
 
 ---
 
@@ -72,10 +72,10 @@ SSE 帧：
 ```
 event: response.output_text.delta
 id: 3
-data: {"response_id":"resp_node-a_…","sequence_number":3,"type":"response.output_text.delta","attempt":1,"payload":"llo"}
+data: {"sequence_number":3,"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"llo"}
 ```
 
-`id:` 承载 `sequence_number`，因此浏览器 `Last-Event-ID` 天然可用于续订——调用方无需自行记账（INV-12）。
+`id:` 承载 `sequence_number`，因此浏览器 `Last-Event-ID` 天然可用于续订——调用方无需自行记账（INV-12）。`response_id` 与 `attempt` 是内部字段（owner 与栅栏），**不上 SSE 线**——前者在 SSE URL 里，后者是并发控制。
 
 ### 3.1 服务端信封事件不带 attempt
 
@@ -133,7 +133,7 @@ data: {"response_id":"resp_node-a_…","sequence_number":3,"type":"response.outp
 
 axum 的 `Json<T>` 提取器对反序列化失败返回 `422`。为守住「一律 400」契约，请求体先以 `Json<Value>` 接收再手动解析。
 
-> D23 起不再有 `/v1/agent/complete` 端点。链闭合性（INV-47）现由进程内执行引擎在提交前校验（`nova_agent` 的 `validate_outcome`），仍是同一道闸——只是从「网关拒绝外来写入」变为「引擎拒绝不可存的结果」。
+> 不再有 `/v1/agent/complete` 端点。链闭合性（INV-47）现由执行进程在提交前校验（`nova_agent` 的 `validate_outcome`），仍是同一道闸——只是从「网关拒绝外来写入」变为「执行引擎拒绝不可存的结果」。
 
 ---
 
@@ -166,6 +166,6 @@ SIGTERM → accepting=false（创建 503；查询与订阅继续）
         → 退出
 ```
 
-超时后剩余在途由**下次启动的孤儿收口**置失败（INV-45），故仍是显式失败而非挂起。这是有意的取舍：单个超长生成不得无限阻塞发布。
+超时后剩余在途由 **sweep 进程的心跳收口**置失败（INV-45），故仍是显式失败而非挂起。这是有意的取舍：单个超长生成不得无限阻塞发布。
 
-> 夹具配置将 `drain_timeout_ms` 设为 3s。生产默认 10 分钟。曾因夹具沿用生产默认值，导致无 agent 节点的在途生成把端口占住整个预算，下一次运行报出令人困惑的 `503`——teardown 因此改用 `SIGKILL`。
+> 夹具配置将 `drain_timeout_ms` 设为 3s。生产默认 10 分钟。曾因夹具沿用生产默认值，导致挂起的在途生成把端口占住整个预算，下一次运行报出令人困惑的 `503`——teardown 因此改用 `SIGKILL`。

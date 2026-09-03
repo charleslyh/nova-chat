@@ -8,9 +8,9 @@
 
 | 层 | 内容 | 后端 | Docker |
 |---|---|---|---|
-| **L0** | 端口契约（15 用例，含领取局部性、并发、过载完整性、输出溯源） | **内存 + SQL 共用同一套断言** | 内存部分无需 |
+| **L0** | 端口契约（14 用例，含全局领取、并发、过载完整性、输出溯源） | **内存 + SQL 共用同一套断言** | 内存部分无需 |
 | **L1** | 场景（进程内，直驱端口） | 内存 | 无 |
-| **L2** | 场景（三节点 HTTP） | 内存 + `route_inflight` 转发 | 无 |
+| **L2** | 场景（三节点 HTTP） | 共享载体 `mem-server` + 独立 agentd + 独立 sweep | 无 |
 | **L3** | 端到端 | SQL | 允许（D17） |
 
 **L0–L2 完全不依赖基础设施**。L3 无数据库时**跳过而非失败**，否则没有基础设施的开发机会被门禁挡住。
@@ -225,30 +225,28 @@ fn saw_relevant_data(&self, trace: &Trace) -> bool;   // 无默认实现
 
 ---
 
-## 6. L1 场景（29 个）
+## 6. L1 场景（30 个）
 
 | 组 | 场景 |
 |---|---|
 | 生命周期 | sequential-responses · idempotent-create · double-claim · claim-when-empty · attempt-fence |
 | 流式 | resume-starting-after · event-expired-explicit |
-| 上下文链 | chain-multi-turn · chain-depth-limit · chain-bytes-limit · chain-broken-explicit · chain-cross-tenant-denied · instructions-not-inherited · store-false-not-referencable |
+| 上下文链 | chain-multi-turn · chain-depth-limit · chain-bytes-limit · chain-broken-explicit · chain-cross-tenant-denied · chain-delete-middle-link-blast-radius · instructions-not-inherited · store-false-not-referencable |
 | 存储治理 | content-delete-and-sweep · tenant-purge · integrity-tamper-detected |
-| 可靠性 | orphan-reclaim-on-boot · partial-usage-accounted · context-store-down-rejects-write |
+| 可靠性 | reap-closes-lost-claim · partial-usage-accounted · context-store-down-rejects-write |
 | 过载 / 降级 | pending-limit-overload · overload-reject-consistent · read-only-reject |
 | 访问控制 | cancel-cross-tenant-denied |
 | 协议子集 | item-reference-rejected · inline-binary-rejected · internal-url-rejected · unknown-field-rejected · chain-closure |
 
 ---
 
-## 7. L2 场景（13 个）与节点职责
+## 7. L2 场景（13 个）与进程拓扑
 
-**无逐场景夹具重置**，故隔离靠节点分工 + 运行顺序：
+**fixture 进程**（`xtask procs up` 启动）：`nova-responses-mem-server`（数据面 19000 + 控制面 19001）· `nova-responses-sweep`（短 heartbeat TTL）· `nova-agentd`（scripted scheduler，含 `hang` 规则）· 三个**对等** gateway（node-a/b/c，18080/18081/18082）。
 
-| 节点 | 职责 |
-|---|---|
-| node-a (18080) | 正常流程；mock agent 挂在此 |
-| node-b (18081) | 路由与优雅停机 |
-| node-c (18082) | 过载与崩溃；调度器**故意挂起**（`hanging-script.yaml`），创建于此的生成永久在途 |
+三节点共享同一载体，执行由全局 agentd 完成，节点之间完全对等——不再有「node-c 挂起」「node-b 路由」这种固定分工。
+
+**无逐场景夹具重置**，故隔离靠运行顺序（破坏性场景强制排最后）。
 
 ### 7.1 破坏性由场景声明，不由文件名承载
 
@@ -264,29 +262,28 @@ requires_nodes: [18080, 18081]
 | health-and-create | 三节点对等，无权威节点 |
 | sync-mode-http | 同步等待返回终态对象 |
 | background-then-subscribe-http | 后台创建后订阅，游标续订不重复 |
-| directed-routing-resume | **经非宿主节点订阅**，`route_inflight` 透明代理 |
+| cross-node-stream-http | **跨节点订阅同一事件序列**（node-a 建、node-b 订阅、node-c 续订）：共享缓冲，无粘性（FR-11/14/30/31） |
 | multi-turn-chain-http | 服务端拼接历史；instructions 不继承 |
 | delete-response-http | 删除后链断裂显式 |
 | unknown-field-400-http | 严格拒绝含定向补救说明 |
-| cross-tenant-404-http | 未知标识 / 非法格式 / **表外节点标签**同形 404（SEC-5） |
-| read-only-http · pending-limit-http | 降级与过载可见 |
+| cross-tenant-404-http | 未知标识 / 非法格式 / 表外节点标签同形 404（SEC-5） |
+| read-only-http · pending-limit-http | 降级与过载可见（pending_limit 经 `hang` 输入确定性占用在途配额） |
 | idempotent-create-http | 幂等 |
-| graceful-drain-and-no-sticky-resume 🔥 | **SIGTERM** 触发 drain；停掉转发节点后**同一游标换节点续订成功**（FR-32） |
-| node-down-abrupt 🔥 | **SIGKILL** 后宿主消失，对端明确失败而非编造部分数据 |
+| z-fr32-no-stickiness-http 🔥 | **SIGKILL** node-c 后，同一游标换 node-a 续订拿到剩余事件（FR-32） |
+| z-fr34-graceful-drain-http 🔥 | **SIGTERM** node-b：拒绝新建（503）、读继续（200）、在途从 node-a 可见不丢（FR-34） |
 
-最后两个场景的信号选择是语义的一部分：用错信号会验证相反的行为。
+最后两个场景的信号选择是语义的一部分：**SIGKILL 模拟实例故障，SIGTERM 触发优雅停机**——用错信号会验证相反的行为。SIGTERM 之所以能在停机窗口内观察到「拒绝新建」，是因为 drain 的 `in_flight` 是**全局共享载体计数**：一个挂起的「hang」响应让它保持非零，节点因此在 drain 预算内持续拒绝新建而不立即退出。
 
-### 7.2 FR-32 与 FR-34 合并验证的理由
+### 7.2 FR-32 与 FR-34 分别验证
 
-两者都需要停掉 node-b，而夹具不重启节点。合并后场景反而更有说服力：**优雅停机之后，调用方换节点仍能用同一游标续订**——这正是「接入层无粘性」的可观测后果。若订阅被钉在接受它的节点上，每次发布都会打断所有开启的流。
+两者各停一个节点（node-c 用 SIGKILL 模拟故障，node-b 用 SIGTERM 模拟优雅停机），互不干扰地排在非破坏性场景之后。这两个性质（跨实例续订无粘性、优雅停机无损）在共享载体下才可在 L2 验证——进程内内存时代它们根本无法表达。
 
 ## 8. L3 检查（5 项 + 契约复用）
 
 | 检查 | 只有共享持久化才能显现的性质 |
 |---|---|
 | `sql-port-contract` | **同一套 L0 契约跑 SQL 后端** |
-| `sql-shared-store-no-forward` | `is_shared()` 为真 ⇒ 直连且链亲和退役 |
-| `sql-multi-turn-chain` | 物化快照跨节点固化；**链可跨节点**（正是链亲和须退役的理由）；快照不选 instructions 列 |
+| `sql-multi-turn-chain` | 物化快照跨节点固化；链可跨节点；快照不选 instructions 列 |
 | `sql-restart-history-intact` | 重启后在途明确失败、**历史完好** |
 | `sql-expiry-sweep` / `sql-tenant-purge` | 到期清理与租户清除 |
 
@@ -309,21 +306,21 @@ requires_nodes: [18080, 18081]
 - **CR 必须全覆盖**，否则失败
 - FR/INV 缺口若在 `deferred` 内则不卡门禁，但**仍在报告中列出**
 
-### 9.1 deferred 列表已收敛到只剩 FR-31
+### 9.1 deferred 列表现为空
 
-复查发现原列表里 5 项其实**当时就可验证**，只是被写进了 deferred：
+共享载体落地后，原先需要数据库或多实例才能验证的性质全部移入 L0–L2：
 
 | 编号 | 实际归属 |
 |---|---|
+| FR-11/14/30/31 | L2 `cross-node-stream-http`（跨节点订阅同一序列、无粘性） |
+| FR-32 | L2 `z-fr32-no-stickiness-http`（SIGKILL 一实例后换实例续订） |
+| FR-34 | L2 `z-fr34-graceful-drain-http`（优雅停机拒绝新建、读继续、在途不丢） |
 | FR-23 | 移入 `check-deps`（发布规范由门禁机械校验） |
-| FR-32 | 移入优雅停机场景 |
 | SEC-5 | 移入 cross-tenant-404-http（表外节点标签 404 且不外发请求） |
-| INV-34 | 新增 L0 `durability-order` 用例 |
-| INV-12 | 已由续订场景覆盖 |
 
-只有 **FR-31** 真需要数据库（共享存储后不再转发），由 L3 覆盖。
+baseline 82 项全部覆盖（CR/FR/INV 各 100%）。deferred 机制保留——若将来某项需求被撤回，它必须写明「为何当期无法验证」而非静默消失。
 
-> 这是 deferred 列表最典型的失效方式：**编号一旦写进「延后」，就没人再复核它**。因此现在的规则是——延后项必须写明「为何当期无法验证」，而非仅列编号。
+> 这是 deferred 列表最典型的失效方式：**编号一旦写进「延后」，就没人再复核它**。因此规则不变——延后项必须写明「为何当期无法验证」，而非仅列编号。
 
 ### 9.2 解析器不得对合法输入静默失败
 
@@ -331,24 +328,24 @@ requires_nodes: [18080, 18081]
 
 同理，场景计数会跳过纯注释的迁移墓碑文件——与 runner 行为一致，否则报告的套件规模虚高。
 
-## 10. 单测分布（261 项）
+## 10. 单测分布（235 项）
 
 | 位置 | 数量 | 侧重 |
 |---|---|---|
-| `crates/core` | 102 | 协议子集拒绝面、**规范化属性测试**、出站 completions 翻译、标识校验 |
-| `crates/adapters/mem` | 27 | 环驱逐水位、快照读取、租户索引、过期堆 |
+| `crates/core` | 110 | 协议子集拒绝面、**规范化属性测试**、出站 completions 翻译、标识校验 |
+| `crates/adapters/mem` | 24 | 环驱逐水位、快照读取、租户索引、过期堆 |
 | `crates/adapters/sql` | 2 | 连通性与迁移可加载；无数据库时跳过而非失败 |
 | `crates/adapters/completions-mock` | 17 | 脚本匹配、切分无损、失败形态可区分 |
-| `crates/agent` | 11 | **引擎端到端**：领取→流式→提交，含栅栏与坏结果，无 socket 无模型 |
-| `crates/gateway` | 74 | 配置校验、鉴权与内部头、错误映射、48 项 HTTP 契约 |
+| `crates/agent` | 15 | **引擎端到端**：领取→流式→提交，含栅栏与坏结果，无 socket 无模型 |
+| `crates/nova-responses` | 39 | 配置校验、鉴权、错误映射、HTTP 契约 |
 | `testing/conformance` | 9 | **契约元测试**：分发完整性、空过检测、并发变异验证 |
 | `testing/harness` | 19 | **裁判元测试**：空过拒绝、未知名报错、相关性声明完整 |
 
-HTTP 契约测试直接编译网关模块（`#[path]`），因此验证的是二进制实际挂载的同一个 router。
+HTTP 契约测试直接编译 `nova-responses` 的 router 模块（`#[path]`），因此验证的是二进制实际挂载的同一个 router。
 
-### 10.1 引擎测试为何值 11 项
+### 10.1 引擎测试为何值 15 项
 
-内部执行把整条执行路径变成进程内可测（D23）。`crates/agent/tests/engine_end_to_end.rs` 用内存适配器加 mock 调度器覆盖：完成、空队列空转、**外节点工作不被执行**、调度失败收口、坏结果拒绝、拒答仍存储、`store=false`、挂起、启动排水、服务端组装历史、链断裂失败。
+执行工作循环端口化后（D25），整条执行路径可脱离 socket/DB/模型测试。`crates/agent/tests/engine_end_to_end.rs` 用内存适配器加 mock 调度器覆盖：完成、空队列空转、调度失败收口、坏结果拒绝、拒答仍存储、`store=false`、挂起、启动排水、服务端组装历史、链断裂失败、全局领取、双领栅栏、部分用量等。
 
 全部无 socket、无数据库、无模型——这是这层抽象最直接的回报。
 

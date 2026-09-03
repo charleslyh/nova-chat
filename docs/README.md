@@ -10,7 +10,7 @@
 |---|---|---|
 | 1 | **存储与订阅分离**：持有生成条目用于拼接上下文；不提供会话线程级订阅与开屏还原 | [D20](./architecture/decisions.md#d20-交付边界收口存储与订阅分离) |
 | 2 | **协议是封闭子集**：子集外一律 400，不静默忽略；严进同时更安全更兼容 | [D22](./architecture/decisions.md#d22-协议封闭子集与严格拒绝) |
-| 3 | **可靠性分层**：内容库与账本上真库高可用；在途缓冲留进程内存 + 四项缓解 | [D21](./architecture/decisions.md#d21-可靠性分层三类存储的差异化投入) |
+| 3 | **可靠性分层**：内容库与账本上真库高可用；在途缓冲共享中间件 + 四项缓解 | [D21](./architecture/decisions.md#d21-可靠性分层三类存储的差异化投入) · [D25](./architecture/decisions.md#d25-执行进程独立与在途缓冲共享化能力层抽离) |
 
 ---
 
@@ -52,7 +52,7 @@ design/01-responses-api.md    对外契约与实现依据
 
 | 文档 | 内容 |
 |---|---|
-| [`design/01-responses-api.md`](./design/01-responses-api.md) | 端点、事件、`starting_after`、两条转发路径、状态码 |
+| [`design/01-responses-api.md`](./design/01-responses-api.md) | 端点、事件、`starting_after`、状态码 |
 | [`design/02-verification.md`](./design/02-verification.md) | L0–L3、裁判清单、场景矩阵 |
 | [`design/03-context-chain.md`](./design/03-context-chain.md) | 数据模型、快照读取（D24 物化）、上限、记录级删除、链亲和退役 |
 | [`design/04-content-integrity.md`](./design/04-content-integrity.md) | 规范化、HMAC、密钥生命周期 |
@@ -87,10 +87,9 @@ design/01-responses-api.md    对外契约与实现依据
 | **生成**（Response） | 一次模型调用的生命周期与结果对象；对外唯一主资源 |
 | **条目**（Item） | 生成的输入或输出单元；协议封闭子集的成员 |
 | **事件流** | 生成期间的增量事件；序号 0 基连续 |
-| **在途事件缓冲** | 承载事件流的进程内有界环；不持久化 |
+| **在途事件缓冲** | 承载事件流的共享载体（Redis Streams / mem-server）有界缓冲；不持久化 |
 | **上下文库** | 持久化生成条目，支撑上下文快照固化 |
 | **上下文链** | 由 `previous_response_id` 连成的生成序列 |
-| **宿主节点** | 持有某次生成在途缓冲的网关进程 |
-| **执行端** | 领取生成、写事件、终态提交输出条目的组件 |
+| **执行进程** | `nova-agentd`：领取生成（全局 claim）、写事件、终态提交输出条目 |
 
 > 完整渲染事件历史（transcript）**不是本服务的概念**：不定义、不存储、不判断。由调用方从实时流自行构建并持有。

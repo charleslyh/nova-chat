@@ -9,16 +9,16 @@
 >
 > | 项 | 实现位置 | 支撑 |
 > |---|---|---|
-> | Bearer → 租户解析 | `gateway/src/auth.rs` | SEC-1 |
-> | **越权返回「不存在」而非「禁止访问」** | 同上 + `error.rs` | SEC-2 |
-> | **走链逐环校验租户** | `ContextStore::resolve_chain` | SEC-3 |
+> | Bearer → 租户解析 | `nova-responses/src/auth.rs` | SEC-1 |
+> | **越权返回「不存在」而非「禁止访问」** | 同上 + `nova-responses/src/error.rs` | SEC-2 |
+> | **快照固化时校验租户**（创建时校验 previous，物化后快照自洽） | `ContextStore`（创建路径） | SEC-3 |
 > | **密钥仅从环境变量读取**；启用校验但缺失时启动即失败 | `core/src/integrity_hmac.rs` | SEC-4 |
-> | **节点间转发白名单**（`peers`），标签不在表内直接 404 且不外发请求 | `gateway/src/routing.rs` | SEC-5 |
+> | **无节点间转发**（转发子系统随共享缓冲化整体删除；不再存在由标识推导转发地址的路径） | —（结构上无 SSRF 向量） | SEC-5 |
 > | **引用链接内网拦截**（仅 https + 私有段拒绝） | `core/src/protocol/url_guard.rs` | SEC-6 |
 > | **请求体限长限深** | `core/src/protocol/limits.rs` | SEC-7 |
-> | **数据访问一律参数绑定**（含递归走链的深度上限） | `adapters/sql/src/context.rs` | SEC-8 |
+> | **数据访问一律参数绑定** | `adapters/sql/src/context.rs` | SEC-8 |
 > | 日志脱敏（不记原文 / 密钥 / 连接串） | 全局 | SEC-9 |
-> | **内部租户头需内部令牌方可采信** | `gateway/src/auth.rs` | SEC-5 |
+> | **内部租户头需内部令牌方可采信** | `nova-responses/src/auth.rs` | SEC-5 |
 >
 > ### 仍为草稿的缺口
 >

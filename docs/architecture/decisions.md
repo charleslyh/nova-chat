@@ -948,7 +948,7 @@ D20 否决全量物化的决定性理由是「删除权无法履行：删一环�
 | | |
 |---|---|
 | **需求** | 执行端独立水平扩容与高可用；接入与执行故障风险分离；接入协议层与 responses 能力解耦 |
-| **结论** | ① **执行进程独立**：Agent 拆为独立进程，经 `ResponseLedger` 端口直连共享账本领活，账本不设独立逻辑层服务。② **在途缓冲共享化**：`ResponseEventLog` 从进程内内存升级为共享中间件（具体方案后置：Redis Streams / TDMQ 等），端口形状不变。③ **读写网关不拆**：Gateway 同时承载 write（`POST /v1/responses`）与 read（`GET retrieve/stream`）；调用方不直连共享缓冲。④ **claim 回退为全局作用域**：废除 node-scoped claim，保留 attempt 栅栏与回收。⑤ **能力层抽离**：新增 `nova-responses-service` 承载 responses 用例编排，`nova-responses-core` 保持零依赖不合并。 |
+| **结论** | ① **执行进程独立**：Agent 拆为独立进程，经 `ResponseLedger` 端口直连共享账本领活，账本不设独立逻辑层服务。② **在途缓冲共享化**：`ResponseEventLog` 从进程内内存升级为共享中间件（具体方案后置：Redis Streams / TDMQ 等），端口形状不变。③ **读写网关不拆**：Gateway 同时承载 write（`POST /v1/responses`）与 read（`GET retrieve/stream`）；调用方不直连共享缓冲。④ **claim 回退为全局作用域**：废除 node-scoped claim，保留 attempt 栅栏与回收。⑤ **能力层抽离**：新增 `nova-responses` 承载 responses 用例编排，`nova-responses-core` 保持零依赖不合并。 |
 | **代价** | 引入共享中间件与其追加延迟（D21 已量化）；Agent 从零 IO 变为持有账本连接与凭证；运维面增加一层 |
 | **SUPERSEDES** | D23（整体）；D21 的「在途缓冲留进程内内存」条款 |
 
@@ -988,7 +988,7 @@ Agent 经 `ResponseLedger` 端口直连共享账本领活（非经 Gateway HTTP�
 
 Gateway 现混杂三层职责（接入协议 / 执行驱动 / 后台维护），根因是 D23 后执行宿主与协议接入合并：
 
-- 新增 `nova-responses-service` 承载用例编排（create / resolve_chain / 幂等 / 三种投递 / 订阅编排），不含 axum / HeaderMap / 状态码
+- 新增 `nova-responses` 承载用例编排（create / resolve_chain / 幂等 / 三种投递 / 订阅编排），不含 axum / HeaderMap / 状态码
 - `nova-responses-core` **不合并**：零 workspace 依赖是 check-deps 不变量；端口与用例抽象层次不同
 - 分两步：先作 gateway 内无 axum 的 service 模块，再视多协议复用独立成 crate
 

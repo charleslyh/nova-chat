@@ -20,10 +20,10 @@
 | `context_depth` BIGINT | 祖先环数（扁平列表无法从条目数反推轮数） |
 | `usage` / `partial_usage` JSONB | 终态用量 / 按 attempt 记录的作废用量 |
 | `integrity` / `integrity_alg` | 防篡改标签（覆盖 `input_items`/`output_items`，不覆盖 `context`） |
-| `node_tag` | 孤儿收口范围 |
+| `node_tag` | 标识来源节点（记录创建它的节点）；claim 与孤儿回收均已全局化（D25），不再按此过滤 |
 | `expires_at_ms` | 过期清理 |
 
-索引：`(tenant_id)`、`(previous_response_id)` 部分索引、`(expires_at_ms)` 部分索引、`(node_tag, status)` 部分索引（供孤儿收口，非终态行是极少数，故该索引很小）。
+索引：`(tenant_id)`、`(previous_response_id)` 部分索引、`(expires_at_ms)` 部分索引、`(node_tag, status)` 部分索引（按来源节点定位非终态行；孤儿回收已由全局心跳收口取代）。
 
 ---
 

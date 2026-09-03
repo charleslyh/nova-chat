@@ -197,7 +197,7 @@ graph BT
 
 ## 3. 协议表面
 
-全部端点，来自 `gateway/src/routes/mod.rs` 的 `router()`：
+全部端点，来自 `nova-responses/src/routes/mod.rs` 的 `router()`：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -220,7 +220,7 @@ graph BT
 
 存储是共享载体（Postgres + Redis），任意节点直读，因此**不存在**节点间转发。历史上为 mem 多节点而生的 `routing.rs`（`route_inflight` / `route_content` / `route_chain_affinity` / `proxy_*`）、`peers` 对等表、节点间内部 token，连同端口上的 `is_shared()` 能力位，已随共享缓冲化（D25）整体移除。
 
-核对点：`gateway/src/routes/responses.rs` 中的 retrieve / stream / cancel / delete 直接读 `state.context` / `state.event_log`，不再经过任何路由分支；`gateway/src/config.rs` 无 `peers` / `internal_token_env` 字段。
+核对点：`nova-responses/src/routes/responses.rs` 中的 retrieve / stream / cancel / delete 直接读 `state.context` / `state.event_log`，不再经过任何路由分支；`nova-responses/src/config.rs` 无 `peers` / `internal_token_env` 字段。
 
 这一删除同时消除了一个攻击面：不再有任何「由请求字段推导转发地址」的路径（原 SEC-5 的 SSRF 向量随转发子系统一起消失）。
 
@@ -476,7 +476,7 @@ sequenceDiagram
 - 栅栏：`append` 携带 attempt，被取代的持有者写入返回 `StaleAttempt` → `SinkVerdict::Stop`（见 `LedgerSink`）
 - **终态事件 `attempt: None`**：栅栏已由 ledger 转换校验过，此处再校验会拒掉宣告转换的那条事件，流将永不终止
 - `Executed` 的四个取值（`Idle`/`Completed`/`Superseded`/`Failed`）刻意区分，测试可断言走过哪条路径而非只看最终状态。特别地 **`Superseded` 不是失败**：活已归属新 attempt，报失败会终结一个正在被服务的响应
-- 并发上限约束**本进程**（`agentd` 的 `--max-concurrent`；mem 形态为 `max_concurrent_executions`）；provider 侧限流属 scheduler
+- 并发上限约束**本进程**（`agentd` 的 `--max-concurrent`，两种形态同构）；provider 侧限流属 scheduler
 
 ### 7.1 为何 attempt 栅栏不可删除
 
@@ -557,7 +557,7 @@ sequenceDiagram
     Note over C,B: 见到终态事件 → 流结束
 ```
 
-**核对点**（`gateway/src/sse.rs`）：
+**核对点**（`nova-responses/src/sse.rs`）：
 
 - **先探测后开流**（`open_stream` 的首个 `read_after`）：未知 id / 过期位点得到真正的 HTTP 状态码，而不是 200 之后的带内错误
 - `starting_after` 是**排他**游标：`starting_after=0` 跳过 seq 0。`resolve_cursor` 让 `Last-Event-ID` 优先于查询串——它反映客户端**实际收到**了什么
@@ -628,7 +628,7 @@ graph LR
 
 ```mermaid
 graph TB
-    subgraph SW["sweeper：单循环三件事（2s 一跳；mem 形态为独立进程，sql 形态在网关）"]
+    subgraph SW["sweeper：单循环三件事（2s 一跳，独立进程 nova-responses-sweep，两种形态同构）"]
         T1["1 reap 失联 claim<br/>抬高 attempt 栅栏<br/>部分用量由 ledger 自身记账"]
         T2["2 释放过期事件缓冲"]
         T3["3 清理过期内容"]
@@ -645,13 +645,13 @@ graph TB
     style D3 fill:#1a5c2a,stroke:#4dd47a,color:#fff
 ```
 
-**核对点**（`gateway/src/sweeper.rs`、`gateway/src/shutdown.rs`）：
+**核对点**（`nova-responses/src/sweeper.rs`、`nova-responses/src/shutdown.rs`、`crates/sweep/src/main.rs`）：
 
 - 三件事合并为**一个**循环：三个独立循环意味着三个定时器和三次忘记其一的机会
 - 部分用量在回收时由 ledger 自身记账，故两步之间崩溃不会丢失（INV-51）
 - reap 是**失联执行的唯一收口**（INV-45）。执行进程独立后没有「启动时扫自己的孤儿」这一步可依赖——崩掉的 worker 不会再启动，只能由 sweep 进程抬 fence 并置失败
 - drain 期间**读与订阅继续服务**（`AppState::accepting`）——这是滚动发布不中断在途流的原因
-- **网关 drain 不影响执行**：`nova-agentd` 是独立进程，故障域已分离；sweep 也是独立进程（mem 形态）或在网关内（sql 形态）
+- **网关 drain 不影响执行**：`nova-agentd` 是独立进程，故障域已分离；sweep 也是独立进程（`nova-responses-sweep`，mem/sql 双 feature），两种形态同构
 
 ---
 
@@ -665,7 +665,7 @@ graph TB
 | **L3** | 复用 L0 契约 + sql 专属场景 | **真实 Postgres** | 只有真库能证的性质（真实 SQL 语义） | `testing/harness/src/l3.rs` |
 
 - L0–L2 **不得需要数据库**（D17）；L3 无库时是**跳过而非失败**
-- gateway 另有 HTTP 契约测试（`crates/gateway/tests/http_contract.rs`），在进程内驱动 Agent 走完 claim → ReAct → complete
+- gateway 另有 HTTP 契约测试（`crates/nova-responses/tests/http_contract.rs`），在进程内驱动 Agent 走完 claim → ReAct → complete
 - `adapters-event-log-redis` 的 Redis 集成测试标记 `#[ignore]`，需 `redis-server`：`cargo test -p adapters-event-log-redis --test redis_integration -- --ignored`
 
 ### 12.1 check-deps 守的是哪些结构性事实
@@ -711,15 +711,15 @@ graph TB
 |---|---|
 | 1 部署形态 | `crates/gateway/src/main.rs`（`mount`）· `crates/agentd/src/main.rs` · `crates/mem-server/src/main.rs` · `crates/adapters/mem/src/proto.rs` · `crates/adapters/mem-client/src/lib.rs` |
 | 2 Crate 分层 | 各 `Cargo.toml` 的 `[dependencies]` |
-| 3 协议表面 | `gateway/src/routes/mod.rs` · [`06-protocol-subset.md`](./06-protocol-subset.md) |
-| 4 无转发 | `gateway/src/routes/responses.rs`（retrieve / stream / cancel / delete 直读端口） |
+| 3 协议表面 | `nova-responses/src/routes/mod.rs` · [`06-protocol-subset.md`](./06-protocol-subset.md) |
+| 4 无转发 | `nova-responses/src/routes/responses.rs`（retrieve / stream / cancel / delete 直读端口） |
 | 5 端到端总览 | 本文档 §6/§7/§9 的综合 · `decisions.md` D24 |
-| 6 创建时序 | [`01-responses-api.md`](./01-responses-api.md) · `routes/responses.rs` · `service/responses.rs` |
+| 6 创建时序 | [`01-responses-api.md`](./01-responses-api.md) · `nova-responses/src/routes/responses.rs` · `nova-responses/src/service/responses.rs` |
 | 7 执行时序 | `crates/agent/src/engine.rs` · `crates/agent/src/lib.rs` 模块注释 |
 | 8 两条写路径 | [`invariants.md`](../architecture/invariants.md) INV-48 · [`03-context-chain.md`](./03-context-chain.md) |
-| 9 订阅续订 | `gateway/src/sse.rs` |
+| 9 订阅续订 | `nova-responses/src/sse.rs` |
 | 10 职责边界 | `core/src/ports/completions.rs` · `decisions.md` D25 |
-| 11 维护与停机 | [`05-reliability.md`](./05-reliability.md) · `gateway/src/sweeper.rs` |
+| 11 维护与停机 | [`05-reliability.md`](./05-reliability.md) · `nova-responses/src/sweeper.rs` · `crates/sweep/src/main.rs` |
 | 12 验证分层 | [`02-verification.md`](./02-verification.md) · `xtask/src/main.rs` |
 | 决策推导（本文档不重复） | [`decisions.md`](../architecture/decisions.md) |
 | 需求编号 | [`spec.md`](../requirements/spec.md) |

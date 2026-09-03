@@ -36,9 +36,9 @@
 | 内部术语 | 含义 |
 |---|---|
 | 物化快照（materialised snapshot） | 创建时把祖先条目扁平拷贝进 `context`（D24） |
-| 在途缓冲（in-flight buffer） | 本进程内有界的事件环形缓冲，瞬态 |
+| 在途缓冲（in-flight buffer） | 共享载体上有界的事件缓冲（Redis Streams / mem-server），瞬态 |
 | 栅栏（fence / attempt） | 防止并发或过期写入的尝试号 |
-| 领取（claim） | 执行端从 ledger 认领本节点待执行响应 |
+| 领取（claim） | 执行端从共享 ledger **全局**认领待执行响应 |
 
 ---
 
