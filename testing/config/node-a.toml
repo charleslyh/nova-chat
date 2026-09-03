@@ -1,29 +1,15 @@
-# Peer node A. All three nodes are equivalent: each can create, each runs its own
-# sweeper. There is no authority node.
+# Peer node A. All three nodes are equivalent: each can create, none is an
+# authority. Execution and sweeping are separate processes over the shared
+# carrier, so the gateway neither embeds an agent nor runs the sweeper.
 #
 # Secrets are absent by design — only the *names* of environment variables appear
 # here (SEC-4).
 node_tag = "node-a"
 listen = "127.0.0.1:18080"
 
-store_backend = "mem"
-
-# Echoes the last user message, reproducing the previous mock-agent behaviour so
-# existing scenarios keep working unchanged.
-scheduler = "echo"
+# The sweep loop is a standalone process; the gateway must not run it.
+run_sweeper = false
 
 # Fixture value. Production defaults to 10 minutes so in-flight generations can
-# finish; here a node may hold work that never completes (no agent attached), and
-# a long budget would keep the port bound and strand the next run.
+# finish; here a short budget keeps the port from stranding the next run.
 drain_timeout_ms = 3000
-
-# Forwarding allow-list, and the only source of forward targets. A tag outside
-# this map yields "not found"; an address is never derived from a request field
-# (SEC-5).
-#
-# NOTE: scalar keys must precede this table — anything after a `[table]` header
-# belongs to that table in TOML.
-[peers]
-node-a = "127.0.0.1:18080"
-node-b = "127.0.0.1:18081"
-node-c = "127.0.0.1:18082"

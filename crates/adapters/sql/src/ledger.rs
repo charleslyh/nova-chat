@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use nova_responses_core::{
     AbortedClaim, AgentId, Attempt, ClaimedResponse, CreateOutcome, IdempotencyKey, LedgerError,
-    NodeTag, ResponseId, ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
+    ResponseId, ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
 };
 use sqlx::{PgPool, Row};
 
@@ -133,7 +133,6 @@ impl ResponseLedger for SqlResponseLedger {
 
     async fn claim(
         &self,
-        node: &NodeTag,
         agent_id: AgentId,
         now_ms: u64,
         exec_ttl_ms: u64,
@@ -143,17 +142,14 @@ impl ResponseLedger for SqlResponseLedger {
         // transition a single atomic step, so two callers can never both win
         // (INV-1). Attempt is incremented in the same statement (INV-5).
         //
-        // `node_tag = $3` is load-bearing, not an optimisation: a response is
-        // executed by the node holding its in-flight buffer (FR-4 / D23). Without
-        // this predicate a shared ledger hands node-b's work to node-a, whose
-        // increments then land in the wrong process heap — the subscriber routes to
-        // node-b and sees `Created` and nothing else, with no error anywhere.
+        // Global claim (D25): no `node_tag` filter — any execution process may
+        // take any queued response, because the in-flight buffer is shared.
         let sql = format!(
             "UPDATE responses SET status = 'in_progress', attempt = attempt + 1, \
                     owner = $1, exec_deadline_ms = $2 \
               WHERE response_id = ( \
                     SELECT response_id FROM responses \
-                     WHERE status = 'queued' AND node_tag = $3 \
+                     WHERE status = 'queued' \
                      ORDER BY created_at_ms \
                      LIMIT 1 \
                      FOR UPDATE SKIP LOCKED ) \
@@ -163,7 +159,6 @@ impl ResponseLedger for SqlResponseLedger {
         let row = sqlx::query(&sql)
             .bind(agent_id.to_string())
             .bind(deadline as i64)
-            .bind(node.as_str())
             .fetch_optional(&self.pool)
             .await
             .map_err(to_ledger_error)?;
@@ -315,31 +310,6 @@ impl ResponseLedger for SqlResponseLedger {
         let rows = sqlx::query(sql)
             .bind(now_ms as i64)
             .bind(heartbeat_ttl_ms as i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(to_ledger_error)?;
-        collect_aborted(rows)
-    }
-
-    async fn reclaim_orphans(
-        &self,
-        node_tag: &NodeTag,
-        now_ms: u64,
-    ) -> Result<Vec<AbortedClaim>, LedgerError> {
-        // Everything non-terminal belonging to this node lost its in-flight
-        // buffer when the previous process died: fail it immediately instead of
-        // waiting out the heartbeat TTL (INV-45).
-        let sql = "UPDATE responses SET attempt = attempt + 1, status = 'failed', \
-                          owner = NULL, exec_deadline_ms = NULL, completed_at_ms = $2, \
-                          partial_usage = CASE \
-                              WHEN usage = '{}'::jsonb THEN partial_usage \
-                              ELSE jsonb_set(partial_usage, ARRAY[attempt::text], usage, true) \
-                          END \
-                    WHERE node_tag = $1 AND status IN ('queued', 'in_progress') \
-                    RETURNING response_id, attempt - 1 AS previous_attempt";
-        let rows = sqlx::query(sql)
-            .bind(node_tag.as_str())
-            .bind(now_ms as i64)
             .fetch_all(&self.pool)
             .await
             .map_err(to_ledger_error)?;

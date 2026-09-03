@@ -10,25 +10,10 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-// The gateway is a binary crate, so its modules are recompiled here. This keeps
-// the test honest: it exercises the same router the binary mounts.
-#[path = "../src/auth.rs"]
-mod auth;
-#[path = "../src/config.rs"]
-mod config;
-#[path = "../src/error.rs"]
-mod error;
-#[path = "../src/routes/mod.rs"]
-mod routes;
-#[path = "../src/routing.rs"]
-mod routing;
-#[path = "../src/sse.rs"]
-mod sse;
-#[path = "../src/state.rs"]
-mod state;
-
-use crate::config::{Config, RawConfig};
-use crate::state::AppState;
+// The gateway binary is thin assembly over `nova-responses`, so these tests drive
+// the same library the binary mounts — just with the mem backend injected in
+// process instead of a real carrier.
+use nova_responses::{AppState, Config, KeyTable, RawConfig, ResponsesService};
 
 struct Harness {
     base: String,
@@ -39,7 +24,6 @@ struct Harness {
     /// node that created it. These tests therefore drive the engine directly
     /// instead of impersonating an external worker over `/v1/agent/*`.
     world: adapters_mem::MemWorld,
-    node_tag: nova_responses_core::NodeTag,
 }
 
 /// Records the request it was handed, so a test can assert on the context the
@@ -154,7 +138,16 @@ async fn start() -> Harness {
 
     let world = adapters_mem::MemWorld::new();
     let world_handle = world.clone();
-    let keys = Arc::new(auth::KeyTable::parse("").expect("keys"));
+    let keys = Arc::new(KeyTable::parse("").expect("keys"));
+    let service = Arc::new(ResponsesService::new(
+        world.ledger.clone(),
+        world.event_log.clone(),
+        world.context.clone(),
+        world.clock.clone(),
+        world.metrics.clone(),
+        cfg.clone(),
+    ));
+
     let app_state = AppState {
         cfg,
         ledger: world.ledger.clone(),
@@ -163,12 +156,11 @@ async fn start() -> Harness {
         clock: world.clock.clone(),
         metrics: world.metrics.clone(),
         keys,
-        http: reqwest::Client::new(),
+        service,
         accepting: Arc::new(AtomicBool::new(true)),
-        work_ready: Arc::new(tokio::sync::Notify::new()),
     };
 
-    let app = routes::router(app_state);
+    let app = nova_responses::routes::router(app_state);
     let listener = tokio::net::TcpListener::bind::<SocketAddr>("127.0.0.1:0".parse().unwrap())
         .await
         .expect("bind");
@@ -183,7 +175,6 @@ async fn start() -> Harness {
         base: format!("http://{addr}"),
         client: reqwest::Client::new(),
         world: world_handle,
-        node_tag: nova_responses_core::NodeTag::parse("node-a").expect("static tag"),
     }
 }
 
@@ -280,7 +271,6 @@ impl Harness {
                 context: self.world.context.clone(),
                 scheduler,
                 tools: Arc::new(nova_responses_core::NoopToolExecutor),
-                node_tag: self.node_tag.clone(),
             },
             nova_agent::AgentConfig::default(),
         )
@@ -301,7 +291,6 @@ impl Harness {
                     output_text: output_text.to_string(),
                 }),
                 tools: Arc::new(nova_responses_core::NoopToolExecutor),
-                node_tag: self.node_tag.clone(),
             },
             nova_agent::AgentConfig::default(),
         );
@@ -315,14 +304,11 @@ impl Harness {
 }
 
 #[tokio::test]
-async fn health_reports_backend_sharing_and_acceptance() {
+async fn health_reports_acceptance() {
     let h = start().await;
     let (status, body) = h.get("/health").await;
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(body["accepting"], true);
-    // The mem backend is not shared, which is what makes content forwarding
-    // necessary in multi-process runs.
-    assert_eq!(body["context_store_shared"], false);
 }
 
 #[tokio::test]
@@ -546,17 +532,6 @@ async fn unknown_response_id_is_not_found_not_a_parse_error() {
     assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
     let (status, _) = h
         .get("/v1/responses/resp_node-a_00000000-0000-0000-0000-000000000000")
-        .await;
-    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn unknown_node_tag_does_not_trigger_a_forward() {
-    let h = start().await;
-    // `node-z` is not in the peer registry. The gateway must report not-found
-    // rather than synthesising an address from the tag (SEC-5).
-    let (status, _) = h
-        .get("/v1/responses/resp_node-z_00000000-0000-0000-0000-000000000000")
         .await;
     assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
 }

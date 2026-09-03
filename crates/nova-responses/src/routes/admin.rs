@@ -112,7 +112,6 @@ pub async fn health(State(state): State<AppState>) -> Response {
             "node_tag": state.cfg.node_tag.as_str(),
             "accepting": state.is_accepting(),
             "read_only": state.ledger.is_read_only(),
-            "context_store_shared": state.content_is_shared(),
             "in_flight": in_flight,
         })),
     )

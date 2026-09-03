@@ -21,14 +21,12 @@ async fn world() -> Option<SqlWorld> {
 }
 
 #[tokio::test]
-async fn migrations_apply_and_store_is_shared() {
+async fn migrations_apply_and_store_is_reachable() {
     let Some(world) = world().await else {
         eprintln!("skipping: {URL_ENV} not set");
         return;
     };
     use nova_responses_core::ContextStore;
-    // Drives direct connection and retires chain affinity (D21).
-    assert!(world.context.is_shared());
     assert!(world.context.health().await.is_ok());
 }
 

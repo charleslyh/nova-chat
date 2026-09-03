@@ -211,7 +211,7 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
     let agent = AgentId::new();
     let claimed = ports
         .ledger
-        .claim(&ports.node_tag, agent, 2_000, 60_000)
+        .claim(agent, 2_000, 60_000)
         .await
         .expect("claim")
         .expect("something claimable");
@@ -354,79 +354,6 @@ pub async fn assert_cancel_conformance(ports: &PortSet) {
         ports.ledger.cancel(&tenant, &id, 2_100).await,
         Err(LedgerError::InvalidTransition(_))
     ));
-}
-
-/// Orphan reclamation contract.
-///
-/// - **FR-5**: a response whose executor is gone becomes reclaimable.
-/// - **FR-38 / CR-6**: reclaimed work fails explicitly instead of lingering
-///   non-terminal forever, so an accepted response always reaches an end state.
-/// - **FR-36 / INV-45**: reclaim is scoped to the reclaiming node; a peer's
-///   in-flight work is untouched.
-pub async fn assert_orphan_reclaim_conformance(ports: &PortSet) {
-    let tenant = fresh_tenant("orphan");
-    let id = ports.new_id();
-    ports
-        .ledger
-        .create(
-            record(ports, &id, None, &tenant, true, ResponseStatus::Queued),
-            fresh_key(),
-            1_000,
-        )
-        .await
-        .expect("create");
-
-    let reclaimed = ports
-        .ledger
-        .reclaim_orphans(&ports.node_tag, 5_000)
-        .await
-        .expect("reclaim");
-    assert!(
-        reclaimed.iter().any(|c| c.response_id == id),
-        "this node's queued work must be reclaimed"
-    );
-
-    let after = ports.ledger.get(&id).await.expect("get").expect("present");
-    assert_eq!(after.status, ResponseStatus::Failed);
-    assert!(
-        after.attempt > Attempt::default(),
-        "the fence must be raised so a dead holder cannot append"
-    );
-
-    // A different node's work is untouched.
-    let other_tag = NodeTag::parse("other-node").expect("tag");
-    let other_tag_for_cleanup = other_tag.clone();
-    let theirs = ResponseId::new(other_tag.clone());
-    let mut theirs_rec = record(ports, &theirs, None, &tenant, true, ResponseStatus::Queued);
-    theirs_rec.node_tag = other_tag;
-    ports
-        .ledger
-        .create(theirs_rec, fresh_key(), 1_000)
-        .await
-        .expect("create");
-    ports
-        .ledger
-        .reclaim_orphans(&ports.node_tag, 6_000)
-        .await
-        .expect("reclaim");
-    let untouched = ports.ledger.get(&theirs).await.expect("get").expect("present");
-    assert_eq!(
-        untouched.status,
-        ResponseStatus::Queued,
-        "reclaim must be scoped to the calling node"
-    );
-
-    // Release it before returning.
-    //
-    // Now that claiming is node-scoped (FR-4), a later case cannot drain another
-    // node's queue — so a record left queued here would permanently occupy part of
-    // the process-wide admission budget, and the overload case would measure this
-    // case's residue instead of its own work.
-    ports
-        .ledger
-        .reclaim_orphans(&other_tag_for_cleanup, 7_000)
-        .await
-        .expect("release the other node's queued work");
 }
 
 // ------------------------------------------------------------------ context
@@ -858,27 +785,23 @@ pub fn assert_reconnect_backoff() {
     assert!(hi.as_millis() <= 30_000 * 2);
 }
 
-// ------------------------------------------------------------- claim locality
+// --------------------------------------------------------------- global claim
 
-/// FR-4 / D23: a response is only ever executed by the node that created it.
+/// D25: any execution process may claim any queued response (FR-4).
 ///
-/// This is the assertion whose absence allowed a real defect to ship. With the
-/// in-memory backend each node holds its own ledger, so the constraint held
-/// automatically and nothing expressed it. Once D21 made the ledger shared, the
-/// selection had no node predicate — and node-b's work could be handed to node-a.
-///
-/// The consequence is invisible rather than loud: increments land in node-a's
-/// in-flight buffer, while a subscriber routes by the node tag inside the id and
-/// is sent to node-b. It sees `Created` and then nothing, forever, with no error
-/// raised anywhere. Indistinguishable from a model that produced no output.
-pub async fn assert_claim_locality(ports: &PortSet) {
-    let tenant = fresh_tenant("locality");
+/// Replaces the D23 `claim-locality` case. The in-flight buffer is now shared
+/// (Redis Streams / TDMQ), so there is no "wrong process" for increments to land
+/// in — a node filter would instead strand queued responses on other nodes. The
+/// two-handed assertion also verifies CR-1: each response is handed out exactly
+/// once, never to two concurrent claimers.
+pub async fn assert_global_claim(ports: &PortSet) {
+    let tenant = fresh_tenant("global-claim");
 
-    // Drain this node's queue so the assertion is about what follows.
+    // Drain the queue so the assertion is about what follows.
     loop {
         let Some(c) = ports
             .ledger
-            .claim(&ports.node_tag, AgentId(uuid::Uuid::new_v4()), 1_000, 30_000)
+            .claim(AgentId::new(), 1_000, 30_000)
             .await
             .expect("drain claim")
         else {
@@ -897,7 +820,7 @@ pub async fn assert_claim_locality(ports: &PortSet) {
             .expect("drain complete");
     }
 
-    // A response owned by a *different* node.
+    // Two queued responses with different node tags.
     let other_node = NodeTag::parse("node-zz").expect("static tag");
     let foreign_id = ResponseId::new(other_node.clone());
     let mut foreign = record(ports, &foreign_id, None, &tenant, true, ResponseStatus::Queued);
@@ -908,62 +831,49 @@ pub async fn assert_claim_locality(ports: &PortSet) {
         .await
         .expect("create foreign");
 
-    assert!(
-        ports
-            .ledger
-            .claim(&ports.node_tag, AgentId(uuid::Uuid::new_v4()), 1_100, 30_000)
-            .await
-            .expect("claim")
-            .is_none(),
-        "this node claimed a response belonging to `{}`. Its increments would go to \
-         this node's in-flight buffer while subscribers are routed to the owning \
-         node — they would see the created event and then silence (FR-4).",
-        other_node.as_str()
-    );
-
-    // The foreign response must still be claimable by its owner: skipping it may
-    // not consume it, or it would be stranded in the queue forever.
-    let by_owner = ports
-        .ledger
-        .claim(&other_node, AgentId(uuid::Uuid::new_v4()), 1_200, 30_000)
-        .await
-        .expect("claim by owner")
-        .expect("the owning node must still be able to claim its own work");
-    assert_eq!(
-        by_owner.record.response_id, foreign_id,
-        "skipping another node's work must defer it, not discard it"
-    );
-
-    // And this node can still claim its own.
     let mine = ports.new_id();
     ports
         .ledger
         .create(
             record(ports, &mine, None, &tenant, true, ResponseStatus::Queued),
             fresh_key(),
-            1_300,
+            1_100,
         )
         .await
         .expect("create local");
-    let claimed = ports
-        .ledger
-        .claim(&ports.node_tag, AgentId(uuid::Uuid::new_v4()), 1_400, 30_000)
-        .await
-        .expect("claim local")
-        .expect("a node must be able to claim work it owns");
-    assert_eq!(claimed.record.response_id, mine);
-    assert_eq!(
-        claimed.attempt.0, 1,
-        "a first claim must produce attempt 1, otherwise the fence cannot tell a \
-         retry from the original"
-    );
 
-    // Drive both claims to a terminal state before returning.
-    //
-    // Not tidiness: the admission counter is process-wide, so in-flight work left
-    // behind here would silently consume another case's capacity budget. The
-    // overload case then measures this case's leftovers instead of its own work.
-    for c in [&by_owner, &claimed] {
+    // One execution process claims both, in FIFO order, regardless of node tag.
+    let first = ports
+        .ledger
+        .claim(AgentId::new(), 2_000, 30_000)
+        .await
+        .expect("claim first")
+        .expect("something claimable");
+    let second = ports
+        .ledger
+        .claim(AgentId::new(), 2_100, 30_000)
+        .await
+        .expect("claim second")
+        .expect("something claimable");
+
+    // Both responses are handed out, and each gets a fresh attempt-1 fence.
+    let mut claimed_ids = [
+        first.record.response_id.clone(),
+        second.record.response_id.clone(),
+    ];
+    claimed_ids.sort();
+    let mut expected = [foreign_id, mine];
+    expected.sort();
+    assert_eq!(
+        claimed_ids, expected,
+        "global claim must hand out every queued response regardless of node tag"
+    );
+    assert_eq!(first.attempt.0, 1);
+    assert_eq!(second.attempt.0, 1);
+
+    // Drive both claims to a terminal state before returning, so in-flight work
+    // left behind cannot consume another case's admission budget.
+    for c in [&first, &second] {
         ports
             .ledger
             .complete(
@@ -971,7 +881,7 @@ pub async fn assert_claim_locality(ports: &PortSet) {
                 c.attempt,
                 ResponseStatus::Completed,
                 Usage::default(),
-                1_500,
+                2_200,
             )
             .await
             .expect("release claimed work");
@@ -1012,7 +922,7 @@ pub async fn assert_overload_integrity(ports: &PortSet) {
     loop {
         let Some(c) = ports
             .ledger
-            .claim(&ports.node_tag, AgentId(uuid::Uuid::new_v4()), 1_000, 30_000)
+            .claim(AgentId(uuid::Uuid::new_v4()), 1_000, 30_000)
             .await
             .expect("drain claim")
         else {
@@ -1085,10 +995,9 @@ pub async fn assert_overload_integrity(ports: &PortSet) {
     let mut claim_handles = Vec::new();
     for _ in 0..RACERS {
         let ledger = ports.ledger.clone();
-        let node = ports.node_tag.clone();
         claim_handles.push(tokio::spawn(async move {
             ledger
-                .claim(&node, AgentId(uuid::Uuid::new_v4()), 2_100, 30_000)
+                .claim(AgentId(uuid::Uuid::new_v4()), 2_100, 30_000)
                 .await
         }));
     }
@@ -1237,7 +1146,7 @@ pub async fn assert_output_provenance(ports: &PortSet) {
         .expect("create");
     let claimed = ports
         .ledger
-        .claim(&ports.node_tag, AgentId(uuid::Uuid::new_v4()), 1_100, 30_000)
+        .claim(AgentId(uuid::Uuid::new_v4()), 1_100, 30_000)
         .await
         .expect("claim")
         .expect("something was queued");
@@ -1386,10 +1295,9 @@ pub async fn assert_concurrency_conformance(ports: &PortSet) {
     let mut handles = Vec::new();
     for _ in 0..RACERS {
         let ledger = ports.ledger.clone();
-        let node = ports.node_tag.clone();
         handles.push(tokio::spawn(async move {
             ledger
-                .claim(&node, AgentId(uuid::Uuid::new_v4()), 1_100, 30_000)
+                .claim(AgentId(uuid::Uuid::new_v4()), 1_100, 30_000)
                 .await
         }));
     }
@@ -1588,12 +1496,6 @@ pub fn cases() -> &'static [ContractCase] {
             asserts: "assert_cancel_conformance",
         },
         ContractCase {
-            name: "orphan-reclaim",
-            covers: &["FR-5", "FR-36", "FR-38", "CR-6", "INV-45"],
-            scope: CaseScope::Backend,
-            asserts: "assert_orphan_reclaim_conformance",
-        },
-        ContractCase {
             name: "context-chain",
             covers: &[
                 "FR-15", "FR-16", "FR-17", "FR-18", "FR-19", "FR-21", "FR-22", "CR-9", "CR-10",
@@ -1609,10 +1511,10 @@ pub fn cases() -> &'static [ContractCase] {
             asserts: "assert_integrity_conformance",
         },
         ContractCase {
-            name: "claim-locality",
-            covers: &["FR-4"],
+            name: "global-claim",
+            covers: &["FR-4", "CR-1"],
             scope: CaseScope::Backend,
-            asserts: "assert_claim_locality",
+            asserts: "assert_global_claim",
         },
         ContractCase {
             name: "overload-integrity",
@@ -1712,13 +1614,13 @@ async fn run_case(ports: &PortSet, case: &ContractCase) -> CaseOutcome {
         }
         "ledger" => assert_ledger_conformance(ports).await,
         "cancel" => assert_cancel_conformance(ports).await,
-        "orphan-reclaim" => assert_orphan_reclaim_conformance(ports).await,
+
         "context-chain" => assert_context_conformance(ports).await,
         "integrity" => match &ports.integrity {
             Some(integrity) => assert_integrity_conformance(integrity.clone()).await,
             None => return CaseOutcome::Skipped("backend supplies no ContentIntegrity port"),
         },
-        "claim-locality" => assert_claim_locality(ports).await,
+        "global-claim" => assert_global_claim(ports).await,
         "overload-integrity" => assert_overload_integrity(ports).await,
         "output-provenance" => assert_output_provenance(ports).await,
         "durability-order" => assert_durability_order(ports).await,

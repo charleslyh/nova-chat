@@ -93,22 +93,9 @@ let depth = record.context_depth + 1;
 
 ---
 
-## 5. 链亲和路由及其退役条件
+## 5. 链亲和路由
 
-**仅在上下文库非共享时需要。** 带 `previous_response_id` 的创建请求被导向该链所属节点，使快照固化的解析全程本地完成。
-
-```rust
-pub fn route_chain_affinity(state: &AppState, previous: &ResponseId) -> Route {
-    if state.content_is_shared() {
-        return Route::Local;   // 共享库后必须退役
-    }
-    resolve(state, previous.node_tag())
-}
-```
-
-**共享库后必须退役**：否则长会话把每一轮都钉死在同一节点，制造热点。这由 `is_shared()` 单一标志自动完成，无需人工改动接入层。
-
-> 这是与 `route_inflight` 的本质区别：后者是永久架构特征（状态在特定进程堆内，无共享端点），前者是临时措施。把两者描述为「同一种定向转发」会让链亲和被当作正式设计固化下来。
+**已移除（D25）。** 存储共享化后，`previous_response_id` 的前驱在任意节点直接解析，不再有「把创建请求导向链所属节点」的链亲和路由。`route_chain_affinity`、`is_shared()` 与整个转发子系统已整体删除——长对话也因此在结构上不再可能被钉死在单个节点。
 
 ---
 

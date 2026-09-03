@@ -1,10 +1,11 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::context::{ResponseStatus, StoredResponse, Usage};
-use crate::ids::{AgentId, Attempt, IdempotencyKey, NodeTag, ResponseId, TenantId};
+use crate::ids::{AgentId, Attempt, IdempotencyKey, ResponseId, TenantId};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CreateOutcome {
     Accepted { response_id: ResponseId },
     Duplicate { response_id: ResponseId },
@@ -15,20 +16,20 @@ pub enum CreateOutcome {
     // No `Busy`: there is no session lock any more (D20 ①).
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClaimedResponse {
     pub record: StoredResponse,
     pub attempt: Attempt,
     pub exec_deadline_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AbortedClaim {
     pub response_id: ResponseId,
     pub previous_attempt: Attempt,
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LedgerError {
     #[error("not found")]
     NotFound,
@@ -59,31 +60,18 @@ pub trait ResponseLedger: Send + Sync {
         now_ms: u64,
     ) -> Result<CreateOutcome, LedgerError>;
 
-    /// Take the next queued response **belonging to `node`** for execution.
+    /// Take the next queued response for execution.
     ///
     /// Single-point conditional update (INV-1): the check and the transition to
     /// claimed happen in one atomic operation, so two concurrent callers cannot
     /// both succeed on the same response.
     ///
-    /// # Why `node` is a parameter and not an implementation detail
-    ///
-    /// A response is executed by the node that created it (FR-4 / D23), because
-    /// that node — and only that node — holds its in-flight event buffer. The
-    /// buffer is a `VecDeque` in one process's heap by deliberate design (D21), so
-    /// there is no shared endpoint another node could append to.
-    ///
-    /// Handing node-b's response to node-a therefore produces a response whose
-    /// increments land in the wrong process: the subscriber, routing by the node
-    /// tag inside the id, is sent to node-b and sees only `Created` — never any
-    /// output, and never an error either. Silent, and indistinguishable from a
-    /// model that simply produced nothing.
-    ///
-    /// This was a real defect once the ledger became shared: the per-node ledger
-    /// of the in-memory backend had made the constraint hold automatically, so
-    /// nothing expressed it. Implementations **must** filter by `node`.
+    /// Global claim (D25): any execution process may claim any queued response.
+    /// The in-flight buffer is shared (Redis Streams / TDMQ), so the producer is
+    /// no longer tied to the creating node. The attempt fence still protects
+    /// against double-claim and stale writes (INV-5/6).
     async fn claim(
         &self,
-        node: &NodeTag,
         agent_id: AgentId,
         now_ms: u64,
         exec_ttl_ms: u64,
@@ -115,15 +103,6 @@ pub trait ResponseLedger: Send + Sync {
         &self,
         now_ms: u64,
         heartbeat_ttl_ms: u64,
-    ) -> Result<Vec<AbortedClaim>, LedgerError>;
-
-    /// Startup orphan sweep (INV-45): everything still non-terminal that belongs
-    /// to this node is failed immediately, because its in-flight buffer died
-    /// with the previous process.
-    async fn reclaim_orphans(
-        &self,
-        node_tag: &NodeTag,
-        now_ms: u64,
     ) -> Result<Vec<AbortedClaim>, LedgerError>;
 
     /// Book usage consumed by an attempt that was abandoned (INV-51).

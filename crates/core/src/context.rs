@@ -196,7 +196,7 @@ impl StoredResponse {
 
 /// Bounds for chain resolution. Exceeding any of them is an **error**, never a
 /// silent truncation (INV-41).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainLimits {
     pub max_depth: usize,
     pub max_items: usize,
@@ -214,7 +214,7 @@ impl Default for ChainLimits {
 }
 
 /// Result of resolving a response's context: history in chronological order.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ResolvedContext {
     pub items: Vec<ResponseItem>,
     pub depth: usize,

@@ -8,4 +8,5 @@ description = "In-memory adapters for nova-responses-core ports"
 nova-responses-core = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
+serde = { workspace = true }
 tokio = { workspace = true }

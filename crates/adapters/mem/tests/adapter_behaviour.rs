@@ -498,47 +498,6 @@ async fn tenant_purge_uses_the_index_and_leaves_others_intact() {
 }
 
 #[tokio::test]
-async fn orphan_reclaim_fails_only_this_nodes_in_flight_work() {
-    let world = MemWorld::new();
-    let mine = ResponseId::new(tag());
-    let mut queued = record(&mine, None, "t1", true);
-    queued.status = ResponseStatus::InProgress;
-    world
-        .ledger
-        .create(queued, IdempotencyKey("k1".into()), 0)
-        .await
-        .unwrap();
-
-    let other_node = NodeTag::parse("node-b").unwrap();
-    let theirs = ResponseId::new(other_node.clone());
-    let mut theirs_rec = record(&theirs, None, "t1", true);
-    theirs_rec.status = ResponseStatus::InProgress;
-    theirs_rec.node_tag = other_node;
-    theirs_rec.response_id = theirs.clone();
-    world
-        .ledger
-        .create(theirs_rec, IdempotencyKey("k2".into()), 0)
-        .await
-        .unwrap();
-
-    let reclaimed = world.ledger.reclaim_orphans(&tag(), 5_000).await.unwrap();
-    assert_eq!(reclaimed.len(), 1);
-    assert_eq!(reclaimed[0].response_id, mine);
-
-    let mine_rec = world.ledger.get(&mine).await.unwrap().unwrap();
-    assert_eq!(mine_rec.status, ResponseStatus::Failed);
-    // The fence was raised so the dead holder cannot append.
-    assert!(mine_rec.attempt > Attempt::default());
-
-    let theirs_rec = world.ledger.get(&theirs).await.unwrap().unwrap();
-    assert_eq!(
-        theirs_rec.status,
-        ResponseStatus::InProgress,
-        "another node's work must be untouched"
-    );
-}
-
-#[tokio::test]
 async fn partial_usage_survives_cancellation() {
     let world = MemWorld::new();
     let id = ResponseId::new(tag());
@@ -553,7 +512,7 @@ async fn partial_usage_survives_cancellation() {
 
     let claimed = world
         .ledger
-        .claim(&tag(), nova_responses_core::AgentId::new(), 0, 60_000)
+        .claim(nova_responses_core::AgentId::new(), 0, 60_000)
         .await
         .unwrap()
         .expect("claimable");
@@ -602,7 +561,7 @@ async fn stale_attempt_cannot_append_after_reaping() {
         .await
         .unwrap();
     let agent = nova_responses_core::AgentId::new();
-    let claimed = world.ledger.claim(&tag(), agent, 0, 60_000).await.unwrap().unwrap();
+    let claimed = world.ledger.claim(agent, 0, 60_000).await.unwrap().unwrap();
 
     let mut ev = event(&id, ResponseEventKind::OutputTextDelta, "a");
     ev.attempt = Some(claimed.attempt);
@@ -632,14 +591,6 @@ async fn expiry_sweep_removes_only_due_records() {
     assert_eq!(world.context.sweep_expired(1_000, 100).await.unwrap(), 1);
     assert!(world.context.get(&tenant("t1"), &soon).await.unwrap().is_none());
     assert!(world.context.get(&tenant("t1"), &later).await.unwrap().is_some());
-}
-
-#[tokio::test]
-async fn mem_context_store_is_not_shared() {
-    // Drives the forwarding decision in the ingress layer; the sql adapter
-    // returns true and retires chain affinity.
-    let world = MemWorld::new();
-    assert!(!world.context.is_shared());
 }
 
 #[tokio::test]

@@ -54,7 +54,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nova_responses_core::{
     validate_outcome, AgentId, Attempt, ClaimedResponse, CompletionsRequest,
-    CompletionsRequestScheduler, CompletionsSink, ContextStore, EventBody, FinishReason, NodeTag,
+    CompletionsRequestScheduler, CompletionsSink, ContextStore, EventBody, FinishReason,
     RequestProvenance, ResponseEvent, ResponseEventKind, ResponseEventLog, ResponseId,
     ResponseItem, ResponseLedger, ResponseStatus, SchedulerError, SinkError, SinkVerdict,
     TenantId, ToolExecutor, ToolSpec, Usage,
@@ -71,8 +71,6 @@ pub struct AgentDeps {
     /// Carries tool calls out. `NoopToolExecutor` is the explicit "no tools"
     /// instance; a real registry or a remote bridge is the same shape.
     pub tools: Arc<dyn ToolExecutor>,
-    /// This node. Claiming is scoped to it (FR-4).
-    pub node_tag: NodeTag,
 }
 
 #[derive(Debug, Clone)]
@@ -139,7 +137,7 @@ impl Agent {
         let claimed = match self
             .deps
             .ledger
-            .claim(&self.deps.node_tag, agent, now_ms, self.cfg.exec_ttl_ms)
+            .claim(agent, now_ms, self.cfg.exec_ttl_ms)
             .await
         {
             Ok(Some(c)) => c,

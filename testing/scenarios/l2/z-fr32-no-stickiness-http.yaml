@@ -1,0 +1,27 @@
+name: z-fr32-no-stickiness-http
+covers: [FR-32]
+oracles: []
+destructive: true
+requires_nodes: [18080, 18082]
+steps:
+  # 创建响应（background），事件流落到共享载体。
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"no stickiness resume","background":true}'
+    expect_status: 202
+    capture:
+      rid: id
+  # 从 node-c 订阅，拿到部分事件与游标。
+  - action: http_sse_collect
+    url: http://127.0.0.1:18082/v1/responses/{{rid}}?stream=true
+    expect_min_events: 1
+    max_events: 3
+    capture_last_seq: cursor
+  # 停掉 node-c（SIGKILL，模拟实例故障）。
+  - action: kill_listener
+    port: 18082
+  # 用同一游标换 node-a 续订，拿到剩余事件——缓冲共享，无连接粘性。
+  - action: http_sse_collect
+    url: http://127.0.0.1:18080/v1/responses/{{rid}}?stream=true&starting_after={{cursor}}
+    expect_min_events: 1
+    max_events: 5

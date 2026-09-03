@@ -1,0 +1,33 @@
+[package]
+name = "nova-responses"
+version.workspace = true
+edition.workspace = true
+description = "Responses 能力层 + HTTP 接入层 + 后台维护，不含具体存储适配器（经 core 端口注入）"
+
+[dependencies]
+nova-responses-core = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The HTTP contract test drives the library with the mem backend and an embedded
+# agent injected in process — these are test-only and never part of the library's
+# production dependency surface.
+adapters-mem = { workspace = true }
+adapters-completions-mock = { workspace = true }
+nova-agent = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+toml = { workspace = true }

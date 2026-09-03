@@ -1,18 +1,25 @@
-//! Response service gateway.
+//! Gateway binary over [`nova_responses`]: thin assembly that mounts a backend.
 //!
-//! Assembly only: load config, mount a backend, validate startup preconditions,
-//! reclaim orphans, start the sweeper, serve, drain.
+//! Which backend is mounted is a **compile-time** choice, not a runtime config
+//! switch:
+//!
+//! - `feature = "mem"` (default): the mem carrier **client** adapters, reaching
+//!   the shared `nova-responses-mem-server`. Execution is the separate
+//!   `nova-agentd` process — the same process topology as production, with the
+//!   carrier swapped for an in-memory double. This is what protocol-compatibility
+//!   checks, local development and L2 verification run.
+//! - `feature = "sql"`: the real carriers (Postgres + Redis); execution is the
+//!   separate `nova-agentd` process. Built with `--no-default-features
+//!   --features sql` so the release binary statically excludes mem.
+//!
+//! The `nova-responses` library and every port consumer below are unaware of
+//! which backend is mounted — the choice exists only at this injection point.
 
-mod auth;
-mod config;
-mod execution;
-mod error;
-mod routes;
-mod routing;
-mod sse;
-mod state;
-mod sweeper;
-mod shutdown;
+#[cfg(all(feature = "sql", feature = "mem"))]
+compile_error!(
+    "mem and sql backends are mutually exclusive; build production with \
+     `--no-default-features --features sql`"
+);
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -21,22 +28,32 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use nova_responses_core::{
-    Clock, ContextStore, MetricsSink, ResponseEventLog, ResponseLedger,
-};
-use tracing::{info, warn};
+use nova_responses_core::{Clock, ContextStore, MetricsSink, ResponseEventLog, ResponseLedger};
+use nova_responses::{AppState, Config, CountingMetrics, KeyTable, ResponsesService, SystemClock};
+use tracing::info;
 
-use crate::auth::KeyTable;
-use crate::config::{Config, StoreBackend};
-use crate::state::AppState;
+#[cfg(feature = "sql")]
+const DEFAULT_CONFIG: &str = "testing/config/node-a-sql.toml";
+#[cfg(not(feature = "sql"))]
+const DEFAULT_CONFIG: &str = "testing/config/node-a.toml";
 
 #[derive(Debug, Parser)]
 struct Args {
-    #[arg(long, default_value = "testing/config/node-a.toml")]
+    #[arg(long, default_value = DEFAULT_CONFIG)]
     config: PathBuf,
 }
 
 const ADMIN_KEY_ENV: &str = "NOVA_ADMIN_KEY";
+
+/// The mounted ports, all as trait objects. Downstream sees only these; the
+/// concrete adapter type is gone past this struct.
+struct Ports {
+    ledger: Arc<dyn ResponseLedger>,
+    event_log: Arc<dyn ResponseEventLog>,
+    context: Arc<dyn ContextStore>,
+    clock: Arc<dyn Clock>,
+    metrics: Arc<dyn MetricsSink>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,141 +72,57 @@ async fn main() -> Result<()> {
         .with_context(|| format!("listen address `{}`", cfg.listen))?;
 
     let keys = Arc::new(
-        KeyTable::from_env(&cfg.api_keys_env, &cfg.internal_token_env, ADMIN_KEY_ENV)
+        KeyTable::from_env(&cfg.api_keys_env, ADMIN_KEY_ENV)
             .map_err(|e| anyhow::anyhow!("api keys from ${}: {e}", cfg.api_keys_env))?,
     );
-    if keys.is_empty() {
-        warn!(
-            env = cfg.api_keys_env,
-            "no API keys configured; running unauthenticated (verification only)"
-        );
-    }
-    if !cfg.peers.is_empty() && !keys.has_internal_token() {
-        // Without a shared token, peers cannot authenticate forwards and the
-        // internal tenant header would have to be trusted blindly.
-        bail!(
-            "peers are configured but ${} is not set; node-to-node forwarding requires it",
-            cfg.internal_token_env
-        );
-    }
 
-    // Mount a backend. Everything downstream sees only trait objects.
-    let (ledger, event_log, context, clock, metrics): (
-        Arc<dyn ResponseLedger>,
-        Arc<dyn ResponseEventLog>,
-        Arc<dyn ContextStore>,
-        Arc<dyn Clock>,
-        Arc<dyn MetricsSink>,
-    ) = match cfg.store_backend {
-        StoreBackend::Mem => {
-            let world = adapters_mem::MemWorld::with_config(adapters_mem::MemWorldConfig {
-                events_per_response: cfg.max_events_per_response,
-                max_logs: cfg.max_event_logs,
-                max_records: 100_000,
-                pending_limit: cfg.pending_limit,
-                verify_integrity: cfg.verify_integrity,
-            });
-            warn!("store_backend=mem: not durable and not shared; verification use only");
-            (
-                world.ledger.clone(),
-                world.event_log.clone(),
-                world.context.clone(),
-                world.clock.clone(),
-                world.metrics.clone(),
-            )
-        }
-        StoreBackend::Sql => {
-            // Startup fails outright when the integrity key or the database is
-            // missing: storing records that cannot later be verified, or
-            // accepting traffic that must all be refused, is worse than not
-            // starting (INV-44 / INV-46).
-            let sql = adapters_sql::SqlWorld::connect_from_env(
-                &cfg.database_url_env,
-                adapters_sql::SqlConfig {
-                    verify_integrity: cfg.verify_integrity,
-                    ..Default::default()
-                },
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "connecting to the context store via ${}",
-                    cfg.database_url_env
-                )
-            })?;
-            let mem_side = adapters_mem::MemWorld::with_config(adapters_mem::MemWorldConfig {
-                events_per_response: cfg.max_events_per_response,
-                max_logs: cfg.max_event_logs,
-                verify_integrity: false,
-                ..Default::default()
-            });
-            (
-                sql.ledger.clone(),
-                // In-flight events stay in process memory regardless of backend:
-                // that is the deliberate tiering decision, not an omission (D21).
-                mem_side.event_log.clone(),
-                sql.context.clone(),
-                mem_side.clock.clone(),
-                mem_side.metrics.clone(),
-            )
-        }
-    };
-
-    ledger.set_pending_limit(cfg.pending_limit);
+    let ports = mount(&cfg).await?;
+    ports.ledger.set_pending_limit(cfg.pending_limit);
 
     // Liveness probe before serving: a node that cannot store would refuse every
     // `store: true` create, so failing fast is clearer than serving 503s.
-    if let Err(e) = context.health().await {
+    if let Err(e) = ports.context.health().await {
         bail!("context store is not reachable at startup: {e}");
     }
 
-    // Same reasoning for the scheduler: a misconfigured one would start cleanly and
-    // fail every generation, which reads as a provider outage.
-    if let Err(e) = cfg.validate_scheduler() {
-        bail!("{e}");
-    }
-    let scheduler = build_scheduler(&cfg)?;
+    let service = Arc::new(ResponsesService::new(
+        ports.ledger.clone(),
+        ports.event_log.clone(),
+        ports.context.clone(),
+        ports.clock.clone(),
+        ports.metrics.clone(),
+        cfg.clone(),
+    ));
 
     let state = AppState {
         cfg: cfg.clone(),
-        ledger: ledger.clone(),
-        event_log: event_log.clone(),
-        context: context.clone(),
-        clock: clock.clone(),
-        metrics: metrics.clone(),
+        ledger: ports.ledger.clone(),
+        event_log: ports.event_log.clone(),
+        context: ports.context.clone(),
+        clock: ports.clock.clone(),
+        metrics: ports.metrics.clone(),
         keys,
-        http: reqwest::Client::new(),
+        service,
         accepting: Arc::new(AtomicBool::new(true)),
-        work_ready: Arc::new(tokio::sync::Notify::new()),
     };
 
-    // Orphan reclaim (INV-45): anything non-terminal owned by this node lost its
-    // in-flight buffer when the previous process died. Fail it now — seconds
-    // instead of a 90 s heartbeat timeout.
-    let now = state.now_ms().await;
-    match ledger.reclaim_orphans(&cfg.node_tag, now).await {
-        Ok(reclaimed) if !reclaimed.is_empty() => {
-            info!(
-                count = reclaimed.len(),
-                node_tag = cfg.node_tag.as_str(),
-                "reclaimed orphaned responses from a previous process"
-            );
-            metrics.incr("orphans_reclaimed", reclaimed.len() as u64).await;
-        }
-        Ok(_) => {}
-        Err(e) => warn!(error = %e, "orphan reclaim failed"),
-    }
-
+    // The sweep loop runs as a separate process under the shared carrier (its
+    // single owner); the in-gateway copy is kept config-gated for the sql build
+    // and is disabled in the mem fixtures.
     if cfg.run_sweeper {
-        sweeper::spawn(state.clone());
+        nova_responses::sweeper::spawn(nova_responses::sweeper::SweepDeps {
+            ledger: state.ledger.clone(),
+            event_log: state.event_log.clone(),
+            context: state.context.clone(),
+            clock: state.clock.clone(),
+            metrics: state.metrics.clone(),
+            heartbeat_ttl_ms: state.cfg.heartbeat_ttl_ms,
+            retain_after_terminal_ms: state.cfg.retain_after_terminal_ms,
+        });
     }
 
-    // This node executes its own generations (D23).
-    execution::spawn(state.clone(), scheduler);
+    let app = nova_responses::routes::router(state.clone());
 
-    let app = routes::router(state.clone());
-
-    // Readiness marker for the local process harness.
     if let Some(parent) = args.config.parent() {
         let marker = parent.join(format!(".ready-{}", cfg.node_tag));
         let _ = std::fs::write(&marker, b"ok");
@@ -198,46 +131,72 @@ async fn main() -> Result<()> {
     info!(
         node_tag = cfg.node_tag.as_str(),
         %addr,
-        backend = ?cfg.store_backend,
-        scheduler = ?cfg.scheduler,
-        context_store_shared = context.is_shared(),
         "nova-responses-gateway listening"
     );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown::drain(state))
+        .with_graceful_shutdown(nova_responses::shutdown::drain(state))
         .await?;
 
     info!("shutdown complete");
     Ok(())
 }
 
-/// Build the configured scheduler.
-///
-/// The only place a concrete provider is named. Adding a real one means adding an
-/// arm here plus an adapter crate — the execution loop and the request translation
-/// are untouched (D23 ⑤).
-fn build_scheduler(
-    cfg: &config::Config,
-) -> anyhow::Result<std::sync::Arc<dyn nova_responses_core::CompletionsRequestScheduler>> {
-    use config::SchedulerKind;
+/// Real carriers: Postgres + Redis. Startup fails outright when the integrity key
+/// or the database is missing (INV-44 / INV-46).
+#[cfg(feature = "sql")]
+async fn mount(cfg: &Config) -> Result<Ports> {
+    let sql = adapters_sql::SqlWorld::connect_from_env(
+        &cfg.database_url_env,
+        adapters_sql::SqlConfig {
+            verify_integrity: cfg.verify_integrity,
+            ..Default::default()
+        },
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "connecting to the context store via ${}",
+            cfg.database_url_env
+        )
+    })?;
 
-    Ok(match cfg.scheduler {
-        SchedulerKind::Echo => std::sync::Arc::new(
-            adapters_completions_mock::EchoScheduler::new(8),
-        ),
-        SchedulerKind::Scripted => {
-            let path = cfg
-                .scheduler_script
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("scheduler_script is required"))?;
-            let src = std::fs::read_to_string(path)
-                .with_context(|| format!("reading scheduler script {path}"))?;
-            std::sync::Arc::new(
-                adapters_completions_mock::ScriptedScheduler::from_yaml(&src)
-                    .with_context(|| format!("parsing scheduler script {path}"))?,
-            )
-        }
+    let redis_url = std::env::var(&cfg.redis_url_env)
+        .with_context(|| format!("reading ${}", cfg.redis_url_env))?;
+    let event_log = adapters_event_log_redis::RedisResponseEventLog::connect(
+        &redis_url,
+        sql.ledger.clone(),
+        "resp",
+    )
+    .await
+    .with_context(|| format!("connecting to the event buffer via ${}", cfg.redis_url_env))?;
+
+    Ok(Ports {
+        ledger: sql.ledger.clone(),
+        event_log: Arc::new(event_log),
+        context: sql.context.clone(),
+        // Real wall clock: created_at / reap deadlines must use wall time, not a
+        // frozen virtual clock.
+        clock: Arc::new(SystemClock),
+        metrics: Arc::new(CountingMetrics::default()),
+    })
+}
+
+/// In-memory shared carrier (verification). The ledger, event buffer and context
+/// are reached through the client adapters; execution is the separate
+/// `nova-agentd` process, not embedded here.
+#[cfg(feature = "mem")]
+async fn mount(cfg: &Config) -> Result<Ports> {
+    let url = std::env::var(&cfg.mem_server_url_env)
+        .with_context(|| format!("reading ${}", cfg.mem_server_url_env))?;
+    let world = adapters_mem_client::MemClientWorld::new(&url);
+
+    Ok(Ports {
+        ledger: world.ledger.clone(),
+        event_log: world.event_log.clone(),
+        context: world.context.clone(),
+        clock: Arc::new(SystemClock),
+        metrics: Arc::new(CountingMetrics::default()),
     })
 }

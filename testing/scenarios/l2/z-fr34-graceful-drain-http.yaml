@@ -1,0 +1,32 @@
+name: z-fr34-graceful-drain-http
+covers: [FR-34]
+oracles: []
+destructive: true
+requires_nodes: [18080, 18081]
+steps:
+  # 一个在途响应（agentd 挂起执行），让 node-b 的 drain 有「在途」要等，并用于
+  # 验证停机不丢。
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"please hang","background":true}'
+    expect_status: 202
+    capture:
+      rid: id
+  # 优雅停机 node-b：SIGTERM 后 accepting 翻转，drain 仍在窗口内。
+  - action: graceful_stop
+    port: 18081
+    wait_ms: 200
+  # 停机窗口内：新建被拒（503 draining）。
+  - action: http_post
+    url: http://127.0.0.1:18081/v1/responses
+    body: '{"model":"m","input":"blocked by drain","background":true}'
+    expect_status: 503
+  # 读继续可用，且 health 如实报告 accepting:false。
+  - action: http_get
+    url: http://127.0.0.1:18081/health
+    expect_status: 200
+    expect_contains: '"accepting":false'
+  # 停机后，在途响应仍从 node-a 可见——在途生成未丢失。
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/responses/{{rid}}
+    expect_status: 200

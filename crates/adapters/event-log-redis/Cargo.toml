@@ -1,0 +1,19 @@
+[package]
+name = "adapters-event-log-redis"
+version.workspace = true
+edition.workspace = true
+description = "Redis Streams backend for the ResponseEventLog port (D25)"
+
+[dependencies]
+nova-responses-core = { workspace = true }
+async-trait = { workspace = true }
+redis = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Provides a process-local `ResponseLedger` for the ignored integration tests,
+# which otherwise need no external database.
+adapters-mem = { workspace = true }

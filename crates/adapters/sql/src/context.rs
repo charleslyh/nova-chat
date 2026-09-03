@@ -60,12 +60,6 @@ impl SqlContextStore {
 
 #[async_trait]
 impl ContextStore for SqlContextStore {
-    fn is_shared(&self) -> bool {
-        // Shared storage: every node reads directly, and chain affinity routing
-        // must therefore be disabled (D21).
-        true
-    }
-
     async fn put(&self, mut record: StoredResponse) -> Result<(), ContextError> {
         self.sign(&mut record)?;
         let sql = "INSERT INTO responses (\

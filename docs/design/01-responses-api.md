@@ -103,28 +103,9 @@ data: {"response_id":"resp_node-a_…","sequence_number":3,"type":"response.outp
 
 ---
 
-## 5. 两条转发路径
+## 5. 无节点间转发
 
-```mermaid
-%%{init: {"flowchart": {"curve": "basis", "rankSpacing": 70, "nodeSpacing": 28}}}%%
-flowchart LR
-    client(["调用方"]) --> nb["node-b"]
-    nb -.->|"route_inflight<br/><b>永久</b>：状态在宿主进程堆内"| na["node-a"]
-    na --> ring["有界事件环"]
-    nb -->|"route_content<br/>is_shared 为真则<b>直连</b>"| db[("上下文库 + 账本")]
-    na --> db
-```
-
-| 路径 | 性质 | 直连是否可能 |
-|---|---|---|
-| `route_inflight` | **永久架构特征** | **不可能**——无共享端点 |
-| `route_content` | **临时措施** | 共享库后**应当直连** |
-
-由 `ContextStore::is_shared()` 单一标志驱动：内存实现 `false` 走转发，SQL 实现 `true` 直连**且链亲和自动退役**。接真库时接入层零改动。
-
-流式请求只能**代理**不能 `307`：重定向暴露内部拓扑，且跨区或经负载均衡后调用方未必能直达宿主节点。
-
-节点标签不在 `peers` 注册表内 → 直接 `404`，**绝不由标签拼装地址**（SEC-5）。
+存储是共享载体（Postgres + Redis），任意节点直读，因此**不存在**节点间转发。历史上为 mem 多节点而生的 `route_inflight` / `route_content` / `route_chain_affinity` / `proxy_*`、`peers` 注册表、节点间内部 token，以及端口上的 `is_shared()` 能力位，已随共享缓冲化（D25）整体移除（见 [`00-architecture-review.md`](./00-architecture-review.md) §4）。
 
 ---
 

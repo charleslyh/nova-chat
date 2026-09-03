@@ -1,0 +1,23 @@
+# Model behaviour for the L2 shared-carrier fixture, declared as data.
+#
+# One execution daemon serves every node through the shared carrier, so the
+# failure modes that were previously expressed per-node (node-c's hanging
+# scheduler) are now expressed per-input on this single script.
+
+rules:
+  # Keeps a generation in flight indefinitely, so `pending-limit-http` can observe
+  # an occupied admission slot deterministically. `hang`, not `stall`: `stall`
+  # reaches a terminal state promptly and would free the slot.
+  - when: !contains "hang"
+    then: !hang
+
+  # Starts answering, then hangs past the deadline. Partial output exists but the
+  # attempt must not complete.
+  - when: !contains "stall"
+    then: !stall
+      before: "Let me think about"
+
+# Ordinary answer, streamed in several pieces, for every unmatched input.
+default: !text
+  text: "I don't have an answer for that."
+  chunks: 2

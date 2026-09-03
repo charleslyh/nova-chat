@@ -1,11 +1,12 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::context::{ChainLimits, ResolvedContext, ResponseStatus, StoredResponse, Usage};
 use crate::ids::{ResponseId, TenantId};
 use crate::protocol::ResponseItem;
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContextError {
     #[error("not found")]
     NotFound,
@@ -49,15 +50,6 @@ pub enum ContextError {
 /// hold. It holds the items that make up model context.
 #[async_trait]
 pub trait ContextStore: Send + Sync {
-    /// Whether the backing store is shared across nodes.
-    ///
-    /// This single flag decides how the ingress layer reaches content:
-    /// `false` → forward to the owning node; `true` → connect directly.
-    /// When it returns `true`, **chain affinity routing must be disabled**,
-    /// otherwise long conversations pin all their traffic to one node and
-    /// create a hotspot (D21).
-    fn is_shared(&self) -> bool;
-
     async fn put(&self, record: StoredResponse) -> Result<(), ContextError>;
 
     /// Commit the final output.

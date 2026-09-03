@@ -55,5 +55,11 @@ sim:
 deploy cmd:
     cargo run -q -p xtask -- deploy {{cmd}}
 
+# Production build: real carriers (sql + redis), statically excluding mem / agent
+# / completions-mock so the release binary never carries verification code.
+[group('deploy')]
+release:
+    cargo build --release --no-default-features --features sql -p nova-responses-gateway
+
 default:
     @just --list

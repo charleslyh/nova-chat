@@ -1,81 +1,29 @@
-# 当期计划 · W 期（Responses 协议子集重构）
+# 当期计划 · Y 期（能力层独立成 crate + 后端编译期门控）
 
 > 状态：**已完成**
-> 依据：[D20](../architecture/decisions.md#d20-交付边界收口存储与订阅分离) · [D21](../architecture/decisions.md#d21-可靠性分层三类存储的差异化投入) · [D22](../architecture/decisions.md#d22-协议封闭子集与严格拒绝)
-> 上一期（V10–V13）见 §5 归档说明
+> 依据：[D25](../architecture/decisions.md#d25-执行进程独立与在途缓冲共享化能力层抽离)（「分两步」的第二步）
+> 上一期（X 期）成果见 §3
 
 ---
 
 ## 1. 交付项
 
-| # | 交付 | 退出标准 | 状态 |
-|---|---|---|---|
-| **W1** | 契约先行：D20/D21/D22 + spec v3 + parameters + invariants | FR/CR/INV/SEC 编号锁定，覆盖率门禁据此统计 | ✅ |
-| **W2** | 协议封闭子集类型层 | 封闭枚举 + 严格拒绝 + 限长限深 + 链接内网拦截 | ✅ |
-| **W3** | core 重写 | 四端口就位；snapshot / StreamChannel / MetaStore 移除 | ✅ |
-| **W4** | 内存适配器重写 | 0 基有界环、单锁走链、HMAC 校验 | ✅ |
-| **W5** | SQL 适配器（新建） | 递归走链、原子领取、孤儿收口、租户清除 | ✅ |
-| **W6** | gateway 重写 | 三种模式、两条转发路径、鉴权、sweeper、优雅停机 | ✅ |
-| **W7** | 验证体系 | **同一套 L0 契约跑两个后端**；L1 29 项、L2 13 项、L3 5 项 | ✅ |
-| **W8** | 改名与清扫 | `nova-responses-*`；门禁硬编码同步 | ✅ |
-| **W9** | 文档收口 | 设计四篇新增 + 协议子集可发布契约 | ✅ |
-
----
-
-## 2. 验证现状
-
-```
-just verify l0   → 端口契约（内存 + SQL 共用）
-just verify l1   → 29 场景
-just verify l2   → 13 场景（三对等节点）
-just verify l3   → 5 项 + 契约复用（无数据库时跳过）
-just coverage    → 基线命中 70/82（85%）· CR 全覆盖
-just check-deps  → OK
-```
-
-单测 174 项：core 69 · mem 27 · gateway 74（含 48 项 HTTP 契约）· mock-agent 4。
-
----
-
-## 3. 实现期发现并修复的真实缺陷
-
-记录在案，因为都属于「不写测试就发现不了」的类别：
-
-| # | 缺陷 | 后果 | 修正 |
-|---|---|---|---|
-| 1 | 终态事件被自身 attempt 栅栏拒绝 | **流永不终止**，同步模式必然超时 | 服务端信封事件不带 attempt |
-| 2 | mem 与 sql 对「起点无效」返回不同错误 | 换后端行为漂移 | 统一 `chain_broken`；中间环跨租户才是 `cross_tenant` |
-| 3 | `complete` 经 axum extractor 返回 422 | 违反「一律 400」契约 | 手动解析请求体 |
-| 4 | `check_deps` 被自身注释误伤 | 门禁假阳性 | 只解析依赖段，忽略注释 |
-| 5 | `yaml_seq` 只支持块式数组 | **场景 covers 全部漏统计**，覆盖率失真 | 同时支持行内数组 |
-| 6 | 夹具 teardown 用 SIGTERM | 触发 drain 反而占住端口，下次运行报困惑的 503 | teardown 改 SIGKILL；夹具另设短 drain 预算 |
-| 7 | L2 场景相互污染 | 破坏性场景让后续场景失去可用节点 | 节点职责分工 + `zz-`/`zzz-` 排序前缀 |
-
----
-
-## 4. 下期入口（条件触发，非排期）
-
-| 入口 | 触发条件 | 预案 |
+| # | 交付 | 状态 |
 |---|---|---|
-| **三层高可用**（在途上共享中间件） | 非计划崩溃失败率 > 0.05%/月 ｜ 生成时长 P99 > 15 分钟 ｜ 合作方明确要求 | 选 Redis Streams（形状匹配）；端口形状即抽象层，只需新增适配器 |
-| **子集扩展** | 调用方提出用例并通过评审 | 先验链闭合性 → 网关先行升级 → 更新 06 文档 |
-| **密钥轮换（多密钥并存）** | 安全策略要求定期轮换 | `alg` 标记已随记录保存，具备识别基础 |
-| **跨地域灾备** | 可用性目标提升至 99.99% | 当前同城多可用区，D8 仍成立 |
+| **Y1** | 新建 `nova-responses` library，平移 gateway 的能力层 + HTTP 层 + 后台维护，`crate::` 引用不变 | ✅ |
+| **Y2** | gateway 后端改为**编译期 feature 门控**：`mem`（默认，内嵌执行）与 `sql`（`--no-default-features --features sql`，执行 = agentd）互斥，后端依赖全部 `optional` | ✅ |
+| **Y3** | `http_contract.rs` 从 gateway 移入 `nova-responses` 测试，去 `#[path]` 重编译，复用 library | ✅ |
+| **Y4** | `check-deps` 新增「服务层无 adapter」「gateway 后端依赖 optional」门禁；workspace / justfile / 文档收口 | ✅ |
 
-**均不预先实现**：无触发条件时的投入无法证明收益。
+## 2. 成果
 
----
+- **能力层独立**：`nova-responses` 承载用例编排 + HTTP 接入 + 后台维护，只依赖 `nova-responses-core` 端口，不依赖任何具体 adapter——D25 决策里「分两步，第二步独立成 crate」的落地。
+- **后端编译期门控**：gateway 的 `mount()` 按 `#[cfg(feature)]` 静态分派，`mem` 与 `sql` 互斥（`compile_error!`），没有 `store_backend` 运行时配置。默认 `cargo build` 得到 mem 形态（协议兼容验证、本地开发、L2 都不需要数据库）；`just release` 用 `--no-default-features --features sql` 构建生产形态，release 二进制静态排除 mem / agent / completions-mock。
+- **mem 作为可控替身**：mem 及内嵌执行（`execution.rs`，`#[cfg(feature = "mem")]`）仍是默认形态的组成部分，供 OpenAI SDK 协议兼容验证与 L0–L2 使用，而非仅验证层专用。
+- **门禁守边界**：`check-deps` 拒绝 `nova-responses` 依赖任何 adapter、强制 gateway 的后端依赖 `optional = true`（防止某个后端泄漏进所有构建）。
 
-## 5. 上一期（V10–V13）归档说明
+## 3. 上一期（X 期）成果
 
-V10–V13 的主要成果为：热层 miss → 冷层归档与 Gap 引导恢复、带 `snapshot_seq` 的开屏契约、跨区只读 Mirror 投影。
+X 期（D25 执行进程独立 + 在途缓冲共享化）已完成：能力层抽离第一步（gateway 内 service 模块）、`adapters-event-log-redis`、`nova-agentd`、claim 全局化、gateway 拆薄、验证体系更新。本期的 `nova-responses` 独立 crate 即其「第二步」。
 
-这三项**均被 D20 推翻**：
-
-| 原成果 | 现状 | 原因 |
-|---|---|---|
-| 热层冷层 + Gap 引导 | 删除 | 生命周期收敛到单次生成后无界回放需求消失；位点过期改为显式失败且**无恢复路径** |
-| 开屏快照契约 | 删除 | 开屏能力取消（D20 ⑥） |
-| 跨区只读 Mirror | 删除 | 节点改对等；仅保留在途事件的定向转发 |
-
-推导过程保留在 `docs/archive/` 与 ADR 正文中备查——**不删改历史决策正文**是纪律，否则将来无法回答「当初为何那样设计」。
+更早的 W 期（D20/21/22 子集重构）成果与缺陷清单见归档。

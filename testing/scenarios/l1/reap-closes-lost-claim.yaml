@@ -1,0 +1,15 @@
+name: reap-closes-lost-claim
+covers: [FR-35, FR-38, CR-6, INV-45]
+oracles: [CreatedResponsesTerminal]
+steps:
+  - action: create_response
+    input: "interrupted"
+    key: reap-1
+  - action: claim
+  - action: append_delta
+  # Stands in for an execution process that stopped heartbeating — a crash, a
+  # partition, or a stall past the deadline. With execution detached (D25) there
+  # is no boot-time sweep to lean on: whichever gateway ticks next must reap the
+  # claim, raise the fence and drive the response to a terminal state, so the
+  # caller gets an explicit failure instead of silence until the TTL.
+  - action: reap

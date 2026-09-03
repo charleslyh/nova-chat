@@ -1,26 +1,18 @@
 //! Authentication and tenant resolution.
 //!
-//! Three rules:
+//! Two rules:
 //!
 //! 1. **Keys come from the environment** (SEC-4). The config file names the
 //!    variable; the values never touch disk here.
 //! 2. **Ownership mismatch reports "not found", not "forbidden"** (SEC-2).
 //!    `403` on a foreign id confirms that the id exists, which turns the API
 //!    into an id oracle.
-//! 3. **The internal tenant header is only trusted with the internal token.**
-//!    Without that check, any client could impersonate any tenant by setting a
-//!    header.
 
 use std::collections::HashMap;
 
 use axum::http::HeaderMap;
 use nova_responses_core::TenantId;
 use subtle::ConstantTimeEq;
-
-/// Header carrying the tenant on node-to-node forwards.
-pub const INTERNAL_TENANT_HEADER: &str = "x-nova-internal-tenant";
-/// Header carrying the shared secret that authenticates a forward.
-pub const INTERNAL_TOKEN_HEADER: &str = "x-nova-internal-token";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
@@ -31,8 +23,6 @@ pub enum AuthError {
 pub struct KeyTable {
     /// api key -> tenant
     keys: HashMap<String, TenantId>,
-    /// Shared secret for internal forwards. Absent disables forward trust.
-    internal_token: Option<String>,
     /// Admin endpoints require this key when set.
     admin_key: Option<String>,
 }
@@ -53,17 +43,15 @@ impl KeyTable {
         }
         Ok(Self {
             keys,
-            internal_token: None,
             admin_key: None,
         })
     }
 
     /// Load from the environment. An empty table is allowed only so local
     /// verification can run unauthenticated; production always sets keys.
-    pub fn from_env(keys_env: &str, token_env: &str, admin_env: &str) -> Result<Self, String> {
+    pub fn from_env(keys_env: &str, admin_env: &str) -> Result<Self, String> {
         let spec = std::env::var(keys_env).unwrap_or_default();
         let mut table = Self::parse(&spec)?;
-        table.internal_token = std::env::var(token_env).ok().filter(|v| !v.is_empty());
         table.admin_key = std::env::var(admin_env).ok().filter(|v| !v.is_empty());
         Ok(table)
     }
@@ -72,22 +60,8 @@ impl KeyTable {
         self.keys.is_empty()
     }
 
-    pub fn has_internal_token(&self) -> bool {
-        self.internal_token.is_some()
-    }
-
     fn lookup(&self, key: &str) -> Option<&TenantId> {
         self.keys.get(key)
-    }
-
-    fn internal_token_matches(&self, presented: &str) -> bool {
-        match &self.internal_token {
-            None => false,
-            Some(expected) => {
-                let equal: bool = expected.as_bytes().ct_eq(presented.as_bytes()).into();
-                equal
-            }
-        }
     }
 
     fn admin_key_matches(&self, presented: &str) -> bool {
@@ -103,15 +77,7 @@ impl KeyTable {
     }
 
     /// Resolve the tenant for a request.
-    ///
-    /// Order matters: the internal header is considered **only** after the
-    /// internal token has been verified, so an external caller cannot use it to
-    /// impersonate a tenant.
     pub fn resolve(&self, headers: &HeaderMap) -> Result<TenantId, AuthError> {
-        if let Some(tenant) = self.resolve_internal(headers)? {
-            return Ok(tenant);
-        }
-
         let bearer = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
@@ -131,25 +97,6 @@ impl KeyTable {
         }
     }
 
-    fn resolve_internal(&self, headers: &HeaderMap) -> Result<Option<TenantId>, AuthError> {
-        let Some(tenant_raw) = headers
-            .get(INTERNAL_TENANT_HEADER)
-            .and_then(|v| v.to_str().ok())
-        else {
-            return Ok(None);
-        };
-        let presented = headers
-            .get(INTERNAL_TOKEN_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        if !self.internal_token_matches(presented) {
-            // Header present without a valid token: an impersonation attempt.
-            return Err(AuthError::Invalid);
-        }
-        let tenant = TenantId::parse(tenant_raw).map_err(|_| AuthError::Invalid)?;
-        Ok(Some(tenant))
-    }
-
     pub fn authorize_admin(&self, headers: &HeaderMap) -> Result<(), AuthError> {
         let presented = headers
             .get(axum::http::header::AUTHORIZATION)
@@ -163,15 +110,6 @@ impl KeyTable {
             Err(AuthError::Invalid)
         }
     }
-
-    /// Headers to attach when forwarding to a peer.
-    pub fn internal_headers(&self, tenant: &TenantId) -> Vec<(&'static str, String)> {
-        let mut out = vec![(INTERNAL_TENANT_HEADER, tenant.to_string())];
-        if let Some(token) = &self.internal_token {
-            out.push((INTERNAL_TOKEN_HEADER, token.clone()));
-        }
-        out
-    }
 }
 
 #[cfg(test)]
@@ -179,9 +117,7 @@ mod tests {
     use super::*;
 
     fn table() -> KeyTable {
-        let mut t = KeyTable::parse("key-aaaaaaa:tenant-a,key-bbbbbbb:tenant-b").unwrap();
-        t.internal_token = Some("internal-secret".into());
-        t
+        KeyTable::parse("key-aaaaaaa:tenant-a,key-bbbbbbb:tenant-b").unwrap()
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -215,48 +151,6 @@ mod tests {
     }
 
     #[test]
-    fn internal_header_without_token_is_rejected() {
-        // The impersonation vector: if the header alone were trusted, any client
-        // could act as any tenant.
-        let t = table();
-        assert_eq!(
-            t.resolve(&headers(&[(INTERNAL_TENANT_HEADER, "victim")])),
-            Err(AuthError::Invalid)
-        );
-        assert_eq!(
-            t.resolve(&headers(&[
-                (INTERNAL_TENANT_HEADER, "victim"),
-                (INTERNAL_TOKEN_HEADER, "wrong-secret"),
-            ])),
-            Err(AuthError::Invalid)
-        );
-    }
-
-    #[test]
-    fn internal_header_with_token_is_accepted() {
-        let t = table();
-        let tenant = t
-            .resolve(&headers(&[
-                (INTERNAL_TENANT_HEADER, "tenant-b"),
-                (INTERNAL_TOKEN_HEADER, "internal-secret"),
-            ]))
-            .unwrap();
-        assert_eq!(tenant.as_str(), "tenant-b");
-    }
-
-    #[test]
-    fn internal_header_cannot_carry_a_malformed_tenant() {
-        let t = table();
-        assert_eq!(
-            t.resolve(&headers(&[
-                (INTERNAL_TENANT_HEADER, "bad tenant!"),
-                (INTERNAL_TOKEN_HEADER, "internal-secret"),
-            ])),
-            Err(AuthError::Invalid)
-        );
-    }
-
-    #[test]
     fn empty_table_allows_local_unauthenticated_use() {
         let t = KeyTable::parse("").unwrap();
         assert!(t.is_empty());
@@ -268,15 +162,6 @@ mod tests {
         assert!(KeyTable::parse("short:t").is_err());
         assert!(KeyTable::parse("key-aaaaaaa").is_err());
         assert!(KeyTable::parse("key-aaaaaaa:bad tenant").is_err());
-    }
-
-    #[test]
-    fn forward_headers_include_token_when_configured() {
-        let t = table();
-        let tenant = TenantId::parse("tenant-a").unwrap();
-        let hs = t.internal_headers(&tenant);
-        assert!(hs.iter().any(|(k, _)| *k == INTERNAL_TENANT_HEADER));
-        assert!(hs.iter().any(|(k, _)| *k == INTERNAL_TOKEN_HEADER));
     }
 
     #[test]

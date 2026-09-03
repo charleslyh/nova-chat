@@ -89,10 +89,6 @@ enum Step {
         expect: Option<String>,
     },
     Reap,
-    ReclaimOrphans {
-        #[serde(default)]
-        expect_min: usize,
-    },
     ResumeStartingAfter {
         #[serde(default)]
         starting_after: Option<u64>,
@@ -452,7 +448,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let claimed = ctx
                 .world
                 .ledger
-                .claim(&ctx.node_tag, agent, ctx.now_ms, 60_000)
+                .claim(agent, ctx.now_ms, 60_000)
                 .await?;
             let want = expect.as_deref().unwrap_or("some");
             match (want, claimed) {
@@ -650,32 +646,6 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             trace.push(TraceEvent::MockState {
                 component: "ledger".into(),
                 detail: format!("reaped={}", aborted.len()),
-                at_ms: ctx.now_ms,
-            });
-        }
-
-        Step::ReclaimOrphans { expect_min } => {
-            let reclaimed = ctx
-                .world
-                .ledger
-                .reclaim_orphans(&ctx.node_tag, ctx.now_ms)
-                .await?;
-            if reclaimed.len() < expect_min {
-                bail!(
-                    "{sc}: expected at least {expect_min} orphans reclaimed, got {}",
-                    reclaimed.len()
-                );
-            }
-            for claim in &reclaimed {
-                trace.push(TraceEvent::ResponseTerminal {
-                    response_id: claim.response_id.to_string(),
-                    status: "failed".into(),
-                    at_ms: ctx.now_ms,
-                });
-            }
-            trace.push(TraceEvent::OrphanReclaimed {
-                node_tag: ctx.node_tag.to_string(),
-                count: reclaimed.len(),
                 at_ms: ctx.now_ms,
             });
         }

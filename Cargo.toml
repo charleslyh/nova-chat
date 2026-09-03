@@ -5,7 +5,13 @@ members = [
     "crates/adapters/mem",
     "crates/adapters/sql",
     "crates/adapters/completions-mock",
+    "crates/adapters/event-log-redis",
+    "crates/adapters/mem-client",
     "crates/agent",
+    "crates/agentd",
+    "crates/mem-server",
+    "crates/sweep",
+    "crates/nova-responses",
     "crates/gateway",
     "testing/conformance",
     "testing/harness",
@@ -19,9 +25,12 @@ license = "MIT"
 
 [workspace.dependencies]
 nova-responses-core = { path = "crates/core" }
+nova-responses = { path = "crates/nova-responses" }
 adapters-mem = { path = "crates/adapters/mem" }
+adapters-mem-client = { path = "crates/adapters/mem-client" }
 adapters-sql = { path = "crates/adapters/sql" }
 adapters-completions-mock = { path = "crates/adapters/completions-mock" }
+adapters-event-log-redis = { path = "crates/adapters/event-log-redis" }
 nova-agent = { path = "crates/agent" }
 conformance = { path = "testing/conformance" }
 harness = { path = "testing/harness" }
@@ -42,6 +51,9 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# Shared in-flight event carrier (D25). Redis Streams is the first concrete
+# adapter; the port is interchangeable with TDMQ / other message buses.
+redis = { version = "1.6", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script"] }
 # Content integrity (D20 ⑧ / INV-44): canonicalisation + tamper detection.
 hmac = "0.12"
 sha2 = "0.10"

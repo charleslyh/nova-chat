@@ -6,8 +6,9 @@
 //! makes the invariant structural rather than something callers must remember —
 //! and it mirrors the SQL adapter, where both live in one table.
 //!
-//! Scope: **verification only** (L0–L2). Nothing here survives a restart and
-//! nothing is shared between processes; production uses the sql adapter.
+//! Scope: **verification only** (L0–L2). Nothing here survives a restart;
+//! production uses the sql adapter. When mounted in the carrier process it is
+//! shared across processes by construction — the same state backs every client.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

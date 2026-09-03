@@ -50,6 +50,19 @@ services:
     # managed instance with a standby in another availability zone plus periodic
     # backups (D21 ①).
 
+  # Shared in-flight event carrier (D25). Per-response streams are cheap and
+  # self-bounded via MAXLEN + TTL; a single container is for local/L3 use only.
+  redis:
+    image: redis:7-alpine
+    profiles: ["full"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - redisdata:/data
+
   node-a:
     <<: *gateway-common
     profiles: ["full"]
@@ -81,3 +94,4 @@ services:
 
 volumes:
   pgdata:
+  redisdata:

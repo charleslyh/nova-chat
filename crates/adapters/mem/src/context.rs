@@ -1,9 +1,8 @@
 //! Context store over the shared in-memory state.
 //!
-//! Scope: **verification only** (L0–L2). No durability, no cross-process
-//! sharing — production uses the sql adapter. `is_shared()` returns `false`
-//! accordingly, which is what makes the ingress layer forward content reads to
-//! the owning node in multi-process scenarios.
+//! Scope: **verification only** (L0–L2). No durability — production uses the sql
+//! adapter. In the carrier process this is the shared context store every node
+//! reaches through the client stubs.
 
 use std::sync::Arc;
 
@@ -108,10 +107,6 @@ fn canonical_payload(record: &StoredResponse) -> String {
 
 #[async_trait]
 impl ContextStore for MemContextStore {
-    fn is_shared(&self) -> bool {
-        false
-    }
-
     async fn put(&self, mut record: StoredResponse) -> Result<(), ContextError> {
         self.guard_writable()?;
         // Sign before taking the lock: signing is pure computation, and doing it

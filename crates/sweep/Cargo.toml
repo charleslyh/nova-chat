@@ -1,0 +1,27 @@
+[package]
+name = "nova-responses-sweep"
+version.workspace = true
+edition.workspace = true
+description = "Standalone sweep process for the shared carrier (reap / retention / expiry)"
+
+[[bin]]
+name = "nova-responses-sweep"
+path = "src/main.rs"
+
+[features]
+# mem：L2 验证；sql：生产。同一份 sweep 逻辑，两种载体都可挂载。
+default = ["mem"]
+mem = ["dep:adapters-mem-client"]
+sql = ["dep:adapters-sql", "dep:adapters-event-log-redis"]
+
+[dependencies]
+nova-responses = { workspace = true }
+nova-responses-core = { workspace = true }
+adapters-mem-client = { workspace = true, optional = true }
+adapters-sql = { workspace = true, optional = true }
+adapters-event-log-redis = { workspace = true, optional = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

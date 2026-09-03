@@ -1,10 +1,11 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::events::ResponseEvent;
 use crate::ids::ResponseId;
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventLogError {
     /// No buffer for this id on this node — either never created here, or the
     /// host process restarted.

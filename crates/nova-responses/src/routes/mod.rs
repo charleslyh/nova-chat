@@ -2,11 +2,11 @@
 //!
 //! Gone with D20: every `/v1/sessions/*` endpoint and `/v1/admin/trim_hot`.
 //!
-//! Gone with D23: `/v1/agent/claim`, `/heartbeat`, `/append`, `/complete`.
-//! Execution is no longer a protocol — a generation is run by the node that created
-//! it, in process. The pull protocol let a worker attached to one node claim
-//! another node's generation, whose increments then landed in the wrong process
-//! heap while subscribers were routed to the owning node and saw silence.
+//! Gone with D23, and still gone under D25: `/v1/agent/claim`, `/heartbeat`,
+//! `/append`, `/complete`. Execution is not a protocol — `nova-agentd` claims
+//! from the shared ledger through the `ResponseLedger` port, so an HTTP pull
+//! surface would only add a hop, a second authorisation path and a second place
+//! for the attempt fence to be checked.
 
 pub mod admin;
 pub mod responses;

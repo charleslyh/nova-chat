@@ -2,17 +2,19 @@ name: pending-limit-http
 covers: [FR-33, INV-29, INV-30]
 oracles: []
 steps:
+  # Keep one generation in flight deterministically: the shared execution daemon
+  # hangs on any input containing "hang", so the admission count stays occupied.
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"please hang","background":true}'
+    expect_status: 202
+  # node-c's admission limit is 1 while one generation is already in flight.
   - action: http_post
     url: http://127.0.0.1:18082/v1/admin/pending_limit
     body: '{"pending_limit":1}'
     expect_status: 200
-  - action: http_post
-    url: http://127.0.0.1:18082/v1/responses
-    body: '{"model":"m","input":"first","background":true}'
-    expect_status: 202
-  # node-c's scheduler hangs, so the first generation stays in flight and keeps its
-  # admission slot. The second must be refused with a retryable status rather than
-  # being queued without bound.
+  # The second create must be refused with a retryable status rather than being
+  # queued without bound.
   - action: http_post
     url: http://127.0.0.1:18082/v1/responses
     body: '{"model":"m","input":"second","background":true}'

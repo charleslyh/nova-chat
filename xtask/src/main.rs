@@ -98,9 +98,44 @@ async fn procs(action: &str) -> Result<()> {
             procs_down(&run_dir)?;
             // A leftover sim or gateway may still hold these ports; clear them
             // before starting the L2 fixture.
-            kill_listeners(&[18080, 18081, 18082])?;
-            // Three peer nodes: every node can create, and every node runs its
-            // own sweeper. There is no authority node any more.
+            kill_listeners(&[18080, 18081, 18082, 19000, 19001])?;
+
+            // 1. Shared in-memory carrier: data plane (19000) + control plane (19001).
+            start_bin(
+                "nova-responses-mem-server",
+                &[
+                    "--listen",
+                    "127.0.0.1:19000",
+                    "--control-listen",
+                    "127.0.0.1:19001",
+                ],
+                run_dir.join("mem-server.pid"),
+            )?;
+            wait_port("127.0.0.1:19000", Duration::from_secs(20)).await?;
+            wait_port("127.0.0.1:19001", Duration::from_secs(20)).await?;
+
+            // 2. Standalone sweep process: single owner of reap/retention/expiry.
+            //    Short heartbeat TTL so lost-claim recovery is observable in tests.
+            start_bin(
+                "nova-responses-sweep",
+                &["--heartbeat-ttl-ms", "2000", "--retain-after-terminal-ms", "60000"],
+                run_dir.join("sweep.pid"),
+            )?;
+
+            // 3. Execution daemon over the shared carrier, with a scripted scheduler
+            //    (normal answers plus a `hang` rule for overload scenarios).
+            start_bin(
+                "nova-agentd",
+                &[
+                    "--scheduler",
+                    "scripted",
+                    "--scheduler-script",
+                    "testing/config/l2-agent-script.yaml",
+                ],
+                run_dir.join("agentd.pid"),
+            )?;
+
+            // 4. Three peer gateways over the shared carrier (no embedded execution).
             for (tag, port) in [("node-a", 18080), ("node-b", 18081), ("node-c", 18082)] {
                 start_bin(
                     "nova-responses-gateway",
@@ -109,14 +144,13 @@ async fn procs(action: &str) -> Result<()> {
                 )?;
                 let _ = port;
             }
-            // No execution process to start: each node runs its own engine (D23).
             wait_port("127.0.0.1:18080", Duration::from_secs(20)).await?;
             wait_port("127.0.0.1:18081", Duration::from_secs(20)).await?;
             wait_port("127.0.0.1:18082", Duration::from_secs(20)).await?;
         }
         "down" => {
             procs_down(&run_dir)?;
-            kill_listeners(&[18080, 18081, 18082])?;
+            kill_listeners(&[18080, 18081, 18082, 19000, 19001])?;
         }
         other => bail!("unknown procs action {other}"),
     }
@@ -128,8 +162,9 @@ fn procs_down(run_dir: &Path) -> Result<()> {
         "node-a.pid",
         "node-b.pid",
         "node-c.pid",
-        "agent.pid",
-        "worker.pid",
+        "mem-server.pid",
+        "sweep.pid",
+        "agentd.pid",
     ] {
         kill_pidfile(&run_dir.join(name))?;
     }
@@ -142,16 +177,15 @@ fn procs_down(run_dir: &Path) -> Result<()> {
 /// because that is the only channel the service reads them from (SEC-4). These
 /// values are for verification and must never appear in a deployment.
 const FIXTURE_ENV: &[(&str, &str)] = &[
-    // Required whenever peers are configured: without it, node-to-node forwards
-    // cannot be authenticated and the internal tenant header would have to be
-    // trusted blindly.
-    ("NOVA_INTERNAL_TOKEN", "l2-fixture-internal-token"),
+    // mem-server 校验完整性时需要；仅在验证夹具使用，绝不出现于部署。
     ("NOVA_INTEGRITY_KEY", "l2-fixture-integrity-key-0123456789"),
+    // 共享载体的数据面地址；gateway / agentd / sweep 都从这里连。
+    ("NOVA_MEM_SERVER_URL", "http://127.0.0.1:19000"),
 ];
 
 fn start_bin(bin: &str, args: &[&str], pidfile: PathBuf) -> Result<()> {
     let status = Command::new("cargo")
-        .args(["build", "-p", bin])
+        .args(["build", "--bin", bin])
         .status()?;
     if !status.success() {
         bail!("build {bin} failed");
@@ -436,21 +470,13 @@ async fn coverage() -> Result<()> {
     // Requirements whose verification is intentionally deferred. Listing them
     // here keeps them visible in the report instead of quietly missing.
     //
-    // FR-13/FR-14/FR-30/FR-31/FR-32 and SEC-5 are HTTP-level routing and
-    // ownership properties covered by the gateway's own contract tests rather
-    // than by declarative scenarios; FR-34 (graceful drain) needs a real signal,
-    // so it lives at L2.
-    // Only FR-31 remains genuinely deferred: it asserts that a *shared* store
-    // removes node-to-node content forwarding, which cannot be observed without a
-    // real database. It is verified by L3 (`sql-shared-store-no-forward`) and is
-    // therefore covered whenever a database is configured.
-    //
-    // FR-23 moved to `check-deps` (the published spec is gated mechanically),
-    // FR-32 into the drain scenario, SEC-5 into cross-tenant-404-http, and INV-34
-    // into the L0 durability-order case. Each had been listed here while actually
-    // being verifiable — which is the failure mode this list is most prone to:
-    // once an id is written down as deferred, nobody re-examines it.
-    let deferred: BTreeSet<&str> = ["FR-31"].into_iter().collect();
+    // All baseline requirements are now covered at L0–L2: the shared-carrier
+    // read/stream semantics (FR-11/FR-14/FR-30/FR-31) by `cross-node-stream-http`,
+    // and the instance-lifecycle properties (FR-32 no-stickiness resume, FR-34
+    // graceful drain) by their `z-` destructive scenarios. The list is empty;
+    // the mechanism stays so a future withdrawn requirement stays visible rather
+    // than silently dropping coverage.
+    let deferred: BTreeSet<&str> = BTreeSet::new();
 
     let covered_baseline: BTreeSet<_> = covered
         .iter()
@@ -784,39 +810,47 @@ fn check_deps() -> Result<()> {
         }
     }
 
-    check_execution_is_internal()?;
+    check_execution_claims_globally_through_the_port()?;
+    check_service_and_gateway_boundaries()?;
     let spec_covers = check_protocol_spec_is_publishable()?;
 
     println!("check-deps OK ({} gated requirement(s))", spec_covers.len());
     Ok(())
 }
 
-/// D23: execution is in-process, never a protocol.
+/// D25: execution claims through the ledger port, never over HTTP; claim is global.
 ///
-/// Guards against the pull endpoints returning. They were not merely redundant —
-/// they allowed a worker attached to one node to claim another node's generation,
-/// whose increments then landed in the wrong process heap while subscribers were
-/// routed to the owning node and saw silence. Reintroducing them would reopen a
-/// defect that produced no error on any path.
-fn check_execution_is_internal() -> Result<()> {
-    let routes = std::fs::read_to_string("crates/gateway/src/routes/mod.rs")?;
+/// Two things are guarded, and they are not the same thing.
+///
+/// 1. **No `/v1/agent/*` pull surface.** Execution is not a protocol: `nova-agentd`
+///    reaches the ledger through `ResponseLedger`. An HTTP pull endpoint would add
+///    a hop, a second authorisation path, and a second place for the attempt fence
+///    to be checked — the arrangement whose failure mode (increments landing in one
+///    process while subscribers were routed to another, with no error on any path)
+///    cost D23 its rewrite.
+/// 2. **Claim stays global.** The in-flight buffer is shared, so any execution
+///    process may serve any queued response. A node filter would strand work on
+///    nodes that happen to have no agent attached.
+fn check_execution_claims_globally_through_the_port() -> Result<()> {
+    let routes = std::fs::read_to_string("crates/nova-responses/src/routes/mod.rs")?;
     if routes.contains("/v1/agent/") && routes.contains(".route(\"/v1/agent/") {
         bail!(
-            "an /v1/agent/* route is registered again. Execution is in-process (D23): a \
-             generation is run by the node that created it, because that node holds its \
-             in-flight event buffer. A pull endpoint lets another node claim it, and the \
-             resulting silence on the subscriber's stream raises no error anywhere."
+            "an /v1/agent/* route is registered again. Execution is not a protocol (D25): \
+             nova-agentd claims through the ResponseLedger port. An HTTP pull surface adds \
+             a hop, a second authorisation path and a second fence check, and it is how \
+             increments once landed in a process no subscriber was reading."
         );
     }
 
-    // The ledger's claim must stay node-scoped. Without the parameter the constraint
-    // has nowhere to live, and a shared ledger hands work across nodes again.
+    // The ledger's claim must stay global (D25). The in-flight buffer is shared, so
+    // any execution process may claim any queued response; a node filter would
+    // silently strand work on other nodes.
     let ledger_port = std::fs::read_to_string("crates/core/src/ports/ledger.rs")?;
-    if !ledger_port.contains("node: &NodeTag") {
+    if ledger_port.contains("node: &NodeTag") {
         bail!(
-            "ResponseLedger::claim no longer takes a NodeTag. Claiming must be scoped to \
-             the owning node (FR-4 / D23); the in-memory backend used to make this hold \
-             by accident, which is exactly why it needs to be explicit."
+            "ResponseLedger::claim still takes a NodeTag. Claiming must be global (D25): \
+             the in-flight buffer is shared (Redis Streams / TDMQ), so a node filter \
+             would strand queued responses on other nodes."
         );
     }
 
@@ -827,16 +861,59 @@ fn check_execution_is_internal() -> Result<()> {
     // mentions the predicate — so removing the predicate itself passed the gate. A
     // gate that its own documentation can satisfy checks nothing.
     let sql_ledger = std::fs::read_to_string("crates/adapters/sql/src/ledger.rs")?;
-    // Two facts that cannot be satisfied by prose: the predicate as it appears in the
-    // WHERE clause, and the bind that supplies it.
     let has_predicate = sql_ledger.contains("WHERE status = 'queued' AND node_tag = $3");
-    let has_bind = sql_ledger.contains(".bind(node.as_str())");
-    if !(has_predicate && has_bind) {
+    if has_predicate {
         bail!(
-            "the sql claim statement no longer filters by node_tag. With a shared ledger \
-             this hands node-b's generation to node-a, whose increments land in the wrong \
-             process — subscribers see the created event and then nothing, with no error."
+            "the sql claim statement still filters by node_tag. Claiming must be global \
+             (D25): the in-flight buffer is shared, so a node filter would strand queued \
+             responses on other nodes."
         );
+    }
+
+    Ok(())
+}
+
+/// `nova-responses` is the adapter-free service layer; the gateway chooses its
+/// backend at compile time via features. Two boundaries must not blur:
+///
+/// 1. `nova-responses` must not depend on any concrete adapter — it talks to
+///    `nova-responses-core` ports only, so the mem/sql choice is made by the
+///    assembler, never by the library.
+/// 2. Every backend dependency of the gateway must be `optional` and therefore
+///    feature-gated. That is what makes the backend a compile-time choice: a mem
+///    build never compiles sql/redis, and a production build
+///    (`--no-default-features --features sql`) never carries mem/agent/mock.
+fn check_service_and_gateway_boundaries() -> Result<()> {
+    let service = std::fs::read_to_string("crates/nova-responses/Cargo.toml")?;
+    let service_deps = declared_dependencies_in_section(&service, "[dependencies]");
+    for forbidden in [
+        "adapters-mem",
+        "adapters-sql",
+        "adapters-event-log-redis",
+        "adapters-completions-mock",
+        "nova-agent",
+    ] {
+        if service_deps.iter().any(|d| d == forbidden) {
+            bail!(
+                "nova-responses must not depend on `{forbidden}`: the service layer talks \
+                 to ports only, and the adapter choice belongs to the assembler"
+            );
+        }
+    }
+
+    let gw = std::fs::read_to_string("crates/gateway/Cargo.toml")?;
+    for dep in [
+        "adapters-mem-client",
+        "adapters-sql",
+        "adapters-event-log-redis",
+    ] {
+        if !gw.contains(&format!("{dep} = {{ workspace = true, optional = true }}")) {
+            bail!(
+                "gateway's `{dep}` must be `optional = true` so the backend is chosen at \
+                 compile time via features — a non-optional backend would leak into every \
+                 build, defeating the static mem/sql split"
+            );
+        }
     }
 
     Ok(())

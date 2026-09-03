@@ -96,7 +96,7 @@ pub struct ResponseEvent {
 
 /// The kind-specific fields of a streaming event, matching the OpenAI Responses
 /// event objects.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EventBody {
     /// `response.output_text.delta` / `response.function_call_arguments.delta`.

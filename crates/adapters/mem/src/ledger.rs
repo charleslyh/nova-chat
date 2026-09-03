@@ -12,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nova_responses_core::{
     AbortedClaim, AgentId, Attempt, ClaimedResponse, CreateOutcome, IdempotencyKey, LedgerError,
-    NodeTag, ResponseId, ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
+    ResponseId, ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
 };
 
 use crate::store::MemStore;
@@ -102,7 +102,6 @@ impl ResponseLedger for MemResponseLedger {
 
     async fn claim(
         &self,
-        node: &NodeTag,
         agent_id: AgentId,
         now_ms: u64,
         exec_ttl_ms: u64,
@@ -112,22 +111,16 @@ impl ResponseLedger for MemResponseLedger {
         // Pop-and-verify in one lock: the check and the transition are a single
         // atomic step, so two callers cannot both win (INV-1).
         //
-        // Responses belonging to another node are skipped but **put back**, not
-        // dropped: only their own node may execute them (FR-4), and discarding
-        // them here would strand them forever.
-        let mut deferred: Vec<ResponseId> = Vec::new();
-        let claimed = loop {
+        // Global claim (D25): no node filter — any execution process may take any
+        // queued response, because the in-flight buffer is shared.
+        loop {
             let Some(id) = g.queued.pop_front() else {
-                break None;
+                return Ok(None);
             };
             let Some(rec) = g.records.get_mut(&id) else {
                 continue; // deleted meanwhile
             };
             if rec.status != ResponseStatus::Queued {
-                continue;
-            }
-            if rec.node_tag != *node {
-                deferred.push(id);
                 continue;
             }
             let attempt = rec.attempt.next();
@@ -137,19 +130,12 @@ impl ResponseLedger for MemResponseLedger {
             let deadline = now_ms.saturating_add(exec_ttl_ms);
             let record = rec.clone();
             g.heartbeats.insert(agent_id, now_ms);
-            break Some(ClaimedResponse {
+            return Ok(Some(ClaimedResponse {
                 record,
                 attempt,
                 exec_deadline_ms: deadline,
-            });
-        };
-
-        // Restore the other nodes' work at the front, preserving relative order so
-        // the oldest still comes first on their own next poll.
-        for id in deferred.into_iter().rev() {
-            g.queued.push_front(id);
+            }));
         }
-        Ok(claimed)
     }
 
     async fn heartbeat(&self, agent_id: AgentId, now_ms: u64) -> Result<(), LedgerError> {
@@ -267,59 +253,6 @@ impl ResponseLedger for MemResponseLedger {
                 previous_attempt,
             });
         }
-        Ok(aborted)
-    }
-
-    async fn reclaim_orphans(
-        &self,
-        node_tag: &NodeTag,
-        now_ms: u64,
-    ) -> Result<Vec<AbortedClaim>, LedgerError> {
-        let mut g = self.store.lock();
-        // Anything non-terminal owned by this node lost its in-flight buffer
-        // when the previous process died. Failing it now turns a 90 s heartbeat
-        // hang into an immediate, explicit failure (INV-45).
-        let orphans: Vec<ResponseId> = g
-            .records
-            .iter()
-            .filter(|(_, r)| &r.node_tag == node_tag && !r.status.is_terminal())
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        let mut aborted = Vec::new();
-        for id in orphans {
-            let Some(rec) = g.records.get_mut(&id) else {
-                continue;
-            };
-            let previous_attempt = rec.attempt;
-            let partial = rec.usage;
-            rec.attempt = previous_attempt.next();
-            rec.status = ResponseStatus::Failed;
-            rec.owner = None;
-            rec.completed_at_ms = Some(now_ms);
-            if !partial.is_zero() {
-                g.partial_usage
-                    .insert((id.clone(), previous_attempt), partial);
-            }
-            aborted.push(AbortedClaim {
-                response_id: id,
-                previous_attempt,
-            });
-        }
-        // Drop reclaimed ids from the queue. Collected first because the
-        // predicate needs to read `records` while `queued` is mutably borrowed.
-        let still_queued: Vec<ResponseId> = g
-            .queued
-            .iter()
-            .filter(|id| {
-                g.records
-                    .get(*id)
-                    .map(|r| r.status == ResponseStatus::Queued)
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
-        g.queued = still_queued.into();
         Ok(aborted)
     }
 

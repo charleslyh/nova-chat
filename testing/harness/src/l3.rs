@@ -15,7 +15,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use conformance::PortSet;
-use nova_responses_core::NodeTag;
+use nova_responses_core::{AgentId, NodeTag};
 
 /// Environment variable naming the L3 database. Absent ⇒ skip.
 pub const DATABASE_URL_ENV: &str = "NOVA_TEST_DATABASE_URL";
@@ -59,13 +59,11 @@ pub async fn sql_ports_from_env() -> Result<(Option<PortSet>, L3Availability)> {
         .with_context(|| format!("connecting to {DATABASE_URL_ENV}"))?;
     world.truncate_all().await.context("truncating L3 tables")?;
 
-    // The in-flight event log stays in process memory even here: that is the
-    // deliberate tiering decision (D21), not a gap L3 is meant to close.
-    //
-    // Consequence worth stating plainly: the `event-log` contract case therefore
-    // runs against the *mem* implementation during L3 as well. There is no sql
-    // event log to verify, and presenting this run as though there were would
-    // misrepresent what was checked — see `EVENT_LOG_IS_NOT_SQL_BACKED`.
+    // The in-flight event log is not yet wired to Redis here, so the `event-log`
+    // contract case still runs against mem during L3. This is a known gap (see
+    // `00-architecture-review.md` §13 item 4): FR-14/30/32 (multi-instance direct
+    // read) and FR-11 (no stickiness) are therefore deferred until L3 mounts
+    // `adapters-event-log-redis`.
     let mem = adapters_mem::MemWorld::new();
     let ports = PortSet {
         ledger: world.ledger.clone(),
@@ -160,16 +158,6 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
     let mut names = Vec::new();
     let tenant = TenantId::parse("l3-tenant").expect("tenant");
 
-    // --- sql-shared-store-no-forward -------------------------------------
-    eprint!("  sql-shared-store-no-forward ... ");
-    assert!(
-        ports.context.is_shared(),
-        "the sql adapter must report shared storage, otherwise the ingress layer \
-         keeps forwarding content reads and chain affinity never retires"
-    );
-    eprintln!("ok");
-    names.push("sql-shared-store-no-forward".into());
-
     // --- sql-multi-turn-chain --------------------------------------------
     eprint!("  sql-multi-turn-chain ... ");
     let mut previous: Option<ResponseId> = None;
@@ -234,12 +222,11 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
 
     // --- sql-restart-history-intact --------------------------------------
     eprint!("  sql-restart-history-intact ... ");
-    // Simulate a restart: reclaim this node's in-flight work, then confirm the
-    // completed history is untouched. This is the failure semantics tiering
-    // promises — in-flight fails explicitly, history survives (FR-38).
-    let in_flight_id = ResponseId::new(ports.node_tag.clone());
+    // Simulate a restart: claim work (in_progress with a deadline), let the
+    // deadline pass, then reap it. The completed history is untouched — in-flight
+    // fails explicitly, history survives (FR-38).
     let in_flight = StoredResponse {
-        response_id: in_flight_id.clone(),
+        response_id: ResponseId::new(ports.node_tag.clone()),
         previous_response_id: None,
         tenant_id: tenant.clone(),
         model: "m".into(),
@@ -261,6 +248,7 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
         context: Vec::new(),
         context_depth: 0,
     };
+    let in_flight_id = in_flight.response_id.clone();
     ports
         .ledger
         .create(
@@ -271,11 +259,20 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
         .await
         .context("create in-flight")?;
 
-    ports
+    // Claim it with a zero TTL, so its execution deadline is already expired.
+    let claimed = ports
         .ledger
-        .reclaim_orphans(&ports.node_tag, 4_000)
+        .claim(AgentId::new(), 3_000, 0)
         .await
-        .context("reclaim")?;
+        .context("claim")?
+        .expect("claimable");
+
+    // Reap the expired claim: in-flight fails explicitly (FR-5).
+    let aborted = ports.ledger.reap(3_001, 90_000).await.context("reap")?;
+    assert!(
+        aborted.iter().any(|c| c.response_id == claimed.record.response_id),
+        "the expired in-flight claim must be reaped"
+    );
 
     let failed = ports
         .ledger
@@ -285,7 +282,7 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
     assert_eq!(
         failed.status,
         ResponseStatus::Failed,
-        "in-flight work must fail explicitly after a restart"
+        "in-flight work must fail explicitly after its execution deadline passes"
     );
 
     let history = ports

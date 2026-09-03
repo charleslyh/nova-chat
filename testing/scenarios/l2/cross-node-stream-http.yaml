@@ -1,0 +1,22 @@
+name: cross-node-stream-http
+covers: [FR-11, FR-14, FR-30, FR-31]
+oracles: []
+steps:
+  # Create on node-a; the response and its event stream land in the shared carrier.
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"cross node stream","background":true}'
+    expect_status: 202
+    capture:
+      rid: id
+  # Subscribe from a *different* node: same event sequence, no node-directed routing.
+  - action: http_sse_collect
+    url: http://127.0.0.1:18081/v1/responses/{{rid}}?stream=true
+    expect_min_events: 1
+    max_events: 3
+    capture_last_seq: cursor
+  # Resume with the observed cursor on yet another node: no connection stickiness.
+  - action: http_sse_collect
+    url: http://127.0.0.1:18082/v1/responses/{{rid}}?stream=true&starting_after={{cursor}}
+    expect_min_events: 1
+    max_events: 3

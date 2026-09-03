@@ -1,14 +1,9 @@
 name: health-and-create
 covers: [FR-1, FR-2, FR-29]
 oracles: []
-# Node roles across the L2 suite (there is no per-scenario fixture reset, so this
-# division is what keeps scenarios independent):
-#   node-a — normal flow; the mock agent is attached here
-#   node-b — routing and graceful drain
-#   node-c — overload and abrupt failure; deliberately has no agent, so anything
-#            created here stays in flight forever
-# Hence this scenario creates on a and b only: leaving an in-flight response on
-# node-c would consume the budget that `pending-limit-http` depends on.
+# All three nodes are equivalent peers over one shared carrier, served by one
+# execution daemon. There is no per-node agent and no per-scenario fixture reset;
+# this scenario probes liveness on every node and creation on a and b.
 steps:
   - action: http_get
     url: http://127.0.0.1:18080/health

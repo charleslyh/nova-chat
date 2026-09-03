@@ -67,7 +67,6 @@ fn engine(world: &MemWorld, scheduler: Arc<dyn CompletionsRequestScheduler>) -> 
             context: world.context.clone(),
             scheduler,
             tools: Arc::new(NoopToolExecutor),
-            node_tag: node(),
         },
         AgentConfig::default(),
     )
@@ -88,7 +87,6 @@ fn agent_with(
             context: world.context.clone(),
             scheduler,
             tools,
-            node_tag: node(),
         },
         cfg,
     )
@@ -162,9 +160,9 @@ async fn an_empty_queue_is_idle_not_an_error() {
 }
 
 #[tokio::test]
-async fn another_nodes_work_is_never_executed_here() {
-    // The defect that motivated D23. Increments for node-b's response would land in
-    // node-a's buffer, while subscribers are routed to node-b and see silence.
+async fn any_nodes_work_can_be_executed_here() {
+    // D25: the in-flight buffer is shared, so any execution process may claim and
+    // run any node's response. A node filter would instead strand work.
     let world = MemWorld::new();
     let foreign = ResponseId::new(NodeTag::parse("node-b").expect("tag"));
     world
@@ -180,15 +178,15 @@ async fn another_nodes_work_is_never_executed_here() {
     let e = engine(&world, Arc::new(EchoScheduler::new(2)));
     assert_eq!(
         e.run_once(2_000).await,
-        Executed::Idle,
-        "node-a must not execute a response owned by node-b"
+        Executed::Completed,
+        "any execution process must be able to run any node's response"
     );
 
     let rec = world.ledger.get(&foreign).await.expect("get").expect("present");
     assert_eq!(
         rec.status,
-        ResponseStatus::Queued,
-        "and it must remain claimable by its owner rather than being consumed"
+        ResponseStatus::Completed,
+        "and the response must reach a terminal state"
     );
 }
 
