@@ -24,5 +24,8 @@ pub use auth::KeyTable;
 pub use clock::SystemClock;
 pub use config::{Config, RawConfig};
 pub use metrics::CountingMetrics;
-pub use service::{CreateResult, ResponsesService, ServiceError};
+pub use service::{
+    ContextSource, ConversationsService, CreateResult, ResponsesService, ServiceError,
+    SessionsService, SessionsServiceError,
+};
 pub use state::AppState;

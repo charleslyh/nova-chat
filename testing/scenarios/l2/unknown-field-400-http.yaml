@@ -8,10 +8,12 @@ steps:
     body: '{"model":"m","input":"hi","truncation":"auto"}'
     expect_status: 400
     expect_contains: 'truncation'
-  # And a pointed remedy for the field callers most often try.
+  # And a pointed remedy for a field that is upstream's but deliberately outside
+  # the subset. `conversation` used to be the example here; it is accepted now
+  # (D27), so the mechanism is covered through another entry on that list.
   - action: http_post
     url: http://127.0.0.1:18080/v1/responses
-    body: '{"model":"m","input":"hi","conversation":"conv_1"}'
+    body: '{"model":"m","input":"hi","context_management":{}}'
     expect_status: 400
     expect_contains: 'previous_response_id'
   - action: http_post

@@ -17,6 +17,10 @@ pub enum IdError {
     InvalidUuid,
     #[error("tenant id must be 1..={max} chars of [A-Za-z0-9._-]", max = TenantId::MAX_LEN)]
     InvalidTenantId,
+    #[error("session id must have the form sess_<uuid>")]
+    MalformedSessionId,
+    #[error("conversation id must have the form conv_<uuid>")]
+    MalformedConversationId,
 }
 
 /// Node tag embedded in every response id so in-flight subscriptions can be
@@ -196,6 +200,95 @@ impl<'de> Deserialize<'de> for TenantId {
     }
 }
 
+/// Declare a `{prefix}{uuid}` identifier.
+///
+/// These carry **no node tag**, unlike [`ResponseId`]. Nothing about a session
+/// or a conversation is node-local: there is no in-flight buffer to route a
+/// subscription to, so embedding a routing hint would add an address-forgery
+/// surface (SEC-5) while buying nothing. Both live in the shared store and any
+/// node can serve them directly.
+///
+/// The four trait impls are generated rather than hand-written so the parse
+/// rule has exactly one definition per concern (`parse` is the only validator;
+/// `FromStr`, `Deserialize` and the round trip all route through it).
+macro_rules! uuid_suffixed_id {
+    ($(#[$meta:meta])* $name:ident, $prefix:literal, $err:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name(Uuid);
+
+        impl $name {
+            pub const PREFIX: &'static str = $prefix;
+
+            pub fn new() -> Self {
+                Self(Uuid::new_v4())
+            }
+
+            pub fn from_uuid(uuid: Uuid) -> Self {
+                Self(uuid)
+            }
+
+            pub fn parse(raw: &str) -> Result<Self, IdError> {
+                let rest = raw.strip_prefix(Self::PREFIX).ok_or(IdError::$err)?;
+                let uuid = Uuid::parse_str(rest).map_err(|_| IdError::$err)?;
+                Ok(Self(uuid))
+            }
+
+            pub fn uuid(&self) -> Uuid {
+                self.0
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}{}", Self::PREFIX, self.0)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = IdError;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Self::parse(s)
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.collect_str(self)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let raw = String::deserialize(d)?;
+                Self::parse(&raw).map_err(de::Error::custom)
+            }
+        }
+    };
+}
+
+uuid_suffixed_id!(
+    /// `sess_{uuid}`: the self-hosted session, which owns the event stream, the
+    /// single-turn lock and the business events (D26).
+    SessionId,
+    "sess_",
+    MalformedSessionId
+);
+
+uuid_suffixed_id!(
+    /// `conv_{uuid}`: the upstream-compatible conversation, which is a *pointer
+    /// to the tail of a response chain* and nothing more (D27).
+    ConversationId,
+    "conv_",
+    MalformedConversationId
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AgentId(pub Uuid);
@@ -326,6 +419,76 @@ mod tests {
                 "tenant `{bad}` must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn session_and_conversation_ids_round_trip() {
+        let s = SessionId::new();
+        let text = s.to_string();
+        assert!(text.starts_with("sess_"), "{text}");
+        assert_eq!(SessionId::parse(&text).unwrap(), s);
+        assert_eq!(
+            serde_json::from_str::<SessionId>(&serde_json::to_string(&s).unwrap()).unwrap(),
+            s
+        );
+
+        let c = ConversationId::new();
+        let text = c.to_string();
+        assert!(text.starts_with("conv_"), "{text}");
+        assert_eq!(ConversationId::parse(&text).unwrap(), c);
+        assert_eq!(
+            serde_json::from_str::<ConversationId>(&serde_json::to_string(&c).unwrap()).unwrap(),
+            c
+        );
+    }
+
+    #[test]
+    fn session_and_conversation_ids_carry_no_node_tag() {
+        // The `resp_{node}_{uuid}` shape must NOT be accepted here: these ids
+        // are node-agnostic on purpose, and tolerating an embedded tag would
+        // re-open the routing-forgery surface it was removed to avoid (SEC-5).
+        let uuid = Uuid::new_v4();
+        assert_eq!(
+            SessionId::parse(&format!("sess_node-a_{uuid}")),
+            Err(IdError::MalformedSessionId)
+        );
+        assert_eq!(
+            ConversationId::parse(&format!("conv_node-a_{uuid}")),
+            Err(IdError::MalformedConversationId)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_session_and_conversation_ids() {
+        let uuid = Uuid::new_v4().to_string();
+        for bad in ["", "abc", "sess", "sess_", "sess_not-a-uuid", "conv_x", &uuid] {
+            assert_eq!(
+                SessionId::parse(bad),
+                Err(IdError::MalformedSessionId),
+                "session id `{bad}` must be rejected"
+            );
+        }
+        for bad in ["", "abc", "conv", "conv_", "conv_not-a-uuid", "sess_x", &uuid] {
+            assert_eq!(
+                ConversationId::parse(bad),
+                Err(IdError::MalformedConversationId),
+                "conversation id `{bad}` must be rejected"
+            );
+        }
+        // Path traversal attempts inside the id.
+        assert!(SessionId::parse("sess_../../etc").is_err());
+        assert!(ConversationId::parse("conv_../../etc").is_err());
+    }
+
+    #[test]
+    fn the_two_prefixes_do_not_cross_parse() {
+        // A conversation id must never be accepted where a session id is
+        // expected, and vice versa — otherwise a caller could address the
+        // session layer with a compatibility-layer id and bypass its checks.
+        let s = SessionId::new();
+        let c = ConversationId::new();
+        assert!(ConversationId::parse(&s.to_string()).is_err());
+        assert!(SessionId::parse(&c.to_string()).is_err());
     }
 
     #[test]

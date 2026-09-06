@@ -78,6 +78,15 @@ impl KeyTable {
 
     /// Resolve the tenant for a request.
     pub fn resolve(&self, headers: &HeaderMap) -> Result<TenantId, AuthError> {
+        // Empty table = local verification mode. There is nothing to validate a
+        // key against, so any presented key — the official SDK *always* sends one
+        // — is as unauthenticated as no key at all. Returning `Invalid` here would
+        // break the SDK-compat layer for no security gain: an attacker in this
+        // mode can just omit the header and reach the same endpoint.
+        if self.is_empty() {
+            return Ok(TenantId::parse("local").expect("static tenant is valid"));
+        }
+
         let bearer = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
@@ -85,14 +94,7 @@ impl KeyTable {
             .map(str::trim);
 
         match bearer {
-            None => {
-                if self.is_empty() {
-                    // Unauthenticated local mode.
-                    Ok(TenantId::parse("local").expect("static tenant is valid"))
-                } else {
-                    Err(AuthError::Missing)
-                }
-            }
+            None => Err(AuthError::Missing),
             Some(key) => self.lookup(key).cloned().ok_or(AuthError::Invalid),
         }
     }
@@ -155,6 +157,15 @@ mod tests {
         let t = KeyTable::parse("").unwrap();
         assert!(t.is_empty());
         assert_eq!(t.resolve(&headers(&[])).unwrap().as_str(), "local");
+        // A dummy key is as unauthenticated as no key: the official SDK always
+        // sends one, and rejecting it here would break the SDK-compat layer while
+        // adding no security (an attacker can just omit the header).
+        assert_eq!(
+            t.resolve(&headers(&[("authorization", "Bearer sk-whatever")]))
+                .unwrap()
+                .as_str(),
+            "local"
+        );
     }
 
     #[test]

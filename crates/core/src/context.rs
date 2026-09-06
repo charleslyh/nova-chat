@@ -6,7 +6,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ids::{Attempt, AgentId, IdempotencyKey, NodeTag, ResponseId, TenantId};
+use crate::ids::{
+    Attempt, AgentId, ConversationId, IdempotencyKey, NodeTag, ResponseId, SessionId, TenantId,
+};
 use crate::protocol::ResponseItem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +85,26 @@ pub struct StoredResponse {
     pub response_id: ResponseId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<ResponseId>,
+
+    /// Conversation whose tail pointer this response advances on completion
+    /// (D27).
+    ///
+    /// Recorded here rather than looked up later because the execution side has
+    /// only the record when it reaches a terminal status, and the alternative —
+    /// scanning conversations for one pointing at this response — cannot work:
+    /// the pointer still refers to the *previous* response until this one
+    /// finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<ConversationId>,
+
+    /// Session that holds the turn lock for this response (D26).
+    ///
+    /// Present only when the generation was started through a session. Every
+    /// terminal path must use it to release the lock; a path that does not
+    /// leaves the session busy forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+
     pub tenant_id: TenantId,
     pub model: String,
 
@@ -173,6 +195,11 @@ impl StoredResponse {
     /// returned by `GET`. Only protocol fields are exposed — the internal
     /// bookkeeping (`tenant_id`, `node_tag`, `attempt`, `context`, …) never
     /// leaves the node.
+    ///
+    /// `session_id` is absent for the same reason: the session layer is ours, not
+    /// upstream's, and this object has an upstream shape. Devices learn which
+    /// session a response belongs to from the session event stream, which is
+    /// where that relationship is expressed.
     pub fn to_response_value(&self) -> Value {
         serde_json::json!({
             "id": self.response_id.to_string(),
@@ -181,6 +208,10 @@ impl StoredResponse {
             "status": self.status.as_str(),
             "model": self.model,
             "previous_response_id": self.previous_response_id.as_ref().map(|v| v.to_string()),
+            "conversation": self
+                .conversation_id
+                .as_ref()
+                .map(|id| serde_json::json!({ "id": id.to_string() })),
             "instructions": self.instructions,
             "store": self.stored,
             "input": self.input_items,
@@ -233,6 +264,8 @@ mod tests {
         StoredResponse {
             response_id: ResponseId::new(NodeTag::parse("n1").unwrap()),
             previous_response_id: None,
+            conversation_id: None,
+            session_id: None,
             tenant_id: tenant(tenant_id),
             model: "m".into(),
             instructions: Some("secret system prompt".into()),

@@ -10,13 +10,17 @@
 //! infrastructure-free (D17). `migrate!` is fine: it only embeds local SQL.
 
 mod context;
+mod conversation;
 mod error;
 mod ledger;
 mod row;
+mod session;
 
 pub use context::SqlContextStore;
+pub use conversation::SqlConversationStore;
 pub use error::SqlError;
 pub use ledger::SqlResponseLedger;
+pub use session::SqlSessionStore;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,6 +59,10 @@ pub struct SqlWorld {
     pub pool: PgPool,
     pub ledger: Arc<SqlResponseLedger>,
     pub context: Arc<SqlContextStore>,
+    /// Conversation pointers (D27) and session state (D26). On the same pool, so
+    /// nothing here introduces a fourth storage class (D21).
+    pub conversation: Arc<SqlConversationStore>,
+    pub session: Arc<SqlSessionStore>,
     pub integrity: Option<Arc<dyn ContentIntegrity>>,
 }
 
@@ -92,16 +100,24 @@ impl SqlWorld {
         Ok(Self {
             ledger: Arc::new(SqlResponseLedger::new(pool.clone())),
             context: Arc::new(SqlContextStore::new(pool.clone(), integrity.clone())),
+            conversation: Arc::new(SqlConversationStore::new(pool.clone())),
+            session: Arc::new(SqlSessionStore::new(pool.clone())),
             integrity,
             pool,
         })
     }
 
     /// Remove all rows. Test helper only — never exposed through a port.
+    ///
+    /// `session_events` is truncated through `CASCADE` on `sessions`, but is
+    /// named explicitly anyway: a truncate that silently depended on a foreign
+    /// key would start leaving rows behind the day that key changed.
     pub async fn truncate_all(&self) -> Result<(), SqlError> {
-        sqlx::query("TRUNCATE responses, agent_heartbeats")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "TRUNCATE responses, agent_heartbeats, session_events, sessions, conversations",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 }

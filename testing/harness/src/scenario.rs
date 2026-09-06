@@ -10,9 +10,10 @@ use adapters_mem::MemWorld;
 use anyhow::{bail, Context, Result};
 use nova_responses_core::protocol::{CreateResponseRequest, InputLimits};
 use nova_responses_core::{
-    canonical_items, AgentId, Attempt, ChainLimits, ContextError, ContextStore, CreateOutcome,
-    EventLogError, IdempotencyKey, NodeTag, ResponseEvent, ResponseEventKind, ResponseEventLog,
-    ResponseId, ResponseItem, ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
+    canonical_items, AgentId, Attempt, ChainLimits, ContextError, ContextStore, ConversationStore,
+    CreateOutcome, EventLogError, IdempotencyKey, NodeTag, ResponseEvent, ResponseEventKind,
+    ResponseEventLog, ResponseId, ResponseItem, ResponseLedger, ResponseStatus, SessionStore,
+    StoredResponse, TenantId, Usage,
 };
 use serde::Deserialize;
 
@@ -355,6 +356,8 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             }
             let id = ResponseId::new(ctx.node_tag.clone());
             let record = StoredResponse {
+                conversation_id: None,
+                session_id: None,
                 response_id: id.clone(),
                 previous_response_id: previous_id.clone(),
                 tenant_id: tenant_id.clone(),
@@ -605,6 +608,11 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 },
                 at_ms: ctx.now_ms,
             });
+            // Terminal, so the session bookkeeping is owed here too. This step
+            // stands in for the engine's terminal funnel, and a stand-in that
+            // skipped it would let a scenario pass while the real path is broken.
+            settle_session(ctx, &record, status).await?;
+
             trace.push(TraceEvent::ResponseTerminal {
                 response_id: id.to_string(),
                 status: status.as_str().into(),
@@ -619,6 +627,9 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let want = expect.as_deref().unwrap_or("ok");
             match (want, result) {
                 ("ok", Ok(())) => {
+                    if let Some(record) = ctx.world.ledger.get(&id).await? {
+                        settle_session(ctx, &record, ResponseStatus::Cancelled).await?;
+                    }
                     trace.push(TraceEvent::ResponseTerminal {
                         response_id: id.to_string(),
                         status: "cancelled".into(),
@@ -637,6 +648,21 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
         Step::Reap => {
             let aborted = ctx.world.ledger.reap(ctx.now_ms, 0).await?;
             for claim in &aborted {
+                // Reap is the only release a reaped response gets: its holder is
+                // gone and the fence has moved, so that holder's own terminal path
+                // is refused as stale.
+                if let Some(session_id) = &claim.session_id {
+                    ctx.world
+                        .session
+                        .end_turn(
+                            &claim.tenant_id,
+                            session_id,
+                            &claim.response_id,
+                            ResponseStatus::Failed,
+                            ctx.now_ms,
+                        )
+                        .await?;
+                }
                 trace.push(TraceEvent::ResponseTerminal {
                     response_id: claim.response_id.to_string(),
                     status: "failed".into(),
@@ -998,6 +1024,50 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             ctx.now_ms += by;
             trace.push(TraceEvent::Clock { now_ms: ctx.now_ms });
         }
+    }
+    Ok(())
+}
+
+/// Session and conversation bookkeeping for a response that just reached a
+/// terminal state.
+///
+/// These steps stand in for the engine's terminal funnel, so they owe the same
+/// two effects. Mirrors `Agent::settle`, including the ordering: the tail is
+/// advanced **before** the lock is released, so a client that acts on
+/// `turn_completed` cannot read a tail that has not moved yet.
+///
+/// A record with no association is a no-op, which is the common case for the
+/// scenarios that predate sessions.
+async fn settle_session(
+    ctx: &Ctx,
+    record: &StoredResponse,
+    status: ResponseStatus,
+) -> anyhow::Result<()> {
+    // Only a turn that committed output may advance the tail; a failed or
+    // cancelled turn would leave the conversation ending on an unanswered
+    // question.
+    if matches!(
+        status,
+        ResponseStatus::Completed | ResponseStatus::Incomplete
+    ) {
+        if let Some(conversation_id) = &record.conversation_id {
+            ctx.world
+                .conversation
+                .advance(&record.tenant_id, conversation_id, &record.response_id)
+                .await?;
+        }
+    }
+    if let Some(session_id) = &record.session_id {
+        ctx.world
+            .session
+            .end_turn(
+                &record.tenant_id,
+                session_id,
+                &record.response_id,
+                status,
+                ctx.now_ms,
+            )
+            .await?;
     }
     Ok(())
 }

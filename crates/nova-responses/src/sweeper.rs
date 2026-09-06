@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use nova_responses_core::{
     Clock, ContextStore, MetricsSink, ResponseEvent, ResponseEventKind, ResponseEventLog,
-    ResponseLedger,
+    ResponseLedger, ResponseStatus, SessionStore,
 };
 use tracing::warn;
 
@@ -26,6 +26,14 @@ pub struct SweepDeps {
     pub ledger: Arc<dyn ResponseLedger>,
     pub event_log: Arc<dyn ResponseEventLog>,
     pub context: Arc<dyn ContextStore>,
+    /// Reaping is a terminal transition, so it owes the session layer a lock
+    /// release (D26). It is also the **only** release a reaped response gets: its
+    /// holder is gone and the fence has moved, so that holder's own terminal path
+    /// is refused as stale. Without this the session stays busy forever.
+    ///
+    /// No `ConversationStore` counterpart: a reaped turn committed no output, so
+    /// there is no tail to advance.
+    pub sessions: Arc<dyn SessionStore>,
     pub clock: Arc<dyn Clock>,
     pub metrics: Arc<dyn MetricsSink>,
     pub heartbeat_ttl_ms: u64,
@@ -58,8 +66,12 @@ async fn tick(deps: &SweepDeps) -> anyhow::Result<()> {
 
     for claim in aborted {
         // Partial usage is booked by the ledger itself during reaping, so a
-        // crash between the two cannot lose it (INV-51). The reap path has no
-        // tenant handle, so the terminal event carries a minimal response object.
+        // crash between the two cannot lose it (INV-51).
+        //
+        // The terminal event carries a minimal response object: the full record
+        // could be read back now that the claim carries a tenant, but that would
+        // be an extra read per reaped claim to enrich an event whose only job is
+        // to end the stream. Subscribers that want the finished object use `GET`.
         let response = serde_json::json!({
             "id": claim.response_id.to_string(),
             "object": "response",
@@ -77,6 +89,37 @@ async fn tick(deps: &SweepDeps) -> anyhow::Result<()> {
             .event_log
             .close(&claim.response_id, now, deps.retain_after_terminal_ms)
             .await;
+
+        // Release the turn lock. `Failed` rather than a status of its own: from a
+        // client's point of view a reaped turn is a failed turn, and inventing a
+        // sixth status would oblige every subscriber to learn one.
+        if let Some(session_id) = &claim.session_id {
+            if let Err(e) = deps
+                .sessions
+                .end_turn(
+                    &claim.tenant_id,
+                    session_id,
+                    &claim.response_id,
+                    ResponseStatus::Failed,
+                    now,
+                )
+                .await
+            {
+                // Not retried here: the reap already moved the record out of
+                // `in_progress`, so the next tick will not select it again. The
+                // recovery is on the admission side instead — a lock whose holder
+                // is already terminal is taken over by the next `begin_turn`
+                // (see `ResponsesService::acquire_turn`).
+                warn!(
+                    response = %claim.response_id,
+                    session = %session_id,
+                    error = %e,
+                    "could not release the turn lock for a reaped claim; the next turn \
+                     on this session will take the stale lock over"
+                );
+            }
+        }
+
         deps.metrics.incr("responses_reaped", 1).await;
     }
 

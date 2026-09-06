@@ -1,0 +1,6 @@
+# The only external dependency of the L4 compat layer. Everything else the
+# script touches is the stdlib or a running gateway.
+#
+# Pinned so a future SDK release that changes the conversation wire shape fails
+# loudly here (a version bump) rather than silently against a stale expectation.
+openai>=1.60.0

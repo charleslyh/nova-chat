@@ -20,6 +20,8 @@ verify level="all":
       # Included in `all` because it self-skips without a database, so it can
       # never fail a machine that has no infrastructure (D17).
       just verify l3
+      # Also self-skipping: a machine without python3/openai is not at fault.
+      just verify l4
     else
       cargo run -q -p xtask -- verify --level "{{level}}"
     fi

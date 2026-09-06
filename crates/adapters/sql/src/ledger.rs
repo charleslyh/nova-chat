@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use nova_responses_core::{
     AbortedClaim, AgentId, Attempt, ClaimedResponse, CreateOutcome, IdempotencyKey, LedgerError,
-    ResponseId, ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
+    ResponseId, ResponseLedger, ResponseStatus, SessionId, StoredResponse, TenantId, Usage,
 };
 use sqlx::{PgPool, Row};
 
@@ -86,8 +86,9 @@ impl ResponseLedger for SqlResponseLedger {
         let sql = "INSERT INTO responses (\
                 response_id, previous_response_id, tenant_id, model, status, stored, node_tag, \
                 attempt, owner, idempotency_key, instructions, input_items, output_items, usage, \
-                partial_usage, integrity, integrity_alg, created_at_ms, completed_at_ms, expires_at_ms) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'{}'::jsonb,$15,$16,$17,$18,$19)";
+                partial_usage, integrity, integrity_alg, created_at_ms, completed_at_ms, expires_at_ms, \
+                conversation_id, session_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'{}'::jsonb,$15,$16,$17,$18,$19,$20,$21)";
         let result = sqlx::query(sql)
             .bind(record.response_id.to_string())
             .bind(record.previous_response_id.as_ref().map(|v| v.to_string()))
@@ -108,6 +109,8 @@ impl ResponseLedger for SqlResponseLedger {
             .bind(record.created_at_ms as i64)
             .bind(record.completed_at_ms.map(|v| v as i64))
             .bind(record.expires_at_ms.map(|v| v as i64))
+            .bind(record.conversation_id.as_ref().map(|v| v.to_string()))
+            .bind(record.session_id.as_ref().map(|v| v.to_string()))
             .execute(&self.pool)
             .await;
 
@@ -291,6 +294,8 @@ impl ResponseLedger for SqlResponseLedger {
     ) -> Result<Vec<AbortedClaim>, LedgerError> {
         // Raise the fence and fail in one statement so a stale holder cannot
         // append between the two.
+        // Concatenated rather than `format!`-ed: the statement contains
+        // `'{}'::jsonb`, which a format string would try to interpret.
         let sql = "UPDATE responses SET attempt = attempt + 1, status = 'failed', \
                           owner = NULL, exec_deadline_ms = NULL, completed_at_ms = $1, \
                           partial_usage = CASE \
@@ -306,8 +311,10 @@ impl ResponseLedger for SqlResponseLedger {
                                WHERE h.agent_id = responses.owner \
                                  AND $1 - h.last_seen_ms <= $2 ) \
                       ) \
-                    RETURNING response_id, attempt - 1 AS previous_attempt";
-        let rows = sqlx::query(sql)
+                    RETURNING "
+            .to_string()
+            + ABORTED_COLUMNS;
+        let rows = sqlx::query(&sql)
             .bind(now_ms as i64)
             .bind(heartbeat_ttl_ms as i64)
             .fetch_all(&self.pool)
@@ -431,15 +438,33 @@ impl SqlResponseLedger {
     }
 }
 
+/// Columns every `RETURNING` clause feeding [`collect_aborted`] must produce.
+///
+/// Named once so the two call sites cannot return different column sets and only
+/// fail at decode time, on the reap path, in production.
+const ABORTED_COLUMNS: &str =
+    "response_id, attempt - 1 AS previous_attempt, tenant_id, session_id";
+
 fn collect_aborted(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<AbortedClaim>, LedgerError> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let raw: String = row.try_get("response_id").map_err(to_ledger_error)?;
         let previous: i64 = row.try_get("previous_attempt").map_err(to_ledger_error)?;
+        let tenant_raw: String = row.try_get("tenant_id").map_err(to_ledger_error)?;
+        let session_raw: Option<String> = row.try_get("session_id").map_err(to_ledger_error)?;
         out.push(AbortedClaim {
             response_id: ResponseId::parse(&raw)
                 .map_err(|e| LedgerError::Internal(e.to_string()))?,
             previous_attempt: Attempt(previous.max(0) as u64),
+            tenant_id: TenantId::parse(&tenant_raw)
+                .map_err(|e| LedgerError::Internal(format!("tenant_id: {e}")))?,
+            session_id: match session_raw {
+                None => None,
+                Some(raw) => Some(
+                    SessionId::parse(&raw)
+                        .map_err(|e| LedgerError::Internal(format!("session_id: {e}")))?,
+                ),
+            },
         });
     }
     Ok(out)

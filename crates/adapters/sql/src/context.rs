@@ -66,8 +66,9 @@ impl ContextStore for SqlContextStore {
                 response_id, previous_response_id, tenant_id, model, status, stored, node_tag, \
                 attempt, owner, idempotency_key, instructions, input_items, output_items, context, \
                 context_depth, usage, \
-                integrity, integrity_alg, created_at_ms, completed_at_ms, expires_at_ms) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) \
+                integrity, integrity_alg, created_at_ms, completed_at_ms, expires_at_ms, \
+                conversation_id, session_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) \
              ON CONFLICT (response_id) DO UPDATE SET \
                 status = EXCLUDED.status, \
                 stored = EXCLUDED.stored, \
@@ -82,7 +83,9 @@ impl ContextStore for SqlContextStore {
                 integrity = EXCLUDED.integrity, \
                 integrity_alg = EXCLUDED.integrity_alg, \
                 completed_at_ms = EXCLUDED.completed_at_ms, \
-                expires_at_ms = EXCLUDED.expires_at_ms";
+                expires_at_ms = EXCLUDED.expires_at_ms, \
+                conversation_id = EXCLUDED.conversation_id, \
+                session_id = EXCLUDED.session_id";
         sqlx::query(sql)
             .bind(record.response_id.to_string())
             .bind(record.previous_response_id.as_ref().map(|v| v.to_string()))
@@ -105,6 +108,8 @@ impl ContextStore for SqlContextStore {
             .bind(record.created_at_ms as i64)
             .bind(record.completed_at_ms.map(|v| v as i64))
             .bind(record.expires_at_ms.map(|v| v as i64))
+            .bind(record.conversation_id.as_ref().map(|v| v.to_string()))
+            .bind(record.session_id.as_ref().map(|v| v.to_string()))
             .execute(&self.pool)
             .await
             .map_err(to_context_error)?;

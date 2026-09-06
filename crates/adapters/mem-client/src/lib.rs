@@ -7,25 +7,31 @@
 //! them as process-local atomics (INV-32 / FR-33 are per-node, not per-carrier).
 
 mod context;
+mod conversation;
 mod event_log;
 mod ledger;
 mod rpc;
+mod session;
 
 pub use context::MemContextClient;
+pub use conversation::MemConversationClient;
 pub use event_log::MemEventLogClient;
 pub use ledger::MemLedgerClient;
+pub use session::MemSessionClient;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 
 use rpc::Rpc;
 
-/// The assembled client side of the shared carrier: three adapters over one
+/// The assembled client side of the shared carrier: five adapters over one
 /// logical node, sharing its local runtime controls.
 pub struct MemClientWorld {
     pub ledger: Arc<MemLedgerClient>,
     pub event_log: Arc<MemEventLogClient>,
     pub context: Arc<MemContextClient>,
+    pub conversation: Arc<MemConversationClient>,
+    pub session: Arc<MemSessionClient>,
 }
 
 impl MemClientWorld {
@@ -44,11 +50,18 @@ impl MemClientWorld {
         ));
         let event_log = Arc::new(MemEventLogClient::new(rpc.clone(), read_only.clone()));
         let context = Arc::new(MemContextClient::new(rpc.clone(), read_only.clone()));
+        let conversation = Arc::new(MemConversationClient::new(
+            rpc.clone(),
+            read_only.clone(),
+        ));
+        let session = Arc::new(MemSessionClient::new(rpc.clone(), read_only.clone()));
 
         Self {
             ledger,
             event_log,
             context,
+            conversation,
+            session,
         }
     }
 }

@@ -1,4 +1,4 @@
-use nova_responses_core::{ContextError, LedgerError};
+use nova_responses_core::{ContextError, ConversationError, LedgerError, SessionError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -43,6 +43,22 @@ pub(crate) fn to_ledger_error(err: sqlx::Error) -> LedgerError {
         LedgerError::Unavailable
     } else {
         LedgerError::Internal(err.to_string())
+    }
+}
+
+pub(crate) fn to_conversation_error(err: sqlx::Error) -> ConversationError {
+    if is_unavailable(&err) {
+        ConversationError::Unavailable
+    } else {
+        ConversationError::Internal(err.to_string())
+    }
+}
+
+pub(crate) fn to_session_error(err: sqlx::Error) -> SessionError {
+    if is_unavailable(&err) {
+        SessionError::Unavailable
+    } else {
+        SessionError::Internal(err.to_string())
     }
 }
 

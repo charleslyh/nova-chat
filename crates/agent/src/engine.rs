@@ -54,10 +54,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nova_responses_core::{
     validate_outcome, AgentId, Attempt, ClaimedResponse, CompletionsRequest,
-    CompletionsRequestScheduler, CompletionsSink, ContextStore, EventBody, FinishReason,
-    RequestProvenance, ResponseEvent, ResponseEventKind, ResponseEventLog, ResponseId,
-    ResponseItem, ResponseLedger, ResponseStatus, SchedulerError, SinkError, SinkVerdict,
-    TenantId, ToolExecutor, ToolSpec, Usage,
+    CompletionsRequestScheduler, CompletionsSink, ContextStore, ConversationStore, EventBody,
+    FinishReason, RequestProvenance, ResponseEvent, ResponseEventKind, ResponseEventLog,
+    ResponseId, ResponseItem, ResponseLedger, ResponseStatus, SchedulerError, SessionStore,
+    SinkError, SinkVerdict, StoredResponse, TenantId, ToolExecutor, ToolSpec, Usage,
 };
 use nova_responses_core::{ChainLimits, LedgerError};
 use tracing::{debug, info, warn};
@@ -71,6 +71,17 @@ pub struct AgentDeps {
     /// Carries tool calls out. `NoopToolExecutor` is the explicit "no tools"
     /// instance; a real registry or a remote bridge is the same shape.
     pub tools: Arc<dyn ToolExecutor>,
+
+    /// Session and conversation bookkeeping at terminal (D26 / D27).
+    ///
+    /// `Option` rather than a null object, unlike `tools`: these two are used
+    /// *together with* a record field that is itself optional, so "no port
+    /// mounted" and "this response has no session" are already two different
+    /// things. A null object would answer both, and answering the first one
+    /// silently is how a session ends up locked forever with nothing in the log
+    /// to say why.
+    pub sessions: Option<Arc<dyn SessionStore>>,
+    pub conversations: Option<Arc<dyn ConversationStore>>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,10 +187,10 @@ impl Agent {
 
     async fn serve(&self, claimed: ClaimedResponse, now_ms: u64) -> Executed {
         let record = claimed.record;
+        // Only the id is lifted out, for logging. Everything the terminal funnels
+        // need travels as `&record`, so they cannot be handed a mismatched pair.
         let id = record.response_id.clone();
-        let tenant = record.tenant_id.clone();
         let attempt = claimed.attempt;
-        let stored = record.stored;
 
         // Announce the transition so a subscriber attached from the start sees a
         // defined progression rather than a gap.
@@ -243,7 +254,7 @@ impl Agent {
                 Err(e) => {
                     warn!(response = %id, error = %e, "cannot build a request");
                     return self
-                        .fail(&id, &tenant, attempt, usage, &format!("context: {e}"), now_ms)
+                        .fail(&record, attempt, usage, &format!("context: {e}"), now_ms)
                         .await;
                 }
             };
@@ -262,7 +273,7 @@ impl Agent {
                         error = %e,
                         "scheduling failed"
                     );
-                    return self.fail(&id, &tenant, attempt, usage, &e.to_string(), now_ms).await;
+                    return self.fail(&record, attempt, usage, &e.to_string(), now_ms).await;
                 }
             };
 
@@ -278,7 +289,7 @@ impl Agent {
                     error = %e,
                     "scheduler produced an unusable outcome"
                 );
-                return self.fail(&id, &tenant, attempt, usage, &e.to_string(), now_ms).await;
+                return self.fail(&record, attempt, usage, &e.to_string(), now_ms).await;
             }
 
             // Pull the tool calls out before `outcome.items` is moved into the
@@ -306,10 +317,8 @@ impl Agent {
                     let produced = conversation[base_len..].to_vec();
                     return self
                         .complete(
-                            &id,
-                            &tenant,
+                            &record,
                             attempt,
-                            stored,
                             produced,
                             usage,
                             ResponseStatus::Completed,
@@ -326,10 +335,8 @@ impl Agent {
                     let produced = conversation[base_len..].to_vec();
                     return self
                         .complete(
-                            &id,
-                            &tenant,
+                            &record,
                             attempt,
-                            stored,
                             produced,
                             usage,
                             ResponseStatus::Incomplete,
@@ -348,10 +355,8 @@ impl Agent {
                         let produced = conversation[base_len..].to_vec();
                         return self
                             .complete(
-                                &id,
-                                &tenant,
+                                &record,
                                 attempt,
-                                stored,
                                 produced,
                                 usage,
                                 ResponseStatus::Incomplete,
@@ -366,8 +371,7 @@ impl Agent {
                         // report Incomplete for what is a malformed outcome.
                         return self
                             .fail(
-                                &id,
-                                &tenant,
+                                &record,
                                 attempt,
                                 usage,
                                 "finish=ToolCalls but no tool calls were produced",
@@ -391,7 +395,7 @@ impl Agent {
                                 // terminal via `GET`.
                                 if let Err(e) = sink.output_item_added(&item).await {
                                     return self
-                                        .fail(&id, &tenant, attempt, usage, &e.to_string(), now_ms)
+                                        .fail(&record, attempt, usage, &e.to_string(), now_ms)
                                         .await;
                                 }
                                 if sink.stopped {
@@ -399,7 +403,7 @@ impl Agent {
                                 }
                                 if let Err(e) = sink.output_item_done(&item).await {
                                     return self
-                                        .fail(&id, &tenant, attempt, usage, &e.to_string(), now_ms)
+                                        .fail(&record, attempt, usage, &e.to_string(), now_ms)
                                         .await;
                                 }
                                 conversation.push(item);
@@ -413,7 +417,7 @@ impl Agent {
                                     "tool execution failed"
                                 );
                                 return self
-                                    .fail(&id, &tenant, attempt, usage, &e.to_string(), now_ms)
+                                    .fail(&record, attempt, usage, &e.to_string(), now_ms)
                                     .await;
                             }
                         }
@@ -424,17 +428,24 @@ impl Agent {
         }
     }
 
+    /// Terminal funnel for a response that produced output.
+    ///
+    /// Takes the whole record rather than `(id, tenant, stored, …)` picked apart:
+    /// those are three fields of one thing, and passing them separately makes it
+    /// possible to pair an id with the wrong tenant — which the ports would then
+    /// read as "not found" and no test would notice.
     async fn complete(
         &self,
-        id: &ResponseId,
-        tenant: &TenantId,
+        record: &StoredResponse,
         attempt: Attempt,
-        stored: bool,
         produced: Vec<ResponseItem>,
         usage: Usage,
         status: ResponseStatus,
         now_ms: u64,
     ) -> Executed {
+        let id = &record.response_id;
+        let tenant = &record.tenant_id;
+
         if let Err(e) = self
             .deps
             .ledger
@@ -442,23 +453,44 @@ impl Agent {
             .await
         {
             warn!(response = %id, error = %e, "complete failed");
+            // The ledger did not move, so nothing downstream is owed — including
+            // the session lock, which some later terminal path will release.
             return Executed::Failed;
         }
 
+        // Past this point the ledger says terminal, so the session lock **must**
+        // be released whatever the remaining writes do. That is why the result of
+        // the output write is captured rather than returned on: an early return
+        // here is exactly the path that would leave a session busy forever.
+        //
         // Second, independent write path. Deliberately not derived from the event
         // stream: that buffer is bounded and transient, so durable history may not
         // depend on it (FR-20 / INV-48). The tool-call trace is part of `produced`,
         // so the next turn's snapshot sees the whole agent loop.
-        if stored {
-            if let Err(e) = self
+        let output_stored = if record.stored {
+            match self
                 .deps
                 .context
                 .append_output(tenant, id, produced, usage, status, now_ms)
                 .await
             {
-                warn!(response = %id, error = %e, "storing output failed");
-                return Executed::Failed;
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(response = %id, error = %e, "storing output failed");
+                    false
+                }
             }
+        } else {
+            false
+        };
+
+        // The tail advances only when this turn's output actually landed. Pointing
+        // a conversation at a response whose output is missing would give the next
+        // turn a transcript that ends mid-question.
+        self.settle(record, status, output_stored, now_ms).await;
+
+        if record.stored && !output_stored {
+            return Executed::Failed;
         }
 
         let kind = match status {
@@ -470,15 +502,18 @@ impl Agent {
         Executed::Completed
     }
 
+    /// Terminal funnel for a response that produced nothing usable.
     async fn fail(
         &self,
-        id: &ResponseId,
-        tenant: &TenantId,
+        record: &StoredResponse,
         attempt: Attempt,
         usage: Usage,
         reason: &str,
         now_ms: u64,
     ) -> Executed {
+        let id = &record.response_id;
+        let tenant = &record.tenant_id;
+
         if let Err(e) = self
             .deps
             .ledger
@@ -488,10 +523,71 @@ impl Agent {
             warn!(response = %id, error = %e, "could not record failure");
             return Executed::Failed;
         }
+
+        // Lock released, tail **not** advanced: a failed turn committed no output,
+        // so advancing would leave the conversation ending on an unanswered
+        // question. The caller retrying against the same conversation gets the
+        // same context it had, which is the point.
+        self.settle(record, ResponseStatus::Failed, false, now_ms)
+            .await;
+
         debug!(response = %id, reason, "failed");
         self.close_stream(id, tenant, ResponseEventKind::Failed, now_ms)
             .await;
         Executed::Failed
+    }
+
+    /// Release the turn lock, and advance the conversation tail when asked.
+    ///
+    /// Order matters: the tail is advanced **before** the lock is released.
+    /// Reversed, a client that sees `turn_completed` and immediately starts the
+    /// next turn could read a tail that has not moved yet, and the new turn would
+    /// silently lose the one just finished.
+    ///
+    /// Failures here are logged and not propagated. The caller's outcome is about
+    /// its generation, and masking that with a bookkeeping error would hide the
+    /// real cause; the lock is also not lost for good, since the reap path
+    /// releases it too.
+    async fn settle(
+        &self,
+        record: &StoredResponse,
+        status: ResponseStatus,
+        advance_tail: bool,
+        now_ms: u64,
+    ) {
+        let tenant = &record.tenant_id;
+        let id = &record.response_id;
+
+        if advance_tail {
+            if let (Some(conversations), Some(conversation_id)) =
+                (&self.deps.conversations, &record.conversation_id)
+            {
+                if let Err(e) = conversations.advance(tenant, conversation_id, id).await {
+                    warn!(
+                        response = %id,
+                        conversation = %conversation_id,
+                        error = %e,
+                        "could not advance the conversation tail; the next turn will \
+                         inherit the previous turn's context"
+                    );
+                }
+            }
+        }
+
+        if let (Some(sessions), Some(session_id)) = (&self.deps.sessions, &record.session_id) {
+            if let Err(e) = sessions
+                .end_turn(tenant, session_id, id, status, now_ms)
+                .await
+            {
+                warn!(
+                    response = %id,
+                    session = %session_id,
+                    error = %e,
+                    "could not release the turn lock; the session stays busy until \
+                     a later terminal path releases it"
+                );
+            }
+        }
     }
 
     /// Emit the terminal event and start the retention window.

@@ -11,13 +11,18 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use nova_responses_core::protocol::{preflight_unsupported, CreateResponseRequest};
-use nova_responses_core::{ContextError, IdempotencyKey, ResponseId, StoredResponse, TenantId};
+use nova_responses_core::{
+    ContextError, ConversationId, IdempotencyKey, ResponseId, StoredResponse, TenantId,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::auth::AuthError;
-use crate::error::{api_error, bad_request, map_context_error, map_ledger_error, not_found};
-use crate::service::{CreateResult, ServiceError};
+use crate::error::{
+    api_error, bad_request, map_context_error, map_conversation_error, map_ledger_error,
+    map_session_error, not_found,
+};
+use crate::routes::shared::tenant_or_reject;
+use crate::service::{ContextSource, CreateResult, ServiceError};
 use crate::sse::{map_event_log_error, open_stream, resolve_cursor};
 use crate::state::AppState;
 
@@ -27,21 +32,6 @@ pub struct StreamQuery {
     pub stream: Option<bool>,
     #[serde(default)]
     pub starting_after: Option<u64>,
-}
-
-fn tenant_or_reject(state: &AppState, headers: &HeaderMap) -> Result<TenantId, Response> {
-    state.keys.resolve(headers).map_err(|e| match e {
-        AuthError::Missing => api_error(
-            StatusCode::UNAUTHORIZED,
-            "missing_credentials",
-            "provide `Authorization: Bearer <key>`",
-        ),
-        AuthError::Invalid => api_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_credentials",
-            "credentials were rejected",
-        ),
-    })
 }
 
 fn parse_id(raw: &str) -> Result<ResponseId, Response> {
@@ -59,6 +49,39 @@ fn map_service_error(err: &ServiceError) -> Response {
         ServiceError::EventLog(e) => {
             let (status, code, message) = map_event_log_error(e);
             api_error(status, code, message)
+        }
+        ServiceError::Conversation(e) => map_conversation_error(e),
+        // Notably includes `Busy` → 409: a second concurrent turn on one session
+        // is refused, never queued behind the running one.
+        ServiceError::Session(e) => map_session_error(e),
+    }
+}
+
+/// Decide which context this generation inherits, from the two upstream fields.
+///
+/// Validation has already rejected the case where both are present, so this only
+/// has to parse — but it still parses *both* rather than short-circuiting on the
+/// first, so a malformed value is reported as malformed either way.
+fn context_source(request: &CreateResponseRequest) -> Result<ContextSource, Response> {
+    if let Some(reference) = &request.conversation {
+        let id = ConversationId::parse(reference.id()).map_err(|_| {
+            bad_request(
+                "invalid_request",
+                "conversation is not a valid conversation id",
+            )
+        })?;
+        return Ok(ContextSource::Conversation(id));
+    }
+    match &request.previous_response_id {
+        None => Ok(ContextSource::Fresh),
+        Some(raw) => {
+            let id = ResponseId::parse(raw).map_err(|_| {
+                bad_request(
+                    "chain_broken",
+                    "previous_response_id is not a valid response id",
+                )
+            })?;
+            Ok(ContextSource::Previous(id))
         }
     }
 }
@@ -102,19 +125,12 @@ pub async fn create(
         Err(e) => return bad_request("invalid_request", e.to_string()),
     };
 
-    // Storage is shared, so the previous link resolves here directly (no chain
-    // affinity hop).
-    let previous = match &request.previous_response_id {
-        Some(previous_raw) => match parse_id(previous_raw) {
-            Ok(previous) => Some(previous),
-            Err(_) => {
-                return bad_request(
-                    "chain_broken",
-                    "previous_response_id is not a valid response id",
-                )
-            }
-        },
-        None => None,
+    // Only parsing happens here. Resolving what the source *means* — a
+    // conversation's tail, and the session lock that goes with it — is the
+    // capability layer's job, so no facade can bypass it.
+    let source = match context_source(&request) {
+        Ok(source) => source,
+        Err(resp) => return resp,
     };
 
     let idempotency_key = headers
@@ -124,7 +140,7 @@ pub async fn create(
 
     let result = match state
         .service
-        .create(&tenant, &request, input_items, previous, idempotency_key)
+        .create(&tenant, &request, input_items, source, idempotency_key)
         .await
     {
         Ok(r) => r,

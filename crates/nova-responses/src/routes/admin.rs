@@ -10,7 +10,9 @@ use axum::Json;
 use nova_responses_core::TenantId;
 use serde::Deserialize;
 
-use crate::error::{api_error, bad_request, map_context_error};
+use crate::error::{
+    api_error, bad_request, map_context_error, map_conversation_error, map_session_error,
+};
 use crate::state::AppState;
 
 fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
@@ -80,13 +82,31 @@ pub async fn purge_tenant(
     let Ok(tenant) = TenantId::parse(&tenant_raw) else {
         return bad_request("invalid_tenant", "tenant id is malformed");
     };
+
+    // Erasure must cover every store holding tenant data, or "purged" would be a
+    // false claim. Order matters: sessions first, then conversations, then
+    // content. Each step only ever references what the previous one already
+    // removed, so an interruption leaves a partially purged tenant rather than a
+    // session pointing at a conversation that no longer exists.
+    let sessions = match state.session_store.delete_by_tenant(&tenant).await {
+        Ok(n) => n,
+        Err(e) => return map_session_error(&e),
+    };
+    let conversations = match state.conversation_store.delete_by_tenant(&tenant).await {
+        Ok(n) => n,
+        Err(e) => return map_conversation_error(&e),
+    };
     match state.context.delete_by_tenant(&tenant).await {
         Ok(deleted) => {
             state.metrics.incr("tenant_purges", 1).await;
             Json(serde_json::json!({
                 "ok": true,
                 "tenant": tenant.as_str(),
+                // `deleted` keeps its meaning (response records) so existing
+                // callers are unaffected; the two new counts are additive.
                 "deleted": deleted,
+                "sessions_deleted": sessions,
+                "conversations_deleted": conversations,
             }))
             .into_response()
         }
@@ -97,10 +117,16 @@ pub async fn purge_tenant(
 /// GET /health
 pub async fn health(State(state): State<AppState>) -> Response {
     // Store liveness is part of health: a node that cannot store must not look
-    // healthy, because it will refuse every `store: true` create (INV-46).
-    let store_ok = state.context.health().await.is_ok();
+    // healthy, because it will refuse every `store: true` create (INV-46). All
+    // three stores are probed, and each is reported separately — `ok` alone tells
+    // an operator to look, the breakdown tells them where.
+    let context_ok = state.context.health().await.is_ok();
+    let conversation_ok = state.conversation_store.health().await.is_ok();
+    let session_ok = state.session_store.health().await.is_ok();
+    let ok = context_ok && conversation_ok && session_ok;
+
     let in_flight = state.ledger.in_flight().await.unwrap_or(0);
-    let status = if store_ok {
+    let status = if ok {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -108,11 +134,16 @@ pub async fn health(State(state): State<AppState>) -> Response {
     (
         status,
         Json(serde_json::json!({
-            "ok": store_ok,
+            "ok": ok,
             "node_tag": state.cfg.node_tag.as_str(),
             "accepting": state.is_accepting(),
             "read_only": state.ledger.is_read_only(),
             "in_flight": in_flight,
+            "stores": {
+                "context": context_ok,
+                "conversation": conversation_ok,
+                "session": session_ok,
+            },
         })),
     )
         .into_response()

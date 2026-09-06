@@ -13,7 +13,9 @@ use serde_json::{json, Value};
 // The gateway binary is thin assembly over `nova-responses`, so these tests drive
 // the same library the binary mounts — just with the mem backend injected in
 // process instead of a real carrier.
-use nova_responses::{AppState, Config, KeyTable, RawConfig, ResponsesService};
+use nova_responses::{
+    AppState, Config, ConversationsService, KeyTable, RawConfig, ResponsesService, SessionsService,
+};
 
 struct Harness {
     base: String,
@@ -139,10 +141,27 @@ async fn start() -> Harness {
     let world = adapters_mem::MemWorld::new();
     let world_handle = world.clone();
     let keys = Arc::new(KeyTable::parse("").expect("keys"));
+    // Assembly order follows the dependency direction, exactly as the gateway
+    // does it — this fixture is only worth anything if it is wired the same way.
+    let conversations = Arc::new(ConversationsService::new(
+        world.conversation.clone(),
+        world.context.clone(),
+        world.clock.clone(),
+        world.metrics.clone(),
+        cfg.clone(),
+    ));
+    let sessions = Arc::new(SessionsService::new(
+        world.session.clone(),
+        conversations.clone(),
+        world.clock.clone(),
+        world.metrics.clone(),
+    ));
     let service = Arc::new(ResponsesService::new(
         world.ledger.clone(),
         world.event_log.clone(),
         world.context.clone(),
+        conversations.clone(),
+        sessions.clone(),
         world.clock.clone(),
         world.metrics.clone(),
         cfg.clone(),
@@ -153,10 +172,14 @@ async fn start() -> Harness {
         ledger: world.ledger.clone(),
         event_log: world.event_log.clone(),
         context: world.context.clone(),
+        conversation_store: world.conversation.clone(),
+        session_store: world.session.clone(),
         clock: world.clock.clone(),
         metrics: world.metrics.clone(),
         keys,
         service,
+        conversations,
+        sessions,
         accepting: Arc::new(AtomicBool::new(true)),
     };
 
@@ -271,6 +294,12 @@ impl Harness {
                 context: self.world.context.clone(),
                 scheduler,
                 tools: Arc::new(nova_responses_core::NoopToolExecutor),
+                // Mounted, not `None`: with the ports absent every terminal path
+                // would skip the lock release and the tail advance, and this
+                // harness could not tell working bookkeeping from missing
+                // bookkeeping.
+                sessions: Some(self.world.session.clone()),
+                conversations: Some(self.world.conversation.clone()),
             },
             nova_agent::AgentConfig::default(),
         )
@@ -281,19 +310,10 @@ impl Harness {
     /// `deltas` are streamed; `output_text` is what gets submitted. They differ on
     /// purpose — see [`DivergentScheduler`].
     async fn run_agent_turn(&self, deltas: &[&str], output_text: &str) {
-        let engine = nova_agent::Agent::new(
-            nova_agent::AgentDeps {
-                ledger: self.world.ledger.clone(),
-                event_log: self.world.event_log.clone(),
-                context: self.world.context.clone(),
-                scheduler: Arc::new(DivergentScheduler {
-                    deltas: deltas.iter().map(|d| d.to_string()).collect(),
-                    output_text: output_text.to_string(),
-                }),
-                tools: Arc::new(nova_responses_core::NoopToolExecutor),
-            },
-            nova_agent::AgentConfig::default(),
-        );
+        let engine = self.engine_with(Arc::new(DivergentScheduler {
+            deltas: deltas.iter().map(|d| d.to_string()).collect(),
+            output_text: output_text.to_string(),
+        }));
 
         assert_eq!(
             engine.run_once(2_000).await,
@@ -472,13 +492,17 @@ async fn unknown_field_is_rejected_with_the_field_name() {
     assert!(message.contains("truncation"), "unhelpful error: {message}");
 }
 
+/// `conversation` was the field this covered until D27 accepted it. The
+/// mechanism it exercises — a *pointed* remedy rather than a generic "unknown
+/// field" — is still worth covering, so it moved to another field on the list
+/// rather than being deleted along with the entry.
 #[tokio::test]
-async fn conversation_field_gets_a_pointed_remedy() {
+async fn deliberately_unsupported_fields_get_a_pointed_remedy() {
     let h = start().await;
     let (status, body) = h
         .post_raw(
             "/v1/responses",
-            r#"{"model":"m","input":"hi","conversation":"conv_1"}"#,
+            r#"{"model":"m","input":"hi","context_management":{}}"#,
         )
         .await;
     assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);

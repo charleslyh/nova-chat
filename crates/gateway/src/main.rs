@@ -28,8 +28,14 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use nova_responses_core::{Clock, ContextStore, MetricsSink, ResponseEventLog, ResponseLedger};
-use nova_responses::{AppState, Config, CountingMetrics, KeyTable, ResponsesService, SystemClock};
+use nova_responses_core::{
+    Clock, ContextStore, ConversationStore, MetricsSink, ResponseEventLog, ResponseLedger,
+    SessionStore,
+};
+use nova_responses::{
+    AppState, Config, ConversationsService, CountingMetrics, KeyTable, ResponsesService,
+    SessionsService, SystemClock,
+};
 use tracing::info;
 
 #[cfg(feature = "sql")]
@@ -51,6 +57,8 @@ struct Ports {
     ledger: Arc<dyn ResponseLedger>,
     event_log: Arc<dyn ResponseEventLog>,
     context: Arc<dyn ContextStore>,
+    conversation: Arc<dyn ConversationStore>,
+    session: Arc<dyn SessionStore>,
     clock: Arc<dyn Clock>,
     metrics: Arc<dyn MetricsSink>,
 }
@@ -80,15 +88,41 @@ async fn main() -> Result<()> {
     ports.ledger.set_pending_limit(cfg.pending_limit);
 
     // Liveness probe before serving: a node that cannot store would refuse every
-    // `store: true` create, so failing fast is clearer than serving 503s.
+    // `store: true` create, so failing fast is clearer than serving 503s. The two
+    // newer stores are probed for the same reason — a gateway that answers
+    // `/v1/conversations` with a 503 on every call is worse than one that never
+    // came up.
     if let Err(e) = ports.context.health().await {
         bail!("context store is not reachable at startup: {e}");
     }
+    if let Err(e) = ports.conversation.health().await {
+        bail!("conversation store is not reachable at startup: {e}");
+    }
+    if let Err(e) = ports.session.health().await {
+        bail!("session store is not reachable at startup: {e}");
+    }
 
+    // Assembly order follows the dependency direction: conversations know about
+    // content, sessions know about conversations, responses knows about both.
+    let conversations = Arc::new(ConversationsService::new(
+        ports.conversation.clone(),
+        ports.context.clone(),
+        ports.clock.clone(),
+        ports.metrics.clone(),
+        cfg.clone(),
+    ));
+    let sessions = Arc::new(SessionsService::new(
+        ports.session.clone(),
+        conversations.clone(),
+        ports.clock.clone(),
+        ports.metrics.clone(),
+    ));
     let service = Arc::new(ResponsesService::new(
         ports.ledger.clone(),
         ports.event_log.clone(),
         ports.context.clone(),
+        conversations.clone(),
+        sessions.clone(),
         ports.clock.clone(),
         ports.metrics.clone(),
         cfg.clone(),
@@ -99,10 +133,14 @@ async fn main() -> Result<()> {
         ledger: ports.ledger.clone(),
         event_log: ports.event_log.clone(),
         context: ports.context.clone(),
+        conversation_store: ports.conversation.clone(),
+        session_store: ports.session.clone(),
         clock: ports.clock.clone(),
         metrics: ports.metrics.clone(),
         keys,
         service,
+        conversations,
+        sessions,
         accepting: Arc::new(AtomicBool::new(true)),
     };
 
@@ -114,6 +152,7 @@ async fn main() -> Result<()> {
             ledger: state.ledger.clone(),
             event_log: state.event_log.clone(),
             context: state.context.clone(),
+            sessions: state.session_store.clone(),
             clock: state.clock.clone(),
             metrics: state.metrics.clone(),
             heartbeat_ttl_ms: state.cfg.heartbeat_ttl_ms,
@@ -176,6 +215,14 @@ async fn mount(cfg: &Config) -> Result<Ports> {
         ledger: sql.ledger.clone(),
         event_log: Arc::new(event_log),
         context: sql.context.clone(),
+        conversation: sql.conversation.clone(),
+        // Rebuilt from the pool rather than taken from `sql.session`, so the
+        // configured bound is the one in force; the default on `SqlWorld` exists
+        // for callers that have no config to consult.
+        session: Arc::new(adapters_sql::SqlSessionStore::with_max_events_per_session(
+            sql.pool.clone(),
+            cfg.max_events_per_session,
+        )),
         // Real wall clock: created_at / reap deadlines must use wall time, not a
         // frozen virtual clock.
         clock: Arc::new(SystemClock),
@@ -196,6 +243,8 @@ async fn mount(cfg: &Config) -> Result<Ports> {
         ledger: world.ledger.clone(),
         event_log: world.event_log.clone(),
         context: world.context.clone(),
+        conversation: world.conversation.clone(),
+        session: world.session.clone(),
         clock: Arc::new(SystemClock),
         metrics: Arc::new(CountingMetrics::default()),
     })

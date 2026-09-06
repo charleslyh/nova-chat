@@ -47,6 +47,10 @@ struct Args {
     max_logs: usize,
     #[arg(long, default_value_t = 100_000)]
     max_records: usize,
+    /// Upper bound on one session's event stream. Reaching it refuses the append
+    /// rather than evicting, unlike `--events-per-response`.
+    #[arg(long, default_value_t = 100_000)]
+    events_per_session: usize,
 }
 
 #[tokio::main]
@@ -73,6 +77,7 @@ async fn main() -> Result<()> {
             events_per_response: args.events_per_response,
             max_logs: args.max_logs,
             max_records: args.max_records,
+            events_per_session: args.events_per_session,
             // The carrier does no admission control; see module doc.
             pending_limit: usize::MAX,
             verify_integrity: args.verify_integrity,

@@ -25,6 +25,7 @@
 | **04** | [`04-content-integrity.md`](./04-content-integrity.md) | 内容完整性：HMAC 防篡改 |
 | **05** | [`05-reliability.md`](./05-reliability.md) | 可靠性：存储分层、故障语义、优雅停机、reap |
 | **06** | [`06-protocol-subset.md`](./06-protocol-subset.md) | 对外可发布的协议子集规范 |
+| **07** | [`07-conversations-and-sessions.md`](./07-conversations-and-sessions.md) | 会话容器（链尾指针，D27）与会话层（状态广播，D26）；关键时序图 |
 | — | [`01-session-stream.md`](./01-session-stream.md) | **历史**：Session/Turn/快照/热冷层/镜像，D20 已移除，不描述当前系统 |
 
 ## 草稿

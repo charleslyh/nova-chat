@@ -1,0 +1,68 @@
+name: conversation-session-transcript-http
+covers: [FR-41, FR-45]
+oracles: []
+steps:
+  # A conversation is the compatibility-layer pointer (D27). Creating one gives a
+  # caller a place to hang a chain without owning a session.
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/conversations
+    body: '{"metadata":{"topic":"demo"}}'
+    expect_status: 200
+    capture:
+      conv: id
+
+  # A session binds to that conversation, so multi-device delivery has a stream
+  # and the transcript has a home.
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/sessions
+    body: '{"conversation":{"id":"{{conv}}"}}'
+    expect_status: 200
+    capture:
+      sess: id
+
+  # First turn, started the standard way: `conversation`, not a self-hosted
+  # endpoint. The service finds the owning session and takes its turn lock.
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"first-marker-one","conversation":"{{conv}}","background":true}'
+    expect_status: 202
+    capture:
+      first: id
+
+  # The turn must finish before the next one can start: the session lock is
+  # exclusive, so posting a second turn while this one runs would be a 409.
+  - action: http_get_until
+    url: http://127.0.0.1:18080/v1/responses/{{first}}
+    expect_contains: '"status":"completed"'
+    timeout_ms: 15000
+
+  # Second turn inherits the conversation's tail — no `previous_response_id` is
+  # sent, so this is the conversation pointer doing the chaining (FR-41).
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"second-marker-two","conversation":"{{conv}}","background":true}'
+    expect_status: 202
+    capture:
+      second: id
+
+  - action: http_get_until
+    url: http://127.0.0.1:18080/v1/responses/{{second}}
+    expect_contains: '"status":"completed"'
+    timeout_ms: 15000
+
+  # The transcript is the single call a reopened page makes (FR-45): it returns
+  # the whole history at once. Polling until the *second* turn's marker shows up
+  # is what proves the tail advanced past the first turn — the transcript resolves
+  # the conversation's tail, so it only contains the second marker once the first
+  # turn's pointer moved on.
+  - action: http_get_until
+    url: http://127.0.0.1:18080/v1/sessions/{{sess}}/transcript
+    expect_contains: 'second-marker-two'
+    timeout_ms: 15000
+
+  # Both turns are present in one read: inheritance worked, and nothing needed
+  # paging (FR-41 + FR-45 together).
+  - action: http_get
+    url: http://127.0.0.1:18080/v1/sessions/{{sess}}/transcript
+    expect_status: 200
+    expect_contains: 'first-marker-one'

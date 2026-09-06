@@ -30,6 +30,8 @@ fn tenant() -> TenantId {
 
 fn record(id: &ResponseId, text: &str, stored: bool) -> StoredResponse {
     StoredResponse {
+        conversation_id: None,
+        session_id: None,
         response_id: id.clone(),
         previous_response_id: None,
         tenant_id: tenant(),
@@ -60,14 +62,10 @@ fn record(id: &ResponseId, text: &str, stored: bool) -> StoredResponse {
 }
 
 fn engine(world: &MemWorld, scheduler: Arc<dyn CompletionsRequestScheduler>) -> Agent {
-    Agent::new(
-        AgentDeps {
-            ledger: world.ledger.clone(),
-            event_log: world.event_log.clone(),
-            context: world.context.clone(),
-            scheduler,
-            tools: Arc::new(NoopToolExecutor),
-        },
+    agent_with(
+        world,
+        scheduler,
+        Arc::new(NoopToolExecutor),
         AgentConfig::default(),
     )
 }
@@ -87,6 +85,11 @@ fn agent_with(
             context: world.context.clone(),
             scheduler,
             tools,
+            // Mounted, not `None`: with the ports absent every terminal path
+            // would skip the release and this fixture could not tell a working
+            // release from a missing one.
+            sessions: Some(world.session.clone()),
+            conversations: Some(world.conversation.clone()),
         },
         cfg,
     )

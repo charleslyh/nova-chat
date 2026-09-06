@@ -13,9 +13,11 @@ use std::sync::Arc;
 use nova_responses_core::protocol::{CreateResponseRequest, InputLimits, ResponseItem};
 use nova_responses_core::{
     canonical_items, AgentId, Attempt, ChainLimits, ContentIntegrity, ContextError, ContextStore,
-    CreateOutcome, EventBody, EventLogError, IdempotencyKey, LedgerError, NodeTag, ResponseEvent,
-    ResponseEventKind, ResponseEventLog, ResponseId, ResponseLedger, ResponseStatus, StoredResponse,
-    TenantId, Usage,
+    Conversation, ConversationError, ConversationId, ConversationStore, CreateOutcome, EventBody,
+    EventLogError, IdempotencyKey, LedgerError, LockState, NodeTag, ResponseEvent,
+    ResponseEventKind, ResponseEventLog, ResponseId, ResponseLedger, ResponseStatus, Session,
+    SessionError, SessionEvent, SessionEventKind, SessionId, SessionStore, StoredResponse, TenantId,
+    Usage,
 };
 
 /// The set of ports under test. Backend-agnostic by construction.
@@ -24,6 +26,8 @@ pub struct PortSet {
     pub ledger: Arc<dyn ResponseLedger>,
     pub event_log: Arc<dyn ResponseEventLog>,
     pub context: Arc<dyn ContextStore>,
+    pub conversation: Arc<dyn ConversationStore>,
+    pub session: Arc<dyn SessionStore>,
     pub integrity: Option<Arc<dyn ContentIntegrity>>,
     pub node_tag: NodeTag,
 }
@@ -31,6 +35,31 @@ pub struct PortSet {
 impl PortSet {
     fn new_id(&self) -> ResponseId {
         ResponseId::new(self.node_tag.clone())
+    }
+
+    /// A persisted conversation for `tenant`, with no tail yet.
+    async fn fresh_conversation(&self, tenant: &TenantId) -> Conversation {
+        self.conversation
+            .create(Conversation::new(
+                ConversationId::new(),
+                tenant.clone(),
+                Default::default(),
+                1_000,
+            ))
+            .await
+            .expect("create conversation")
+    }
+
+    /// A persisted session for `tenant`, bound to a fresh conversation.
+    async fn fresh_session(&self, tenant: &TenantId) -> Session {
+        let conversation = self.fresh_conversation(tenant).await;
+        self.session
+            .create(
+                Session::new(SessionId::new(), tenant.clone(), conversation.id, 1_000),
+                1_000,
+            )
+            .await
+            .expect("create session")
     }
 }
 
@@ -56,6 +85,11 @@ fn record(
     StoredResponse {
         response_id: id.clone(),
         previous_response_id: previous.cloned(),
+        // Association is opt-in: cases that exercise it set these with
+        // struct-update syntax rather than threading two more parameters through
+        // every call site that does not care.
+        conversation_id: None,
+        session_id: None,
         tenant_id: tenant.clone(),
         model: "test-model".into(),
         instructions: Some("INSTRUCTIONS-MARKER".into()),
@@ -1424,6 +1458,821 @@ pub async fn assert_concurrency_conformance(ports: &PortSet) {
 
 // -------------------------------------------------------------- entry points
 
+// ------------------------------------------------------------- conversation
+
+/// Conversation store contract (D27).
+///
+/// - **FR-40**: the four upstream operations round-trip; metadata replaces
+///   wholesale so a key can be removed; deletion does not cascade.
+/// - **FR-21**: tenant-level bulk erasure reaches conversations, so a purge is
+///   not a false claim.
+/// - **INV-54**: the conversation holds a pointer, never items.
+/// - **INV-55**: advancing the tail is last-write-wins — no compare-and-set,
+///   because the conflict status one would have to return does not exist
+///   upstream.
+/// - **SEC-2**: another tenant's conversation is indistinguishable from absent,
+///   across reads *and* writes.
+pub async fn assert_conversation_conformance(ports: &PortSet) {
+    let tenant = fresh_tenant("conv");
+    let other = fresh_tenant("conv-other");
+
+    let created = ports.fresh_conversation(&tenant).await;
+    assert!(
+        created.is_empty(),
+        "a new conversation has no tail: the first turn must start from empty context"
+    );
+
+    let fetched = ports
+        .conversation
+        .get(&tenant, &created.id)
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(fetched, created, "retrieve must round-trip the record");
+
+    // SEC-2: a foreign tenant reads as absent, not as forbidden — otherwise the
+    // status alone confirms the id exists.
+    assert_eq!(
+        ports.conversation.get(&other, &created.id).await.expect("get"),
+        None,
+        "another tenant's conversation must read as absent"
+    );
+    assert_eq!(
+        ports
+            .conversation
+            .update_metadata(&other, &created.id, Default::default())
+            .await,
+        Err(ConversationError::NotFound),
+        "a foreign tenant must not be able to update"
+    );
+    assert_eq!(
+        ports.conversation.delete(&other, &created.id).await,
+        Ok(false),
+        "a foreign tenant must not be able to delete"
+    );
+
+    // Metadata replaces wholesale, so a key can be removed. A merge-patch could
+    // only ever add.
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert("topic".to_string(), "demo".to_string());
+    metadata.insert("stale".to_string(), "x".to_string());
+    let updated = ports
+        .conversation
+        .update_metadata(&tenant, &created.id, metadata)
+        .await
+        .expect("update");
+    assert_eq!(updated.metadata.len(), 2);
+
+    let mut narrower = std::collections::BTreeMap::new();
+    narrower.insert("topic".to_string(), "demo".to_string());
+    let updated = ports
+        .conversation
+        .update_metadata(&tenant, &created.id, narrower)
+        .await
+        .expect("update");
+    assert_eq!(
+        updated.metadata.len(),
+        1,
+        "metadata is replaced wholesale, so a key must be removable"
+    );
+    assert_eq!(
+        updated.created_at_ms, created.created_at_ms,
+        "updating metadata must not disturb the rest of the record"
+    );
+
+    // The tail: what the next generation inherits.
+    let first = ports.new_id();
+    ports
+        .conversation
+        .advance(&tenant, &created.id, &first)
+        .await
+        .expect("advance");
+    let after = ports
+        .conversation
+        .get(&tenant, &created.id)
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(after.last_response_id.as_ref(), Some(&first));
+    assert!(!after.is_empty());
+
+    // INV-55: last write wins. Two turns racing on one conversation leave
+    // whichever finished last as the tail; the other's chain survives and stays
+    // addressable, it simply is not the tail. A compare-and-set here would have
+    // to reject the loser with a status upstream never returns.
+    let second = ports.new_id();
+    ports
+        .conversation
+        .advance(&tenant, &created.id, &second)
+        .await
+        .expect("advance again");
+    assert_eq!(
+        ports
+            .conversation
+            .get(&tenant, &created.id)
+            .await
+            .expect("get")
+            .expect("present")
+            .last_response_id
+            .as_ref(),
+        Some(&second),
+        "advancing must overwrite unconditionally (last write wins)"
+    );
+
+    // Advancing a conversation that does not exist is an error, never a silent
+    // no-op: the caller would otherwise believe the tail moved.
+    assert_eq!(
+        ports
+            .conversation
+            .advance(&tenant, &ConversationId::new(), &second)
+            .await,
+        Err(ConversationError::NotFound)
+    );
+    assert_eq!(
+        ports
+            .conversation
+            .advance(&other, &created.id, &second)
+            .await,
+        Err(ConversationError::NotFound),
+        "advancing across a tenant boundary must fail as absent"
+    );
+
+    // Delete, and confirm it is gone. Response records are deliberately not
+    // cascaded — see the port docs and D24.
+    assert_eq!(
+        ports.conversation.delete(&tenant, &created.id).await,
+        Ok(true)
+    );
+    assert_eq!(
+        ports.conversation.get(&tenant, &created.id).await.expect("get"),
+        None
+    );
+    assert_eq!(
+        ports.conversation.delete(&tenant, &created.id).await,
+        Ok(false),
+        "deleting twice reports no removal rather than an error"
+    );
+
+    // Bulk erasure by tenant (FR-21) must reach conversations too, or a purge
+    // would leave them behind while reporting success.
+    let a = ports.fresh_conversation(&tenant).await;
+    let b = ports.fresh_conversation(&tenant).await;
+    let untouched = ports.fresh_conversation(&other).await;
+    let removed = ports
+        .conversation
+        .delete_by_tenant(&tenant)
+        .await
+        .expect("purge");
+    assert!(removed >= 2, "purge must remove this tenant's conversations");
+    for id in [&a.id, &b.id] {
+        assert_eq!(ports.conversation.get(&tenant, id).await.expect("get"), None);
+    }
+    assert!(
+        ports
+            .conversation
+            .get(&other, &untouched.id)
+            .await
+            .expect("get")
+            .is_some(),
+        "a purge must not cross the tenant boundary"
+    );
+}
+
+// ------------------------------------------------------------------ session
+
+/// Session store contract (D26): metadata, the turn lock and the event stream.
+///
+/// - **FR-42**: session lifecycle, and the exclusive binding to a conversation —
+///   deleting a session does not destroy the conversation it broadcast for.
+/// - **FR-43**: the durable event stream, with 0-based contiguous sequence
+///   numbers and an exclusive cursor — the same rule as the per-response log, so
+///   both are read with one discipline. Business events share that sequence
+///   space rather than a parallel one.
+/// - **FR-44**: one turn at a time; the refused caller is told who holds the
+///   lock, and a refused turn leaves no trace.
+/// - **FR-21**: tenant-level bulk erasure reaches sessions.
+/// - **CR-15 / INV-58**: every terminal status releases the lock — completed,
+///   failed, incomplete and cancelled are each exercised rather than assumed —
+///   and `end_turn` is idempotent so a retry cannot append a second terminal
+///   event. A lock that outlived its holder can be taken over, conditionally on
+///   the named holder, without emitting a duplicate terminal event. The lock
+///   transition and the event announcing it are atomic: the lock is never held
+///   without the event that explains it.
+/// - **INV-56**: the stream carries *references* to content, never content. A
+///   turn envelope names a response id; it does not copy its items — checked by
+///   asserting the wire form of the envelope carries no item-shaped keys.
+/// - **INV-57**: sequence numbers are 0-based and contiguous per session, and
+///   business events share that space rather than a parallel one.
+/// - **INV-59**: hitting the stream bound refuses the append; it never evicts
+///   the oldest events. Checked by shrinking the bound and overflowing it.
+/// - **SEC-2**: another tenant's session is indistinguishable from absent,
+///   across reads *and* writes.
+pub async fn assert_session_conformance(ports: &PortSet) {
+    let tenant = fresh_tenant("session");
+    let other = fresh_tenant("session-other");
+
+    let session = ports.fresh_session(&tenant).await;
+    assert_eq!(
+        session.lock_state,
+        LockState::Idle,
+        "a new session must start idle"
+    );
+
+    // Sequence 0 exists from the start, so a subscriber can tell "stream begins
+    // here" from "nothing has happened yet".
+    let events = ports
+        .session
+        .read_after(&tenant, &session.id, None, 100, 0)
+        .await
+        .expect("read");
+    assert_eq!(events.len(), 1, "creation must be on the stream");
+    assert_eq!(events[0].seq, 0, "session sequence numbers are 0-based");
+    assert_eq!(events[0].kind, SessionEventKind::SessionCreated);
+
+    // SEC-2 across every operation, not just reads.
+    assert_eq!(
+        ports.session.get(&other, &session.id).await.expect("get"),
+        None
+    );
+    assert_eq!(
+        ports
+            .session
+            .read_after(&other, &session.id, None, 10, 0)
+            .await,
+        Err(SessionError::NotFound),
+        "a foreign tenant must not be able to read the stream"
+    );
+    assert_eq!(
+        ports
+            .session
+            .append_event(
+                &other,
+                &session.id,
+                SessionEventKind::Business {
+                    kind: "intrusion".into(),
+                    payload: serde_json::Value::Null,
+                },
+                1_000
+            )
+            .await,
+        Err(SessionError::NotFound),
+        "a foreign tenant must not be able to write to the stream"
+    );
+    assert_eq!(
+        ports.session.delete(&other, &session.id).await,
+        Ok(false)
+    );
+
+    // The exclusive binding: a second session over the same conversation would be
+    // a second turn lock guarding the same chain, which is no lock at all.
+    let taken = ports
+        .session
+        .create(
+            Session::new(
+                SessionId::new(),
+                tenant.clone(),
+                session.conversation_id.clone(),
+                2_000,
+            ),
+            2_000,
+        )
+        .await;
+    assert_eq!(
+        taken.err(),
+        Some(SessionError::ConversationTaken),
+        "one conversation may belong to at most one session"
+    );
+    let found = ports
+        .session
+        .get_by_conversation(&tenant, &session.conversation_id)
+        .await
+        .expect("lookup")
+        .expect("present");
+    assert_eq!(
+        found.id, session.id,
+        "the reverse lookup is what lets a standard request reach the lock"
+    );
+    assert_eq!(
+        ports
+            .session
+            .get_by_conversation(&other, &session.conversation_id)
+            .await
+            .expect("lookup"),
+        None,
+        "the reverse lookup is tenant-scoped too"
+    );
+
+    // INV-54: taking the lock and announcing it are one step.
+    let first = ports.new_id();
+    let started = ports
+        .session
+        .begin_turn(&tenant, &session.id, &first, 3_000)
+        .await
+        .expect("begin");
+    assert_eq!(started, 1, "the event follows creation contiguously");
+    let state = ports
+        .session
+        .get(&tenant, &session.id)
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(
+        state.lock_state,
+        LockState::Busy {
+            response_id: first.clone()
+        },
+        "the lock must be held by the response that took it"
+    );
+    let events = ports
+        .session
+        .read_after(&tenant, &session.id, Some(0), 100, 0)
+        .await
+        .expect("read");
+    assert_eq!(
+        events.first().map(|e| &e.kind),
+        Some(&SessionEventKind::TurnStarted {
+            response_id: first.clone()
+        }),
+        "the lock must never be held without the event that explains it"
+    );
+
+    // Re-entry by the holder returns the same sequence: an execution-side retry
+    // must not announce the same turn twice.
+    let again = ports
+        .session
+        .begin_turn(&tenant, &session.id, &first, 3_100)
+        .await
+        .expect("re-entry by the holder is allowed");
+    assert_eq!(again, started, "re-entry must not append a second event");
+
+    // A competing turn is refused, and **nothing is written** — no event, no
+    // half state. The holder is named so the caller can act on it.
+    let second = ports.new_id();
+    let before = ports
+        .session
+        .read_after(&tenant, &session.id, None, 100, 0)
+        .await
+        .expect("read")
+        .len();
+    assert_eq!(
+        ports
+            .session
+            .begin_turn(&tenant, &session.id, &second, 3_200)
+            .await,
+        Err(SessionError::Busy {
+            holder: first.clone()
+        }),
+        "a concurrent turn must be refused, and told which turn is running"
+    );
+    assert_eq!(
+        ports
+            .session
+            .read_after(&tenant, &session.id, None, 100, 0)
+            .await
+            .expect("read")
+            .len(),
+        before,
+        "a refused turn must leave no trace on the stream"
+    );
+
+    // Business events share the sequence space, which is what keeps them ordered
+    // relative to the conversation rather than merely timestamped.
+    let business = ports
+        .session
+        .append_event(
+            &tenant,
+            &session.id,
+            SessionEventKind::Business {
+                kind: "file_uploaded".into(),
+                payload: serde_json::json!({ "path": "/tmp/a" }),
+            },
+            3_300,
+        )
+        .await
+        .expect("append business");
+    assert_eq!(
+        business,
+        started + 1,
+        "business events take the next sequence number, not a parallel one"
+    );
+
+    // INV-55: the terminal path releases the lock, atomically with the event.
+    let completed = ports
+        .session
+        .end_turn(
+            &tenant,
+            &session.id,
+            &first,
+            ResponseStatus::Completed,
+            3_400,
+        )
+        .await
+        .expect("end");
+    assert_eq!(completed, business + 1);
+    assert_eq!(
+        ports
+            .session
+            .get(&tenant, &session.id)
+            .await
+            .expect("get")
+            .expect("present")
+            .lock_state,
+        LockState::Idle,
+        "a terminal turn must release the lock"
+    );
+
+    // Idempotent: the execution side may re-enter after a retry or a restart.
+    let repeat = ports
+        .session
+        .end_turn(
+            &tenant,
+            &session.id,
+            &first,
+            ResponseStatus::Completed,
+            3_500,
+        )
+        .await
+        .expect("end again");
+    assert_eq!(
+        repeat, completed,
+        "repeating end_turn must return the sequence already assigned"
+    );
+
+    // INV-58 for the other statuses: a failed, incomplete or cancelled turn
+    // releases the lock exactly as a completed one does. A path that did not
+    // would lock the session forever, so each is exercised rather than assumed.
+    for status in [
+        ResponseStatus::Failed,
+        ResponseStatus::Incomplete,
+        ResponseStatus::Cancelled,
+    ] {
+        let id = ports.new_id();
+        ports
+            .session
+            .begin_turn(&tenant, &session.id, &id, 4_000)
+            .await
+            .expect("begin");
+        ports
+            .session
+            .end_turn(&tenant, &session.id, &id, status, 4_100)
+            .await
+            .expect("end");
+        assert_eq!(
+            ports
+                .session
+                .get(&tenant, &session.id)
+                .await
+                .expect("get")
+                .expect("present")
+                .lock_state,
+            LockState::Idle,
+            "terminal status {status:?} must release the lock"
+        );
+    }
+
+    // A lock can outlive its holder: the process may die between the ledger
+    // transition and the release. Taking it back must be possible, and must be
+    // conditional on the named holder still holding it.
+    let stuck = ports.new_id();
+    ports
+        .session
+        .begin_turn(&tenant, &session.id, &stuck, 5_000)
+        .await
+        .expect("begin");
+    assert_eq!(
+        ports
+            .session
+            .release_stale_lock(&tenant, &session.id, &ports.new_id())
+            .await,
+        Ok(false),
+        "releasing must be conditional: a wrong holder must not unlock a live turn"
+    );
+    assert!(
+        ports
+            .session
+            .get(&tenant, &session.id)
+            .await
+            .expect("get")
+            .expect("present")
+            .lock_state
+            .is_busy(),
+        "a conditional release that did not match must leave the lock alone"
+    );
+    let before = ports
+        .session
+        .read_after(&tenant, &session.id, None, 500, 0)
+        .await
+        .expect("read")
+        .len();
+    assert_eq!(
+        ports
+            .session
+            .release_stale_lock(&tenant, &session.id, &stuck)
+            .await,
+        Ok(true)
+    );
+    assert_eq!(
+        ports
+            .session
+            .get(&tenant, &session.id)
+            .await
+            .expect("get")
+            .expect("present")
+            .lock_state,
+        LockState::Idle
+    );
+    assert_eq!(
+        ports
+            .session
+            .read_after(&tenant, &session.id, None, 500, 0)
+            .await
+            .expect("read")
+            .len(),
+        before,
+        "a stale release must not append an event: the terminal event was already \
+         emitted by whoever completed the response"
+    );
+
+    // Cursor discipline, matching the per-response log so both are read with one
+    // rule: `None` is from the beginning, `Some(n)` is exclusive.
+    let all = ports
+        .session
+        .read_after(&tenant, &session.id, None, 500, 0)
+        .await
+        .expect("read");
+    let seqs: Vec<u64> = all.iter().map(|e| e.seq).collect();
+    let expected: Vec<u64> = (0..all.len() as u64).collect();
+    assert_eq!(
+        seqs, expected,
+        "session sequence numbers must be contiguous with no gaps or repeats"
+    );
+    let after_zero = ports
+        .session
+        .read_after(&tenant, &session.id, Some(0), 500, 0)
+        .await
+        .expect("read");
+    assert_eq!(
+        after_zero.first().map(|e| e.seq),
+        Some(1),
+        "starting_after must be exclusive"
+    );
+    // Beyond the tip: empty and still connected, not an error. A subscriber that
+    // has caught up waits for the next event rather than being disconnected.
+    assert_eq!(
+        ports
+            .session
+            .read_after(&tenant, &session.id, Some(9_999), 10, 0)
+            .await
+            .expect("read")
+            .len(),
+        0
+    );
+    // Unlike the per-response log, nothing here is ever evicted, so there is no
+    // expired-cursor case to report.
+
+    // INV-56: the stream carries *references* to content, never content. A turn
+    // envelope names a response id; it must not copy the response's items. The
+    // check runs on the wire form so a future variant that grows an items field
+    // is caught by name rather than by subtle misbehaviour.
+    let envelopes: Vec<&SessionEvent> = all
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                SessionEventKind::TurnStarted { .. } | SessionEventKind::TurnCompleted { .. }
+            )
+        })
+        .collect();
+    assert!(
+        !envelopes.is_empty(),
+        "the session must have turn envelopes by this point"
+    );
+    for ev in envelopes {
+        let json = serde_json::to_value(&ev.kind).expect("serialize envelope");
+        for forbidden in ["items", "input", "output", "content", "input_items", "output_items"] {
+            assert!(
+                !json.as_object().map(|o| o.contains_key(forbidden)).unwrap_or(false),
+                "a turn envelope must not copy content (INV-56): {json}"
+            );
+        }
+    }
+
+    // INV-59: hitting the bound refuses the append, it does not evict. Overflow a
+    // fresh session with a tiny bound and confirm the refusal is clean — the
+    // events already written survive, and only the excess append is refused.
+    let capped = ports.fresh_session(&tenant).await;
+    ports.session.set_max_events_per_session(3);
+    let business = |i: u64| SessionEventKind::Business {
+        kind: "cap".into(),
+        payload: serde_json::json!({ "i": i }),
+    };
+    // Sequence 0 (SessionCreated) already exists; two more fill the bound.
+    assert_eq!(
+        ports
+            .session
+            .append_event(&tenant, &capped.id, business(1), 6_000)
+            .await,
+        Ok(1)
+    );
+    assert_eq!(
+        ports
+            .session
+            .append_event(&tenant, &capped.id, business(2), 6_100)
+            .await,
+        Ok(2)
+    );
+    assert_eq!(
+        ports
+            .session
+            .append_event(&tenant, &capped.id, business(3), 6_200)
+            .await,
+        Err(SessionError::CapacityExceeded),
+        "reaching the bound must refuse the append, not evict the oldest event"
+    );
+    let survived = ports
+        .session
+        .read_after(&tenant, &capped.id, None, 100, 0)
+        .await
+        .expect("read");
+    assert_eq!(
+        survived.len(),
+        3,
+        "the refused append must not have evicted anything (INV-59)"
+    );
+    ports.session.set_max_events_per_session(100_000);
+
+    // A missing session is reported, never treated as an empty stream — that
+    // would look identical to a quiet session.
+    assert_eq!(
+        ports
+            .session
+            .read_after(&tenant, &SessionId::new(), None, 10, 0)
+            .await,
+        Err(SessionError::NotFound)
+    );
+
+    // Deleting the session takes its stream with it, and leaves the conversation
+    // alone: the conversation holds the history, the session only broadcasts.
+    let conversation_id = session.conversation_id.clone();
+    assert_eq!(ports.session.delete(&tenant, &session.id).await, Ok(true));
+    assert_eq!(
+        ports.session.get(&tenant, &session.id).await.expect("get"),
+        None
+    );
+    assert_eq!(
+        ports
+            .session
+            .read_after(&tenant, &session.id, None, 10, 0)
+            .await,
+        Err(SessionError::NotFound)
+    );
+    assert!(
+        ports
+            .conversation
+            .get(&tenant, &conversation_id)
+            .await
+            .expect("get")
+            .is_some(),
+        "deleting a session must not destroy the conversation it broadcast for"
+    );
+    assert_eq!(ports.session.delete(&tenant, &session.id).await, Ok(false));
+
+    // Bulk erasure by tenant (FR-21).
+    let a = ports.fresh_session(&tenant).await;
+    let untouched = ports.fresh_session(&other).await;
+    let removed = ports
+        .session
+        .delete_by_tenant(&tenant)
+        .await
+        .expect("purge");
+    assert!(removed >= 1);
+    assert_eq!(ports.session.get(&tenant, &a.id).await.expect("get"), None);
+    assert!(
+        ports
+            .session
+            .get(&other, &untouched.id)
+            .await
+            .expect("get")
+            .is_some(),
+        "a purge must not cross the tenant boundary"
+    );
+}
+
+/// Session concurrency contract.
+///
+/// - **CR-14 / INV-58**: exactly one of N racing turns takes the lock; the rest
+///   are refused, and none of them leaves a partial write — no "locked with
+///   nothing on the stream", and no event for a turn that never ran.
+/// - **CR-16 / INV-57**: concurrent appends never collide on a sequence number,
+///   and every one of them is readable back rather than merely acknowledged.
+///
+/// Separate from [`assert_session_conformance`] because a sequential test cannot
+/// observe either property: an implementation that allocated sequence numbers
+/// with a read-then-write would pass every assertion above.
+pub async fn assert_session_concurrency(ports: &PortSet) {
+    let tenant = fresh_tenant("session-race");
+    let session = ports.fresh_session(&tenant).await;
+
+    // N callers, one lock. The winner count must be exactly one — "at least one"
+    // would pass an implementation that let two turns run at once.
+    const RACERS: usize = 16;
+    let mut handles = Vec::new();
+    for _ in 0..RACERS {
+        let store = ports.session.clone();
+        let tenant = tenant.clone();
+        let session_id = session.id.clone();
+        let response_id = ports.new_id();
+        handles.push(tokio::spawn(async move {
+            store
+                .begin_turn(&tenant, &session_id, &response_id, 1_000)
+                .await
+        }));
+    }
+    let mut winners = 0usize;
+    let mut refused = 0usize;
+    for handle in handles {
+        match handle.await.expect("task") {
+            Ok(_) => winners += 1,
+            Err(SessionError::Busy { .. }) => refused += 1,
+            Err(other) => panic!("unexpected error from a racing begin_turn: {other:?}"),
+        }
+    }
+    assert_eq!(
+        winners, 1,
+        "exactly one of {RACERS} racing turns may take the lock"
+    );
+    assert_eq!(refused, RACERS - 1, "every other racer must be refused");
+
+    // Only the winner's `TurnStarted` may be on the stream: a refused turn writes
+    // nothing at all.
+    let events = ports
+        .session
+        .read_after(&tenant, &session.id, None, 500, 0)
+        .await
+        .expect("read");
+    let started = events
+        .iter()
+        .filter(|e| matches!(e.kind, SessionEventKind::TurnStarted { .. }))
+        .count();
+    assert_eq!(
+        started, 1,
+        "the {} refused turns must not have written events",
+        RACERS - 1
+    );
+
+    // Concurrent appends must not collide. Checked by counting distinct sequence
+    // numbers, because a duplicate would silently overwrite one event and the
+    // stream would still *look* contiguous.
+    const APPENDS: usize = 32;
+    let mut handles = Vec::new();
+    for i in 0..APPENDS {
+        let store = ports.session.clone();
+        let tenant = tenant.clone();
+        let session_id = session.id.clone();
+        handles.push(tokio::spawn(async move {
+            store
+                .append_event(
+                    &tenant,
+                    &session_id,
+                    SessionEventKind::Business {
+                        kind: "race".into(),
+                        payload: serde_json::json!({ "i": i }),
+                    },
+                    2_000,
+                )
+                .await
+        }));
+    }
+    let mut assigned = Vec::new();
+    for handle in handles {
+        assigned.push(handle.await.expect("task").expect("append"));
+    }
+    let total = assigned.len();
+    assigned.sort_unstable();
+    assigned.dedup();
+    assert_eq!(
+        assigned.len(),
+        total,
+        "concurrent appends must never be assigned the same sequence number"
+    );
+
+    let all = ports
+        .session
+        .read_after(&tenant, &session.id, None, 1_000, 0)
+        .await
+        .expect("read");
+    let seqs: Vec<u64> = all.iter().map(|e| e.seq).collect();
+    let expected: Vec<u64> = (0..all.len() as u64).collect();
+    assert_eq!(
+        seqs, expected,
+        "the stream must stay 0-based and contiguous under concurrency"
+    );
+    assert!(
+        all.len() >= APPENDS,
+        "every concurrent append must be readable back, not merely acknowledged"
+    );
+}
+
 /// What a contract case actually exercises.
 ///
 /// The distinction matters for reporting: running a protocol-level case against
@@ -1566,6 +2415,33 @@ pub fn cases() -> &'static [ContractCase] {
             scope: CaseScope::Protocol,
             asserts: "assert_reconnect_backoff",
         },
+        ContractCase {
+            name: "conversation",
+            // FR-41 is *not* claimed here: this case can show the tail moves, but
+            // "the next generation inherits it" is assembled in the service layer
+            // and is covered by the L2 http scenarios.
+            covers: &["FR-40", "FR-21", "INV-54", "INV-55", "SEC-2"],
+            scope: CaseScope::Backend,
+            asserts: "assert_conversation_conformance",
+        },
+        ContractCase {
+            name: "session",
+            covers: &[
+                "FR-42", "FR-43", "FR-44", "FR-21", "CR-15", "INV-56", "INV-57", "INV-58",
+                "INV-59", "SEC-2",
+            ],
+            scope: CaseScope::Backend,
+            asserts: "assert_session_conformance",
+        },
+        ContractCase {
+            name: "session-concurrency",
+            // Separate from `session` because a sequential test cannot observe
+            // either property: an implementation that allocated sequence numbers
+            // with a read-then-write would pass the sequential case in full.
+            covers: &["CR-14", "CR-16", "INV-57", "INV-58"],
+            scope: CaseScope::Backend,
+            asserts: "assert_session_concurrency",
+        },
     ]
 }
 
@@ -1629,6 +2505,9 @@ async fn run_case(ports: &PortSet, case: &ContractCase) -> CaseOutcome {
         "protocol-subset" => assert_protocol_subset_rejects(),
         "event-coalesce" => assert_event_coalescing(),
         "reconnect-backoff" => assert_reconnect_backoff(),
+        "conversation" => assert_conversation_conformance(ports).await,
+        "session" => assert_session_conformance(ports).await,
+        "session-concurrency" => assert_session_concurrency(ports).await,
         unknown => panic!(
             "contract case `{unknown}` is listed in cases() but has no dispatch arm; \
              it would be reported as covered without ever running"
@@ -1686,6 +2565,8 @@ pub fn mem_ports() -> PortSet {
         ledger: world.ledger.clone(),
         event_log: world.event_log.clone(),
         context: world.context.clone(),
+        conversation: world.conversation.clone(),
+        session: world.session.clone(),
         integrity: world.integrity.clone(),
         node_tag: NodeTag::parse("node-a").expect("static tag"),
     }

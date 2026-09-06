@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 
 use nova_responses_core::{
-    AgentId, Attempt, IdempotencyKey, NodeTag, ResponseId, ResponseItem, ResponseStatus,
-    StoredResponse, TenantId, Usage,
+    AgentId, Attempt, ConversationId, IdempotencyKey, NodeTag, ResponseId, ResponseItem,
+    ResponseStatus, SessionId, StoredResponse, TenantId, Usage,
 };
 use serde_json::Value;
 use sqlx::postgres::PgRow;
@@ -63,6 +63,24 @@ pub(crate) fn total_usage(base: Usage, partial: &PartialUsage) -> Usage {
     partial.values().fold(base, |acc, u| acc.add(*u))
 }
 
+/// Decode an optional id column, keeping the column name in the error so a
+/// mis-mapped column is identifiable from the message alone.
+fn optional_id<T, F>(
+    raw: Option<String>,
+    column: &str,
+    parse: F,
+) -> Result<Option<T>, SqlError>
+where
+    F: Fn(&str) -> Result<T, nova_responses_core::IdError>,
+{
+    match raw {
+        None => Ok(None),
+        Some(raw) => parse(&raw)
+            .map(Some)
+            .map_err(|e| SqlError::Decode(format!("{column}: {e}"))),
+    }
+}
+
 pub(crate) fn record_from_row(row: &PgRow) -> Result<StoredResponse, SqlError> {
     let response_id: String = row.try_get("response_id")?;
     let previous: Option<String> = row.try_get("previous_response_id")?;
@@ -74,13 +92,13 @@ pub(crate) fn record_from_row(row: &PgRow) -> Result<StoredResponse, SqlError> {
     Ok(StoredResponse {
         response_id: ResponseId::parse(&response_id)
             .map_err(|e| SqlError::Decode(format!("response_id: {e}")))?,
-        previous_response_id: match previous {
-            None => None,
-            Some(raw) => Some(
-                ResponseId::parse(&raw)
-                    .map_err(|e| SqlError::Decode(format!("previous_response_id: {e}")))?,
-            ),
-        },
+        previous_response_id: optional_id(previous, "previous_response_id", ResponseId::parse)?,
+        conversation_id: optional_id(
+            row.try_get("conversation_id")?,
+            "conversation_id",
+            ConversationId::parse,
+        )?,
+        session_id: optional_id(row.try_get("session_id")?, "session_id", SessionId::parse)?,
         tenant_id: TenantId::parse(&tenant_id)
             .map_err(|e| SqlError::Decode(format!("tenant_id: {e}")))?,
         model: row.try_get("model")?,
@@ -122,4 +140,5 @@ pub(crate) fn record_from_row(row: &PgRow) -> Result<StoredResponse, SqlError> {
 pub(crate) const RECORD_COLUMNS: &str = "response_id, previous_response_id, tenant_id, model, \
      status, stored, node_tag, attempt, owner, idempotency_key, instructions, \
      input_items, output_items, usage, integrity, integrity_alg, \
-     created_at_ms, completed_at_ms, expires_at_ms, context, context_depth";
+     created_at_ms, completed_at_ms, expires_at_ms, context, context_depth, \
+     conversation_id, session_id";

@@ -48,6 +48,25 @@ pub struct RawConfig {
     #[serde(default = "default_max_logs")]
     pub max_event_logs: usize,
 
+    /// Upper bound on one session's event stream (D26).
+    ///
+    /// Reaching it **refuses the append** rather than evicting the oldest events,
+    /// unlike `max_events_per_response`. The two differ because what they hold
+    /// differs: dropping a token delta costs a subscriber some replay, while
+    /// dropping a turn boundary or a business event loses the only record that it
+    /// happened. Three orders of magnitude smaller for the same reason — a turn
+    /// contributes two or three envelopes, not thousands of deltas.
+    #[serde(default = "default_events_per_session")]
+    pub max_events_per_session: usize,
+
+    /// How many session events one subscription read may return.
+    ///
+    /// Bounds the response size of a replay-from-zero, which is what a reopened
+    /// page does. The stream continues from where the batch ended, so this caps
+    /// memory per read without capping how much history is reachable.
+    #[serde(default = "default_session_events_page")]
+    pub session_events_page: usize,
+
     /// How long a terminal response's events stay readable.
     #[serde(default = "default_retain_after_terminal_ms")]
     pub retain_after_terminal_ms: u64,
@@ -113,6 +132,14 @@ fn default_events_per_response() -> usize {
 fn default_max_logs() -> usize {
     100_000
 }
+fn default_events_per_session() -> usize {
+    // Two or three envelopes per turn plus business events: room for tens of
+    // thousands of turns before the bound is anywhere near.
+    100_000
+}
+fn default_session_events_page() -> usize {
+    256
+}
 fn default_retain_after_terminal_ms() -> u64 {
     60_000
 }
@@ -165,6 +192,8 @@ pub struct Config {
     pub pending_limit: usize,
     pub max_events_per_response: usize,
     pub max_event_logs: usize,
+    pub max_events_per_session: usize,
+    pub session_events_page: usize,
     pub retain_after_terminal_ms: u64,
     pub content_retention_ms: u64,
     pub chain_limits: ChainLimits,
@@ -195,6 +224,14 @@ impl Config {
         if raw.max_events_per_response == 0 {
             bail!("max_events_per_response must be at least 1");
         }
+        if raw.max_events_per_session == 0 {
+            bail!("max_events_per_session must be at least 1");
+        }
+        // A zero page would make every subscription return nothing forever, which
+        // reads as "the session is quiet" rather than as a misconfiguration.
+        if raw.session_events_page == 0 {
+            bail!("session_events_page must be at least 1");
+        }
         // A zero drain budget silently reintroduces the rolling-deploy loss that
         // graceful shutdown exists to remove (D21).
         if raw.drain_timeout_ms == 0 {
@@ -211,6 +248,8 @@ impl Config {
             pending_limit: raw.pending_limit,
             max_events_per_response: raw.max_events_per_response,
             max_event_logs: raw.max_event_logs,
+            max_events_per_session: raw.max_events_per_session,
+            session_events_page: raw.session_events_page,
             retain_after_terminal_ms: raw.retain_after_terminal_ms,
             content_retention_ms: raw.content_retention_ms,
             chain_limits: ChainLimits {
@@ -272,5 +311,17 @@ mod tests {
     fn rejects_zero_bounds() {
         assert!(Config::from_raw(raw("chain_max_depth = 0\n")).is_err());
         assert!(Config::from_raw(raw("max_events_per_response = 0\n")).is_err());
+        assert!(Config::from_raw(raw("max_events_per_session = 0\n")).is_err());
+        assert!(Config::from_raw(raw("session_events_page = 0\n")).is_err());
+    }
+
+    #[test]
+    fn session_bounds_have_workable_defaults() {
+        let cfg = Config::from_raw(raw("")).expect("defaults are valid");
+        assert!(cfg.max_events_per_session > 0);
+        assert!(cfg.session_events_page > 0);
+        // A page larger than the stream bound would be pointless, and a page
+        // equal to it would make one read able to return the whole stream.
+        assert!(cfg.session_events_page < cfg.max_events_per_session);
     }
 }

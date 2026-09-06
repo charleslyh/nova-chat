@@ -85,9 +85,77 @@ async fn verify(level: &str) -> Result<()> {
                 println!("verify l3 OK ({} checks)", names.len());
             }
         }
+        "l4" => verify_l4().await?,
         other => bail!("unknown level {other}"),
     }
     Ok(())
+}
+
+/// L4: the official Python SDK driving the conversation endpoints (D27).
+///
+/// Self-skipping: the SDK is a supplementary check, not a hard gate. A machine
+/// without `python3` or the `openai` package must not fail `just verify` — the
+/// claim being verified is "an unmodified official client works", and it is
+/// meaningless to *fail* a machine that merely lacks the client.
+async fn verify_l4() -> Result<()> {
+    println!("verify l4");
+
+    if !python_has_openai().await {
+        println!("verify l4 SKIPPED (python3 or the `openai` package is unavailable)");
+        return Ok(());
+    }
+
+    eprint!("  procs up ... ");
+    procs("up").await?;
+    eprintln!("ok");
+    let result = run_sdk_compat().await;
+    eprint!("  procs down ... ");
+    procs("down").await?;
+    eprintln!("ok");
+
+    let status = result?;
+    if status != 0 {
+        bail!("verify l4 FAILED: testing/sdk-compat/run.py exited {status}");
+    }
+    println!("verify l4 OK");
+    Ok(())
+}
+
+/// Whether `python3` can import the `openai` package.
+///
+/// Checked with an import, not a package-manager probe: `pip show openai` can
+/// report a broken install, and a different interpreter than the one `python3`
+/// resolves to would go unnoticed.
+async fn python_has_openai() -> bool {
+    tokio::process::Command::new("python3")
+        .args(["-c", "import openai"])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Run the SDK-compat script against the local fixture and return its exit code.
+async fn run_sdk_compat() -> Result<i32> {
+    let out = tokio::process::Command::new("python3")
+        .arg("testing/sdk-compat/run.py")
+        .env("NOVA_GATEWAY_URL", "http://127.0.0.1:18080/v1")
+        .output()
+        .await
+        .context("spawning python3 for the SDK-compat layer")?;
+
+    // The script is the only thing that knows what it asserted; surface its
+    // output in both outcomes so a passing run is visible and a failing one
+    // carries its own diagnosis.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !stdout.is_empty() {
+        print!("{}", stdout);
+    }
+    if !out.status.success() {
+        eprint!("{}", stderr);
+    }
+    Ok(out.status.code().unwrap_or(1))
 }
 
 async fn procs(action: &str) -> Result<()> {
@@ -375,13 +443,18 @@ async fn coverage() -> Result<()> {
         "FR-29", "FR-30", "FR-31", "FR-32", "FR-33",
         // Reliability.
         "FR-34", "FR-35", "FR-36", "FR-37", "FR-38", "FR-39",
+        // Conversation container (compatibility layer, D27).
+        "FR-40", "FR-41",
+        // Session event stream (self-hosted layer, D26).
+        "FR-42", "FR-43", "FR-44", "FR-45",
         // Correctness.
         "CR-1", "CR-2", "CR-3", "CR-4", "CR-5", "CR-6", "CR-7", "CR-8", "CR-9", "CR-10",
-        "CR-11", "CR-12", "CR-13",
+        "CR-11", "CR-12", "CR-13", "CR-14", "CR-15", "CR-16",
         // Invariants still in force.
         "INV-1", "INV-2", "INV-5", "INV-6", "INV-11", "INV-12", "INV-16", "INV-29", "INV-30",
         "INV-32", "INV-33", "INV-34", "INV-35", "INV-40", "INV-41", "INV-42", "INV-43",
         "INV-44", "INV-45", "INV-46", "INV-47", "INV-49", "INV-50", "INV-51", "INV-52",
+        "INV-54", "INV-55", "INV-56", "INV-57", "INV-58", "INV-59",
         // Security.
         "SEC-2", "SEC-3", "SEC-5", "SEC-6", "SEC-7",
     ]
@@ -812,9 +885,50 @@ fn check_deps() -> Result<()> {
 
     check_execution_claims_globally_through_the_port()?;
     check_service_and_gateway_boundaries()?;
+    check_sdk_compat_is_python_only()?;
     let spec_covers = check_protocol_spec_is_publishable()?;
 
     println!("check-deps OK ({} gated requirement(s))", spec_covers.len());
+    Ok(())
+}
+
+/// L4 stays a *compatibility harness*, not a second Rust implementation.
+///
+/// The SDK-compat layer exists to prove an unmodified official client works. A
+/// `Cargo.toml` here would be a temptation to reimplement what the Python script
+/// already exercises, inside the same workspace — and the two copies would drift.
+/// A dependency on anything beyond `openai` would turn "compatible with the
+/// official client" into "compatible with a pile of our own code".
+fn check_sdk_compat_is_python_only() -> Result<()> {
+    let dir = "testing/sdk-compat";
+    if Path::new(&format!("{dir}/Cargo.toml")).exists() {
+        bail!(
+            "testing/sdk-compat must stay a pure-Python harness: a Cargo.toml here \
+             would let the SDK-compat claim silently drift into a second Rust client"
+        );
+    }
+    let req = std::fs::read_to_string(format!("{dir}/requirements.txt"))?;
+    // A specifier is `name<op>version`; strip the operator and version, keeping
+    // the bare distribution name. `openai>=1.60` → `openai`.
+    let deps: Vec<&str> = req
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .map(|l| {
+            let l = l.trim();
+            l.find(['=', '<', '>', '~', '!', ';'])
+                .map(|i| &l[..i])
+                .unwrap_or(l)
+        })
+        .collect();
+    for dep in deps {
+        if dep != "openai" {
+            bail!(
+                "testing/sdk-compat must depend only on the official `openai` SDK; \
+                 found `{dep}`. Anything else would make the claim \"official client \
+                 works unmodified\" untestable."
+            );
+        }
+    }
     Ok(())
 }
 
@@ -926,6 +1040,48 @@ fn check_service_and_gateway_boundaries() -> Result<()> {
 /// either way, and a spec that has drifted still *reads* as authoritative. An
 /// integrator following a stale document gets 400s that the document says are
 /// impossible.
+/// Field names on the deliberate-rejection list, parsed from
+/// `EXPLICITLY_UNSUPPORTED_FIELDS`.
+///
+/// Each entry spans several lines, with the field name as the first string
+/// literal after the opening paren; the second literal is the remedy text and
+/// must not be mistaken for a name.
+fn explicitly_unsupported_fields(protocol_mod: &str) -> Result<Vec<String>> {
+    let start = protocol_mod
+        .find("EXPLICITLY_UNSUPPORTED_FIELDS")
+        .context("EXPLICITLY_UNSUPPORTED_FIELDS is the source of truth for the rejection list")?;
+    let body = &protocol_mod[start..];
+    let end = body
+        .find("];")
+        .context("EXPLICITLY_UNSUPPORTED_FIELDS is not terminated")?;
+
+    let mut names = Vec::new();
+    let mut expect_name = false;
+    for line in body[..end].lines() {
+        let line = line.trim();
+        if line == "(" {
+            expect_name = true;
+            continue;
+        }
+        if expect_name {
+            if let Some(rest) = line.strip_prefix('"') {
+                if let Some(name) = rest.split('"').next() {
+                    names.push(name.to_string());
+                }
+                expect_name = false;
+            }
+        }
+    }
+    if names.is_empty() {
+        bail!(
+            "parsed no field names out of EXPLICITLY_UNSUPPORTED_FIELDS; the parser \
+             and the constant's formatting have diverged, so this gate is silently \
+             checking nothing"
+        );
+    }
+    Ok(names)
+}
+
 fn check_protocol_spec_is_publishable() -> Result<&'static [&'static str]> {
     let path = Path::new("docs/design/06-protocol-subset.md");
     let spec = std::fs::read_to_string(path)
@@ -952,18 +1108,18 @@ fn check_protocol_spec_is_publishable() -> Result<&'static [&'static str]> {
 
     // Every parameter the code rejects by name must appear in the document, so the
     // published rejection list cannot fall behind the enforced one.
-    let request = std::fs::read_to_string("crates/core/src/protocol/request.rs")?;
-    for param in ["conversation", "context_management", "prompt"] {
-        if !request.contains(param) {
+    //
+    // The list is read out of the source rather than restated here. Restating it
+    // means two lists, and two lists disagree the first time one of them changes:
+    // when `conversation` moved into the subset (D27), a hard-coded copy would
+    // have kept demanding the document still call it rejected.
+    let protocol_mod = std::fs::read_to_string("crates/core/src/protocol/mod.rs")?;
+    let rejected = explicitly_unsupported_fields(&protocol_mod)?;
+    for param in &rejected {
+        if !spec.contains(param.as_str()) {
             bail!(
-                "`{param}` is documented as rejected but no longer appears in \
-                 request.rs; the published subset would overstate what is enforced"
-            );
-        }
-        if !spec.contains(param) {
-            bail!(
-                "`{param}` is rejected by request.rs but absent from {} (FR-23); \
-                 integrators would hit an undocumented 400",
+                "`{param}` is on EXPLICITLY_UNSUPPORTED_FIELDS but absent from {} \
+                 (FR-23); integrators would hit an undocumented 400",
                 path.display()
             );
         }

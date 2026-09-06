@@ -26,8 +26,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nova_agent::{Agent, AgentConfig, AgentDeps, Executed};
 use nova_responses_core::{
-    ChainLimits, CompletionsRequestScheduler, ContextStore, NoopToolExecutor, ResponseEventLog,
-    ResponseLedger,
+    ChainLimits, CompletionsRequestScheduler, ContextStore, ConversationStore, NoopToolExecutor,
+    ResponseEventLog, ResponseLedger, SessionStore,
 };
 use tokio::sync::Semaphore;
 use tracing::info;
@@ -82,6 +82,12 @@ struct Backend {
     ledger: Arc<dyn ResponseLedger>,
     event_log: Arc<dyn ResponseEventLog>,
     context: Arc<dyn ContextStore>,
+    /// Needed at terminal, not during generation: releasing the turn lock and
+    /// advancing the conversation tail (D26 / D27). Mounted unconditionally —
+    /// the *record* says whether a given response has an association, so a
+    /// missing port here would silently skip the release for every response.
+    conversation: Arc<dyn ConversationStore>,
+    session: Arc<dyn SessionStore>,
 }
 
 fn now_ms() -> u64 {
@@ -124,6 +130,8 @@ async fn mount_sql(args: &Args) -> Result<Backend> {
         ledger: sql.ledger.clone(),
         event_log: Arc::new(event_log),
         context: sql.context.clone(),
+        conversation: sql.conversation.clone(),
+        session: sql.session.clone(),
     })
 }
 
@@ -137,6 +145,8 @@ async fn mount_mem(args: &Args) -> Result<Backend> {
         ledger: world.ledger.clone(),
         event_log: world.event_log.clone(),
         context: world.context.clone(),
+        conversation: world.conversation.clone(),
+        session: world.session.clone(),
     })
 }
 
@@ -164,6 +174,8 @@ async fn main() -> Result<()> {
             context: backend.context,
             scheduler,
             tools: Arc::new(NoopToolExecutor),
+            sessions: Some(backend.session),
+            conversations: Some(backend.conversation),
         },
         AgentConfig {
             exec_ttl_ms: args.exec_ttl_ms,

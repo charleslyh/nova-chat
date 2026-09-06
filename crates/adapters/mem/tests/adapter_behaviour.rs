@@ -27,6 +27,8 @@ fn record(
     stored: bool,
 ) -> StoredResponse {
     StoredResponse {
+        conversation_id: None,
+        session_id: None,
         response_id: id.clone(),
         previous_response_id: previous.cloned(),
         tenant_id: tenant(tenant_id),

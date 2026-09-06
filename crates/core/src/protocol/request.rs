@@ -50,6 +50,15 @@ pub struct CreateResponseRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
 
+    /// Conversation to continue, and whose tail pointer this response advances
+    /// once it completes (D27).
+    ///
+    /// Mutually exclusive with `previous_response_id`: both name the context to
+    /// inherit, and honouring one while ignoring the other would be a silent
+    /// choice made on the caller's behalf.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<ConversationRef>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
 
@@ -71,6 +80,108 @@ pub struct CreateResponseRequest {
 
 fn default_true() -> bool {
     true
+}
+
+/// `conversation` accepts either a bare id string or `{"id": "conv_…"}`.
+///
+/// Both forms are upstream's, not ours, so both are preserved on the wire rather
+/// than normalised on the way in — a request that round-trips differently from
+/// how it arrived is a request the caller cannot recognise. Consumers use
+/// [`ConversationRef::id`] and never branch on the shape.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum ConversationRef {
+    Id(String),
+    Object { id: String },
+}
+
+impl ConversationRef {
+    pub fn id(&self) -> &str {
+        match self {
+            ConversationRef::Id(id) | ConversationRef::Object { id } => id,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ConversationRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RefVisitor;
+
+        impl<'de> Visitor<'de> for RefVisitor {
+            type Value = ConversationRef;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a conversation id string or an object with an `id` field")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(ConversationRef::Id(v.to_string()))
+            }
+
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(ConversationRef::Id(v))
+            }
+
+            /// Dispatching on the JSON kind first, then letting the inner error
+            /// through, is why this is hand-written: `untagged` would report
+            /// "data did not match any variant" and discard which field was
+            /// wrong (see the module header).
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut id: Option<String> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => {
+                            if id.is_some() {
+                                return Err(de::Error::duplicate_field("id"));
+                            }
+                            id = Some(map.next_value()?);
+                        }
+                        other => {
+                            return Err(de::Error::unknown_field(other, &["id"]));
+                        }
+                    }
+                }
+                let id = id.ok_or_else(|| de::Error::missing_field("id"))?;
+                Ok(ConversationRef::Object { id })
+            }
+        }
+
+        deserializer.deserialize_any(RefVisitor)
+    }
+}
+
+/// Validate a metadata map against the upstream limits.
+///
+/// Shared by the create-response request and the conversation endpoints because
+/// upstream applies the same numbers to both. One implementation means the two
+/// cannot drift into disagreeing about what a valid key is.
+pub fn validate_metadata(
+    metadata: &BTreeMap<String, String>,
+) -> Result<(), RequestViolation> {
+    if metadata.len() > MAX_METADATA_ENTRIES {
+        return Err(RequestViolation::TooManyMetadataEntries {
+            actual: metadata.len(),
+            max: MAX_METADATA_ENTRIES,
+        });
+    }
+    for (key, value) in metadata {
+        if key.len() > MAX_METADATA_KEY_BYTES {
+            return Err(RequestViolation::MetadataKeyTooLong {
+                key: key.clone(),
+                max: MAX_METADATA_KEY_BYTES,
+            });
+        }
+        if value.len() > MAX_METADATA_VALUE_BYTES {
+            return Err(RequestViolation::MetadataValueTooLong {
+                key: key.clone(),
+                max: MAX_METADATA_VALUE_BYTES,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// `input` accepts either a bare string (shorthand for a single user message)
@@ -232,6 +343,14 @@ pub enum RequestViolation {
     InstructionsTooLong { max: usize },
     #[error("previous_response_id must not be empty")]
     EmptyPreviousId,
+    #[error("conversation id must not be empty")]
+    EmptyConversationId,
+    /// Both name the context to inherit. Upstream's own documentation does not
+    /// state whether it rejects the combination, so this is our call, taken the
+    /// way the rest of the service takes such calls: fail loudly rather than pick
+    /// one silently (see `docs/design/07-conversations.md`).
+    #[error("previous_response_id and conversation must not both be set")]
+    PreviousIdAndConversation,
     #[error("max_output_tokens must be greater than zero")]
     ZeroMaxOutputTokens,
     #[error("temperature must be within [0, 2]")]
@@ -282,6 +401,14 @@ impl CreateResponseRequest {
                 return Err(RequestViolation::EmptyPreviousId);
             }
         }
+        if let Some(conversation) = &self.conversation {
+            if conversation.id().trim().is_empty() {
+                return Err(RequestViolation::EmptyConversationId);
+            }
+            if self.previous_response_id.is_some() {
+                return Err(RequestViolation::PreviousIdAndConversation);
+            }
+        }
         if let Some(0) = self.max_output_tokens {
             return Err(RequestViolation::ZeroMaxOutputTokens);
         }
@@ -296,26 +423,7 @@ impl CreateResponseRequest {
             }
         }
         if let Some(metadata) = &self.metadata {
-            if metadata.len() > MAX_METADATA_ENTRIES {
-                return Err(RequestViolation::TooManyMetadataEntries {
-                    actual: metadata.len(),
-                    max: MAX_METADATA_ENTRIES,
-                });
-            }
-            for (key, value) in metadata {
-                if key.len() > MAX_METADATA_KEY_BYTES {
-                    return Err(RequestViolation::MetadataKeyTooLong {
-                        key: key.clone(),
-                        max: MAX_METADATA_KEY_BYTES,
-                    });
-                }
-                if value.len() > MAX_METADATA_VALUE_BYTES {
-                    return Err(RequestViolation::MetadataValueTooLong {
-                        key: key.clone(),
-                        max: MAX_METADATA_VALUE_BYTES,
-                    });
-                }
-            }
+            validate_metadata(metadata)?;
         }
         if let Some(tools) = &self.tools {
             for tool in tools {
@@ -416,11 +524,97 @@ mod tests {
     }
 
     #[test]
-    fn preflight_flags_conversation_field_with_remedy() {
-        let raw: Value = serde_json::from_str(r#"{"model":"m","input":"a","conversation":"c1"}"#).unwrap();
-        let (field, hint) = preflight_unsupported(&raw).expect("must flag conversation");
-        assert_eq!(field, "conversation");
-        assert!(hint.contains("previous_response_id"), "{hint}");
+    fn preflight_no_longer_rejects_conversation() {
+        // The field is inside the subset now (D27). Leaving it on the rejection
+        // list would have made the new feature unreachable behind its own
+        // pre-flight check.
+        let raw: Value =
+            serde_json::from_str(r#"{"model":"m","input":"a","conversation":"conv_1"}"#).unwrap();
+        assert_eq!(preflight_unsupported(&raw), None);
+    }
+
+    #[test]
+    fn conversation_accepts_both_upstream_shapes_and_null() {
+        let req = minimal(r#"{"model":"m","input":"a","conversation":"conv_1"}"#).unwrap();
+        assert_eq!(
+            req.conversation,
+            Some(ConversationRef::Id("conv_1".into()))
+        );
+        assert_eq!(req.conversation.as_ref().map(ConversationRef::id), Some("conv_1"));
+
+        let req = minimal(r#"{"model":"m","input":"a","conversation":{"id":"conv_2"}}"#).unwrap();
+        assert_eq!(
+            req.conversation,
+            Some(ConversationRef::Object { id: "conv_2".into() })
+        );
+        assert_eq!(req.conversation.as_ref().map(ConversationRef::id), Some("conv_2"));
+
+        // `null` is an accepted upstream spelling of "no conversation".
+        let req = minimal(r#"{"model":"m","input":"a","conversation":null}"#).unwrap();
+        assert_eq!(req.conversation, None);
+    }
+
+    #[test]
+    fn conversation_shape_is_preserved_across_a_round_trip() {
+        for json in [
+            r#"{"model":"m","input":"a","conversation":"conv_1"}"#,
+            r#"{"model":"m","input":"a","conversation":{"id":"conv_1"}}"#,
+        ] {
+            let req = minimal(json).unwrap();
+            let again: CreateResponseRequest =
+                serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(again.conversation, req.conversation, "{json}");
+        }
+    }
+
+    #[test]
+    fn malformed_conversation_objects_report_the_real_problem() {
+        // The hand-written visitor exists so these say what is wrong instead of
+        // "data did not match any variant".
+        let err = minimal(r#"{"model":"m","input":"a","conversation":{}}"#).unwrap_err();
+        assert!(err.to_string().contains("id"), "unhelpful error: {err}");
+
+        let err = minimal(r#"{"model":"m","input":"a","conversation":{"ref":"conv_1"}}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("ref"), "unhelpful error: {err}");
+
+        let err = minimal(r#"{"model":"m","input":"a","conversation":7}"#).unwrap_err();
+        assert!(
+            !err.to_string().contains("did not match any variant"),
+            "untagged fallback leaked: {err}"
+        );
+    }
+
+    #[test]
+    fn conversation_and_previous_response_id_are_mutually_exclusive() {
+        let req = minimal(
+            r#"{"model":"m","input":"a","conversation":"conv_1","previous_response_id":"resp_n1_x"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.validate(&InputLimits::default()),
+            Err(RequestViolation::PreviousIdAndConversation)
+        );
+
+        // Either one alone is fine.
+        assert!(minimal(r#"{"model":"m","input":"a","conversation":"conv_1"}"#)
+            .unwrap()
+            .validate(&InputLimits::default())
+            .is_ok());
+    }
+
+    #[test]
+    fn empty_conversation_ids_are_rejected_in_both_shapes() {
+        for json in [
+            r#"{"model":"m","input":"a","conversation":""}"#,
+            r#"{"model":"m","input":"a","conversation":{"id":"   "}}"#,
+        ] {
+            assert_eq!(
+                minimal(json).unwrap().validate(&InputLimits::default()),
+                Err(RequestViolation::EmptyConversationId),
+                "{json}"
+            );
+        }
     }
 
     #[test]

@@ -12,10 +12,14 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeMap;
+
 use nova_responses_core::{
-    AbortedClaim, AgentId, Attempt, ChainLimits, ClaimedResponse, ContextError, CreateOutcome,
-    EventLogError, IdempotencyKey, LedgerError, ResolvedContext, ResponseEvent,
-    ResponseEventKind, ResponseId, ResponseItem, ResponseStatus, StoredResponse, TenantId, Usage,
+    AbortedClaim, AgentId, Attempt, ChainLimits, ClaimedResponse, ContextError, Conversation,
+    ConversationError, ConversationId, CreateOutcome, EventLogError, IdempotencyKey, LedgerError,
+    ResolvedContext, ResponseEvent, ResponseEventKind, ResponseId, ResponseItem, ResponseStatus,
+    Session, SessionError, SessionEvent, SessionEventKind, SessionId, StoredResponse, TenantId,
+    Usage,
 };
 
 /// Internal wire form of a stream event.
@@ -64,6 +68,8 @@ pub enum ProtoError {
     Ledger(LedgerError),
     EventLog(EventLogError),
     Context(ContextError),
+    Conversation(ConversationError),
+    Session(SessionError),
     /// A failure in the carrier itself (serialization, dispatch) rather than in
     /// a domain operation. Carried as text for debuggability.
     Internal(String),
@@ -169,6 +175,94 @@ pub enum Request {
         limit: usize,
     },
     ContextHealth,
+
+    // --- conversation (D27) ---
+    ConversationCreate {
+        conversation: Conversation,
+    },
+    ConversationGet {
+        tenant: TenantId,
+        id: ConversationId,
+    },
+    ConversationUpdateMetadata {
+        tenant: TenantId,
+        id: ConversationId,
+        metadata: BTreeMap<String, String>,
+    },
+    ConversationDelete {
+        tenant: TenantId,
+        id: ConversationId,
+    },
+    ConversationDeleteByTenant {
+        tenant: TenantId,
+    },
+    ConversationAdvance {
+        tenant: TenantId,
+        id: ConversationId,
+        last: ResponseId,
+    },
+    ConversationHealth,
+
+    // --- session (D26) ---
+    //
+    // `begin_turn` and `end_turn` are carried as their own operations rather than
+    // as a lock write plus an append. Splitting them here would put the atomicity
+    // the port promises on the wrong side of the wire, where a dropped connection
+    // between the two halves would leave the session inconsistent.
+    SessionCreate {
+        session: Session,
+        now_ms: u64,
+    },
+    SessionGet {
+        tenant: TenantId,
+        id: SessionId,
+    },
+    SessionGetByConversation {
+        tenant: TenantId,
+        conversation: ConversationId,
+    },
+    SessionDelete {
+        tenant: TenantId,
+        id: SessionId,
+    },
+    SessionDeleteByTenant {
+        tenant: TenantId,
+    },
+    SessionBeginTurn {
+        tenant: TenantId,
+        id: SessionId,
+        response_id: ResponseId,
+        now_ms: u64,
+    },
+    SessionEndTurn {
+        tenant: TenantId,
+        id: SessionId,
+        response_id: ResponseId,
+        status: ResponseStatus,
+        now_ms: u64,
+    },
+    SessionReleaseStaleLock {
+        tenant: TenantId,
+        id: SessionId,
+        holder: ResponseId,
+    },
+    SessionAppendEvent {
+        tenant: TenantId,
+        id: SessionId,
+        kind: SessionEventKind,
+        now_ms: u64,
+    },
+    SessionReadAfter {
+        tenant: TenantId,
+        id: SessionId,
+        starting_after: Option<u64>,
+        limit: usize,
+        wait_ms: u64,
+    },
+    SessionHealth,
+    SessionSetMaxEvents {
+        limit: usize,
+    },
 }
 
 /// A single data-plane response. Success variants carry the typed result; the
@@ -199,6 +293,25 @@ pub enum Response {
     ContextDeleteByTenant(u64),
     ContextSweepExpired(u64),
     ContextHealth,
+
+    ConversationCreate(Conversation),
+    ConversationGet(Option<Conversation>),
+    ConversationUpdateMetadata(Conversation),
+    ConversationDelete(bool),
+    ConversationDeleteByTenant(u64),
+    ConversationAdvance,
+    ConversationHealth,
+
+    SessionCreate(Session),
+    SessionGet(Option<Session>),
+    SessionDelete(bool),
+    SessionDeleteByTenant(u64),
+    SessionReleaseStaleLock(bool),
+    /// Assigned sequence number, shared by the three appending operations.
+    SessionSeq(u64),
+    SessionReadAfter(Vec<SessionEvent>),
+    SessionHealth,
+    SessionSetMaxEvents,
 
     Err(ProtoError),
 }
