@@ -10,12 +10,11 @@ use std::sync::Arc;
 
 use nova_responses_core::{
     Clock, ContextStore, ConversationStore, MetricsSink, ResponseEventLog, ResponseLedger,
-    SessionStore,
 };
 
 use crate::auth::KeyTable;
 use crate::config::Config;
-use crate::service::{ConversationsService, ResponsesService, SessionsService};
+use crate::service::{ConversationsService, ResponsesService};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -23,18 +22,16 @@ pub struct AppState {
     pub ledger: Arc<dyn ResponseLedger>,
     pub event_log: Arc<dyn ResponseEventLog>,
     pub context: Arc<dyn ContextStore>,
-    pub conversation_store: Arc<dyn ConversationStore>,
-    /// Held directly, not only behind [`SessionsService`], because the SSE
+    /// Held directly, not only behind [`ConversationsService`], because the SSE
     /// skeleton reads the stream itself: streaming is transport, and routing it
     /// through the capability layer would mean a service method whose only job is
     /// to hand a port back out.
-    pub session_store: Arc<dyn SessionStore>,
+    pub conversation_store: Arc<dyn ConversationStore>,
     pub clock: Arc<dyn Clock>,
     pub metrics: Arc<dyn MetricsSink>,
     pub keys: Arc<KeyTable>,
     pub service: Arc<ResponsesService>,
     pub conversations: Arc<ConversationsService>,
-    pub sessions: Arc<SessionsService>,
     /// Cleared on SIGTERM so creation is refused while in-flight work drains
     /// (FR-34). Reads and subscriptions keep serving.
     pub accepting: Arc<AtomicBool>,

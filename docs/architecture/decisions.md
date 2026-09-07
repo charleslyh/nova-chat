@@ -22,8 +22,9 @@
 | [D14](#d14-承载技术一律端口化) · [D15](#d15-验证分层与虚拟时钟) · [D17](#d17-本机验证与-docker-部署分离) | 端口化 · 分层验证 · 无 Docker 前置 |
 | [D24](#d24-上下文物化每个生成保存完整上下文快照) | 每生成物化完整上下文快照 | ✅ 生效 |
 | [D25](#d25-执行进程独立与在途缓冲共享化能力层抽离) | 执行独立 + 缓冲共享化 + 能力层抽离 | ✅ 生效 |
-| [D26](#d26-自研会话层状态如何广播) | session = 状态广播：事件流 + 轮次锁 + 业务事件，绝不存内容 | ✅ 生效 |
-| [D27](#d27-会话容器退化为链尾指针) | conversation = 指向响应链尾的指针，不存条目 | ✅ 生效 |
+| [D26](#d26-自研会话层状态如何广播) | session = 状态广播：事件流 + 轮次锁 + 业务事件，绝不存内容 | ⛔ SUPERSEDED BY D28 |
+| [D27](#d27-会话容器退化为链尾指针) | conversation = 指向响应链尾的指针，不存条目 | ⛔ SUPERSEDED BY D28 |
+| [D28](#d28-会话能力下沉数据层conversation-吸收-session) | conversation 单实体承载链尾 + 互斥 + 事件流；互斥下沉数据层；端点统一 conversations | ✅ 生效 |
 
 其余条目多为任务系统时代决策，已 ⛔ SUPERSEDED BY D19，正文保留备查。D18 / D19 中的会话资源、开屏快照、热→冷、跨区镜像条款由 D20–D22 收口，正文同样保留备查。
 
@@ -58,8 +59,9 @@
 | [D23](#d23-生成由宿主节点内部执行取消拉取式执行端) | 执行位置 | 宿主节点内部执行 | ⛔ SUPERSEDED BY D25 |
 | [D24](#d24-上下文物化每个生成保存完整上下文快照) | 上下文 | 每生成物化完整快照 | ✅ 生效 |
 | [D25](#d25-执行进程独立与在途缓冲共享化能力层抽离) | 执行与分层 | 执行独立 + 缓冲共享化 + 能力层 | ✅ 生效 |
-| [D26](#d26-自研会话层状态如何广播) | 会话层 | 状态广播：事件流 + 锁 + 业务事件 | ✅ 生效 |
-| [D27](#d27-会话容器退化为链尾指针) | 兼容层 | conversation = 链尾指针 | ✅ 生效 |
+| [D26](#d26-自研会话层状态如何广播) | 会话层 | 状态广播：事件流 + 锁 + 业务事件 | ⛔ SUPERSEDED BY D28 |
+| [D27](#d27-会话容器退化为链尾指针) | 兼容层 | conversation = 链尾指针 | ⛔ SUPERSEDED BY D28 |
+| [D28](#d28-会话能力下沉数据层conversation-吸收-session) | 会话层 | conversation 单实体：链尾 + 互斥 + 事件流 | ✅ 生效 |
 
 ---
 
@@ -1020,6 +1022,8 @@ Gateway 现混杂三层职责（接入协议 / 执行驱动 / 后台维护），
 
 ## D26 自研会话层：状态如何广播
 
+> ⛔ SUPERSEDED BY [D28](#d28-会话能力下沉数据层conversation-吸收-session)
+
 | | |
 |---|---|
 | **需求** | 多端同步、并发互斥、业务事件（`spec.md` FR-42~45） |
@@ -1062,6 +1066,8 @@ conversation（D27）回答「上下文从哪来」，是官方协议；session 
 
 ## D27 会话容器退化为链尾指针
 
+> ⛔ SUPERSEDED BY [D28](#d28-会话能力下沉数据层conversation-吸收-session)
+
 | | |
 |---|---|
 | **需求** | 官方 conversation 兼容（`spec.md` FR-40/41） |
@@ -1099,3 +1105,36 @@ conversation 退化为指针后，`resolve_chain` 仍是上下文装配的唯一
 | 实现官方 `items` 子资源 | 容器无条目可增删；分页/排序/`include`/删除语义全在此，成本高、收益零 |
 | advance 加 CAS | 官方 SDK 收到不存在的 409 |
 | 只有 conversation 没有 session | 多端同步无承载；且官方无会话概念 |
+
+---
+
+## D28 会话能力下沉数据层：conversation 吸收 session
+
+| | |
+|---|---|
+| **需求** | 消除 `responses ↔ session` 的概念纠缠；让生命周期同步不绑定在 responses 实现上（`spec.md` FR-42~45） |
+| **结论** | ① conversation 退化为**单实体**：链尾 `last_response_id` + 在途互斥 `active_response_id` + 事件流（`turn_started`/`turn_completed`/`business`/`response_deleted`），`Session`/`SessionId`/`SessionStore`/`SessionsService` 全部移除。② **互斥（锁）下沉到 conversation 数据层**：`active_response_id` 的 CAS（空 → 占用，忙 → 409）；responses / engine / cancel / sweep 只通过 conversation 锚定生命周期，**不感知 session 的存在**。③ 端点统一 `/v1/conversations`：官方 CRUD 对象纯净（不暴露 `last`/`active`），自研能力走子资源（`GET /` 列表、`/{id}/events`、`/{id}/transcript`、`POST /{id}/events`）。④ **去写前探活**：失败即感知 + 补偿回撤，仅保留启动探活。 |
+| **代价** | 跨 core / nova-responses / agent / 三个 adapter / sweep 的大重构；conversation 语义扩展（自研子资源）；删除 conversation 即删除会话对象（历史内容仍留在响应记录，D24 物化快照） |
+
+### 为何互斥下沉 conversation，而非注入 hook
+
+注入式 lifecycle hook 是「运行时埋点」：依赖注入只解决了**编译期**解耦（responses 不 import session 类型），却把同步能力绑死在「我们的 responses 实现里埋了调用点」上。换成任何第三方 / 官方 responses 实现，那里没有埋点，session 就失去取锁 / 释放锁能力。
+
+互斥下沉到 conversation 后，同步的锚点变成**协议 / 数据层本来就存在的东西**：任何 responses 实现创建 response 都会带 `conversation`（官方字段），都会经过 `ConversationStore`。`active_response_id` 的 CAS 在存储层原子完成，第三方实现只要遵守 conversation 字段，互斥就自动成立，不依赖实现埋点。
+
+### 取锁与事件为何仍须同一端口（延续 D26 ③）
+
+下沉不改变原子性约束：`acquire_active`（CAS 占用）+ 发 `turn_started` 必须同一事务 / 临界区落地，`release_active` + 发 `turn_completed` 同理。差别只在端口从 `SessionStore` 移到 `ConversationStore`，原子性仍是存储的属性。
+
+### 为何去写前探活
+
+写前 `health()` 每次写操作多一次 RPC（延迟 + 压力），而它防的是「库明确不可用」这一低概率事件。低概率失败用「治疗」（失败即返回错误 + 补偿回撤）而非「预防」（每次都探活）更划算。启动探活保留：一次 fail-fast，成本可忽略，避免服务空转 503。
+
+### 否决方案
+
+| 方案 | 否决理由 |
+|---|---|
+| 注入式 lifecycle hook | 运行时埋点，换 responses 实现丢同步能力 |
+| session 独立保留（D26 原案） | `find_by_conversation` 反查 + `responses → session → response` 概念纠缠 |
+| 写前探活 | 延迟 + 压力，低概率失败不值得预防 |
+| 自研能力塞进官方 conversation 对象 | 官方 SDK 见未知字段（`active_response_id` 等），污染协议 |

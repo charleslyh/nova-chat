@@ -11,13 +11,11 @@ mod conversation;
 mod event_log;
 mod ledger;
 mod rpc;
-mod session;
 
 pub use context::MemContextClient;
 pub use conversation::MemConversationClient;
 pub use event_log::MemEventLogClient;
 pub use ledger::MemLedgerClient;
-pub use session::MemSessionClient;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
@@ -31,7 +29,6 @@ pub struct MemClientWorld {
     pub event_log: Arc<MemEventLogClient>,
     pub context: Arc<MemContextClient>,
     pub conversation: Arc<MemConversationClient>,
-    pub session: Arc<MemSessionClient>,
 }
 
 impl MemClientWorld {
@@ -54,14 +51,12 @@ impl MemClientWorld {
             rpc.clone(),
             read_only.clone(),
         ));
-        let session = Arc::new(MemSessionClient::new(rpc.clone(), read_only.clone()));
 
         Self {
             ledger,
             event_log,
             context,
             conversation,
-            session,
         }
     }
 }

@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 
 use nova_responses_core::{
-    AgentId, Attempt, ConversationId, IdempotencyKey, NodeTag, ResponseId, ResponseItem,
-    ResponseStatus, SessionId, StoredResponse, TenantId, Usage,
+    AgentId, Attempt, CompletionsToolChoice, ConversationId, IdempotencyKey, NodeTag, ResponseId,
+    ResponseItem, ResponseStatus, StoredResponse, TenantId, ToolSpec, Usage,
 };
 use serde_json::Value;
 use sqlx::postgres::PgRow;
@@ -37,6 +37,25 @@ pub(crate) fn items_from_json(value: Value) -> Result<Vec<ResponseItem>, SqlErro
 
 pub(crate) fn items_to_json(items: &[ResponseItem]) -> Value {
     serde_json::to_value(items).unwrap_or_else(|_| Value::Array(vec![]))
+}
+
+pub(crate) fn tools_from_json(value: Value) -> Vec<ToolSpec> {
+    serde_json::from_value(value).unwrap_or_default()
+}
+
+pub(crate) fn tools_to_json(tools: &[ToolSpec]) -> Value {
+    serde_json::to_value(tools).unwrap_or_else(|_| Value::Array(vec![]))
+}
+
+pub(crate) fn tool_choice_from_json(value: Value) -> Option<CompletionsToolChoice> {
+    serde_json::from_value(value).ok()
+}
+
+pub(crate) fn tool_choice_to_json(choice: Option<&CompletionsToolChoice>) -> Value {
+    match choice {
+        Some(c) => serde_json::to_value(c).unwrap_or(Value::Null),
+        None => Value::Null,
+    }
 }
 
 pub(crate) fn usage_from_json(value: Value) -> Usage {
@@ -106,11 +125,12 @@ pub(crate) fn record_from_row(row: &PgRow) -> Result<StoredResponse, SqlError> {
             "conversation_id",
             ConversationId::parse,
         )?,
-        session_id: optional_id(row.try_get("session_id")?, "session_id", SessionId::parse)?,
         tenant_id: TenantId::parse(&tenant_id)
             .map_err(|e| SqlError::Decode(format!("tenant_id: {e}")))?,
         model: row.try_get("model")?,
         instructions: row.try_get("instructions")?,
+        tools: tools_from_json(row.try_get("tools")?),
+        tool_choice: tool_choice_from_json(row.try_get("tool_choice")?),
         input_items: items_from_json(row.try_get("input_items")?)?,
         output_items: items_from_json(row.try_get("output_items")?)?,
         reasoning: row.try_get("reasoning")?,
@@ -148,7 +168,7 @@ pub(crate) fn record_from_row(row: &PgRow) -> Result<StoredResponse, SqlError> {
 /// Columns every full-record query must select, so `record_from_row` always
 /// finds what it needs.
 pub(crate) const RECORD_COLUMNS: &str = "response_id, previous_response_id, tenant_id, model, \
-     status, stored, node_tag, attempt, owner, idempotency_key, instructions, \
+     status, stored, node_tag, attempt, owner, idempotency_key, instructions, tools, tool_choice, \
      input_items, output_items, reasoning, usage, integrity, integrity_alg, \
      created_at_ms, completed_at_ms, expires_at_ms, context, context_reasoning, context_depth, \
-     conversation_id, session_id";
+     conversation_id";

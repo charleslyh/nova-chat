@@ -5,11 +5,12 @@
 //! has started, the status is already committed and the only way to report a
 //! problem would be an in-band error event, which clients routinely ignore.
 //!
-//! Two streams use this: the per-response event log and the session event stream.
-//! They differ in what they read, how an event is named, and whether the stream
-//! can end at all — but not in the probe, the cursor discipline, the keep-alive
-//! interval or the in-band error report. Those are the parts that are easy to get
-//! subtly wrong, so they exist once, behind [`SseSource`], rather than twice.
+//! Two streams use this: the per-response event log and the conversation event
+//! stream. They differ in what they read, how an event is named, and whether the
+//! stream can end at all — but not in the probe, the cursor discipline, the
+//! keep-alive interval or the in-band error report. Those are the parts that are
+//! easy to get subtly wrong, so they exist once, behind [`SseSource`], rather
+//! than twice.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -21,8 +22,8 @@ use axum::response::{IntoResponse, Response};
 use futures::future::BoxFuture;
 use futures::StreamExt;
 use nova_responses_core::{
-    EventLogError, ResponseEvent, ResponseEventLog, ResponseId, SessionEvent, SessionId,
-    SessionStore, TenantId,
+    ConversationEvent, ConversationId, ConversationStore, EventLogError, ResponseEvent,
+    ResponseEventLog, ResponseId, TenantId,
 };
 
 use crate::error::api_error;
@@ -109,9 +110,9 @@ pub trait SseSource: Send + Sync + 'static {
 
     /// Whether this event ends the stream.
     ///
-    /// A per-response stream ends at a terminal status. A session stream never
-    /// does — it is open for as long as the client stays connected, which is what
-    /// makes "replay history then continue live" a single request.
+    /// A per-response stream ends at a terminal status. A conversation stream
+    /// never does — it is open for as long as the client stays connected, which
+    /// is what makes "replay history then continue live" a single request.
     fn is_terminal(event: &Self::Event) -> bool;
 }
 
@@ -246,15 +247,15 @@ pub async fn open_stream(
     .await
 }
 
-/// The session envelope stream.
-struct SessionSource {
-    sessions: Arc<dyn SessionStore>,
+/// The conversation event stream (D28).
+struct ConversationSource {
+    conversations: Arc<dyn ConversationStore>,
     tenant: TenantId,
-    session_id: SessionId,
+    conversation_id: ConversationId,
 }
 
-impl SseSource for SessionSource {
-    type Event = SessionEvent;
+impl SseSource for ConversationSource {
+    type Event = ConversationEvent;
 
     fn read(
         &self,
@@ -263,10 +264,10 @@ impl SseSource for SessionSource {
         wait_ms: u64,
     ) -> BoxFuture<'_, Result<Vec<Self::Event>, StreamFailure>> {
         Box::pin(async move {
-            self.sessions
-                .read_after(&self.tenant, &self.session_id, cursor, limit, wait_ms)
+            self.conversations
+                .read_after(&self.tenant, &self.conversation_id, cursor, limit, wait_ms)
                 .await
-                .map_err(|e| crate::error::map_session_stream_error(&e))
+                .map_err(|e| crate::error::map_conversation_stream_error(&e))
         })
     }
 
@@ -282,7 +283,7 @@ impl SseSource for SessionSource {
         serde_json::to_string(event).unwrap_or_default()
     }
 
-    /// Never. A session outlives any single turn, so its stream has no last
+    /// Never. A conversation outlives any single turn, so its stream has no last
     /// event: a subscriber that has caught up waits for the next one rather than
     /// being disconnected and made to reconnect.
     fn is_terminal(_event: &Self::Event) -> bool {
@@ -290,24 +291,24 @@ impl SseSource for SessionSource {
     }
 }
 
-/// Open an SSE stream for one session's events.
+/// Open an SSE stream for one conversation's events.
 ///
 /// `starting_after` is exclusive; `None` starts from sequence 0, which replays the
 /// whole durable history before continuing live — that is the single call that
 /// restores a reopened page, so there is no snapshot endpoint and therefore no
 /// snapshot that can go stale.
-pub async fn open_session_stream(
-    sessions: Arc<dyn SessionStore>,
+pub async fn open_conversation_stream(
+    conversations: Arc<dyn ConversationStore>,
     tenant: TenantId,
-    session_id: SessionId,
+    conversation_id: ConversationId,
     starting_after: Option<u64>,
     batch: usize,
 ) -> Response {
     open_sse(
-        SessionSource {
-            sessions,
+        ConversationSource {
+            conversations,
             tenant,
-            session_id,
+            conversation_id,
         },
         starting_after,
         batch,
@@ -329,7 +330,7 @@ pub fn resolve_cursor(query: Option<u64>, last_event_id: Option<&str>) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nova_responses_core::{ResponseStatus, SessionEventKind};
+    use nova_responses_core::{ConversationEventKind, ResponseStatus};
 
     #[test]
     fn last_event_id_takes_precedence() {
@@ -365,9 +366,9 @@ mod tests {
         );
     }
 
-    fn session_event(kind: SessionEventKind) -> SessionEvent {
-        SessionEvent {
-            session_id: SessionId::new(),
+    fn conversation_event(kind: ConversationEventKind) -> ConversationEvent {
+        ConversationEvent {
+            conversation_id: ConversationId::new(),
             seq: 3,
             kind,
             ts_ms: 1,
@@ -375,25 +376,27 @@ mod tests {
     }
 
     #[test]
-    fn a_session_stream_never_ends_on_its_own() {
-        // Not even at a turn boundary: the session outlives the turn, and
+    fn a_conversation_stream_never_ends_on_its_own() {
+        // Not even at a turn boundary: the conversation outlives the turn, and
         // disconnecting a caught-up subscriber would force a reconnect for every
         // turn, which is exactly the round trip the long poll removes.
         let response_id = nova_responses_core::ResponseId::new(
             nova_responses_core::NodeTag::parse("n1").unwrap(),
         );
         for kind in [
-            SessionEventKind::SessionCreated,
-            SessionEventKind::TurnCompleted {
+            ConversationEventKind::TurnStarted {
+                response_id: response_id.clone(),
+            },
+            ConversationEventKind::TurnCompleted {
                 response_id: response_id.clone(),
                 status: ResponseStatus::Completed,
             },
-            SessionEventKind::TurnCompleted {
+            ConversationEventKind::TurnCompleted {
                 response_id,
                 status: ResponseStatus::Cancelled,
             },
         ] {
-            assert!(!SessionSource::is_terminal(&session_event(kind)));
+            assert!(!ConversationSource::is_terminal(&conversation_event(kind)));
         }
     }
 
@@ -401,9 +404,13 @@ mod tests {
     fn both_sources_use_the_sequence_number_as_the_sse_id() {
         // Resumption depends on this: `Last-Event-ID` is fed back as
         // `starting_after`, so the id must be the cursor and nothing else.
-        let ev = session_event(SessionEventKind::SessionCreated);
-        assert_eq!(SessionSource::seq(&ev), ev.seq);
-        assert_eq!(SessionSource::name(&ev), "session.created");
-        assert!(SessionSource::data(&ev).contains("session.created"));
+        let ev = conversation_event(ConversationEventKind::TurnStarted {
+            response_id: nova_responses_core::ResponseId::new(
+                nova_responses_core::NodeTag::parse("n1").unwrap(),
+            ),
+        });
+        assert_eq!(ConversationSource::seq(&ev), ev.seq);
+        assert_eq!(ConversationSource::name(&ev), "conversation.turn_started");
+        assert!(ConversationSource::data(&ev).contains("conversation.turn_started"));
     }
 }

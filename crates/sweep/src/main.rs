@@ -17,7 +17,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use nova_responses::{CountingMetrics, SystemClock};
-use nova_responses_core::{ContextStore, ResponseEventLog, ResponseLedger, SessionStore};
+use nova_responses_core::{ContextStore, ConversationStore, ResponseEventLog, ResponseLedger};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -49,10 +49,10 @@ struct Backend {
     ledger: Arc<dyn ResponseLedger>,
     event_log: Arc<dyn ResponseEventLog>,
     context: Arc<dyn ContextStore>,
-    /// Reaping is a terminal transition, so it owes the session layer a lock
+    /// Reaping is a terminal transition, so it owes the conversation a marker
     /// release — and it is the only release a reaped response gets, since its
-    /// holder is gone and the fence has moved (D26).
-    session: Arc<dyn SessionStore>,
+    /// holder is gone and the fence has moved (D28).
+    conversation: Arc<dyn ConversationStore>,
 }
 
 /// Real carriers: Postgres + Redis.
@@ -72,7 +72,7 @@ async fn mount_sql(args: &Args) -> Result<Backend> {
         ledger: sql.ledger.clone(),
         event_log: Arc::new(event_log),
         context: sql.context.clone(),
-        session: sql.session.clone(),
+        conversation: sql.conversation.clone(),
     })
 }
 
@@ -86,7 +86,7 @@ async fn mount_mem(args: &Args) -> Result<Backend> {
         ledger: world.ledger.clone(),
         event_log: world.event_log.clone(),
         context: world.context.clone(),
-        session: world.session.clone(),
+        conversation: world.conversation.clone(),
     })
 }
 
@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
         ledger: backend.ledger,
         event_log: backend.event_log,
         context: backend.context,
-        sessions: backend.session,
+        conversations: backend.conversation,
         clock: Arc::new(SystemClock),
         metrics: Arc::new(CountingMetrics::default()),
         heartbeat_ttl_ms: args.heartbeat_ttl_ms,

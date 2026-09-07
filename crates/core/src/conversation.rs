@@ -21,7 +21,9 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::context::ResponseStatus;
 use crate::ids::{ConversationId, ResponseId, TenantId};
 
 /// A conversation record.
@@ -38,6 +40,16 @@ pub struct Conversation {
     /// inherits. `None` until the first turn completes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_response_id: Option<ResponseId>,
+
+    /// The response currently in flight for this conversation, if any (D28).
+    ///
+    /// This is the mutual-exclusion marker: one conversation admits one
+    /// in-flight turn at a time. `Some(id)` means busy; `None` means idle. It is
+    /// **not** exposed on the official conversation object — it is an internal
+    /// serialisation gate reached through the store's `acquire_active` /
+    /// `release_active` compare-and-set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_response_id: Option<ResponseId>,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
@@ -57,6 +69,7 @@ impl Conversation {
             id,
             tenant_id,
             last_response_id: None,
+            active_response_id: None,
             metadata,
             created_at_ms,
         }
@@ -66,6 +79,74 @@ impl Conversation {
     pub fn is_empty(&self) -> bool {
         self.last_response_id.is_none()
     }
+}
+
+/// The closed set of conversation events (D28).
+///
+/// Turn boundaries are emitted atomically with the mutual-exclusion marker
+/// transition (see `ConversationStore::acquire_active` / `release_active`), so an
+/// unpaired `TurnStarted` *is* the "busy" state. There is no separate
+/// lock-acquired / lock-released pair — two events for one fact would be two
+/// things to keep consistent.
+///
+/// Every name is prefixed `conversation.`, keeping this stream in a namespace of
+/// its own, clear of upstream's `response.*` and `conversation.*` (the CRUD
+/// resource) namespaces.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ConversationEventKind {
+    /// A turn began. Emitted atomically with occupying the in-flight marker.
+    #[serde(rename = "conversation.turn_started")]
+    TurnStarted { response_id: ResponseId },
+
+    /// A turn reached a terminal status. Emitted atomically with releasing the
+    /// marker, on **every** terminal path.
+    #[serde(rename = "conversation.turn_completed")]
+    TurnCompleted {
+        response_id: ResponseId,
+        status: ResponseStatus,
+    },
+
+    /// A response record was deleted, so every device can drop the bubble.
+    #[serde(rename = "conversation.response_deleted")]
+    ResponseDeleted { response_id: ResponseId },
+
+    /// Business-side event, ordered in the same sequence space. The **only** open
+    /// variant; the payload is opaque and bounded. Never enters model context.
+    #[serde(rename = "conversation.business")]
+    Business { kind: String, payload: Value },
+}
+
+impl ConversationEventKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConversationEventKind::TurnStarted { .. } => "conversation.turn_started",
+            ConversationEventKind::TurnCompleted { .. } => "conversation.turn_completed",
+            ConversationEventKind::ResponseDeleted { .. } => "conversation.response_deleted",
+            ConversationEventKind::Business { .. } => "conversation.business",
+        }
+    }
+
+    pub fn response_id(&self) -> Option<&ResponseId> {
+        match self {
+            ConversationEventKind::TurnStarted { response_id }
+            | ConversationEventKind::TurnCompleted { response_id, .. }
+            | ConversationEventKind::ResponseDeleted { response_id } => Some(response_id),
+            ConversationEventKind::Business { .. } => None,
+        }
+    }
+}
+
+/// One entry in a conversation's event stream.
+///
+/// `seq` is 0-based and contiguous per conversation, matching the per-response
+/// event log so both streams are read with one cursor rule.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConversationEvent {
+    pub conversation_id: ConversationId,
+    pub seq: u64,
+    pub kind: ConversationEventKind,
+    pub ts_ms: u64,
 }
 
 #[cfg(test)]

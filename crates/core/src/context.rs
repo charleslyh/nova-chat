@@ -6,8 +6,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::completions::{CompletionsToolChoice, ToolSpec};
 use crate::ids::{
-    Attempt, AgentId, ConversationId, IdempotencyKey, NodeTag, ResponseId, SessionId, TenantId,
+    Attempt, AgentId, ConversationId, IdempotencyKey, NodeTag, ResponseId, TenantId,
 };
 use crate::protocol::ResponseItem;
 
@@ -97,20 +98,25 @@ pub struct StoredResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<ConversationId>,
 
-    /// Session that holds the turn lock for this response (D26).
-    ///
-    /// Present only when the generation was started through a session. Every
-    /// terminal path must use it to release the lock; a path that does not
-    /// leaves the session busy forever.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<SessionId>,
-
     pub tenant_id: TenantId,
     pub model: String,
 
     /// Echoed on retrieval, **never** fed into chain resolution (INV-49).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+
+    /// Functions offered to the model this turn, in outbound provider shape.
+    ///
+    /// Declared per-response from the caller's `tools` request field (not a
+    /// static deployment config), so a single fleet can serve callers with
+    /// different tool sets. Empty means the model is offered none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolSpec>,
+
+    /// Per-response `tool_choice` selection, in outbound provider shape.
+    /// `None` lets the provider default; a specific function forces a call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<CompletionsToolChoice>,
 
     pub input_items: Vec<ResponseItem>,
     #[serde(default)]
@@ -321,10 +327,11 @@ mod tests {
             response_id: ResponseId::new(NodeTag::parse("n1").unwrap()),
             previous_response_id: None,
             conversation_id: None,
-            session_id: None,
             tenant_id: tenant(tenant_id),
             model: "m".into(),
             instructions: Some("secret system prompt".into()),
+            tools: Vec::new(),
+            tool_choice: None,
             input_items: vec![ResponseItem::user_text("in")],
             output_items: vec![ResponseItem::assistant_text("out")],
             reasoning: None,

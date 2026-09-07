@@ -19,6 +19,11 @@ pub struct CompletionsRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolSpec>,
 
+    /// Constrains how the model may use the offered tools. `None` lets the
+    /// provider pick its default (typically `"auto"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<CompletionsToolChoice>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u32>,
 
@@ -62,6 +67,7 @@ impl CompletionsRequest {
             model: model.into(),
             messages,
             tools: Vec::new(),
+            tool_choice: None,
             max_completion_tokens: None,
             temperature: None,
             provenance,
@@ -70,6 +76,11 @@ impl CompletionsRequest {
 
     pub fn with_tools(mut self, tools: Vec<ToolSpec>) -> Self {
         self.tools = tools;
+        self
+    }
+
+    pub fn with_tool_choice(mut self, tool_choice: Option<CompletionsToolChoice>) -> Self {
+        self.tool_choice = tool_choice;
         self
     }
 
@@ -286,6 +297,70 @@ impl ToolSpec {
     }
 }
 
+/// The inbound protocol [`Tool`] is the *caller's* spelling (flat `name` /
+/// `description` / `parameters` / `strict`); [`ToolSpec`] is the outbound
+/// provider spelling (nested under `function`). This conversion is the single
+/// place the two shapes meet, so the agent can persist the caller's declaration
+/// verbatim and hand the provider exactly what it expects.
+impl From<crate::protocol::Tool> for ToolSpec {
+    fn from(tool: crate::protocol::Tool) -> Self {
+        match tool {
+            crate::protocol::Tool::Function {
+                name,
+                description,
+                parameters,
+                strict,
+            } => ToolSpec {
+                kind: "function".to_string(),
+                function: FunctionSpec {
+                    name,
+                    description,
+                    parameters,
+                    strict,
+                },
+            },
+        }
+    }
+}
+
+/// The function-name object nested inside a `tool_choice` specific selection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpecificFunction {
+    pub name: String,
+}
+
+/// The outbound chat-completions shape of `tool_choice`.
+///
+/// Two wire forms are accepted:
+/// - a bare mode string (`"auto"` / `"none"` / `"required"`), and
+/// - a specific function (`{ "type": "function", "function": { "name": … } }`).
+///
+/// `untagged` dispatches on the first matching variant: a string maps to
+/// [`CompletionsToolChoice::Mode`], an object to [`CompletionsToolChoice::Specific`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CompletionsToolChoice {
+    Mode(crate::protocol::ToolChoiceMode),
+    Specific {
+        #[serde(rename = "type")]
+        kind: String,
+        function: SpecificFunction,
+    },
+}
+
+impl From<crate::protocol::ToolChoice> for CompletionsToolChoice {
+    fn from(choice: crate::protocol::ToolChoice) -> Self {
+        use crate::protocol::ToolChoice as Inbound;
+        match choice {
+            Inbound::Mode(mode) => CompletionsToolChoice::Mode(mode),
+            Inbound::Function { name } => CompletionsToolChoice::Specific {
+                kind: "function".to_string(),
+                function: SpecificFunction { name },
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +446,7 @@ mod tests {
             model: "m".into(),
             messages: vec![CompletionsMessage::assistant_text("only me")],
             tools: vec![],
+            tool_choice: None,
             max_completion_tokens: None,
             temperature: None,
             provenance: provenance(),
@@ -404,6 +480,7 @@ mod tests {
                 },
             ],
             tools: vec![],
+            tool_choice: None,
             max_completion_tokens: None,
             temperature: None,
             provenance: provenance(),

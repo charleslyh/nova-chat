@@ -13,15 +13,14 @@ use std::sync::Arc;
 
 use nova_responses_core::protocol::CreateResponseRequest;
 use nova_responses_core::{
-    Attempt, Clock, ContextError, ContextStore, ConversationError, ConversationId, CreateOutcome,
-    EventLogError, IdempotencyKey, LedgerError, MetricsSink, ResponseEvent, ResponseEventKind,
-    ResponseEventLog, ResponseId, ResponseItem, ResponseLedger, ResponseStatus, SessionError,
-    SessionId, StoredResponse, TenantId, Usage,
+    Attempt, Clock, CompletionsToolChoice, ContextError, ContextStore, ConversationError,
+    ConversationEventKind, ConversationId, CreateOutcome, EventLogError, IdempotencyKey,
+    LedgerError, MetricsSink, ResponseEvent, ResponseEventKind, ResponseEventLog, ResponseId,
+    ResponseItem, ResponseLedger, ResponseStatus, StoredResponse, TenantId, ToolSpec, Usage,
 };
 
 use crate::config::Config;
 use crate::service::conversations::{ConversationTail, ConversationsService};
-use crate::service::sessions::SessionsService;
 
 /// 能力层错误：包装各端口错误，由接入层映射为 HTTP 状态。
 #[derive(Debug, thiserror::Error)]
@@ -34,8 +33,6 @@ pub enum ServiceError {
     EventLog(#[from] EventLogError),
     #[error(transparent)]
     Conversation(#[from] ConversationError),
-    #[error(transparent)]
-    Session(#[from] SessionError),
 }
 
 /// 本次生成继承哪份上下文。
@@ -72,7 +69,6 @@ pub struct ResponsesService {
     event_log: Arc<dyn ResponseEventLog>,
     context: Arc<dyn ContextStore>,
     conversations: Arc<ConversationsService>,
-    sessions: Arc<SessionsService>,
     clock: Arc<dyn Clock>,
     metrics: Arc<dyn MetricsSink>,
     cfg: Arc<Config>,
@@ -85,7 +81,6 @@ impl ResponsesService {
         event_log: Arc<dyn ResponseEventLog>,
         context: Arc<dyn ContextStore>,
         conversations: Arc<ConversationsService>,
-        sessions: Arc<SessionsService>,
         clock: Arc<dyn Clock>,
         metrics: Arc<dyn MetricsSink>,
         cfg: Arc<Config>,
@@ -95,7 +90,6 @@ impl ResponsesService {
             event_log,
             context,
             conversations,
-            sessions,
             clock,
             metrics,
             cfg,
@@ -157,27 +151,14 @@ impl ResponsesService {
             snapshot_depth = resolved.depth;
         }
 
-        // 存储开启时先探活：库不可用拒写而非静默不存（INV-46）。
-        if request.store {
-            self.context.health().await?;
-        }
-
+        // 不写前探活（D28）：库不可用由失败返回错误直接暴露。准入失败由
+        // `release_after_failed_admission` 补偿释放互斥标记。
         let response_id = ResponseId::new(self.cfg.node_tag.clone());
 
-        // 会话是容器的唯一所有者（端口保证绑定互斥），所以标准请求携带容器标识就
-        // 足以定位会话并取锁——不需要任何官方没有的字段。
-        let session_id = match &conversation_id {
-            None => None,
-            Some(id) => self
-                .sessions
-                .find_by_conversation(tenant, id)
-                .await?
-                .map(|s| s.id),
-        };
-        if let Some(session_id) = &session_id {
-            // 准入闸门：已有轮次在途即 Busy（接入层转 409）。失败时**不写任何
-            // 事件、不留半状态**，这是端口契约的一部分。
-            self.acquire_turn(tenant, session_id, &response_id).await?;
+        // 准入闸门（D28）：conversation 的互斥标记。已有轮次在途即 Busy（接入层
+        // 转 409）。失败时不写任何事件、不留半状态，这是端口契约的一部分。
+        if let Some(conversation_id) = &conversation_id {
+            self.acquire_turn(tenant, conversation_id, &response_id).await?;
         }
 
         // 缺省幂等键取 response_id，保证「同一生成仅一条记录」（FR-3）。
@@ -193,11 +174,21 @@ impl ResponsesService {
             response_id: response_id.clone(),
             previous_response_id: previous,
             conversation_id,
-            session_id: session_id.clone(),
             tenant_id: tenant.clone(),
             model: request.model.clone(),
             // 仅用于检索回显，永不进入链（INV-49）。
             instructions: request.instructions.clone(),
+            // 本轮的工具体声明：由调用方 `tools` 参数逐请求声明（而非静态部署
+            // 配置），落进 record 供执行端喂给模型。协议 `Tool`（扁平）在此转成
+            // 出站 `ToolSpec`（嵌套 function），是两种线形的唯一交汇点。
+            tools: request
+                .tools
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(ToolSpec::from)
+                .collect(),
+            tool_choice: request.tool_choice.clone().map(CompletionsToolChoice::from),
             input_items,
             output_items: Vec::new(),
             reasoning: None,
@@ -228,8 +219,8 @@ impl ResponsesService {
         match &outcome {
             Ok(CreateResult::Accepted { .. }) => {}
             _ => {
-                if let Some(session_id) = &session_id {
-                    self.release_after_failed_admission(tenant, session_id, &response_id)
+                if let Some(conversation_id) = &record.conversation_id {
+                    self.release_after_failed_admission(tenant, conversation_id, &response_id)
                         .await;
                 }
             }
@@ -237,27 +228,26 @@ impl ResponsesService {
         outcome
     }
 
-    /// 取轮次锁，必要时接管一个「持有者已终态」的残留锁。
+    /// 取轮次互斥标记，必要时接管一个「持有者已终态」的残留标记（D28）。
     ///
-    /// 锁可能比持有者活得更久：持有者进程可能在账本终态迁移与释放锁之间被杀，或者
-    /// 释放调用本身失败（reap 路径尤其如此——它释放失败后不会再被选中重试）。若不
-    /// 处理，该会话将永久 409。
+    /// 标记可能比持有者活得更久：持有者进程可能在账本终态迁移与释放标记之间被杀，
+    /// 或者释放调用本身失败（reap 路径尤其如此——它释放失败后不会再被选中重试）。
+    /// 若不处理，该会话将永久 409。
     ///
-    /// 判据用「持有者是否已终态」而非超时：超时要么设得太短、误杀正在跑的长轮次，
-    /// 要么设得太长、把卡死留给用户。账本知道确切答案，直接问它。
+    /// 判据用「持有者是否已终态」而非超时：账本知道确切答案，直接问它。
     async fn acquire_turn(
         &self,
         tenant: &TenantId,
-        session_id: &SessionId,
+        conversation_id: &ConversationId,
         response_id: &ResponseId,
     ) -> Result<(), ServiceError> {
         let holder = match self
-            .sessions
-            .begin_turn(tenant, session_id, response_id)
+            .conversations
+            .acquire_active(tenant, conversation_id, response_id)
             .await
         {
             Ok(_) => return Ok(()),
-            Err(SessionError::Busy { holder }) => holder,
+            Err(ConversationError::Busy { holder }) => holder,
             Err(e) => return Err(e.into()),
         };
 
@@ -272,26 +262,25 @@ impl ResponsesService {
             .map(|record| record.status);
         let stale = holder_status.map(|s| s.is_terminal()).unwrap_or(true);
         if !stale {
-            // 真正在途：明确拒绝，绝不排队等它——排队会让调用方以为自己的请求被受理了。
-            return Err(SessionError::Busy { holder }.into());
+            // 真正在途：明确拒绝，绝不排队等它。
+            return Err(ConversationError::Busy { holder }.into());
         }
 
         let released = self
-            .sessions
-            .release_stale_lock(tenant, session_id, &holder)
+            .conversations
+            .release_stale_active(tenant, conversation_id, &holder)
             .await?;
         tracing::warn!(
-            session_id = %session_id,
+            conversation_id = %conversation_id,
             stale_holder = %holder,
             released,
-            "took over a turn lock whose holder had already reached a terminal state"
+            "took over a turn marker whose holder had already reached a terminal state"
         );
-        self.metrics.incr("session_stale_locks_released", 1).await;
+        self.metrics.incr("conversation_stale_locks_released", 1).await;
 
-        // 只重试一次。再次 Busy 说明有另一个调用方刚抢到锁，那是真冲突而非残留，
-        // 循环重试只会把冲突变成活锁。
-        self.sessions
-            .begin_turn(tenant, session_id, response_id)
+        // 只重试一次。再次 Busy 说明有另一个调用方刚抢到标记，那是真冲突而非残留。
+        self.conversations
+            .acquire_active(tenant, conversation_id, response_id)
             .await?;
         Ok(())
     }
@@ -347,28 +336,28 @@ impl ResponsesService {
         }
     }
 
-    /// 受理失败后归还轮次锁。
+    /// 受理失败后归还轮次互斥标记（D28）。
     ///
     /// 归还失败只记日志、不改变调用方看到的结果：调用方要知道的是它的请求没有被
-    /// 受理，而锁的残留是服务端问题，用一个次生错误盖掉主因只会让诊断更难。残留
-    /// 本身也不是永久的——引擎侧的终态路径与回收路径都会再次释放。
+    /// 受理，而标记的残留是服务端问题。残留本身也不是永久的——引擎侧的终态路径与
+    /// 回收路径都会再次释放。
     async fn release_after_failed_admission(
         &self,
         tenant: &TenantId,
-        session_id: &SessionId,
+        conversation_id: &ConversationId,
         response_id: &ResponseId,
     ) {
         if let Err(err) = self
-            .sessions
-            .end_turn(tenant, session_id, response_id, ResponseStatus::Failed)
+            .conversations
+            .release_active(tenant, conversation_id, response_id, ResponseStatus::Failed)
             .await
         {
             tracing::warn!(
-                session_id = %session_id,
+                conversation_id = %conversation_id,
                 response_id = %response_id,
                 error = %err,
-                "failed to release the turn lock after admission failed; \
-                 the session stays busy until a terminal path releases it"
+                "failed to release the turn marker after admission failed; \
+                 the conversation stays busy until a terminal path releases it"
             );
         }
     }
@@ -446,21 +435,21 @@ impl ResponsesService {
         // output, so advancing would leave the conversation ending on an
         // unanswered question.
         if let Some(record) = &record {
-            if let Some(session_id) = &record.session_id {
+            if let Some(conversation_id) = &record.conversation_id {
                 if let Err(err) = self
-                    .sessions
-                    .end_turn(tenant, session_id, response_id, ResponseStatus::Cancelled)
+                    .conversations
+                    .release_active(tenant, conversation_id, response_id, ResponseStatus::Cancelled)
                     .await
                 {
                     // Logged, not propagated: the caller asked to cancel and the
                     // cancellation happened. Reporting a bookkeeping failure
                     // instead would suggest it did not.
                     tracing::warn!(
-                        session_id = %session_id,
+                        conversation_id = %conversation_id,
                         response_id = %response_id,
                         error = %err,
-                        "could not release the turn lock after cancelling; the session \
-                         stays busy until the reap path releases it"
+                        "could not release the turn marker after cancelling; the \
+                         conversation stays busy until the reap path releases it"
                     );
                 }
             }
@@ -503,33 +492,39 @@ impl ResponsesService {
         tenant: &TenantId,
         response_id: &ResponseId,
     ) -> Result<bool, ServiceError> {
-        // 先读关联，再删：删掉之后就再也拿不到 session_id 了。
-        let session_id = self
+        // 先读关联，再删：删掉之后就再也拿不到 conversation_id 了。
+        let conversation_id = self
             .context
             .get(tenant, response_id)
             .await
             .ok()
             .flatten()
-            .and_then(|record| record.session_id);
+            .and_then(|record| record.conversation_id);
 
         let deleted = self.context.delete(tenant, response_id).await?;
         if deleted {
             self.metrics.incr("responses_deleted", 1).await;
 
-            if let Some(session_id) = &session_id {
+            if let Some(conversation_id) = &conversation_id {
                 if let Err(err) = self
-                    .sessions
-                    .note_response_deleted(tenant, session_id, response_id)
+                    .conversations
+                    .append_event(
+                        tenant,
+                        conversation_id,
+                        ConversationEventKind::ResponseDeleted {
+                            response_id: response_id.clone(),
+                        },
+                    )
                     .await
                 {
                     // 只记日志：记录确实已删除，用一个广播失败去否认它会更糟。代价是
                     // 其它端要等到下次拉取历史才会发现，而不是立刻。
                     tracing::warn!(
-                        session_id = %session_id,
+                        conversation_id = %conversation_id,
                         response_id = %response_id,
                         error = %err,
-                        "could not announce the deletion on the session stream; other \
-                         devices will notice on their next transcript read"
+                        "could not announce the deletion on the conversation stream; \
+                         other devices will notice on their next transcript read"
                     );
                 }
             }

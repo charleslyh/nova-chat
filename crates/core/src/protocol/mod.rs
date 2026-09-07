@@ -21,21 +21,19 @@ mod conversation;
 mod item;
 mod limits;
 mod request;
-mod session;
 mod url_guard;
 
 pub use content::{ContentPart, ContentViolation, ImageDetail};
-pub use conversation::{CreateConversationRequest, UpdateConversationRequest};
+pub use conversation::{
+    AppendBusinessEventRequest, BusinessEventViolation, CreateConversationRequest,
+    UpdateConversationRequest, MAX_BUSINESS_KIND_BYTES, MAX_BUSINESS_PAYLOAD_BYTES,
+};
 pub use item::{ItemStatus, ItemViolation, ResponseItem, Role};
 pub use limits::{json_depth, InputLimits, LimitViolation};
 pub use request::{
     preflight_unsupported, validate_metadata, ConversationRef, CreateResponseRequest,
     RequestViolation, ResponseInput, Tool, ToolChoice, ToolChoiceMode, MAX_INSTRUCTIONS_BYTES,
     MAX_METADATA_ENTRIES, MAX_METADATA_KEY_BYTES, MAX_METADATA_VALUE_BYTES,
-};
-pub use session::{
-    AppendBusinessEventRequest, CreateSessionRequest, SessionRequestViolation,
-    MAX_BUSINESS_KIND_BYTES, MAX_BUSINESS_PAYLOAD_BYTES,
 };
 pub use url_guard::{ensure_public_https, is_blocked_ip, UrlRejection, MAX_URL_BYTES};
 

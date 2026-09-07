@@ -8,7 +8,6 @@ mod event_log;
 mod integrity;
 mod ledger;
 mod metrics;
-mod session;
 mod tool;
 
 pub use clock::Clock;
@@ -24,5 +23,5 @@ pub use ledger::{
     AbortedClaim, ClaimedResponse, CreateOutcome, LedgerError, ResponseLedger,
 };
 pub use metrics::MetricsSink;
-pub use session::{SessionError, SessionStore};
+
 pub use tool::{NoopToolExecutor, ToolError, ToolExecutor};

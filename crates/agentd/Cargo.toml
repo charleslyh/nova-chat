@@ -23,6 +23,7 @@ adapters-sql = { workspace = true, optional = true }
 adapters-event-log-redis = { workspace = true, optional = true }
 adapters-completions-mock = { workspace = true }
 adapters-completions-http = { workspace = true }
+adapters-tool-calculator = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }

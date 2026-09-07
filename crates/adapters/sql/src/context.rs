@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use crate::error::to_context_error;
 use crate::row::{
-    items_to_json, reasoning_to_json, record_from_row, status_to_str, usage_to_json, RECORD_COLUMNS,
+    items_to_json, reasoning_to_json, record_from_row, status_to_str, tool_choice_to_json,
+    tools_to_json, usage_to_json, RECORD_COLUMNS,
 };
 
 pub struct SqlContextStore {
@@ -70,8 +71,8 @@ impl ContextStore for SqlContextStore {
                 reasoning, context, context_reasoning, \
                 context_depth, usage, \
                 integrity, integrity_alg, created_at_ms, completed_at_ms, expires_at_ms, \
-                conversation_id, session_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25) \
+                conversation_id, tools, tool_choice) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26) \
              ON CONFLICT (response_id) DO UPDATE SET \
                 status = EXCLUDED.status, \
                 stored = EXCLUDED.stored, \
@@ -90,7 +91,8 @@ impl ContextStore for SqlContextStore {
                 completed_at_ms = EXCLUDED.completed_at_ms, \
                 expires_at_ms = EXCLUDED.expires_at_ms, \
                 conversation_id = EXCLUDED.conversation_id, \
-                session_id = EXCLUDED.session_id";
+                tools = EXCLUDED.tools, \
+                tool_choice = EXCLUDED.tool_choice";
         sqlx::query(sql)
             .bind(record.response_id.to_string())
             .bind(record.previous_response_id.as_ref().map(|v| v.to_string()))
@@ -116,7 +118,8 @@ impl ContextStore for SqlContextStore {
             .bind(record.completed_at_ms.map(|v| v as i64))
             .bind(record.expires_at_ms.map(|v| v as i64))
             .bind(record.conversation_id.as_ref().map(|v| v.to_string()))
-            .bind(record.session_id.as_ref().map(|v| v.to_string()))
+            .bind(tools_to_json(&record.tools))
+            .bind(tool_choice_to_json(record.tool_choice.as_ref()))
             .execute(&self.pool)
             .await
             .map_err(to_context_error)?;

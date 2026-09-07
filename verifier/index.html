@@ -53,6 +53,8 @@
   .composer textarea:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
   .composer .opts { display: flex; flex-direction: column; gap: 6px; }
   .composer input[type=text] { padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; font-size: 12px; width: 150px; }
+  .composer .opts label.tool-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); user-select: none; cursor: pointer; }
+  .bubble.tool { align-self: flex-start; background: #fef9e7; color: #7a5b00; border: 1px solid #f0e2b6; border-bottom-left-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
   .composer button.send { border: none; background: var(--accent); color: #fff; border-radius: 10px; padding: 10px 18px; font-size: 14px; cursor: pointer; height: 42px; }
   .composer button.send:disabled { opacity: .5; cursor: not-allowed; }
   .composer button.send:not(:disabled):hover { filter: brightness(1.05); }
@@ -63,6 +65,7 @@
   <div class="brand"><span class="dot"></span><h1>Nova Verifier</h1></div>
   <input type="text" id="base" placeholder="gateway base，如 http://localhost:18080/v1" title="能力服务网关地址">
   <button onclick="saveBase(); loadSessions();">连接</button>
+  <button class="quick" onclick="quickCalc()" title="一键勾选计算器并发送示例，触发模型调用 calculate 工具走通完整 ReAct 回路">🧮 使用工具来计算</button>
 </header>
 
 <div class="layout">
@@ -81,6 +84,7 @@
     <div class="composer">
       <textarea id="input" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
       <div class="opts">
+        <label class="tool-toggle" title="勾选后本轮请求会带上 calculate 工具，模型可调用它做算术"><input type="checkbox" id="calc"> 计算器</label>
         <input type="text" id="model" placeholder="模型名，如 gpt-4o（未设 NOVA_CHAT_MODEL 时必填）">
         <button class="send" id="send" onclick="send()">发送</button>
       </div>
@@ -91,8 +95,13 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let BASE = localStorage.getItem('nova_base') || 'http://localhost:18080/v1';
-let current = null;   // { id, conversationId }
+let current = null;   // { id } — 会话就是 conversation，id 即 conversation id
 let streaming = false;
+let eventSource = null;   // 当前会话的实时事件订阅（多设备同步）
+// 单调递增的「渲染代际」：并发 `loadSessions` 时，只有最新一次有权写 ul，
+// 早先的 await 回来后看到 `loadGen` 变了就放弃 append，否则同一对象会被
+// 重复 append 多次（事件一来一去就翻倍）。
+let loadGen = 0;
 
 $('base').value = BASE;
 
@@ -115,16 +124,20 @@ async function api(path, opts = {}) {
 }
 
 async function loadSessions() {
+  const myGen = ++loadGen;                    // 占一个代际
   const list = $('session-list');
   list.innerHTML = '';
   let data;
   try {
-    const resp = await api('/sessions');
+    const resp = await api('/conversations');
+    if (myGen !== loadGen) return;            // 已被更新的刷新取代，不再写 ul
     data = (await resp.json()).data || [];
   } catch (e) {
+    if (myGen !== loadGen) return;
     list.innerHTML = `<li class="system">加载失败：${e.message}</li>`;
     return;
   }
+  if (myGen !== loadGen) return;              // await 后再确认一次
   for (const s of data) {
     const li = document.createElement('li');
     li.className = current && current.id === s.id ? 'active' : '';
@@ -137,12 +150,12 @@ async function loadSessions() {
     const del = document.createElement('button');
     del.className = 'del';
     del.textContent = '✕';
-    del.title = '删除会话（保留对话容器）';
+    del.title = '删除会话';
     del.onclick = async (e) => {
       e.stopPropagation();
-      if (!confirm('删除该会话？（对话内容保留在容器里）')) return;
-      await api('/sessions/' + s.id, { method: 'DELETE' });
-      if (current && current.id === s.id) { current = null; $('messages').innerHTML = '<div class="empty">左侧新建或选择一个会话开始</div>'; }
+      if (!confirm('删除该会话？')) return;
+      await api('/conversations/' + s.id, { method: 'DELETE' });
+      if (current && current.id === s.id) { current = null; closeEvents(); $('messages').innerHTML = '<div class="empty">左侧新建或选择一个会话开始</div>'; }
       loadSessions();
     };
     li.appendChild(del);
@@ -152,7 +165,7 @@ async function loadSessions() {
 
 async function createSession() {
   try {
-    const resp = await api('/sessions', { method: 'POST', body: '{}' });
+    const resp = await api('/conversations', { method: 'POST', body: '{}' });
     const s = await resp.json();
     await loadSessions();
     selectSession(s);
@@ -160,16 +173,54 @@ async function createSession() {
 }
 
 async function selectSession(s) {
-  current = { id: s.id, conversationId: s.conversation.id };
+  current = { id: s.id };
+  closeEvents();
   loadSessions();
   $('messages').innerHTML = '<div class="empty">加载对话…</div>';
   try {
-    const resp = await api(`/sessions/${s.id}/transcript`);
+    const resp = await api(`/conversations/${s.id}/transcript`);
     const items = (await resp.json()).data || [];
     renderTranscript(items);
+    // 订阅该会话的事件流：另一个页面（设备）发起/结束一轮时，这里能实时看到。
+    openEvents(s.id);
   } catch (e) {
     $('messages').innerHTML = `<div class="empty">加载历史失败：${e.message}</div>`;
   }
+}
+
+function closeEvents() {
+  if (eventSource) { eventSource.close(); eventSource = null; }
+}
+
+// 订阅 `/conversations/{id}/events`：turn_started / turn_completed / response_deleted
+// 边界事件一到，就重读 transcript 并刷新列表的「生成中/空闲」状态。这样 A 发消息
+// 一轮结束后，B 无需任何操作就能看到 A 产生的新内容。
+function openEvents(convId) {
+  closeEvents();
+  const es = new EventSource(BASE + `/conversations/${convId}/events`);
+  eventSource = es;
+
+  let timer = null;
+  const scheduleReload = () => {
+    if (timer) return;                       // 合并同一批到达的事件
+    timer = setTimeout(() => { timer = null; refreshTranscript(); }, 150);
+  };
+  es.addEventListener('conversation.turn_started', () => { loadSessions(); scheduleReload(); });
+  es.addEventListener('conversation.turn_completed', () => { loadSessions(); scheduleReload(); });
+  es.addEventListener('conversation.response_deleted', scheduleReload);
+  // 断线由 EventSource 自动重连（带 Last-Event-ID，从断点续传，不重放全量）。
+  es.onerror = () => {};
+}
+
+async function refreshTranscript() {
+  // 自己正在流式输出时不重画（自己的 conversation 也会发出 turn_completed，
+  // 但那时本页已经在流式打字，重画会打断它；流式内容本就完整，无需补拉）。
+  if (!current || streaming) return;
+  try {
+    const resp = await api(`/conversations/${current.id}/transcript`);
+    const items = (await resp.json()).data || [];
+    renderTranscript(items);
+  } catch (e) { /* 静默：下一次边界事件会再试 */ }
 }
 
 function partText(part) {
@@ -216,6 +267,11 @@ function renderTranscript(items) {
       appendThinking(item.text || '');
       continue;
     }
+    // 工具调用与结果渲染成独立的 tool 气泡，与流式呈现一致。
+    if (item.type === 'function_call' || item.type === 'function_call_output') {
+      appendBubble('tool', itemText(item));
+      continue;
+    }
     appendBubble(item.role === 'user' ? 'user' : (item.role === 'assistant' ? 'assistant' : 'system'), itemText(item));
   }
   box.scrollTop = box.scrollHeight;
@@ -239,6 +295,26 @@ async function send() {
   const input = $('input').value.trim();
   if (!input) return;
   const model = $('model').value.trim() || 'm';
+  // 计算器工具（协议子集的 `tools`：仅 `type: "function"`）。勾选后模型可以
+  // 调用 `calculate` 做算术，走通「function_call → 执行 → function_call_output →
+  // 最终回答」的完整 ReAct 回路，用于验证整个服务的工具调用链路。
+  //
+  // 注意：**不发 `tool_choice` 强制**。实测 deepseek 在 `required` 或指定函数下
+  // 会每一轮都再调一次工具，死循环到 max_tool_rounds 上限（incomplete）。靠强
+  // description + 默认 `auto` 触发一次干净的调用即可。
+  const useCalc = $('calc').checked;
+  const tools = useCalc ? [{
+    type: 'function',
+    name: 'calculate',
+    description: '用于做算术计算的工具。任何算术计算都必须调用此工具完成，禁止心算、禁止写示例代码、禁止直接在回复里给出结果。参数 expression 是纯算术表达式（数字、+ - * /、括号），例如 "3 * 7" 或 "(1+2)*3"。',
+    parameters: {
+      type: 'object',
+      properties: {
+        expression: { type: 'string', description: 'The arithmetic expression to evaluate, e.g. "3 * 7".' },
+      },
+      required: ['expression'],
+    },
+  }] : undefined;
 
   $('input').value = '';
   $('send').disabled = true;
@@ -259,7 +335,7 @@ async function send() {
     const resp = await fetch(BASE + '/responses', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, input, conversation: current.conversationId, stream: true }),
+      body: JSON.stringify({ model, input, conversation: current.id, stream: true, ...(tools ? { tools } : {}) }),
     });
     if (!resp.ok) {
       let detail = '';
@@ -278,6 +354,15 @@ async function send() {
         if (ev.type === 'response.reasoning_text.delta' && ev.delta) {
           thinkBody.textContent += ev.delta;
           messages.scrollTop = messages.scrollHeight;
+        }
+        // 工具调用与结果：`output_item.done` 时条目已完整，渲染成独立气泡。
+        if (ev.type === 'response.output_item.done' && ev.item) {
+          const item = ev.item;
+          if (item.type === 'function_call') {
+            appendBubble('tool', `🔧 调用 ${item.name}(${item.arguments})`);
+          } else if (item.type === 'function_call_output') {
+            appendBubble('tool', `⚙️ 结果：${item.output}`);
+          }
         }
         if (ev.type === 'response.completed' || ev.type === 'response.failed' || ev.type === 'response.incomplete') {
           lastStatus = ev.response?.status ?? ev.status ?? ev.type.replace('response.', '');
@@ -344,6 +429,15 @@ $('input').addEventListener('keydown', (e) => {
 });
 
 loadSessions();
+
+// 一键触发：勾选「计算器」+ 写入示例表达式 + 发送。专为「我想直接看工具调用
+// 轨迹而不是自己打表达式」设计——靠强 description + auto 触发模型调用 calculate。
+function quickCalc() {
+  if (!current) { alert('请先选择一个会话'); return; }
+  $('calc').checked = true;
+  $('input').value = '用计算器算 123 * 1234 / 123 - 123 * 23.4';
+  send();
+}
 </script>
 </body>
 </html>

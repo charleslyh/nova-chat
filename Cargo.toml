@@ -6,6 +6,7 @@ members = [
     "crates/adapters/sql",
     "crates/adapters/completions-mock",
     "crates/adapters/completions-http",
+    "crates/adapters/tool-calculator",
     "crates/adapters/event-log-redis",
     "crates/adapters/mem-client",
     "crates/agent",
@@ -32,6 +33,7 @@ adapters-mem-client = { path = "crates/adapters/mem-client" }
 adapters-sql = { path = "crates/adapters/sql" }
 adapters-completions-mock = { path = "crates/adapters/completions-mock" }
 adapters-completions-http = { path = "crates/adapters/completions-http" }
+adapters-tool-calculator = { path = "crates/adapters/tool-calculator" }
 adapters-event-log-redis = { path = "crates/adapters/event-log-redis" }
 nova-agent = { path = "crates/agent" }
 conformance = { path = "testing/conformance" }

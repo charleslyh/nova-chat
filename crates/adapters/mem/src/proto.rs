@@ -16,10 +16,9 @@ use std::collections::BTreeMap;
 
 use nova_responses_core::{
     AbortedClaim, AgentId, Attempt, ChainLimits, ClaimedResponse, ContextError, Conversation,
-    ConversationError, ConversationId, CreateOutcome, EventLogError, IdempotencyKey, LedgerError,
-    ResolvedContext, ResponseEvent, ResponseEventKind, ResponseId, ResponseItem, ResponseStatus,
-    Session, SessionError, SessionEvent, SessionEventKind, SessionId, StoredResponse, TenantId,
-    Usage,
+    ConversationError, ConversationEvent, ConversationEventKind, ConversationId, CreateOutcome,
+    EventLogError, IdempotencyKey, LedgerError, ResolvedContext, ResponseEvent, ResponseEventKind,
+    ResponseId, ResponseItem, ResponseStatus, StoredResponse, TenantId, Usage,
 };
 
 /// Internal wire form of a stream event.
@@ -69,7 +68,6 @@ pub enum ProtoError {
     EventLog(EventLogError),
     Context(ContextError),
     Conversation(ConversationError),
-    Session(SessionError),
     /// A failure in the carrier itself (serialization, dispatch) rather than in
     /// a domain operation. Carried as text for debuggability.
     Internal(String),
@@ -202,71 +200,41 @@ pub enum Request {
         id: ConversationId,
         last: ResponseId,
     },
-    ConversationHealth,
-
-    // --- session (D26) ---
-    //
-    // `begin_turn` and `end_turn` are carried as their own operations rather than
-    // as a lock write plus an append. Splitting them here would put the atomicity
-    // the port promises on the wrong side of the wire, where a dropped connection
-    // between the two halves would leave the session inconsistent.
-    SessionCreate {
-        session: Session,
-        now_ms: u64,
-    },
-    SessionGet {
+    ConversationAcquireActive {
         tenant: TenantId,
-        id: SessionId,
-    },
-    SessionList {
-        tenant: TenantId,
-    },
-    SessionGetByConversation {
-        tenant: TenantId,
-        conversation: ConversationId,
-    },
-    SessionDelete {
-        tenant: TenantId,
-        id: SessionId,
-    },
-    SessionDeleteByTenant {
-        tenant: TenantId,
-    },
-    SessionBeginTurn {
-        tenant: TenantId,
-        id: SessionId,
+        id: ConversationId,
         response_id: ResponseId,
         now_ms: u64,
     },
-    SessionEndTurn {
+    ConversationReleaseActive {
         tenant: TenantId,
-        id: SessionId,
+        id: ConversationId,
         response_id: ResponseId,
         status: ResponseStatus,
         now_ms: u64,
     },
-    SessionReleaseStaleLock {
+    ConversationReleaseStaleActive {
         tenant: TenantId,
-        id: SessionId,
+        id: ConversationId,
         holder: ResponseId,
     },
-    SessionAppendEvent {
+    ConversationAppendEvent {
         tenant: TenantId,
-        id: SessionId,
-        kind: SessionEventKind,
+        id: ConversationId,
+        kind: ConversationEventKind,
         now_ms: u64,
     },
-    SessionReadAfter {
+    ConversationReadAfter {
         tenant: TenantId,
-        id: SessionId,
+        id: ConversationId,
         starting_after: Option<u64>,
         limit: usize,
         wait_ms: u64,
     },
-    SessionHealth,
-    SessionSetMaxEvents {
-        limit: usize,
+    ConversationList {
+        tenant: TenantId,
     },
+    ConversationHealth,
 }
 
 /// A single data-plane response. Success variants carry the typed result; the
@@ -304,19 +272,13 @@ pub enum Response {
     ConversationDelete(bool),
     ConversationDeleteByTenant(u64),
     ConversationAdvance,
+    ConversationAcquireActive(u64),
+    ConversationReleaseActive(u64),
+    ConversationReleaseStaleActive(bool),
+    ConversationAppendEvent(u64),
+    ConversationReadAfter(Vec<ConversationEvent>),
+    ConversationList(Vec<Conversation>),
     ConversationHealth,
-
-    SessionCreate(Session),
-    SessionGet(Option<Session>),
-    SessionList(Vec<Session>),
-    SessionDelete(bool),
-    SessionDeleteByTenant(u64),
-    SessionReleaseStaleLock(bool),
-    /// Assigned sequence number, shared by the three appending operations.
-    SessionSeq(u64),
-    SessionReadAfter(Vec<SessionEvent>),
-    SessionHealth,
-    SessionSetMaxEvents,
 
     Err(ProtoError),
 }

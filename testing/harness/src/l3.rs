@@ -69,12 +69,10 @@ pub async fn sql_ports_from_env() -> Result<(Option<PortSet>, L3Availability)> {
         ledger: world.ledger.clone(),
         event_log: mem.event_log.clone(),
         context: world.context.clone(),
-        // The real sql implementations, so the conversation and session contract
-        // cases actually exercise Postgres — the transactional lock and the
-        // sequence allocator are precisely the parts an in-memory mutex cannot
-        // stand in for.
+        // The real sql implementation, so the conversation contract cases
+        // actually exercise Postgres — the transactional lock and the sequence
+        // allocator are precisely the parts an in-memory mutex cannot stand in for.
         conversation: world.conversation.clone(),
-        session: world.session.clone(),
         integrity: world.integrity.clone(),
         node_tag: NodeTag::parse("node-a").expect("static tag"),
     };
@@ -178,12 +176,13 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
         let id = ResponseId::new(tag.clone());
         let record = StoredResponse {
             conversation_id: None,
-            session_id: None,
             response_id: id.clone(),
             previous_response_id: previous.clone(),
             tenant_id: tenant.clone(),
             model: "m".into(),
             instructions: Some("L3-INSTRUCTIONS".into()),
+            tools: Vec::new(),
+            tool_choice: None,
             input_items: vec![ResponseItem::user_text(format!("q{turn}"))],
             output_items: vec![ResponseItem::assistant_text(format!("a{turn}"))],
             reasoning: None,
@@ -237,12 +236,13 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
     // fails explicitly, history survives (FR-38).
     let in_flight = StoredResponse {
         conversation_id: None,
-        session_id: None,
         response_id: ResponseId::new(ports.node_tag.clone()),
         previous_response_id: None,
         tenant_id: tenant.clone(),
         model: "m".into(),
         instructions: None,
+        tools: Vec::new(),
+        tool_choice: None,
         input_items: vec![ResponseItem::user_text("pending")],
         output_items: vec![],
         reasoning: None,
@@ -316,12 +316,13 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
     let expiring = ResponseId::new(ports.node_tag.clone());
     let mut rec = StoredResponse {
         conversation_id: None,
-        session_id: None,
         response_id: expiring.clone(),
         previous_response_id: None,
         tenant_id: tenant.clone(),
         model: "m".into(),
         instructions: None,
+        tools: Vec::new(),
+        tool_choice: None,
         input_items: vec![ResponseItem::user_text("temp")],
         output_items: vec![],
         reasoning: None,
@@ -358,12 +359,13 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
         .context
         .put(StoredResponse {
             conversation_id: None,
-            session_id: None,
             response_id: keep.clone(),
             previous_response_id: None,
             tenant_id: other.clone(),
             model: "m".into(),
             instructions: None,
+            tools: Vec::new(),
+            tool_choice: None,
             input_items: vec![ResponseItem::user_text("keep")],
             output_items: vec![],
             reasoning: None,

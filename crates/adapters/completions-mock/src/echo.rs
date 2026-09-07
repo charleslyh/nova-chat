@@ -91,6 +91,7 @@ mod tests {
             model: "m".into(),
             messages,
             tools: vec![],
+            tool_choice: None,
             max_completion_tokens: None,
             temperature: None,
             provenance: RequestProvenance {

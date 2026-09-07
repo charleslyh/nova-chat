@@ -5,8 +5,6 @@
 
 pub mod conversations;
 pub mod responses;
-pub mod sessions;
 
 pub use conversations::{ConversationTail, ConversationsService, TranscriptError};
 pub use responses::{ContextSource, CreateResult, ResponsesService, ServiceError};
-pub use sessions::{SessionsService, SessionsServiceError};

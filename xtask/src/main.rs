@@ -450,18 +450,18 @@ async fn coverage() -> Result<()> {
         "FR-29", "FR-30", "FR-31", "FR-32", "FR-33",
         // Reliability.
         "FR-34", "FR-35", "FR-36", "FR-37", "FR-38", "FR-39",
-        // Conversation container (compatibility layer, D27).
+        // Conversation container (D28: the compatibility container plus the
+        // event stream, turn lock and business events that were the D26 session
+        // layer — merged into one resource).
         "FR-40", "FR-41",
-        // Session event stream (self-hosted layer, D26).
-        "FR-42", "FR-43", "FR-44", "FR-45",
         // Correctness.
         "CR-1", "CR-2", "CR-3", "CR-4", "CR-5", "CR-6", "CR-7", "CR-8", "CR-9", "CR-10",
-        "CR-11", "CR-12", "CR-13", "CR-14", "CR-15", "CR-16",
+        "CR-11", "CR-12", "CR-13",
         // Invariants still in force.
         "INV-1", "INV-2", "INV-5", "INV-6", "INV-11", "INV-12", "INV-16", "INV-29", "INV-30",
         "INV-32", "INV-33", "INV-34", "INV-35", "INV-40", "INV-41", "INV-42", "INV-43",
         "INV-44", "INV-45", "INV-46", "INV-47", "INV-49", "INV-50", "INV-51", "INV-52",
-        "INV-54", "INV-55", "INV-56", "INV-57", "INV-58", "INV-59",
+        "INV-54", "INV-55",
         // Security.
         "SEC-2", "SEC-3", "SEC-5", "SEC-6", "SEC-7",
     ]

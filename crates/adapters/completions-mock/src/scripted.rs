@@ -304,6 +304,7 @@ mod tests {
             model: "m".into(),
             messages: vec![CompletionsMessage::user_text(text)],
             tools: vec![],
+            tool_choice: None,
             max_completion_tokens: None,
             temperature: None,
             provenance: RequestProvenance {

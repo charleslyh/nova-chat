@@ -7,14 +7,15 @@
 //!   that `/v1/conversations/{id}` handles both `GET` and `POST`, because
 //!   upstream models the metadata update as a POST to the same path rather than
 //!   a PATCH.
-//! - `/v1/sessions` is **ours** (D26), covering the three things upstream has no
-//!   protocol for: subscribing to a session, ordering business events alongside
-//!   the conversation, and reading the whole history back in one call.
+//! - `/v1/conversations` also carries our **self-hosted** sub-resources (D28):
+//!   the event stream (`/events`), business events ordered alongside the
+//!   conversation, and the whole history in one call (`/transcript`) — three
+//!   things upstream has no protocol for, folded onto the one container rather
+//!   than a parallel surface.
 //!
 //! There is no self-hosted endpoint for *starting* a turn. That happens through
 //! the standard `POST /v1/responses` carrying `conversation`; the service finds
-//! the owning session and takes its lock. A `POST /v1/sessions/{id}/turns` would
-//! have been a second way to do the same thing, and the two would drift.
+//! the owning conversation and takes its turn lock.
 //!
 //! Gone with D23, and still gone under D25: `/v1/agent/claim`, `/heartbeat`,
 //! `/append`, `/complete`. Execution is not a protocol — `nova-agentd` claims
@@ -25,7 +26,6 @@
 pub mod admin;
 pub mod conversations;
 pub mod responses;
-pub mod sessions;
 pub(crate) mod shared;
 
 use axum::routing::{get, post};
@@ -44,24 +44,24 @@ pub fn router(state: AppState) -> Router {
             get(responses::retrieve).delete(responses::delete),
         )
         .route("/v1/responses/{id}/cancel", post(responses::cancel))
-        .route("/v1/conversations", post(conversations::create))
+        // `/v1/conversations` is the single resource (D28): the official CRUD
+        // above plus the self-hosted sub-resources (list / events / transcript)
+        // that upstream has no protocol for.
+        .route("/v1/conversations", get(conversations::list).post(conversations::create))
         .route(
             "/v1/conversations/{id}",
             get(conversations::retrieve)
                 .post(conversations::update)
                 .delete(conversations::delete),
         )
-        // Self-hosted session layer.
-        .route("/v1/sessions", get(sessions::list).post(sessions::create))
         .route(
-            "/v1/sessions/{id}",
-            get(sessions::retrieve).delete(sessions::delete),
+            "/v1/conversations/{id}/events",
+            get(conversations::events).post(conversations::append_event),
         )
         .route(
-            "/v1/sessions/{id}/events",
-            get(sessions::events).post(sessions::append_event),
+            "/v1/conversations/{id}/transcript",
+            get(conversations::transcript),
         )
-        .route("/v1/sessions/{id}/transcript", get(sessions::transcript))
         // Operations.
         .route("/v1/admin/read_only", post(admin::set_read_only))
         .route("/v1/admin/pending_limit", post(admin::set_pending_limit))

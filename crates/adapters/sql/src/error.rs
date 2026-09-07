@@ -1,4 +1,4 @@
-use nova_responses_core::{ContextError, ConversationError, LedgerError, SessionError};
+use nova_responses_core::{ContextError, ConversationError, LedgerError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -51,14 +51,6 @@ pub(crate) fn to_conversation_error(err: sqlx::Error) -> ConversationError {
         ConversationError::Unavailable
     } else {
         ConversationError::Internal(err.to_string())
-    }
-}
-
-pub(crate) fn to_session_error(err: sqlx::Error) -> SessionError {
-    if is_unavailable(&err) {
-        SessionError::Unavailable
-    } else {
-        SessionError::Internal(err.to_string())
     }
 }
 

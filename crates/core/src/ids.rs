@@ -17,8 +17,6 @@ pub enum IdError {
     InvalidUuid,
     #[error("tenant id must be 1..={max} chars of [A-Za-z0-9._-]", max = TenantId::MAX_LEN)]
     InvalidTenantId,
-    #[error("session id must have the form sess_<uuid>")]
-    MalformedSessionId,
     #[error("conversation id must have the form conv_<uuid>")]
     MalformedConversationId,
 }
@@ -274,16 +272,8 @@ macro_rules! uuid_suffixed_id {
 }
 
 uuid_suffixed_id!(
-    /// `sess_{uuid}`: the self-hosted session, which owns the event stream, the
-    /// single-turn lock and the business events (D26).
-    SessionId,
-    "sess_",
-    MalformedSessionId
-);
-
-uuid_suffixed_id!(
-    /// `conv_{uuid}`: the upstream-compatible conversation, which is a *pointer
-    /// to the tail of a response chain* and nothing more (D27).
+    /// `conv_{uuid}`: the conversation, which carries the chain tail, the
+    /// in-flight marker and the event stream (D28).
     ConversationId,
     "conv_",
     MalformedConversationId
@@ -422,16 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn session_and_conversation_ids_round_trip() {
-        let s = SessionId::new();
-        let text = s.to_string();
-        assert!(text.starts_with("sess_"), "{text}");
-        assert_eq!(SessionId::parse(&text).unwrap(), s);
-        assert_eq!(
-            serde_json::from_str::<SessionId>(&serde_json::to_string(&s).unwrap()).unwrap(),
-            s
-        );
-
+    fn conversation_id_round_trips() {
         let c = ConversationId::new();
         let text = c.to_string();
         assert!(text.starts_with("conv_"), "{text}");
@@ -443,15 +424,11 @@ mod tests {
     }
 
     #[test]
-    fn session_and_conversation_ids_carry_no_node_tag() {
-        // The `resp_{node}_{uuid}` shape must NOT be accepted here: these ids
-        // are node-agnostic on purpose, and tolerating an embedded tag would
-        // re-open the routing-forgery surface it was removed to avoid (SEC-5).
+    fn conversation_id_carries_no_node_tag() {
+        // The `resp_{node}_{uuid}` shape must NOT be accepted here: this id is
+        // node-agnostic on purpose, and tolerating an embedded tag would re-open
+        // the routing-forgery surface it was removed to avoid (SEC-5).
         let uuid = Uuid::new_v4();
-        assert_eq!(
-            SessionId::parse(&format!("sess_node-a_{uuid}")),
-            Err(IdError::MalformedSessionId)
-        );
         assert_eq!(
             ConversationId::parse(&format!("conv_node-a_{uuid}")),
             Err(IdError::MalformedConversationId)
@@ -459,16 +436,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_malformed_session_and_conversation_ids() {
+    fn rejects_malformed_conversation_ids() {
         let uuid = Uuid::new_v4().to_string();
-        for bad in ["", "abc", "sess", "sess_", "sess_not-a-uuid", "conv_x", &uuid] {
-            assert_eq!(
-                SessionId::parse(bad),
-                Err(IdError::MalformedSessionId),
-                "session id `{bad}` must be rejected"
-            );
-        }
-        for bad in ["", "abc", "conv", "conv_", "conv_not-a-uuid", "sess_x", &uuid] {
+        for bad in ["", "abc", "conv", "conv_", "conv_not-a-uuid", &uuid] {
             assert_eq!(
                 ConversationId::parse(bad),
                 Err(IdError::MalformedConversationId),
@@ -476,19 +446,7 @@ mod tests {
             );
         }
         // Path traversal attempts inside the id.
-        assert!(SessionId::parse("sess_../../etc").is_err());
         assert!(ConversationId::parse("conv_../../etc").is_err());
-    }
-
-    #[test]
-    fn the_two_prefixes_do_not_cross_parse() {
-        // A conversation id must never be accepted where a session id is
-        // expected, and vice versa — otherwise a caller could address the
-        // session layer with a compatibility-layer id and bypass its checks.
-        let s = SessionId::new();
-        let c = ConversationId::new();
-        assert!(ConversationId::parse(&s.to_string()).is_err());
-        assert!(SessionId::parse(&c.to_string()).is_err());
     }
 
     #[test]

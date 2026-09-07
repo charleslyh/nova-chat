@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nova_responses_core::{
-    Conversation, ConversationError, ConversationId, ConversationStore, ResponseId, TenantId,
+    Conversation, ConversationError, ConversationEvent, ConversationEventKind, ConversationId,
+    ConversationStore, ResponseId, ResponseStatus, TenantId,
 };
 
 use adapters_mem::proto::{ProtoError, Request, Response};
@@ -160,6 +161,146 @@ impl ConversationStore for MemConversationClient {
             Response::ConversationAdvance => Ok(()),
             other => Err(unexpected(other)),
         }
+    }
+
+    async fn acquire_active(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        response_id: &ResponseId,
+        now_ms: u64,
+    ) -> Result<u64, ConversationError> {
+        self.guard_writable()?;
+        match conversation_rpc(
+            &self.rpc,
+            Request::ConversationAcquireActive {
+                tenant: tenant.clone(),
+                id: id.clone(),
+                response_id: response_id.clone(),
+                now_ms,
+            },
+        )
+        .await?
+        {
+            Response::ConversationAcquireActive(seq) => Ok(seq),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn release_active(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        response_id: &ResponseId,
+        status: ResponseStatus,
+        now_ms: u64,
+    ) -> Result<u64, ConversationError> {
+        self.guard_writable()?;
+        match conversation_rpc(
+            &self.rpc,
+            Request::ConversationReleaseActive {
+                tenant: tenant.clone(),
+                id: id.clone(),
+                response_id: response_id.clone(),
+                status,
+                now_ms,
+            },
+        )
+        .await?
+        {
+            Response::ConversationReleaseActive(seq) => Ok(seq),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn release_stale_active(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        holder: &ResponseId,
+    ) -> Result<bool, ConversationError> {
+        self.guard_writable()?;
+        match conversation_rpc(
+            &self.rpc,
+            Request::ConversationReleaseStaleActive {
+                tenant: tenant.clone(),
+                id: id.clone(),
+                holder: holder.clone(),
+            },
+        )
+        .await?
+        {
+            Response::ConversationReleaseStaleActive(released) => Ok(released),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn append_event(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        kind: ConversationEventKind,
+        now_ms: u64,
+    ) -> Result<u64, ConversationError> {
+        self.guard_writable()?;
+        match conversation_rpc(
+            &self.rpc,
+            Request::ConversationAppendEvent {
+                tenant: tenant.clone(),
+                id: id.clone(),
+                kind,
+                now_ms,
+            },
+        )
+        .await?
+        {
+            Response::ConversationAppendEvent(seq) => Ok(seq),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn read_after(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        starting_after: Option<u64>,
+        limit: usize,
+        wait_ms: u64,
+    ) -> Result<Vec<ConversationEvent>, ConversationError> {
+        match conversation_rpc(
+            &self.rpc,
+            Request::ConversationReadAfter {
+                tenant: tenant.clone(),
+                id: id.clone(),
+                starting_after,
+                limit,
+                wait_ms,
+            },
+        )
+        .await?
+        {
+            Response::ConversationReadAfter(events) => Ok(events),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn list(&self, tenant: &TenantId) -> Result<Vec<Conversation>, ConversationError> {
+        match conversation_rpc(
+            &self.rpc,
+            Request::ConversationList {
+                tenant: tenant.clone(),
+            },
+        )
+        .await?
+        {
+            Response::ConversationList(list) => Ok(list),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    fn set_max_events_per_conversation(&self, _limit: usize) {
+        // The bound lives on the carrier (mem-server); the client has no local
+        // knob to flip. No-op here, mirroring other client-side runtime controls.
     }
 
     async fn health(&self) -> Result<(), ConversationError> {

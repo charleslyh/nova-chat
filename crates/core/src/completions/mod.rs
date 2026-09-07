@@ -37,6 +37,6 @@ mod translate;
 pub use outcome::{assistant_text_message, CompletionsOutcome, FinishReason, ToolCall};
 pub use request::{
     AssistantToolCall, CompletionsContent, CompletionsMessage, CompletionsRequest,
-    RequestProvenance, ToolSpec,
+    CompletionsToolChoice, RequestProvenance, SpecificFunction, ToolSpec,
 };
 pub use translate::{items_to_messages, TranslationError};

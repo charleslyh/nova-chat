@@ -243,7 +243,7 @@ impl ResponseLedger for MemResponseLedger {
             // caller needs it to release the turn lock, and a follow-up read
             // would be a second look at a row this loop already holds.
             let tenant_id = rec.tenant_id.clone();
-            let session_id = rec.session_id.clone();
+            let conversation_id = rec.conversation_id.clone();
             // Raise the fence first so the stale holder's next append fails.
             rec.attempt = previous_attempt.next();
             rec.status = ResponseStatus::Failed;
@@ -257,7 +257,7 @@ impl ResponseLedger for MemResponseLedger {
                 response_id: id,
                 previous_attempt,
                 tenant_id,
-                session_id,
+                conversation_id,
             });
         }
         Ok(aborted)

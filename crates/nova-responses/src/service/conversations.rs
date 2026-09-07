@@ -8,8 +8,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use nova_responses_core::{
-    Clock, ContextError, ContextStore, Conversation, ConversationError, ConversationId,
-    ConversationStore, MetricsSink, ResolvedContext, ResponseId, TenantId,
+    Clock, ContextError, ContextStore, Conversation, ConversationError, ConversationEvent,
+    ConversationEventKind, ConversationId, ConversationStore, MetricsSink, ResolvedContext,
+    ResponseId, ResponseStatus, TenantId,
 };
 
 use crate::config::Config;
@@ -71,8 +72,8 @@ impl ConversationsService {
         tenant: &TenantId,
         metadata: BTreeMap<String, String>,
     ) -> Result<Conversation, ConversationError> {
-        // 写前探活：库不可用拒写而非静默不存（INV-46）。
-        self.conversations.health().await?;
+        // 不写前探活（D28）：库不可用由失败返回错误直接暴露，低概率失败用「治疗」
+        // 而非「预防」。启动探活（fail-fast）仍在 gateway 装配处。
         let now_ms = self.clock.now_ms().await;
         let conversation = Conversation::new(
             ConversationId::new(),
@@ -99,7 +100,6 @@ impl ConversationsService {
         id: &ConversationId,
         metadata: BTreeMap<String, String>,
     ) -> Result<Conversation, ConversationError> {
-        self.conversations.health().await?;
         self.conversations
             .update_metadata(tenant, id, metadata)
             .await
@@ -112,7 +112,6 @@ impl ConversationsService {
         tenant: &TenantId,
         id: &ConversationId,
     ) -> Result<bool, ConversationError> {
-        self.conversations.health().await?;
         let deleted = self.conversations.delete(tenant, id).await?;
         if deleted {
             self.metrics.incr("conversations_deleted", 1).await;
@@ -148,6 +147,75 @@ impl ConversationsService {
         last: &ResponseId,
     ) -> Result<(), ConversationError> {
         self.conversations.advance(tenant, id, last).await
+    }
+
+    /// 占用互斥标记并原子发出 `turn_started`（D28）。忙则返回 `Busy` 命名持有者。
+    pub async fn acquire_active(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        response_id: &ResponseId,
+    ) -> Result<u64, ConversationError> {
+        let now_ms = self.clock.now_ms().await;
+        self.conversations
+            .acquire_active(tenant, id, response_id, now_ms)
+            .await
+    }
+
+    /// 释放互斥标记并原子发出 `turn_completed`（D28）。条件释放、幂等。
+    pub async fn release_active(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        response_id: &ResponseId,
+        status: ResponseStatus,
+    ) -> Result<u64, ConversationError> {
+        let now_ms = self.clock.now_ms().await;
+        self.conversations
+            .release_active(tenant, id, response_id, status, now_ms)
+            .await
+    }
+
+    /// 接管「持有者已终态」的残留标记，不发事件。
+    pub async fn release_stale_active(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        holder: &ResponseId,
+    ) -> Result<bool, ConversationError> {
+        self.conversations
+            .release_stale_active(tenant, id, holder)
+            .await
+    }
+
+    /// 追加非轮次事件（business / response_deleted）。
+    pub async fn append_event(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        kind: ConversationEventKind,
+    ) -> Result<u64, ConversationError> {
+        let now_ms = self.clock.now_ms().await;
+        self.conversations.append_event(tenant, id, kind, now_ms).await
+    }
+
+    /// 读事件（排他游标），供 SSE 订阅复用。
+    pub async fn read_after(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        starting_after: Option<u64>,
+        limit: usize,
+        wait_ms: u64,
+    ) -> Result<Vec<ConversationEvent>, ConversationError> {
+        self.conversations
+            .read_after(tenant, id, starting_after, limit, wait_ms)
+            .await
+    }
+
+    /// 列出该租户的全部会话容器，新在前。
+    pub async fn list(&self, tenant: &TenantId) -> Result<Vec<Conversation>, ConversationError> {
+        self.conversations.list(tenant).await
     }
 
     /// 一次取回容器的完整对话历史。

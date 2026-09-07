@@ -28,12 +28,13 @@ fn record(
 ) -> StoredResponse {
     StoredResponse {
         conversation_id: None,
-        session_id: None,
         response_id: id.clone(),
         previous_response_id: previous.cloned(),
         tenant_id: tenant(tenant_id),
         model: "m".into(),
         instructions: Some("SYSTEM-PROMPT-MARKER".into()),
+        tools: Vec::new(),
+        tool_choice: None,
         input_items: vec![ResponseItem::user_text(format!("in-{}", id.uuid()))],
         output_items: vec![ResponseItem::assistant_text(format!("out-{}", id.uuid()))],
         reasoning: None,

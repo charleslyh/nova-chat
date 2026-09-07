@@ -19,7 +19,6 @@ mod ledger;
 mod metrics;
 pub mod proto;
 pub mod server;
-mod session;
 mod store;
 
 pub use clock::MemClock;
@@ -28,7 +27,6 @@ pub use conversation::MemConversationStore;
 pub use event_log::MemResponseEventLog;
 pub use ledger::MemResponseLedger;
 pub use metrics::MemMetrics;
-pub use session::MemSessionStore;
 pub use store::MemStore;
 
 use std::sync::Arc;
@@ -44,10 +42,10 @@ pub struct MemWorldConfig {
     pub max_logs: usize,
     pub max_records: usize,
     pub pending_limit: usize,
-    /// Upper bound on one session's event stream. Reaching it refuses the append
-    /// rather than evicting, unlike `events_per_response` — see
-    /// [`MemStore::set_max_events_per_session`].
-    pub events_per_session: usize,
+    /// Upper bound on one conversation's event stream. Reaching it refuses the
+    /// append rather than evicting, unlike `events_per_response` — see
+    /// [`MemStore::set_max_events_per_conversation`].
+    pub events_per_conversation: usize,
     pub verify_integrity: bool,
 }
 
@@ -58,7 +56,7 @@ impl Default for MemWorldConfig {
             max_logs: 100_000,
             max_records: 100_000,
             pending_limit: 10_000,
-            events_per_session: 100_000,
+            events_per_conversation: 100_000,
             verify_integrity: true,
         }
     }
@@ -72,11 +70,10 @@ pub struct MemWorld {
     pub ledger: Arc<MemResponseLedger>,
     pub event_log: Arc<MemResponseEventLog>,
     pub context: Arc<MemContextStore>,
-    /// Conversation pointers (D27) and session state (D26), backed by the same
-    /// `store` so a turn boundary and the response it names cannot be observed
-    /// out of step.
+    /// Conversation records: chain tail, in-flight marker and event stream (D28),
+    /// backed by the same `store` so a turn boundary and the response it names
+    /// cannot be observed out of step.
     pub conversation: Arc<MemConversationStore>,
-    pub session: Arc<MemSessionStore>,
     pub integrity: Option<Arc<dyn ContentIntegrity>>,
     pub clock: Arc<MemClock>,
     pub metrics: Arc<MemMetrics>,
@@ -114,7 +111,7 @@ impl MemWorld {
         let store = Arc::new(MemStore::new());
         store.set_pending_limit(cfg.pending_limit);
         store.set_max_records(cfg.max_records);
-        store.set_max_events_per_session(cfg.events_per_session);
+        store.set_max_events_per_conversation(cfg.events_per_conversation);
 
         let ledger = Arc::new(MemResponseLedger::new(store.clone()));
         let event_log = Arc::new(MemResponseEventLog::with_capacity(
@@ -129,7 +126,6 @@ impl MemWorld {
         });
 
         let conversation = Arc::new(MemConversationStore::new(store.clone()));
-        let session = Arc::new(MemSessionStore::new(store.clone()));
 
         Self {
             store,
@@ -137,7 +133,6 @@ impl MemWorld {
             event_log,
             context,
             conversation,
-            session,
             integrity,
             clock: Arc::new(MemClock::new()),
             metrics: Arc::new(MemMetrics::new()),

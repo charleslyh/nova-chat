@@ -13,9 +13,7 @@ use serde_json::{json, Value};
 // The gateway binary is thin assembly over `nova-responses`, so these tests drive
 // the same library the binary mounts — just with the mem backend injected in
 // process instead of a real carrier.
-use nova_responses::{
-    AppState, Config, ConversationsService, KeyTable, RawConfig, ResponsesService, SessionsService,
-};
+use nova_responses::{AppState, Config, ConversationsService, KeyTable, RawConfig, ResponsesService};
 
 struct Harness {
     base: String,
@@ -150,18 +148,11 @@ async fn start() -> Harness {
         world.metrics.clone(),
         cfg.clone(),
     ));
-    let sessions = Arc::new(SessionsService::new(
-        world.session.clone(),
-        conversations.clone(),
-        world.clock.clone(),
-        world.metrics.clone(),
-    ));
     let service = Arc::new(ResponsesService::new(
         world.ledger.clone(),
         world.event_log.clone(),
         world.context.clone(),
         conversations.clone(),
-        sessions.clone(),
         world.clock.clone(),
         world.metrics.clone(),
         cfg.clone(),
@@ -173,13 +164,11 @@ async fn start() -> Harness {
         event_log: world.event_log.clone(),
         context: world.context.clone(),
         conversation_store: world.conversation.clone(),
-        session_store: world.session.clone(),
         clock: world.clock.clone(),
         metrics: world.metrics.clone(),
         keys,
         service,
         conversations,
-        sessions,
         accepting: Arc::new(AtomicBool::new(true)),
     };
 
@@ -295,11 +284,10 @@ impl Harness {
                 scheduler,
                 tools: Arc::new(nova_responses_core::NoopToolExecutor),
                 clock: self.world.clock.clone(),
-                // Mounted, not `None`: with the ports absent every terminal path
-                // would skip the lock release and the tail advance, and this
+                // Mounted, not `None`: with the port absent every terminal path
+                // would skip the marker release and the tail advance, and this
                 // harness could not tell working bookkeeping from missing
                 // bookkeeping.
-                sessions: Some(self.world.session.clone()),
                 conversations: Some(self.world.conversation.clone()),
             },
             nova_agent::AgentConfig::default(),

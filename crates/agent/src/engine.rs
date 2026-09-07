@@ -57,8 +57,8 @@ use nova_responses_core::{
     validate_outcome, AgentId, Attempt, ClaimedResponse, Clock, CompletionsRequest,
     CompletionsRequestScheduler, CompletionsSink, ContextStore, ConversationStore, EventBody,
     FinishReason, RequestProvenance, ResponseEvent, ResponseEventKind, ResponseEventLog,
-    ResponseId, ResponseItem, ResponseLedger, ResponseStatus, SchedulerError, SessionStore,
-    SinkError, SinkVerdict, StoredResponse, TenantId, ToolExecutor, ToolSpec, Usage,
+    ResponseId, ResponseItem, ResponseLedger, ResponseStatus, SchedulerError, SinkError,
+    SinkVerdict, StoredResponse, TenantId, ToolExecutor, Usage,
 };
 use nova_responses_core::{ChainLimits, LedgerError};
 use tracing::{debug, info, warn};
@@ -76,15 +76,10 @@ pub struct AgentDeps {
     /// The background heartbeat task reads it for timestamps and interval sleeps.
     pub clock: Arc<dyn Clock>,
 
-    /// Session and conversation bookkeeping at terminal (D26 / D27).
-    ///
-    /// `Option` rather than a null object, unlike `tools`: these two are used
-    /// *together with* a record field that is itself optional, so "no port
-    /// mounted" and "this response has no session" are already two different
-    /// things. A null object would answer both, and answering the first one
-    /// silently is how a session ends up locked forever with nothing in the log
-    /// to say why.
-    pub sessions: Option<Arc<dyn SessionStore>>,
+    /// Conversation bookkeeping at terminal (D28): releasing the in-flight marker
+    /// and advancing the tail. `Option` rather than a null object, unlike `tools`,
+    /// because "no port mounted" and "this response has no conversation" are two
+    /// different things; a null object would answer both silently.
     pub conversations: Option<Arc<dyn ConversationStore>>,
 }
 
@@ -93,9 +88,6 @@ pub struct AgentConfig {
     pub exec_ttl_ms: u64,
     pub chain_limits: ChainLimits,
     pub retain_after_terminal_ms: u64,
-    /// Functions offered to the model: *what it may call*. The executor in
-    /// [`AgentDeps`] is *what carries the call out*.
-    pub tool_specs: Vec<ToolSpec>,
     /// Hard ceiling on tool-calling rounds per response. A model that never
     /// stops asking for tools reaches [`ResponseStatus::Incomplete`], not an
     /// unbounded loop.
@@ -113,7 +105,6 @@ impl Default for AgentConfig {
             exec_ttl_ms: 300_000,
             chain_limits: ChainLimits::default(),
             retain_after_terminal_ms: 60_000,
-            tool_specs: Vec::new(),
             max_tool_rounds: 20,
             heartbeat_interval_ms: 30_000,
         }
@@ -270,7 +261,10 @@ impl Agent {
                 &conversation,
                 provenance.clone(),
             )
-            .map(|r| r.with_tools(self.cfg.tool_specs.clone()))
+            // Tools come from the caller's per-response declaration, not a static
+            // deployment config (single source of truth: `record.tools` and
+            // `record.tool_choice`).
+            .map(|r| r.with_tools(record.tools.clone()).with_tool_choice(record.tool_choice.clone()))
             {
                 Ok(r) => r,
                 Err(e) => {
@@ -589,10 +583,14 @@ impl Agent {
         let tenant = &record.tenant_id;
         let id = &record.response_id;
 
-        if advance_tail {
-            if let (Some(conversations), Some(conversation_id)) =
-                (&self.deps.conversations, &record.conversation_id)
-            {
+        if let (Some(conversations), Some(conversation_id)) =
+            (&self.deps.conversations, &record.conversation_id)
+        {
+            // Advance the tail **first**. A subscriber that sees `turn_completed`
+            // and immediately reads the transcript (or starts the next turn) must
+            // find the output already there. Reversed, it could read a tail that
+            // has not moved yet, and silently lose the turn just finished.
+            if advance_tail {
                 if let Err(e) = conversations.advance(tenant, conversation_id, id).await {
                     warn!(
                         response = %id,
@@ -603,19 +601,19 @@ impl Agent {
                     );
                 }
             }
-        }
-
-        if let (Some(sessions), Some(session_id)) = (&self.deps.sessions, &record.session_id) {
-            if let Err(e) = sessions
-                .end_turn(tenant, session_id, id, status, now_ms)
+            // Release the in-flight marker (atomically emitting `turn_completed`),
+            // on every terminal path. Failures are logged, not propagated: the
+            // marker is recovered by the admission-side stale takeover.
+            if let Err(e) = conversations
+                .release_active(tenant, conversation_id, id, status, now_ms)
                 .await
             {
                 warn!(
                     response = %id,
-                    session = %session_id,
+                    conversation = %conversation_id,
                     error = %e,
-                    "could not release the turn lock; the session stays busy until \
-                     a later terminal path releases it"
+                    "could not release the turn marker; the conversation stays busy \
+                     until a later terminal path releases it"
                 );
             }
         }

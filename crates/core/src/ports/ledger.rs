@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::context::{ResponseStatus, StoredResponse, Usage};
-use crate::ids::{AgentId, Attempt, IdempotencyKey, ResponseId, SessionId, TenantId};
+use crate::ids::{AgentId, Attempt, ConversationId, IdempotencyKey, ResponseId, TenantId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CreateOutcome {
@@ -13,7 +13,7 @@ pub enum CreateOutcome {
     ReadOnly,
     /// FR-33: queued/in-flight count at or above the configured limit.
     Overloaded,
-    // Still no `Busy` here. The session turn lock (D26) lives in `SessionStore`,
+    // Still no `Busy` here. The turn lock (D28) lives in `ConversationStore`,
     // not the ledger: a lock outcome belongs with the store that holds the lock,
     // and admission is refused before this port is reached.
 }
@@ -27,21 +27,21 @@ pub struct ClaimedResponse {
 
 /// A claim the reap path took away from a holder that stopped reporting.
 ///
-/// Carries the tenant and the session/conversation association, not just the id,
-/// because reaping is a terminal transition and terminal transitions owe the
-/// session layer a lock release (D26) — which needs a tenant. Reading them back
-/// with a follow-up `get` would work but would be a second read of a row the
-/// reaping statement already had in hand, and one that could be deleted in
-/// between.
+/// Carries the tenant and the conversation association, not just the id, because
+/// reaping is a terminal transition and terminal transitions owe the conversation
+/// a marker release (D28) — which needs a tenant. Reading them back with a
+/// follow-up `get` would be a second read of a row the reaping statement already
+/// had in hand, and one that could be deleted in between.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AbortedClaim {
     pub response_id: ResponseId,
     pub previous_attempt: Attempt,
     pub tenant_id: TenantId,
-    /// Session holding the turn lock, if any. Reap **must** release it: the
-    /// previous holder is gone and will never reach its own terminal path.
+    /// Conversation whose in-flight marker this claim held, if any. Reap **must**
+    /// release it: the previous holder is gone and will never reach its own
+    /// terminal path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<SessionId>,
+    pub conversation_id: Option<ConversationId>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq, Serialize, Deserialize)]

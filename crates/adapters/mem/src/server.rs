@@ -5,7 +5,7 @@
 //! binary, so this stays unit-testable without a socket.
 
 use nova_responses_core::{
-    ContextStore, ConversationStore, ResponseEventLog, ResponseLedger, SessionStore,
+    ContextStore, ConversationStore, ResponseEventLog, ResponseLedger,
 };
 
 use crate::proto::{ProtoError, Request, Response};
@@ -13,7 +13,7 @@ use crate::MemWorld;
 
 /// Execute one request against the shared world and produce the response.
 ///
-/// `EventLogReadAfter` and `SessionReadAfter` may block up to their `wait_ms`
+/// `EventLogReadAfter` and `ConversationReadAfter` may block up to their `wait_ms`
 /// (long poll); everything else returns promptly.
 pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
     match req {
@@ -231,111 +231,71 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
                 Err(e) => Response::Err(ProtoError::Conversation(e)),
             }
         }
-        Request::ConversationHealth => match world.conversation.health().await {
-            Ok(()) => Response::ConversationHealth,
-            Err(e) => Response::Err(ProtoError::Conversation(e)),
-        },
-
-        Request::SessionCreate { session, now_ms } => {
-            match world.session.create(session, now_ms).await {
-                Ok(s) => Response::SessionCreate(s),
-                Err(e) => Response::Err(ProtoError::Session(e)),
-            }
-        }
-        Request::SessionGet { tenant, id } => match world.session.get(&tenant, &id).await {
-            Ok(s) => Response::SessionGet(s),
-            Err(e) => Response::Err(ProtoError::Session(e)),
-        },
-        Request::SessionList { tenant } => match world.session.list(&tenant).await {
-            Ok(s) => Response::SessionList(s),
-            Err(e) => Response::Err(ProtoError::Session(e)),
-        },
-        Request::SessionGetByConversation {
-            tenant,
-            conversation,
-        } => match world
-            .session
-            .get_by_conversation(&tenant, &conversation)
-            .await
-        {
-            Ok(s) => Response::SessionGet(s),
-            Err(e) => Response::Err(ProtoError::Session(e)),
-        },
-        Request::SessionDelete { tenant, id } => match world.session.delete(&tenant, &id).await {
-            Ok(removed) => Response::SessionDelete(removed),
-            Err(e) => Response::Err(ProtoError::Session(e)),
-        },
-        Request::SessionDeleteByTenant { tenant } => {
-            match world.session.delete_by_tenant(&tenant).await {
-                Ok(n) => Response::SessionDeleteByTenant(n),
-                Err(e) => Response::Err(ProtoError::Session(e)),
-            }
-        }
-        Request::SessionBeginTurn {
+        Request::ConversationAcquireActive {
             tenant,
             id,
             response_id,
             now_ms,
         } => match world
-            .session
-            .begin_turn(&tenant, &id, &response_id, now_ms)
+            .conversation
+            .acquire_active(&tenant, &id, &response_id, now_ms)
             .await
         {
-            Ok(seq) => Response::SessionSeq(seq),
-            Err(e) => Response::Err(ProtoError::Session(e)),
+            Ok(seq) => Response::ConversationAcquireActive(seq),
+            Err(e) => Response::Err(ProtoError::Conversation(e)),
         },
-        Request::SessionEndTurn {
+        Request::ConversationReleaseActive {
             tenant,
             id,
             response_id,
             status,
             now_ms,
         } => match world
-            .session
-            .end_turn(&tenant, &id, &response_id, status, now_ms)
+            .conversation
+            .release_active(&tenant, &id, &response_id, status, now_ms)
             .await
         {
-            Ok(seq) => Response::SessionSeq(seq),
-            Err(e) => Response::Err(ProtoError::Session(e)),
+            Ok(seq) => Response::ConversationReleaseActive(seq),
+            Err(e) => Response::Err(ProtoError::Conversation(e)),
         },
-        Request::SessionReleaseStaleLock { tenant, id, holder } => match world
-            .session
-            .release_stale_lock(&tenant, &id, &holder)
+        Request::ConversationReleaseStaleActive { tenant, id, holder } => match world
+            .conversation
+            .release_stale_active(&tenant, &id, &holder)
             .await
         {
-            Ok(released) => Response::SessionReleaseStaleLock(released),
-            Err(e) => Response::Err(ProtoError::Session(e)),
+            Ok(released) => Response::ConversationReleaseStaleActive(released),
+            Err(e) => Response::Err(ProtoError::Conversation(e)),
         },
-        Request::SessionAppendEvent {
+        Request::ConversationAppendEvent {
             tenant,
             id,
             kind,
             now_ms,
-        } => match world.session.append_event(&tenant, &id, kind, now_ms).await {
-            Ok(seq) => Response::SessionSeq(seq),
-            Err(e) => Response::Err(ProtoError::Session(e)),
+        } => match world.conversation.append_event(&tenant, &id, kind, now_ms).await {
+            Ok(seq) => Response::ConversationAppendEvent(seq),
+            Err(e) => Response::Err(ProtoError::Conversation(e)),
         },
-        Request::SessionReadAfter {
+        Request::ConversationReadAfter {
             tenant,
             id,
             starting_after,
             limit,
             wait_ms,
         } => match world
-            .session
+            .conversation
             .read_after(&tenant, &id, starting_after, limit, wait_ms)
             .await
         {
-            Ok(events) => Response::SessionReadAfter(events),
-            Err(e) => Response::Err(ProtoError::Session(e)),
+            Ok(events) => Response::ConversationReadAfter(events),
+            Err(e) => Response::Err(ProtoError::Conversation(e)),
         },
-        Request::SessionHealth => match world.session.health().await {
-            Ok(()) => Response::SessionHealth,
-            Err(e) => Response::Err(ProtoError::Session(e)),
+        Request::ConversationList { tenant } => match world.conversation.list(&tenant).await {
+            Ok(list) => Response::ConversationList(list),
+            Err(e) => Response::Err(ProtoError::Conversation(e)),
         },
-        Request::SessionSetMaxEvents { limit } => {
-            world.session.set_max_events_per_session(limit);
-            Response::SessionSetMaxEvents
-        }
+        Request::ConversationHealth => match world.conversation.health().await {
+            Ok(()) => Response::ConversationHealth,
+            Err(e) => Response::Err(ProtoError::Conversation(e)),
+        },
     }
 }

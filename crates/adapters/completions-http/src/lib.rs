@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use nova_responses_core::{
     CompletionsOutcome, CompletionsRequest, CompletionsRequestScheduler, CompletionsSink,
-    FinishReason, SchedulerError, Usage,
+    FinishReason, SchedulerError, ToolCall, Usage,
 };
 
 /// Calls `POST {base_url}/chat/completions` with the request's messages.
@@ -94,6 +94,17 @@ impl HttpChatCompletionsScheduler {
             // `max_tokens` is the widely-supported spelling across compatible
             // providers; `max_completion_tokens` is the newer OpenAI-only name.
             body["max_tokens"] = serde_json::json!(n);
+        }
+        if !request.tools.is_empty() {
+            // `ToolSpec` already serialises in chat-completions wire shape
+            // (`{ type: "function", function: { name, … } }`), so it is passed
+            // through unchanged rather than re-shaped here.
+            body["tools"] = serde_json::json!(request.tools);
+        }
+        if let Some(choice) = &request.tool_choice {
+            // `CompletionsToolChoice` is already the provider's wire shape
+            // (`"auto"` / `"none"` / `"required"` / `{ type:"function", function:{name} }`).
+            body["tool_choice"] = serde_json::json!(choice);
         }
         body
     }
@@ -191,6 +202,9 @@ impl HttpChatCompletionsScheduler {
         let mut text = String::new();
         let mut refusal: Option<String> = None;
         let mut finish = FinishReason::Stop;
+        // Tool calls accumulate across frames: the first chunk for an index
+        // carries the id and name, later chunks append argument fragments.
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
 
         // Each SSE event is a sequence of `field: value` lines ending in a blank
         // line; the only field we read is `data:`. Chunks may split a line, so
@@ -252,9 +266,11 @@ impl HttpChatCompletionsScheduler {
                 if let Some(r) = refusal_text(choice) {
                     refusal.get_or_insert_with(String::new).push_str(&r);
                 }
+                accumulate_tool_calls(choice, &mut tool_calls);
                 if let Some(reason) = choice["finish_reason"].as_str() {
                     finish = match reason {
                         "length" => FinishReason::Length,
+                        "tool_calls" => FinishReason::ToolCalls,
                         _ => FinishReason::Stop,
                     };
                 }
@@ -264,6 +280,24 @@ impl HttpChatCompletionsScheduler {
         if let Some(reason) = refusal {
             let usage = Self::estimated_usage(request, &reason);
             return Ok(CompletionsOutcome::refusal(reason, usage));
+        }
+        // Tool calls short-circuit: a tool-calling turn produces no answer text.
+        // Each call is announced to the sink so a subscriber sees it live, and the
+        // outcome carries the same calls for the agent loop to execute.
+        if !tool_calls.is_empty() {
+            for call in &tool_calls {
+                if sink
+                    .tool_call(call)
+                    .await
+                    .map_err(SchedulerError::from)?
+                    .should_stop()
+                {
+                    return Err(SchedulerError::Superseded);
+                }
+            }
+            let args: String = tool_calls.iter().map(|c| c.arguments.as_str()).collect();
+            let usage = Self::estimated_usage(request, &args);
+            return Ok(CompletionsOutcome::tool_calls(tool_calls, usage));
         }
         if text.is_empty() {
             return Err(SchedulerError::EmptyOutcome);
@@ -341,6 +375,45 @@ fn refusal_text(choice: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// Accumulate tool-call fragments from one SSE delta frame.
+///
+/// Chat-completions streams tool calls incrementally: the first chunk for a given
+/// `index` carries `id` and `function.name`, subsequent chunks carry only
+/// `function.arguments` fragments (with `id`/`name` null). Calls are grouped by
+/// `index` and their argument fragments concatenated in arrival order.
+fn accumulate_tool_calls(choice: &serde_json::Value, tool_calls: &mut Vec<ToolCall>) {
+    let Some(delta) = choice.get("delta") else {
+        return;
+    };
+    let Some(array) = delta["tool_calls"].as_array() else {
+        return;
+    };
+    for tc in array {
+        let index = tc["index"].as_u64().unwrap_or(0) as usize;
+        while tool_calls.len() <= index {
+            tool_calls.push(ToolCall {
+                id: String::new(),
+                name: String::new(),
+                arguments: String::new(),
+            });
+        }
+        let entry = &mut tool_calls[index];
+        if let Some(id) = tc["id"].as_str() {
+            if !id.is_empty() {
+                entry.id = id.to_string();
+            }
+        }
+        if let Some(name) = tc["function"]["name"].as_str() {
+            if !name.is_empty() {
+                entry.name = name.to_string();
+            }
+        }
+        if let Some(args) = tc["function"]["arguments"].as_str() {
+            entry.arguments.push_str(args);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +424,7 @@ mod tests {
             model: model.into(),
             messages: vec![CompletionsMessage::user_text("hello")],
             tools: vec![],
+            tool_choice: None,
             max_completion_tokens: None,
             temperature: None,
             provenance: RequestProvenance {
@@ -407,8 +481,7 @@ mod tests {
         // some wrappers use `thinking`. All must surface, and a plain text delta
         // must not.
         assert_eq!(
-            reasoning_text(&serde_json::json!({"delta": {"reasoning_content": "t1"}}))
-                .as_deref(),
+            reasoning_text(&serde_json::json!({"delta": {"reasoning_content": "t1"}})).as_deref(),
             Some("t1")
         );
         assert_eq!(
@@ -423,6 +496,71 @@ mod tests {
             reasoning_text(&serde_json::json!({"delta": {"content": "t4"}})),
             None
         );
+    }
+
+    #[test]
+    fn accumulate_tool_calls_groups_fragments_by_index() {
+        let mut calls: Vec<ToolCall> = Vec::new();
+        // First frame carries the call's identity plus the start of the arguments.
+        accumulate_tool_calls(
+            &serde_json::json!({"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "calculate", "arguments": "{\"expr"}},
+            ]}}),
+            &mut calls,
+        );
+        // Later frames omit id/name and append only argument fragments.
+        accumulate_tool_calls(
+            &serde_json::json!({"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "ession\":\"3*7\"}"}},
+            ]}}),
+            &mut calls,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "calculate");
+        assert_eq!(calls[0].arguments, "{\"expression\":\"3*7\"}");
+    }
+
+    #[test]
+    fn the_body_sends_tools_when_declared() {
+        let s = HttpChatCompletionsScheduler::new("https://example.test/v1", "sk", None)
+            .expect("build");
+        let mut req = request("gpt-4o");
+        req.tools = vec![nova_responses_core::ToolSpec::new(
+            "calculate".into(),
+            Some("evaluate".into()),
+            serde_json::json!({"type": "object"}),
+        )];
+        let body = s.body(&req);
+        assert!(body["tools"].is_array());
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "calculate");
+
+        // No tools declared → the field is absent rather than sent as an empty array.
+        let plain = s.body(&request("gpt-4o"));
+        assert!(plain.get("tools").is_none());
+    }
+
+    #[test]
+    fn the_body_sends_tool_choice_when_declared() {
+        let s = HttpChatCompletionsScheduler::new("https://example.test/v1", "sk", None)
+            .expect("build");
+        let mut req = request("gpt-4o");
+        req.tool_choice = Some(nova_responses_core::CompletionsToolChoice::Specific {
+            kind: "function".to_string(),
+            function: nova_responses_core::SpecificFunction {
+                name: "calculate".to_string(),
+            },
+        });
+        let body = s.body(&req);
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({"type": "function", "function": {"name": "calculate"}})
+        );
+
+        // Absent → the field is omitted.
+        let plain = s.body(&request("gpt-4o"));
+        assert!(plain.get("tool_choice").is_none());
     }
 
     #[tokio::test]

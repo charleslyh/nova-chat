@@ -49,23 +49,20 @@ pub enum ContextError {
 /// reads as "the thing the UI renders", which is exactly what this does *not*
 /// hold. It holds the items that make up model context.
 ///
-/// That distinction is why the two later ports were added beside this one rather
-/// than folded into it, even though all three are talked about as "the
-/// conversation":
+/// That distinction is why the conversation port was added beside this one rather
+/// than folded into it, even though both are talked about as "the conversation":
 ///
 /// - [`crate::ports::ConversationStore`] holds a **pointer** to the tail of a
-///   chain (D27). It stores no items, so it needs nothing from this trait; a
-///   conversation id resolves to a [`crate::ids::ResponseId`] and context
-///   assembly continues through `resolve_chain` exactly as before. Folding it in
-///   would have meant a second way to reach the same items.
-/// - [`crate::ports::SessionStore`] holds session **state and ordering** —
-///   the turn lock and the durable envelope stream (D26). Its writes must be
-///   atomic with the lock transition, which is a different transaction shape
-///   from anything here.
+///   chain plus the turn lock and the durable envelope stream (D28). It stores no
+///   items, so it needs nothing from this trait; a conversation id resolves to a
+///   [`crate::ids::ResponseId`] and context assembly continues through
+///   `resolve_chain` exactly as before. Folding it in would have meant a second
+///   way to reach the same items. Its lock/stream writes must be atomic with the
+///   lock transition, which is a different transaction shape from anything here.
 ///
-/// This trait's signature is unchanged by either of them. Both new concepts were
-/// deliberately expressed so that the materialised-snapshot contract (D24) stays
-/// the single path by which model context is assembled.
+/// This trait's signature is unchanged by it. The new concept was deliberately
+/// expressed so that the materialised-snapshot contract (D24) stays the single
+/// path by which model context is assembled.
 #[async_trait]
 pub trait ContextStore: Send + Sync {
     async fn put(&self, record: StoredResponse) -> Result<(), ContextError>;

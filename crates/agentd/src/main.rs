@@ -27,13 +27,14 @@ use clap::Parser;
 use nova_agent::{Agent, AgentConfig, AgentDeps, Executed};
 use nova_responses_core::{
     ChainLimits, Clock, CompletionsRequestScheduler, ContextStore, ConversationStore,
-    NoopToolExecutor, ResponseEventLog, ResponseLedger, SessionStore,
+    ResponseEventLog, ResponseLedger,
 };
 use tokio::sync::Semaphore;
 use tracing::info;
 
 use adapters_completions_http::HttpChatCompletionsScheduler;
 use adapters_completions_mock::{EchoScheduler, ScriptedScheduler};
+use adapters_tool_calculator::CalculatorTool;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -100,12 +101,11 @@ struct Backend {
     ledger: Arc<dyn ResponseLedger>,
     event_log: Arc<dyn ResponseEventLog>,
     context: Arc<dyn ContextStore>,
-    /// Needed at terminal, not during generation: releasing the turn lock and
-    /// advancing the conversation tail (D26 / D27). Mounted unconditionally —
-    /// the *record* says whether a given response has an association, so a
-    /// missing port here would silently skip the release for every response.
+    /// Needed at terminal, not during generation: releasing the in-flight marker
+    /// and advancing the conversation tail (D28). Mounted unconditionally — the
+    /// *record* says whether a given response has an association, so a missing
+    /// port here would silently skip the release for every response.
     conversation: Arc<dyn ConversationStore>,
-    session: Arc<dyn SessionStore>,
 }
 
 fn now_ms() -> u64 {
@@ -181,7 +181,6 @@ async fn mount_sql(args: &Args) -> Result<Backend> {
         event_log: Arc::new(event_log),
         context: sql.context.clone(),
         conversation: sql.conversation.clone(),
-        session: sql.session.clone(),
     })
 }
 
@@ -196,7 +195,6 @@ async fn mount_mem(args: &Args) -> Result<Backend> {
         event_log: world.event_log.clone(),
         context: world.context.clone(),
         conversation: world.conversation.clone(),
-        session: world.session.clone(),
     })
 }
 
@@ -223,9 +221,8 @@ async fn main() -> Result<()> {
             event_log: backend.event_log,
             context: backend.context,
             scheduler,
-            tools: Arc::new(NoopToolExecutor),
+            tools: Arc::new(CalculatorTool),
             clock: Arc::new(WallClock),
-            sessions: Some(backend.session),
             conversations: Some(backend.conversation),
         },
         AgentConfig {
@@ -237,7 +234,6 @@ async fn main() -> Result<()> {
                 max_bytes: args.chain_max_bytes,
             },
             retain_after_terminal_ms: args.retain_after_terminal_ms,
-            tool_specs: Vec::new(),
             ..AgentConfig::default()
         },
     ));

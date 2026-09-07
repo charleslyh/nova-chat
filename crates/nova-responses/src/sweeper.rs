@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nova_responses_core::{
-    Clock, ContextStore, MetricsSink, ResponseEvent, ResponseEventKind, ResponseEventLog,
-    ResponseLedger, ResponseStatus, SessionStore,
+    Clock, ContextStore, ConversationStore, MetricsSink, ResponseEvent, ResponseEventKind,
+    ResponseEventLog, ResponseLedger, ResponseStatus,
 };
 use tracing::warn;
 
@@ -26,14 +26,12 @@ pub struct SweepDeps {
     pub ledger: Arc<dyn ResponseLedger>,
     pub event_log: Arc<dyn ResponseEventLog>,
     pub context: Arc<dyn ContextStore>,
-    /// Reaping is a terminal transition, so it owes the session layer a lock
-    /// release (D26). It is also the **only** release a reaped response gets: its
+    /// Reaping is a terminal transition, so it owes the conversation a marker
+    /// release (D28). It is also the **only** release a reaped response gets: its
     /// holder is gone and the fence has moved, so that holder's own terminal path
-    /// is refused as stale. Without this the session stays busy forever.
-    ///
-    /// No `ConversationStore` counterpart: a reaped turn committed no output, so
-    /// there is no tail to advance.
-    pub sessions: Arc<dyn SessionStore>,
+    /// is refused as stale. Without this the conversation stays busy forever. A
+    /// reaped turn committed no output, so there is no tail to advance.
+    pub conversations: Arc<dyn ConversationStore>,
     pub clock: Arc<dyn Clock>,
     pub metrics: Arc<dyn MetricsSink>,
     pub heartbeat_ttl_ms: u64,
@@ -90,15 +88,15 @@ async fn tick(deps: &SweepDeps) -> anyhow::Result<()> {
             .close(&claim.response_id, now, deps.retain_after_terminal_ms)
             .await;
 
-        // Release the turn lock. `Failed` rather than a status of its own: from a
-        // client's point of view a reaped turn is a failed turn, and inventing a
-        // sixth status would oblige every subscriber to learn one.
-        if let Some(session_id) = &claim.session_id {
+        // Release the in-flight marker. `Failed` rather than a status of its own:
+        // from a client's point of view a reaped turn is a failed turn, and
+        // inventing a sixth status would oblige every subscriber to learn one.
+        if let Some(conversation_id) = &claim.conversation_id {
             if let Err(e) = deps
-                .sessions
-                .end_turn(
+                .conversations
+                .release_active(
                     &claim.tenant_id,
-                    session_id,
+                    conversation_id,
                     &claim.response_id,
                     ResponseStatus::Failed,
                     now,
@@ -107,15 +105,15 @@ async fn tick(deps: &SweepDeps) -> anyhow::Result<()> {
             {
                 // Not retried here: the reap already moved the record out of
                 // `in_progress`, so the next tick will not select it again. The
-                // recovery is on the admission side instead — a lock whose holder
-                // is already terminal is taken over by the next `begin_turn`
+                // recovery is on the admission side instead — a marker whose holder
+                // is already terminal is taken over by the next `acquire_active`
                 // (see `ResponsesService::acquire_turn`).
                 warn!(
                     response = %claim.response_id,
-                    session = %session_id,
+                    conversation = %conversation_id,
                     error = %e,
-                    "could not release the turn lock for a reaped claim; the next turn \
-                     on this session will take the stale lock over"
+                    "could not release the turn marker for a reaped claim; the next \
+                     turn on this conversation will take the stale marker over"
                 );
             }
         }

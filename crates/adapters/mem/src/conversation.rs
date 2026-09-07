@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nova_responses_core::{
-    Conversation, ConversationError, ConversationId, ConversationStore, ResponseId, TenantId,
+    Conversation, ConversationError, ConversationEvent, ConversationEventKind, ConversationId,
+    ConversationStore, ResponseId, ResponseStatus, TenantId,
 };
 
 use crate::store::MemStore;
@@ -149,6 +150,195 @@ impl ConversationStore for MemConversationStore {
         };
         g.insert_conversation(updated);
         Ok(())
+    }
+
+    async fn acquire_active(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        response_id: &ResponseId,
+        now_ms: u64,
+    ) -> Result<u64, ConversationError> {
+        self.guard_writable()?;
+        let mut g = self.store.lock();
+        let Some(existing) = g.conversations.get(id) else {
+            return Err(ConversationError::NotFound);
+        };
+        if &existing.tenant_id != tenant {
+            return Err(ConversationError::NotFound);
+        }
+        match existing.active_response_id.clone() {
+            None => {
+                let updated = Conversation {
+                    active_response_id: Some(response_id.clone()),
+                    ..existing.clone()
+                };
+                g.insert_conversation(updated);
+                let seq = g.push_conversation_event(
+                    id,
+                    ConversationEventKind::TurnStarted {
+                        response_id: response_id.clone(),
+                    },
+                    now_ms,
+                );
+                if let Some(stream) = g.conversation_events.get_mut(id) {
+                    stream.lock_seq = Some(seq);
+                }
+                Ok(seq)
+            }
+            Some(holder) if holder == *response_id => {
+                // Re-entrant: return the sequence already assigned.
+                Ok(g
+                    .conversation_events
+                    .get(id)
+                    .and_then(|s| s.lock_seq)
+                    .unwrap_or(0))
+            }
+            Some(holder) => Err(ConversationError::Busy { holder }),
+        }
+    }
+
+    async fn release_active(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        response_id: &ResponseId,
+        status: ResponseStatus,
+        now_ms: u64,
+    ) -> Result<u64, ConversationError> {
+        self.guard_writable()?;
+        let mut g = self.store.lock();
+        let Some(existing) = g.conversations.get(id) else {
+            return Ok(0);
+        };
+        if &existing.tenant_id != tenant {
+            return Ok(0);
+        }
+        // Conditional release: only clear it if we still hold it.
+        if existing.active_response_id.as_ref() != Some(response_id) {
+            return Ok(0);
+        }
+        // Idempotent across execution-side retries.
+        if let Some((last, seq)) = g
+            .conversation_events
+            .get(id)
+            .and_then(|s| s.last_completed.clone())
+        {
+            if last == *response_id {
+                return Ok(seq);
+            }
+        }
+        let updated = Conversation {
+            active_response_id: None,
+            ..existing.clone()
+        };
+        g.insert_conversation(updated);
+        let seq = g.push_conversation_event(
+            id,
+            ConversationEventKind::TurnCompleted {
+                response_id: response_id.clone(),
+                status,
+            },
+            now_ms,
+        );
+        if let Some(stream) = g.conversation_events.get_mut(id) {
+            stream.last_completed = Some((response_id.clone(), seq));
+        }
+        Ok(seq)
+    }
+
+    async fn release_stale_active(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        holder: &ResponseId,
+    ) -> Result<bool, ConversationError> {
+        self.guard_writable()?;
+        let mut g = self.store.lock();
+        let Some(existing) = g.conversations.get(id) else {
+            return Ok(false);
+        };
+        if &existing.tenant_id != tenant {
+            return Ok(false);
+        }
+        if existing.active_response_id.as_ref() != Some(holder) {
+            return Ok(false);
+        }
+        let updated = Conversation {
+            active_response_id: None,
+            ..existing.clone()
+        };
+        g.insert_conversation(updated);
+        Ok(true)
+    }
+
+    async fn append_event(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        kind: ConversationEventKind,
+        now_ms: u64,
+    ) -> Result<u64, ConversationError> {
+        self.guard_writable()?;
+        let mut g = self.store.lock();
+        let Some(existing) = g.conversations.get(id) else {
+            return Err(ConversationError::NotFound);
+        };
+        if &existing.tenant_id != tenant {
+            return Err(ConversationError::NotFound);
+        }
+        Ok(g.push_conversation_event(id, kind, now_ms))
+    }
+
+    async fn read_after(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        starting_after: Option<u64>,
+        limit: usize,
+        _wait_ms: u64,
+    ) -> Result<Vec<ConversationEvent>, ConversationError> {
+        self.guard_available()?;
+        let g = self.store.lock();
+        let Some(existing) = g.conversations.get(id) else {
+            return Err(ConversationError::NotFound);
+        };
+        if &existing.tenant_id != tenant {
+            return Err(ConversationError::NotFound);
+        }
+        let Some(stream) = g.conversation_events.get(id) else {
+            return Ok(Vec::new());
+        };
+        let start = starting_after.map(|s| (s + 1) as usize).unwrap_or(0);
+        Ok(stream
+            .events
+            .iter()
+            .skip(start)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn list(&self, tenant: &TenantId) -> Result<Vec<Conversation>, ConversationError> {
+        self.guard_available()?;
+        let g = self.store.lock();
+        let ids: Vec<ConversationId> = g
+            .conversations_by_tenant
+            .get(tenant)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut out: Vec<Conversation> = ids
+            .iter()
+            .filter_map(|id| g.conversations.get(id).cloned())
+            .collect();
+        // Newest first.
+        out.sort_by_key(|c| std::cmp::Reverse(c.created_at_ms));
+        Ok(out)
+    }
+
+    fn set_max_events_per_conversation(&self, _limit: usize) {
+        // The in-memory carrier is bounded by `max_conversations`, not per-stream;
+        // the sql adapter enforces the per-stream bound. No-op here.
     }
 
     async fn health(&self) -> Result<(), ConversationError> {

@@ -14,28 +14,20 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nova_responses_core::{
-    AgentId, Attempt, Conversation, ConversationId, ResponseId, Session, SessionEvent, SessionId,
-    StoredResponse, TenantId, Usage,
+    AgentId, Attempt, Conversation, ConversationEvent, ConversationEventKind, ConversationId,
+    ResponseId, StoredResponse, TenantId, Usage,
 };
 use parking_lot::{Mutex, MutexGuard};
 
-/// Session state plus its event stream, in one entry.
-///
-/// Held together for the same reason the SQL adapter keeps them in one row and
-/// one transaction: taking the turn lock and appending the event that announces
-/// it must be a single step. Under this mutex that is automatic — which is the
-/// point of putting them here rather than in a store of their own.
-pub(crate) struct SessionRow {
-    pub session: Session,
-    /// Next sequence to hand out. 0-based and contiguous (INV-11), so `events`
-    /// can be indexed directly instead of scanned.
+/// A conversation's event stream (D28). Held beside the conversation under the
+/// same mutex so the in-flight marker and the turn boundary events land together.
+#[derive(Default)]
+pub(crate) struct ConversationEventStream {
     pub next_seq: u64,
-    pub events: Vec<SessionEvent>,
-    /// Sequence assigned to the current turn's `TurnStarted`, so a re-entrant
-    /// `begin_turn` returns it rather than appending a duplicate.
+    pub events: Vec<ConversationEvent>,
+    /// Sequence of the current turn's `TurnStarted`, for re-entrant `acquire_active`.
     pub lock_seq: Option<u64>,
-    /// The last completed turn and the sequence its `TurnCompleted` got, making
-    /// `end_turn` idempotent across execution-side retries.
+    /// Last completed turn and its `TurnCompleted` seq, for idempotent `release_active`.
     pub last_completed: Option<(ResponseId, u64)>,
 }
 
@@ -54,15 +46,14 @@ pub(crate) struct Inner {
     pub partial_usage: HashMap<(ResponseId, Attempt), Usage>,
 
     /// Conversations: a pointer to the tail of a response chain each, with no
-    /// items of their own (D27).
+    /// items of their own (D27), plus the in-flight marker (D28).
     pub conversations: HashMap<ConversationId, Conversation>,
     pub conversations_by_tenant: HashMap<TenantId, BTreeSet<ConversationId>>,
 
-    /// Sessions and their event streams (D26). Under the same mutex as
-    /// `records`, so a turn boundary and the response it refers to cannot be
-    /// observed out of step.
-    pub sessions: HashMap<SessionId, SessionRow>,
-    pub sessions_by_tenant: HashMap<TenantId, BTreeSet<SessionId>>,
+    /// Per-conversation event streams (D28). Kept beside `conversations` under the
+    /// same mutex, so a turn boundary (marker transition + event) and the
+    /// response it refers to cannot be observed out of step.
+    pub conversation_events: HashMap<ConversationId, ConversationEventStream>,
 }
 
 pub struct MemStore {
@@ -72,8 +63,7 @@ pub struct MemStore {
     pending_limit: AtomicUsize,
     max_records: AtomicUsize,
     max_conversations: AtomicUsize,
-    max_sessions: AtomicUsize,
-    max_events_per_session: AtomicUsize,
+    max_events_per_conversation: AtomicUsize,
 }
 
 impl MemStore {
@@ -89,16 +79,14 @@ impl MemStore {
                 partial_usage: HashMap::new(),
                 conversations: HashMap::new(),
                 conversations_by_tenant: HashMap::new(),
-                sessions: HashMap::new(),
-                sessions_by_tenant: HashMap::new(),
+                conversation_events: HashMap::new(),
             }),
             read_only: AtomicBool::new(false),
             unavailable: AtomicBool::new(false),
             pending_limit: AtomicUsize::new(10_000),
             max_records: AtomicUsize::new(100_000),
             max_conversations: AtomicUsize::new(100_000),
-            max_sessions: AtomicUsize::new(100_000),
-            max_events_per_session: AtomicUsize::new(100_000),
+            max_events_per_conversation: AtomicUsize::new(100_000),
         }
     }
 
@@ -139,28 +127,18 @@ impl MemStore {
         self.max_conversations.load(Ordering::SeqCst)
     }
 
-    pub fn set_max_sessions(&self, limit: usize) {
-        self.max_sessions.store(limit.max(1), Ordering::SeqCst);
-    }
-
-    pub fn max_sessions(&self) -> usize {
-        self.max_sessions.load(Ordering::SeqCst)
-    }
-
-    /// Upper bound on one session's event stream.
+    /// Upper bound on one conversation's event stream (D28).
     ///
     /// Reaching it **refuses the append** rather than evicting the oldest events,
-    /// unlike the per-response event ring. The two differ because what they hold
-    /// differs: dropping a token delta costs a subscriber some replay, while
-    /// dropping a turn boundary or a business event loses the only record that it
-    /// happened.
-    pub fn set_max_events_per_session(&self, limit: usize) {
-        self.max_events_per_session
+    /// unlike the per-response event ring: dropping a turn boundary or a business
+    /// event loses the only record that it happened.
+    pub fn set_max_events_per_conversation(&self, limit: usize) {
+        self.max_events_per_conversation
             .store(limit.max(1), Ordering::SeqCst);
     }
 
-    pub fn max_events_per_session(&self) -> usize {
-        self.max_events_per_session.load(Ordering::SeqCst)
+    pub fn max_events_per_conversation(&self) -> usize {
+        self.max_events_per_conversation.load(Ordering::SeqCst)
     }
 
     /// Simulate the store being unreachable, to exercise the refuse-writes
@@ -219,23 +197,31 @@ impl Inner {
             &conversation.tenant_id,
             id,
         );
-        // Response records are deliberately untouched: deletion does not cascade
-        // (D24, and upstream's own wording).
+        // The event stream goes with it; response records are deliberately
+        // untouched (D24, and upstream's own wording).
+        self.conversation_events.remove(id);
         Some(conversation)
     }
 
-    pub fn insert_session(&mut self, row: SessionRow) {
-        self.sessions_by_tenant
-            .entry(row.session.tenant_id.clone())
-            .or_default()
-            .insert(row.session.id.clone());
-        self.sessions.insert(row.session.id.clone(), row);
-    }
-
-    pub fn remove_session(&mut self, id: &SessionId) -> Option<SessionRow> {
-        let row = self.sessions.remove(id)?;
-        Self::unindex(&mut self.sessions_by_tenant, &row.session.tenant_id, id);
-        Some(row)
+    /// Append a conversation event and return its sequence number. Caller holds
+    /// the mutex, so allocation is atomic with any marker transition it is paired
+    /// with.
+    pub fn push_conversation_event(
+        &mut self,
+        id: &ConversationId,
+        kind: ConversationEventKind,
+        now_ms: u64,
+    ) -> u64 {
+        let stream = self.conversation_events.entry(id.clone()).or_default();
+        let seq = stream.next_seq;
+        stream.next_seq += 1;
+        stream.events.push(ConversationEvent {
+            conversation_id: id.clone(),
+            seq,
+            kind,
+            ts_ms: now_ms,
+        });
+        seq
     }
 
     /// Drop `id` from a tenant index, removing the tenant entry once empty so an

@@ -2,15 +2,16 @@
 
 use async_trait::async_trait;
 use nova_responses_core::{
-    AbortedClaim, AgentId, Attempt, ClaimedResponse, CreateOutcome, IdempotencyKey, LedgerError,
-    ResponseId, ResponseLedger, ResponseStatus, SessionId, StoredResponse, TenantId, Usage,
+    AbortedClaim, AgentId, Attempt, ClaimedResponse, ConversationId, CreateOutcome, IdempotencyKey,
+    LedgerError, ResponseId, ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
 };
 use sqlx::{PgPool, Row};
 
 use crate::error::{is_unique_violation, to_ledger_error};
 use crate::row::{
     items_to_json, partial_usage_from_json, partial_usage_to_json, record_from_row, status_to_str,
-    total_usage, usage_from_json, usage_to_json, RECORD_COLUMNS,
+    tool_choice_to_json, tools_to_json, total_usage, usage_from_json, usage_to_json,
+    RECORD_COLUMNS,
 };
 
 pub struct SqlResponseLedger {
@@ -87,8 +88,8 @@ impl ResponseLedger for SqlResponseLedger {
                 response_id, previous_response_id, tenant_id, model, status, stored, node_tag, \
                 attempt, owner, idempotency_key, instructions, input_items, output_items, usage, \
                 partial_usage, integrity, integrity_alg, created_at_ms, completed_at_ms, expires_at_ms, \
-                conversation_id, session_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'{}'::jsonb,$15,$16,$17,$18,$19,$20,$21)";
+                conversation_id, tools, tool_choice) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'{}'::jsonb,$15,$16,$17,$18,$19,$20,$21,$22)";
         let result = sqlx::query(sql)
             .bind(record.response_id.to_string())
             .bind(record.previous_response_id.as_ref().map(|v| v.to_string()))
@@ -110,7 +111,8 @@ impl ResponseLedger for SqlResponseLedger {
             .bind(record.completed_at_ms.map(|v| v as i64))
             .bind(record.expires_at_ms.map(|v| v as i64))
             .bind(record.conversation_id.as_ref().map(|v| v.to_string()))
-            .bind(record.session_id.as_ref().map(|v| v.to_string()))
+            .bind(tools_to_json(&record.tools))
+            .bind(tool_choice_to_json(record.tool_choice.as_ref()))
             .execute(&self.pool)
             .await;
 
@@ -443,7 +445,7 @@ impl SqlResponseLedger {
 /// Named once so the two call sites cannot return different column sets and only
 /// fail at decode time, on the reap path, in production.
 const ABORTED_COLUMNS: &str =
-    "response_id, attempt - 1 AS previous_attempt, tenant_id, session_id";
+    "response_id, attempt - 1 AS previous_attempt, tenant_id, conversation_id";
 
 fn collect_aborted(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<AbortedClaim>, LedgerError> {
     let mut out = Vec::with_capacity(rows.len());
@@ -451,18 +453,19 @@ fn collect_aborted(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<AbortedClaim>
         let raw: String = row.try_get("response_id").map_err(to_ledger_error)?;
         let previous: i64 = row.try_get("previous_attempt").map_err(to_ledger_error)?;
         let tenant_raw: String = row.try_get("tenant_id").map_err(to_ledger_error)?;
-        let session_raw: Option<String> = row.try_get("session_id").map_err(to_ledger_error)?;
+        let conversation_raw: Option<String> =
+            row.try_get("conversation_id").map_err(to_ledger_error)?;
         out.push(AbortedClaim {
             response_id: ResponseId::parse(&raw)
                 .map_err(|e| LedgerError::Internal(e.to_string()))?,
             previous_attempt: Attempt(previous.max(0) as u64),
             tenant_id: TenantId::parse(&tenant_raw)
                 .map_err(|e| LedgerError::Internal(format!("tenant_id: {e}")))?,
-            session_id: match session_raw {
+            conversation_id: match conversation_raw {
                 None => None,
                 Some(raw) => Some(
-                    SessionId::parse(&raw)
-                        .map_err(|e| LedgerError::Internal(format!("session_id: {e}")))?,
+                    ConversationId::parse(&raw)
+                        .map_err(|e| LedgerError::Internal(format!("conversation_id: {e}")))?,
                 ),
             },
         });

@@ -34,12 +34,13 @@ fn tenant() -> TenantId {
 fn record(id: &ResponseId, text: &str, stored: bool) -> StoredResponse {
     StoredResponse {
         conversation_id: None,
-        session_id: None,
         response_id: id.clone(),
         previous_response_id: None,
         tenant_id: tenant(),
         model: "m".into(),
         instructions: None,
+        tools: Vec::new(),
+        tool_choice: None,
         input_items: vec![ResponseItem::Message {
             role: Role::User,
             content: vec![ContentPart::InputText { text: text.into() }],
@@ -91,10 +92,9 @@ fn agent_with(
             scheduler,
             tools,
             clock: world.clock.clone(),
-            // Mounted, not `None`: with the ports absent every terminal path
-            // would skip the release and this fixture could not tell a working
-            // release from a missing one.
-            sessions: Some(world.session.clone()),
+            // Mounted, not `None`: with the port absent every terminal path would
+            // skip the release and this fixture could not tell a working release
+            // from a missing one.
             conversations: Some(world.conversation.clone()),
         },
         cfg,

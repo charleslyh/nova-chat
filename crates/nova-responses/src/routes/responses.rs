@@ -18,8 +18,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::{
-    api_error, bad_request, map_context_error, map_conversation_error, map_ledger_error,
-    map_session_error, not_found,
+    api_error, bad_request, map_context_error, map_conversation_error, map_ledger_error, not_found,
 };
 use crate::routes::shared::tenant_or_reject;
 use crate::service::{ContextSource, CreateResult, ServiceError};
@@ -50,10 +49,9 @@ fn map_service_error(err: &ServiceError) -> Response {
             let (status, code, message) = map_event_log_error(e);
             api_error(status, code, message)
         }
+        // Notably includes `Busy` → 409: a second concurrent turn on one
+        // conversation is refused, never queued behind the running one.
         ServiceError::Conversation(e) => map_conversation_error(e),
-        // Notably includes `Busy` → 409: a second concurrent turn on one session
-        // is refused, never queued behind the running one.
-        ServiceError::Session(e) => map_session_error(e),
     }
 }
 
@@ -126,7 +124,7 @@ pub async fn create(
     };
 
     // Only parsing happens here. Resolving what the source *means* — a
-    // conversation's tail, and the session lock that goes with it — is the
+    // conversation's tail, and the turn lock that goes with it — is the
     // capability layer's job, so no facade can bypass it.
     let source = match context_source(&request) {
         Ok(source) => source,

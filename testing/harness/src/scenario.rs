@@ -12,8 +12,8 @@ use nova_responses_core::protocol::{CreateResponseRequest, InputLimits};
 use nova_responses_core::{
     canonical_items, AgentId, Attempt, ChainLimits, ContextError, ContextStore, ConversationStore,
     CreateOutcome, EventLogError, IdempotencyKey, NodeTag, ResponseEvent, ResponseEventKind,
-    ResponseEventLog, ResponseId, ResponseItem, ResponseLedger, ResponseStatus, SessionStore,
-    StoredResponse, TenantId, Usage,
+    ResponseEventLog, ResponseId, ResponseItem, ResponseLedger, ResponseStatus, StoredResponse,
+    TenantId, Usage,
 };
 use serde::Deserialize;
 
@@ -357,12 +357,13 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let id = ResponseId::new(ctx.node_tag.clone());
             let record = StoredResponse {
                 conversation_id: None,
-                session_id: None,
                 response_id: id.clone(),
                 previous_response_id: previous_id.clone(),
                 tenant_id: tenant_id.clone(),
                 model: "test-model".into(),
                 instructions: instructions.clone(),
+                tools: Vec::new(),
+                tool_choice: None,
                 input_items: vec![ResponseItem::user_text(input)],
                 output_items: vec![],
                 reasoning: None,
@@ -653,12 +654,12 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 // Reap is the only release a reaped response gets: its holder is
                 // gone and the fence has moved, so that holder's own terminal path
                 // is refused as stale.
-                if let Some(session_id) = &claim.session_id {
+                if let Some(conversation_id) = &claim.conversation_id {
                     ctx.world
-                        .session
-                        .end_turn(
+                        .conversation
+                        .release_active(
                             &claim.tenant_id,
-                            session_id,
+                            conversation_id,
                             &claim.response_id,
                             ResponseStatus::Failed,
                             ctx.now_ms,
@@ -1059,12 +1060,12 @@ async fn settle_session(
                 .await?;
         }
     }
-    if let Some(session_id) = &record.session_id {
+    if let Some(conversation_id) = &record.conversation_id {
         ctx.world
-            .session
-            .end_turn(
+            .conversation
+            .release_active(
                 &record.tenant_id,
-                session_id,
+                conversation_id,
                 &record.response_id,
                 status,
                 ctx.now_ms,
