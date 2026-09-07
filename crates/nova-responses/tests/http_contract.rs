@@ -294,6 +294,7 @@ impl Harness {
                 context: self.world.context.clone(),
                 scheduler,
                 tools: Arc::new(nova_responses_core::NoopToolExecutor),
+                clock: self.world.clock.clone(),
                 // Mounted, not `None`: with the ports absent every terminal path
                 // would skip the lock release and the tail advance, and this
                 // harness could not tell working bookkeeping from missing

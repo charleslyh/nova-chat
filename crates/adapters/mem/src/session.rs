@@ -168,6 +168,28 @@ impl SessionStore for MemSessionStore {
             .map(|row| row.session.clone()))
     }
 
+    async fn list(&self, tenant: &TenantId) -> Result<Vec<Session>, SessionError> {
+        self.guard_available()?;
+        let g = self.store.lock();
+        let mut sessions: Vec<Session> = g
+            .sessions_by_tenant
+            .get(tenant)
+            .map(|set| {
+                set.iter()
+                    .filter_map(|id| g.sessions.get(id).map(|row| row.session.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Newest first: a tie cannot happen (created_at is monotonic), but the id
+        // fallback keeps the order total even across a clock that is not.
+        sessions.sort_by(|a, b| {
+            b.created_at_ms
+                .cmp(&a.created_at_ms)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(sessions)
+    }
+
     async fn delete(&self, tenant: &TenantId, id: &SessionId) -> Result<bool, SessionError> {
         self.guard_writable()?;
         let mut g = self.store.lock();

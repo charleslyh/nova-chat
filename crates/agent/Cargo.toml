@@ -11,12 +11,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Background heartbeat task (spawn / sleep / abort) while a generation runs.
+tokio = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
 # Model-free schedulers, so the whole loop is exercised without a provider.
 adapters-completions-mock = { workspace = true }
 # Substrate for driving the engine end to end without a database.
 adapters-mem = { workspace = true }
+# `test-util` enables `tokio::time::pause` / `advance` for the heartbeat tests.
+tokio = { workspace = true, features = ["test-util"] }
 uuid = { workspace = true }

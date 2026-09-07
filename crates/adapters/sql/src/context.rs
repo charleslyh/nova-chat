@@ -14,7 +14,9 @@ use sqlx::PgPool;
 use std::sync::Arc;
 
 use crate::error::to_context_error;
-use crate::row::{items_to_json, record_from_row, status_to_str, usage_to_json, RECORD_COLUMNS};
+use crate::row::{
+    items_to_json, reasoning_to_json, record_from_row, status_to_str, usage_to_json, RECORD_COLUMNS,
+};
 
 pub struct SqlContextStore {
     pool: PgPool,
@@ -64,11 +66,12 @@ impl ContextStore for SqlContextStore {
         self.sign(&mut record)?;
         let sql = "INSERT INTO responses (\
                 response_id, previous_response_id, tenant_id, model, status, stored, node_tag, \
-                attempt, owner, idempotency_key, instructions, input_items, output_items, context, \
+                attempt, owner, idempotency_key, instructions, input_items, output_items, \
+                reasoning, context, context_reasoning, \
                 context_depth, usage, \
                 integrity, integrity_alg, created_at_ms, completed_at_ms, expires_at_ms, \
                 conversation_id, session_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25) \
              ON CONFLICT (response_id) DO UPDATE SET \
                 status = EXCLUDED.status, \
                 stored = EXCLUDED.stored, \
@@ -77,7 +80,9 @@ impl ContextStore for SqlContextStore {
                 instructions = EXCLUDED.instructions, \
                 input_items = EXCLUDED.input_items, \
                 output_items = EXCLUDED.output_items, \
+                reasoning = EXCLUDED.reasoning, \
                 context = EXCLUDED.context, \
+                context_reasoning = EXCLUDED.context_reasoning, \
                 context_depth = EXCLUDED.context_depth, \
                 usage = EXCLUDED.usage, \
                 integrity = EXCLUDED.integrity, \
@@ -100,7 +105,9 @@ impl ContextStore for SqlContextStore {
             .bind(record.instructions.as_deref())
             .bind(items_to_json(&record.input_items))
             .bind(items_to_json(&record.output_items))
+            .bind(record.reasoning.as_deref())
             .bind(items_to_json(&record.context))
+            .bind(reasoning_to_json(&record.context_reasoning))
             .bind(record.context_depth as i64)
             .bind(usage_to_json(&record.usage))
             .bind(record.integrity.as_deref())
@@ -121,6 +128,7 @@ impl ContextStore for SqlContextStore {
         tenant: &TenantId,
         response_id: &ResponseId,
         items: Vec<ResponseItem>,
+        reasoning: Option<String>,
         usage: Usage,
         status: ResponseStatus,
         now_ms: u64,
@@ -134,17 +142,19 @@ impl ContextStore for SqlContextStore {
         // Supplied directly by the execution side; never replayed from events
         // (INV-48).
         updated.output_items = items;
+        updated.reasoning = reasoning;
         updated.usage = usage;
         updated.status = status;
         updated.completed_at_ms = Some(now_ms);
         self.sign(&mut updated)?;
 
         let affected = sqlx::query(
-            "UPDATE responses SET output_items = $1, usage = $2, status = $3, \
-                completed_at_ms = $4, integrity = $5, integrity_alg = $6 \
-             WHERE response_id = $7 AND tenant_id = $8",
+            "UPDATE responses SET output_items = $1, reasoning = $2, usage = $3, status = $4, \
+                completed_at_ms = $5, integrity = $6, integrity_alg = $7 \
+             WHERE response_id = $8 AND tenant_id = $9",
         )
         .bind(items_to_json(&updated.output_items))
+        .bind(updated.reasoning.as_deref())
         .bind(usage_to_json(&updated.usage))
         .bind(status_to_str(status))
         .bind(now_ms as i64)
@@ -220,9 +230,8 @@ impl ContextStore for SqlContextStore {
         self.verify(&record)?;
 
         // Flat materialised history (D24): the ancestors' snapshot plus this
-        // response's own items.
-        let mut items = record.context.clone();
-        items.extend(record.chain_items().cloned());
+        // response's own items, with reasoning blocks aligned for rendering.
+        let (items, reasoning) = record.resolved_items_and_reasoning();
 
         let depth = record.context_depth.saturating_add(1);
         if depth > limits.max_depth {
@@ -244,6 +253,7 @@ impl ContextStore for SqlContextStore {
 
         Ok(ResolvedContext {
             items,
+            reasoning,
             depth,
             bytes,
         })

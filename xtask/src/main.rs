@@ -199,6 +199,13 @@ async fn procs(action: &str) -> Result<()> {
                     "scripted",
                     "--scheduler-script",
                     "testing/config/l2-agent-script.yaml",
+                    // The sweep fixture reaps at 2000ms; the heartbeat must fire
+                    // well inside that or any generation the agent does not finish
+                    // instantly gets reaped mid-flight (see the default of 30s
+                    // against a 2s TTL, which is exactly the mismatch that made
+                    // background-then-subscribe flake).
+                    "--heartbeat-interval-ms",
+                    "500",
                 ],
                 run_dir.join("agentd.pid"),
             )?;

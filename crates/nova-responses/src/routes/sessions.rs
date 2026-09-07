@@ -119,6 +119,29 @@ pub async fn create(
     }
 }
 
+/// GET /v1/sessions
+///
+/// 列出该租户的全部会话，新在前。列表只给「有哪些会话」这一维，逐会话的内容仍走
+/// `GET /v1/sessions/{id}` 与 transcript——列表不承载气泡。
+pub async fn list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let tenant = match tenant_or_reject(&state, &headers) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+
+    match state.sessions.list(&tenant).await {
+        Ok(sessions) => Json(json!({
+            "object": "list",
+            "data": sessions.iter().map(session_object).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => map_session_error(&e),
+    }
+}
+
 /// GET /v1/sessions/{id}
 pub async fn retrieve(
     State(state): State<AppState>,
@@ -287,10 +310,21 @@ pub async fn transcript(
 /// 形状刻意与官方的列表约定一致（`object: "list"` + `data`），但**没有** `has_more`
 /// 或游标字段：一次就是全部，声明一个永远为假的 `has_more` 只会让调用方以为这里
 /// 有分页可翻。
+///
+/// `data` 在条目间穿插 `{"type":"reasoning","text":…}` 块：思考过程与对话内容
+/// 同属「页面恢复所需的内容」，放在一起调用方才能按原顺序重放。reasoning 块不是
+/// 条目（不进入模型上下文），但必须在刷新后仍可见，否则呈现与流式时不一致。
 fn transcript_object(id: &SessionId, context: &ResolvedContext) -> Value {
+    let mut data: Vec<Value> = Vec::with_capacity(context.items.len());
+    for (item, reasoning) in context.items.iter().zip(context.reasoning.iter()) {
+        if let Some(text) = reasoning {
+            data.push(json!({ "type": "reasoning", "text": text }));
+        }
+        data.push(serde_json::to_value(item).unwrap_or_default());
+    }
     json!({
         "object": "list",
         "session_id": id.to_string(),
-        "data": context.items,
+        "data": data,
     })
 }

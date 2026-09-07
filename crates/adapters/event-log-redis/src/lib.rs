@@ -146,7 +146,9 @@ fn rebuild_body(kind: ResponseEventKind, rest: &serde_json::Map<String, serde_js
         | ResponseEventKind::Incomplete => EventBody::Response {
             response: rest.get("response").cloned().unwrap_or(serde_json::Value::Null),
         },
-        ResponseEventKind::OutputTextDelta | ResponseEventKind::FunctionCallArgumentsDelta => {
+        ResponseEventKind::OutputTextDelta
+        | ResponseEventKind::FunctionCallArgumentsDelta
+        | ResponseEventKind::ReasoningTextDelta => {
             EventBody::Delta {
                 item_id: get_string(rest, "item_id"),
                 output_index: get_u32(rest, "output_index"),

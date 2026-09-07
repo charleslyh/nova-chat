@@ -116,6 +116,17 @@ pub struct StoredResponse {
     #[serde(default)]
     pub output_items: Vec<ResponseItem>,
 
+    /// Reasoning / thinking text streamed by a reasoning model for this
+    /// response, concatenated into one string.
+    ///
+    /// Persisted so a re-render shows the same thinking it showed during
+    /// streaming, but **never** fed back as context: a model does not read its
+    /// own thinking, and [`ResponseItem`] keeps `reasoning` out of the subset.
+    /// Like `instructions`, it is render-only and therefore not part of the
+    /// integrity tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+
     pub status: ResponseStatus,
     #[serde(default)]
     pub usage: Usage,
@@ -162,6 +173,16 @@ pub struct StoredResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<ResponseItem>,
 
+    /// Materialised reasoning of every ancestor, aligned to [`Self::context`]:
+    /// one entry per item, where `Some(text)` marks a reasoning block to render
+    /// immediately before that item.
+    ///
+    /// Kept separate from `context` so reasoning can be materialised for
+    /// rendering (D24) **without** ever entering the model context, which is
+    /// assembled from `context` alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_reasoning: Vec<Option<String>>,
+
     /// How many ancestors contributed to `context`.
     ///
     /// Kept separate because a flat list cannot recover this — one turn may hold
@@ -184,6 +205,35 @@ impl StoredResponse {
 
     pub fn chain_byte_len(&self) -> usize {
         self.chain_items().map(ResponseItem::byte_len).sum()
+    }
+
+    /// The resolved history this record anchors: the materialised ancestors plus
+    /// this record's own items, paired with reasoning blocks aligned to the item
+    /// list (one entry per item; `Some(text)` marks a reasoning block to render
+    /// immediately before that item).
+    ///
+    /// The alignment rule lives here — not in each backend — so both stores
+    /// materialise reasoning identically. Reasoning precedes this record's
+    /// output: it is the thinking that produced the answer, and it never enters
+    /// the model context (that is assembled from `context`/`items` alone).
+    pub fn resolved_items_and_reasoning(&self) -> (Vec<ResponseItem>, Vec<Option<String>>) {
+        let mut items = self.context.clone();
+        let mut reasoning = self.context_reasoning.clone();
+        // Defensive: a legacy or hand-built record may carry mismatched lengths.
+        // Reasoning is render-only, so recovering by padding is always safe.
+        reasoning.resize(items.len(), None);
+
+        items.extend(self.input_items.iter().cloned());
+        reasoning.extend(std::iter::repeat(None).take(self.input_items.len()));
+
+        items.extend(self.output_items.iter().cloned());
+        // The reasoning block sits at the boundary before the first output item;
+        // `resize` pads the remaining output items (or trims when output is
+        // empty, where reasoning is meaningless).
+        reasoning.push(self.reasoning.clone());
+        reasoning.resize(items.len(), None);
+
+        (items, reasoning)
     }
 
     /// Whether this record may be used as `previous_response_id` by `tenant`.
@@ -216,6 +266,7 @@ impl StoredResponse {
             "store": self.stored,
             "input": self.input_items,
             "output": self.output_items,
+            "reasoning": self.reasoning,
             "usage": {
                 "input_tokens": self.usage.input_tokens,
                 "output_tokens": self.usage.output_tokens,
@@ -248,6 +299,11 @@ impl Default for ChainLimits {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ResolvedContext {
     pub items: Vec<ResponseItem>,
+    /// Reasoning blocks aligned to `items`: one entry per item, `Some(text)`
+    /// meaning a reasoning block precedes that item. Render-only — never fed
+    /// back into model context.
+    #[serde(default)]
+    pub reasoning: Vec<Option<String>>,
     pub depth: usize,
     pub bytes: usize,
 }
@@ -271,6 +327,7 @@ mod tests {
             instructions: Some("secret system prompt".into()),
             input_items: vec![ResponseItem::user_text("in")],
             output_items: vec![ResponseItem::assistant_text("out")],
+            reasoning: None,
             status: ResponseStatus::Completed,
             usage: Usage::new(1, 2),
             created_at_ms: 0,
@@ -284,6 +341,7 @@ mod tests {
             owner: None,
             attempt: Attempt::default(),
             context: Vec::new(),
+            context_reasoning: Vec::new(),
             context_depth: 0,
         }
     }

@@ -74,11 +74,15 @@ pub trait ContextStore: Send + Sync {
     ///
     /// Items are supplied by the execution side directly; they are **never**
     /// derived by replaying the event stream (INV-48).
+    ///
+    /// `reasoning` is the concatenated thinking text streamed during the turn.
+    /// It is persisted for rendering but is not part of chain resolution.
     async fn append_output(
         &self,
         tenant: &TenantId,
         response_id: &ResponseId,
         items: Vec<ResponseItem>,
+        reasoning: Option<String>,
         usage: Usage,
         status: ResponseStatus,
         now_ms: u64,

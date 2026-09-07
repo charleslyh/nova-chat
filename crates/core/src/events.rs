@@ -13,6 +13,13 @@ pub enum ResponseEventKind {
     InProgress,
     #[serde(rename = "response.output_text.delta")]
     OutputTextDelta,
+    /// Reasoning / thinking text streamed by a reasoning model (DeepSeek-R1,
+    /// o1, QwQ, …). Never an item and never fed back as context (a model does
+    /// not read its own thinking, and D22 keeps `reasoning` out of the item
+    /// subset); it is persisted on the response for re-render, but as a field,
+    /// not as an output item.
+    #[serde(rename = "response.reasoning_text.delta")]
+    ReasoningTextDelta,
     #[serde(rename = "response.output_item.added")]
     OutputItemAdded,
     #[serde(rename = "response.output_item.done")]
@@ -41,7 +48,9 @@ impl ResponseEventKind {
     pub fn coalescible(self) -> bool {
         matches!(
             self,
-            ResponseEventKind::OutputTextDelta | ResponseEventKind::FunctionCallArgumentsDelta
+            ResponseEventKind::OutputTextDelta
+                | ResponseEventKind::FunctionCallArgumentsDelta
+                | ResponseEventKind::ReasoningTextDelta
         )
     }
 
@@ -60,6 +69,7 @@ impl ResponseEventKind {
             ResponseEventKind::Created => "response.created",
             ResponseEventKind::InProgress => "response.in_progress",
             ResponseEventKind::OutputTextDelta => "response.output_text.delta",
+            ResponseEventKind::ReasoningTextDelta => "response.reasoning_text.delta",
             ResponseEventKind::OutputItemAdded => "response.output_item.added",
             ResponseEventKind::OutputItemDone => "response.output_item.done",
             ResponseEventKind::FunctionCallArgumentsDelta => "response.function_call_arguments.delta",
@@ -212,6 +222,30 @@ impl ResponseEvent {
         }
     }
 
+    /// A reasoning / thinking fragment (`response.reasoning_text.delta`).
+    ///
+    /// It carries no item id and no content index, because reasoning is not an
+    /// output item (D22 keeps `reasoning` out of the subset). The stream carries
+    /// it for live rendering; persistence happens on the stored response.
+    pub fn reasoning_text_delta(
+        response_id: ResponseId,
+        attempt: Attempt,
+        delta: impl Into<String>,
+    ) -> Self {
+        Self {
+            response_id,
+            sequence_number: 0,
+            kind: ResponseEventKind::ReasoningTextDelta,
+            attempt: Some(attempt),
+            body: EventBody::Delta {
+                item_id: String::new(),
+                output_index: 0,
+                content_index: None,
+                delta: delta.into(),
+            },
+        }
+    }
+
     /// The completed text of an output_text part (`response.output_text.done`).
     pub fn output_text_done(
         response_id: ResponseId,
@@ -313,6 +347,10 @@ mod tests {
                 "\"response.output_text.delta\"",
             ),
             (
+                ResponseEventKind::ReasoningTextDelta,
+                "\"response.reasoning_text.delta\"",
+            ),
+            (
                 ResponseEventKind::OutputItemAdded,
                 "\"response.output_item.added\"",
             ),
@@ -346,6 +384,7 @@ mod tests {
     fn only_incremental_events_are_coalescible() {
         assert!(ResponseEventKind::OutputTextDelta.coalescible());
         assert!(ResponseEventKind::FunctionCallArgumentsDelta.coalescible());
+        assert!(ResponseEventKind::ReasoningTextDelta.coalescible());
         for kind in [
             ResponseEventKind::Created,
             ResponseEventKind::InProgress,

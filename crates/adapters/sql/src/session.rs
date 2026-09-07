@@ -265,6 +265,19 @@ impl SessionStore for SqlSessionStore {
         row.as_ref().map(session_from_row).transpose()
     }
 
+    async fn list(&self, tenant: &TenantId) -> Result<Vec<Session>, SessionError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions \
+             WHERE tenant_id = $1 ORDER BY created_at_ms DESC, session_id"
+        ))
+        .bind(tenant.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(to_session_error)?;
+
+        rows.iter().map(session_from_row).collect()
+    }
+
     async fn delete(&self, tenant: &TenantId, id: &SessionId) -> Result<bool, SessionError> {
         // `session_events` goes with it through `ON DELETE CASCADE`.
         let result = sqlx::query("DELETE FROM sessions WHERE session_id = $1 AND tenant_id = $2")

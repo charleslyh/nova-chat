@@ -36,6 +36,7 @@ fn record(
         instructions: Some("SYSTEM-PROMPT-MARKER".into()),
         input_items: vec![ResponseItem::user_text(format!("in-{}", id.uuid()))],
         output_items: vec![ResponseItem::assistant_text(format!("out-{}", id.uuid()))],
+        reasoning: None,
         status: ResponseStatus::Completed,
         usage: Usage::new(1, 1),
         created_at_ms: 0,
@@ -49,6 +50,7 @@ fn record(
         owner: None,
         attempt: Attempt::default(),
         context: Vec::new(),
+        context_reasoning: Vec::new(),
         context_depth: 0,
     }
 }

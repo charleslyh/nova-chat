@@ -141,6 +141,7 @@ impl ResponsesService {
 
         // 解析前驱历史（D24）：在创建前固化扁平快照，断裂即失败，不留半创建记录。
         let mut snapshot: Vec<ResponseItem> = Vec::new();
+        let mut snapshot_reasoning: Vec<Option<String>> = Vec::new();
         let mut snapshot_depth: usize = 0;
         if let Some(previous) = &previous {
             let resolved = self
@@ -151,6 +152,8 @@ impl ResponsesService {
                 .incr("chain_resolved_depth", resolved.depth as u64)
                 .await;
             snapshot = resolved.items;
+            // 祖先的 reasoning 随快照一起物化，用于渲染；不进模型上下文。
+            snapshot_reasoning = resolved.reasoning;
             snapshot_depth = resolved.depth;
         }
 
@@ -197,6 +200,7 @@ impl ResponsesService {
             instructions: request.instructions.clone(),
             input_items,
             output_items: Vec::new(),
+            reasoning: None,
             status: ResponseStatus::Queued,
             usage: Usage::default(),
             created_at_ms: now_ms,
@@ -210,6 +214,7 @@ impl ResponsesService {
             owner: None,
             attempt: Attempt::default(),
             context: snapshot,
+            context_reasoning: snapshot_reasoning,
             context_depth: snapshot_depth,
         };
 

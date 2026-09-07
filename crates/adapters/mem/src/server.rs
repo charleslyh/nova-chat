@@ -138,12 +138,13 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
             tenant,
             response_id,
             items,
+            reasoning,
             usage,
             status,
             now_ms,
         } => match world
             .context
-            .append_output(&tenant, &response_id, items, usage, status, now_ms)
+            .append_output(&tenant, &response_id, items, reasoning, usage, status, now_ms)
             .await
         {
             Ok(()) => Response::ContextAppendOutput,
@@ -243,6 +244,10 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
         }
         Request::SessionGet { tenant, id } => match world.session.get(&tenant, &id).await {
             Ok(s) => Response::SessionGet(s),
+            Err(e) => Response::Err(ProtoError::Session(e)),
+        },
+        Request::SessionList { tenant } => match world.session.list(&tenant).await {
+            Ok(s) => Response::SessionList(s),
             Err(e) => Response::Err(ProtoError::Session(e)),
         },
         Request::SessionGetByConversation {

@@ -77,6 +77,19 @@ pub trait CompletionsSink: Send {
     /// align to tokens, words, or grapheme clusters.
     async fn text_delta(&mut self, text: &str) -> Result<SinkVerdict, SinkError>;
 
+    /// Push a reasoning / thinking fragment.
+    ///
+    /// Distinct from [`CompletionsSink::text_delta`] because reasoning never
+    /// becomes an output item and never re-enters context. A sink that persists
+    /// it (the agent's [`LedgerSink`]) accumulates it for re-render; the default
+    /// ignores it, so the mock schedulers need no change.
+    async fn reasoning_text_delta(
+        &mut self,
+        _text: &str,
+    ) -> Result<SinkVerdict, SinkError> {
+        Ok(SinkVerdict::Continue)
+    }
+
     /// A new output item appears.
     ///
     /// For a `function_call` this precedes its argument deltas; for a
@@ -283,6 +296,8 @@ pub struct CollectingSink {
     pub done: Vec<ResponseItem>,
     /// Argument fragments announced via `function_call_arguments_delta`.
     pub arg_deltas: Vec<String>,
+    /// Reasoning / thinking fragments announced via `reasoning_text_delta`.
+    pub reasoning: Vec<String>,
     /// Complete arguments announced via `function_call_arguments_done`.
     pub arg_dones: Vec<String>,
     /// `content_index` values announced via `content_part_added`.
@@ -325,6 +340,11 @@ impl CompletionsSink for CollectingSink {
             Some(n) if self.deltas.len() >= n => Ok(SinkVerdict::Stop),
             _ => Ok(SinkVerdict::Continue),
         }
+    }
+
+    async fn reasoning_text_delta(&mut self, text: &str) -> Result<SinkVerdict, SinkError> {
+        self.reasoning.push(text.to_string());
+        Ok(SinkVerdict::Continue)
     }
 
     async fn tool_call(&mut self, call: &ToolCall) -> Result<SinkVerdict, SinkError> {

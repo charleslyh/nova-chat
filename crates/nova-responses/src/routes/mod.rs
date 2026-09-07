@@ -52,7 +52,7 @@ pub fn router(state: AppState) -> Router {
                 .delete(conversations::delete),
         )
         // Self-hosted session layer.
-        .route("/v1/sessions", post(sessions::create))
+        .route("/v1/sessions", get(sessions::list).post(sessions::create))
         .route(
             "/v1/sessions/{id}",
             get(sessions::retrieve).delete(sessions::delete),

@@ -26,12 +26,13 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nova_agent::{Agent, AgentConfig, AgentDeps, Executed};
 use nova_responses_core::{
-    ChainLimits, CompletionsRequestScheduler, ContextStore, ConversationStore, NoopToolExecutor,
-    ResponseEventLog, ResponseLedger, SessionStore,
+    ChainLimits, Clock, CompletionsRequestScheduler, ContextStore, ConversationStore,
+    NoopToolExecutor, ResponseEventLog, ResponseLedger, SessionStore,
 };
 use tokio::sync::Semaphore;
 use tracing::info;
 
+use adapters_completions_http::HttpChatCompletionsScheduler;
 use adapters_completions_mock::{EchoScheduler, ScriptedScheduler};
 
 #[derive(Debug, Parser)]
@@ -56,6 +57,12 @@ struct Args {
     #[arg(long, default_value_t = 3_600_000)]
     exec_ttl_ms: u64,
 
+    /// Keep-alive heartbeat interval while a generation runs, in milliseconds.
+    /// Must be shorter than the sweeper's heartbeat TTL, otherwise long
+    /// generations get reaped mid-flight.
+    #[arg(long, default_value_t = 30_000)]
+    heartbeat_interval_ms: u64,
+
     /// How long a terminal response's events stay readable, in milliseconds.
     #[arg(long, default_value_t = 60_000)]
     retain_after_terminal_ms: u64,
@@ -68,12 +75,23 @@ struct Args {
     #[arg(long, default_value_t = 1_048_576)]
     chain_max_bytes: usize,
 
-    /// `echo` or `scripted` (verification schedulers).
+    /// `echo` or `scripted` (verification schedulers) or `http` (real provider).
     #[arg(long, default_value = "echo")]
     scheduler: String,
     /// Script path, required when `--scheduler scripted`.
     #[arg(long)]
     scheduler_script: Option<String>,
+
+    /// Env var naming the chat-completions base URL (for `--scheduler http`).
+    #[arg(long, default_value = "NOVA_CHAT_BASE_URL")]
+    http_base_url_env: String,
+    /// Env var naming the chat-completions API key (SEC-4: never the key itself).
+    #[arg(long, default_value = "NOVA_CHAT_API_KEY")]
+    http_api_key_env: String,
+    /// Env var naming the fallback model (for `--scheduler http`). Optional — the
+    /// request's own `model` wins when the env is unset.
+    #[arg(long, default_value = "NOVA_CHAT_MODEL")]
+    http_model_env: String,
 }
 
 /// The mounted ports, all as trait objects. The concrete adapter is gone past
@@ -97,6 +115,25 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Wall clock for the agent's background heartbeat task (production source).
+/// The agent only reads it through the `Clock` port, so the virtual `MemClock`
+/// used in tests plugs in unchanged.
+struct WallClock;
+
+#[async_trait::async_trait]
+impl Clock for WallClock {
+    async fn now_ms(&self) -> u64 {
+        now_ms()
+    }
+
+    async fn sleep_until_ms(&self, deadline_ms: u64) {
+        let now = now_ms();
+        if deadline_ms > now {
+            tokio::time::sleep(std::time::Duration::from_millis(deadline_ms - now)).await;
+        }
+    }
+}
+
 fn build_scheduler(args: &Args) -> Result<Arc<dyn CompletionsRequestScheduler>> {
     match args.scheduler.as_str() {
         "echo" => Ok(Arc::new(EchoScheduler::new(8))),
@@ -112,7 +149,20 @@ fn build_scheduler(args: &Args) -> Result<Arc<dyn CompletionsRequestScheduler>> 
                     .with_context(|| format!("parsing scheduler script {path}"))?,
             ))
         }
-        other => anyhow::bail!("unknown scheduler `{other}` (expected echo or scripted)"),
+        "http" => {
+            let base_url = std::env::var(&args.http_base_url_env)
+                .with_context(|| format!("reading ${}", args.http_base_url_env))?;
+            let api_key = std::env::var(&args.http_api_key_env)
+                .with_context(|| format!("reading ${}", args.http_api_key_env))?;
+            let model = std::env::var(&args.http_model_env)
+                .ok()
+                .filter(|v| !v.is_empty());
+            Ok(Arc::new(
+                HttpChatCompletionsScheduler::new(base_url, api_key, model)
+                    .map_err(anyhow::Error::msg)?,
+            ))
+        }
+        other => anyhow::bail!("unknown scheduler `{other}` (expected echo, scripted or http)"),
     }
 }
 
@@ -174,11 +224,13 @@ async fn main() -> Result<()> {
             context: backend.context,
             scheduler,
             tools: Arc::new(NoopToolExecutor),
+            clock: Arc::new(WallClock),
             sessions: Some(backend.session),
             conversations: Some(backend.conversation),
         },
         AgentConfig {
             exec_ttl_ms: args.exec_ttl_ms,
+            heartbeat_interval_ms: args.heartbeat_interval_ms,
             chain_limits: ChainLimits {
                 max_depth: args.chain_max_depth,
                 max_items: args.chain_max_items,

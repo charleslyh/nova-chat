@@ -86,6 +86,14 @@ pub trait SessionStore: Send + Sync {
         conversation: &ConversationId,
     ) -> Result<Option<Session>, SessionError>;
 
+    /// Every session the tenant owns, newest first.
+    ///
+    /// Ordered by creation time so a UI can render a stable list without sorting
+    /// client-side. The ordering contract lives here rather than in every caller,
+    /// for the same reason the sequence-number contract lives in the port: it is a
+    /// property the store can guarantee once and every consumer can rely on.
+    async fn list(&self, tenant: &TenantId) -> Result<Vec<Session>, SessionError>;
+
     /// Delete a session and its events. Returns whether one was removed.
     async fn delete(&self, tenant: &TenantId, id: &SessionId) -> Result<bool, SessionError>;
 

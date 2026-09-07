@@ -105,6 +105,15 @@ impl SessionsService {
         self.sessions.get(tenant, id).await
     }
 
+    /// 列出该租户的全部会话，新在前。
+    ///
+    /// 排序契约落在端口（`SessionStore::list`）而非这里：UI 直接渲染即可，不必再
+    /// 排一次。列表是「状态广播」这层的能力——它回答「有哪些会话可订阅」，与
+    /// 「某会话里聊了什么」分属两个问题。
+    pub async fn list(&self, tenant: &TenantId) -> Result<Vec<Session>, SessionError> {
+        self.sessions.list(tenant).await
+    }
+
     /// 拥有该容器的会话（绑定互斥，至多一个）。
     ///
     /// 生成入口靠它把标准的 `POST /v1/responses { conversation }` 接到会话锁上，

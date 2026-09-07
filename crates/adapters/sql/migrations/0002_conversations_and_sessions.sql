@@ -6,14 +6,6 @@
 -- (D21) exists for the token-level stream, whose volume is three orders of
 -- magnitude higher, and nothing here approaches that.
 
--- Which conversation a response advances, and which session held its turn lock.
---
--- Recorded on the response because the execution side has only the record when
--- it reaches a terminal status. Neither column is indexed: they are read from a
--- row already fetched by primary key, never searched by.
-ALTER TABLE responses ADD COLUMN IF NOT EXISTS conversation_id TEXT;
-ALTER TABLE responses ADD COLUMN IF NOT EXISTS session_id      TEXT;
-
 -- A conversation is a *pointer to the tail of a response chain*, so this table
 -- has no items and no child table. The chain is already materialised on
 -- `responses.context` (D24); a container here would be a second copy of the same

@@ -50,10 +50,11 @@
 //! "no concurrent write".
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use nova_responses_core::{
-    validate_outcome, AgentId, Attempt, ClaimedResponse, CompletionsRequest,
+    validate_outcome, AgentId, Attempt, ClaimedResponse, Clock, CompletionsRequest,
     CompletionsRequestScheduler, CompletionsSink, ContextStore, ConversationStore, EventBody,
     FinishReason, RequestProvenance, ResponseEvent, ResponseEventKind, ResponseEventLog,
     ResponseId, ResponseItem, ResponseLedger, ResponseStatus, SchedulerError, SessionStore,
@@ -71,6 +72,9 @@ pub struct AgentDeps {
     /// Carries tool calls out. `NoopToolExecutor` is the explicit "no tools"
     /// instance; a real registry or a remote bridge is the same shape.
     pub tools: Arc<dyn ToolExecutor>,
+    /// Wall clock in production; a virtual clock the test can advance (D15).
+    /// The background heartbeat task reads it for timestamps and interval sleeps.
+    pub clock: Arc<dyn Clock>,
 
     /// Session and conversation bookkeeping at terminal (D26 / D27).
     ///
@@ -96,6 +100,11 @@ pub struct AgentConfig {
     /// stops asking for tools reaches [`ResponseStatus::Incomplete`], not an
     /// unbounded loop.
     pub max_tool_rounds: usize,
+    /// Interval between keep-alive heartbeats sent while the (possibly long)
+    /// ReAct loop runs. Must be shorter than the sweeper's `heartbeat_ttl_ms`,
+    /// otherwise a generation longer than that TTL is reaped mid-flight. The
+    /// actual interval is clamped to a sane floor to avoid a hot spin.
+    pub heartbeat_interval_ms: u64,
 }
 
 impl Default for AgentConfig {
@@ -106,6 +115,7 @@ impl Default for AgentConfig {
             retain_after_terminal_ms: 60_000,
             tool_specs: Vec::new(),
             max_tool_rounds: 20,
+            heartbeat_interval_ms: 30_000,
         }
     }
 }
@@ -165,7 +175,7 @@ impl Agent {
             }
         };
 
-        self.serve(claimed, now_ms).await
+        self.serve(claimed, agent, now_ms).await
     }
 
     /// Drain everything currently queued for this node.
@@ -185,12 +195,23 @@ impl Agent {
         out
     }
 
-    async fn serve(&self, claimed: ClaimedResponse, now_ms: u64) -> Executed {
+    async fn serve(&self, claimed: ClaimedResponse, agent_id: AgentId, now_ms: u64) -> Executed {
         let record = claimed.record;
         // Only the id is lifted out, for logging. Everything the terminal funnels
         // need travels as `&record`, so they cannot be handed a mismatched pair.
         let id = record.response_id.clone();
         let attempt = claimed.attempt;
+
+        // Keep the claim alive across the whole (possibly long) ReAct loop. The
+        // sweeper reaps a claim whose owner stops heartbeating past its TTL, which
+        // would raise the fence and turn an in-flight generation into `Superseded`.
+        // The guard aborts the heartbeat task when `serve` returns on any path.
+        let _heartbeat = spawn_heartbeat(
+            self.deps.ledger.clone(),
+            agent_id,
+            self.deps.clock.clone(),
+            self.cfg.heartbeat_interval_ms,
+        );
 
         // Announce the transition so a subscriber attached from the start sees a
         // defined progression rather than a gap.
@@ -239,6 +260,7 @@ impl Agent {
             output_index: 0,
             current_item_id: None,
             current_content_index: None,
+            reasoning: String::new(),
         };
 
         loop {
@@ -320,6 +342,7 @@ impl Agent {
                             &record,
                             attempt,
                             produced,
+                            sink.reasoning.clone(),
                             usage,
                             ResponseStatus::Completed,
                             now_ms,
@@ -338,6 +361,7 @@ impl Agent {
                             &record,
                             attempt,
                             produced,
+                            sink.reasoning.clone(),
                             usage,
                             ResponseStatus::Incomplete,
                             now_ms,
@@ -358,6 +382,7 @@ impl Agent {
                                 &record,
                                 attempt,
                                 produced,
+                                sink.reasoning.clone(),
                                 usage,
                                 ResponseStatus::Incomplete,
                                 now_ms,
@@ -439,6 +464,7 @@ impl Agent {
         record: &StoredResponse,
         attempt: Attempt,
         produced: Vec<ResponseItem>,
+        reasoning: String,
         usage: Usage,
         status: ResponseStatus,
         now_ms: u64,
@@ -468,10 +494,15 @@ impl Agent {
         // depend on it (FR-20 / INV-48). The tool-call trace is part of `produced`,
         // so the next turn's snapshot sees the whole agent loop.
         let output_stored = if record.stored {
+            let reasoning = if reasoning.is_empty() {
+                None
+            } else {
+                Some(reasoning)
+            };
             match self
                 .deps
                 .context
-                .append_output(tenant, id, produced, usage, status, now_ms)
+                .append_output(tenant, id, produced, reasoning, usage, status, now_ms)
                 .await
             {
                 Ok(()) => true,
@@ -626,6 +657,55 @@ impl Agent {
     }
 }
 
+/// Floor for the heartbeat interval, so a misconfigured `0` cannot turn the
+/// background task into a hot spin.
+const MIN_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
+
+/// RAII guard that aborts the background heartbeat task when dropped.
+struct HeartbeatGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Spawn a background task that keeps the claim's heartbeat fresh while the
+/// agent runs the (possibly long) ReAct loop.
+///
+/// The sweeper reaps a claim whose owner stops heartbeating past
+/// `heartbeat_ttl_ms`; without this task, any generation longer than that TTL
+/// would be reaped mid-flight — its fence raised and its writes refused as
+/// stale. The interval must be shorter than the sweeper's TTL (deployment
+/// invariant, not enforced here).
+fn spawn_heartbeat(
+    ledger: Arc<dyn ResponseLedger>,
+    agent_id: AgentId,
+    clock: Arc<dyn Clock>,
+    interval_ms: u64,
+) -> HeartbeatGuard {
+    let interval_ms = interval_ms.max(MIN_HEARTBEAT_INTERVAL_MS);
+    let handle = tokio::spawn(async move {
+        // First beat comes after one interval: `claim` already recorded one.
+        // The interval is wall-clock (tokio time, pausable in tests), while the
+        // timestamp read for the beat is the injected `Clock` — the two stay
+        // independent so a test can advance time and reap deterministically.
+        loop {
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            match ledger.heartbeat(agent_id, clock.now_ms().await).await {
+                Ok(()) => {}
+                // Read-only degrade: the ledger will not accept writes, and the
+                // reap path will clean up the abandoned claim.
+                Err(LedgerError::ReadOnly) => break,
+                Err(e) => warn!(error = %e, "heartbeat failed"),
+            }
+        }
+    });
+    HeartbeatGuard { handle }
+}
+
 /// Streams scheduler output into this node's in-flight buffer.
 struct LedgerSink {
     event_log: Arc<dyn ResponseEventLog>,
@@ -642,6 +722,9 @@ struct LedgerSink {
     /// Index of the content part currently being streamed, carried on text
     /// delta/done events as `content_index`.
     current_content_index: Option<u32>,
+    /// Reasoning / thinking text accumulated across the whole loop, to be
+    /// persisted with the final output (render-only, never re-enters context).
+    reasoning: String,
 }
 
 /// The stream identity of an output item: a tool `call_id` for tool items, the
@@ -709,6 +792,23 @@ impl CompletionsSink for LedgerSink {
                 item_id: self.current_item_id.clone().unwrap_or_default(),
                 output_index: self.output_index.saturating_sub(1),
                 content_index: self.current_content_index,
+                delta: text.to_string(),
+            },
+        )
+        .await
+    }
+
+    async fn reasoning_text_delta(&mut self, text: &str) -> Result<SinkVerdict, SinkError> {
+        // Render-only on the stream, but accumulated so it can be persisted with
+        // the final output: reasoning carries no item id / output index because
+        // it is not an output item, yet a later re-render must reproduce it.
+        self.reasoning.push_str(text);
+        self.push(
+            ResponseEventKind::ReasoningTextDelta,
+            EventBody::Delta {
+                item_id: String::new(),
+                output_index: 0,
+                content_index: None,
                 delta: text.to_string(),
             },
         )

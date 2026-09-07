@@ -3,6 +3,19 @@
 version = 4
 
 [[package]]
+name = "adapters-completions-http"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "nova-responses-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "adapters-completions-mock"
 version = "0.1.0"
 dependencies = [
@@ -1223,11 +1236,13 @@ dependencies = [
 name = "nova-agentd"
 version = "0.1.0"
 dependencies = [
+ "adapters-completions-http",
  "adapters-completions-mock",
  "adapters-event-log-redis",
  "adapters-mem-client",
  "adapters-sql",
  "anyhow",
+ "async-trait",
  "clap",
  "nova-agent",
  "nova-responses-core",

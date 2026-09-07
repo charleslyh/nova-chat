@@ -5,17 +5,20 @@
 //! provider failure — are all reachable and cheap.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use adapters_completions_mock::{EchoScheduler, Match, Script, ScriptedScheduler};
 use adapters_mem::MemWorld;
 use async_trait::async_trait;
 use nova_agent::{Agent, AgentConfig, AgentDeps, Executed};
+use tokio::sync::Notify;
 use nova_responses_core::protocol::{ContentPart, ResponseItem, Role};
 use nova_responses_core::{
-    Attempt, CompletionsMessage, CompletionsOutcome, CompletionsRequest, CompletionsRequestScheduler,
-    CompletionsSink, ContextStore, EventBody, IdempotencyKey, NodeTag, NoopToolExecutor,
-    ResponseEventKind, ResponseEventLog, ResponseId, ResponseLedger, ResponseStatus, SchedulerError,
-    StoredResponse, TenantId, ToolCall, ToolError, ToolExecutor, Usage,
+    Attempt, Clock, CompletionsMessage, CompletionsOutcome, CompletionsRequest,
+    CompletionsRequestScheduler, CompletionsSink, ContextStore, EventBody, IdempotencyKey, NodeTag,
+    NoopToolExecutor, ResponseEventKind, ResponseEventLog, ResponseId, ResponseLedger,
+    ResponseStatus, SchedulerError, StoredResponse, TenantId, ToolCall, ToolError, ToolExecutor,
+    Usage,
 };
 
 const NODE: &str = "node-a";
@@ -44,6 +47,7 @@ fn record(id: &ResponseId, text: &str, stored: bool) -> StoredResponse {
             status: None,
         }],
         output_items: vec![],
+        reasoning: None,
         status: ResponseStatus::Queued,
         usage: Usage::default(),
         created_at_ms: 1_000,
@@ -57,6 +61,7 @@ fn record(id: &ResponseId, text: &str, stored: bool) -> StoredResponse {
         owner: None,
         attempt: Attempt::default(),
         context: Vec::new(),
+        context_reasoning: Vec::new(),
         context_depth: 0,
     }
 }
@@ -85,6 +90,7 @@ fn agent_with(
             context: world.context.clone(),
             scheduler,
             tools,
+            clock: world.clock.clone(),
             // Mounted, not `None`: with the ports absent every terminal path
             // would skip the release and this fixture could not tell a working
             // release from a missing one.
@@ -755,4 +761,182 @@ async fn tool_calls_stream_incrementally_to_the_subscriber() {
             && matches!(&ev.body, EventBody::Item { item, .. } if item.to_string().contains("20"))
     });
     assert!(result_added, "the function_call_output must be streamed too");
+}
+
+/// Emits reasoning text, then the answer — the shape a reasoning model
+/// (DeepSeek-R1, o1, QwQ) produces.
+struct ReasoningThenAnswer;
+
+#[async_trait]
+impl CompletionsRequestScheduler for ReasoningThenAnswer {
+    fn name(&self) -> &str {
+        "reasoning-then-answer"
+    }
+
+    async fn schedule(
+        &self,
+        _request: &CompletionsRequest,
+        sink: &mut dyn CompletionsSink,
+    ) -> Result<CompletionsOutcome, SchedulerError> {
+        sink.reasoning_text_delta("Let me think").await?;
+        sink.reasoning_text_delta(" about this.").await?;
+        let text = "The answer.";
+        sink.text_delta(text).await?;
+        Ok(CompletionsOutcome::text(text, Usage::new(2, 2)))
+    }
+}
+
+#[tokio::test]
+async fn reasoning_is_persisted_but_never_fed_back_as_context() {
+    let world = MemWorld::new();
+    let id = queue(&world, "think", true).await;
+
+    let e = engine(&world, Arc::new(ReasoningThenAnswer));
+    assert_eq!(e.run_once(2_000).await, Executed::Completed);
+
+    let stored = world
+        .context
+        .get(&tenant(), &id)
+        .await
+        .expect("ctx get")
+        .expect("stored");
+    // Reasoning is persisted so a re-render reproduces the thinking…
+    assert_eq!(stored.reasoning.as_deref(), Some("Let me think about this."));
+    // …but it is not an output item, so it can never re-enter model context.
+    assert_eq!(stored.output_items.len(), 1, "reasoning must not become an item");
+    assert!(
+        !nova_responses_core::canonical_items(&stored.output_items).contains("Let me think"),
+        "reasoning must not leak into output items"
+    );
+
+    // The resolved history carries the reasoning aligned to the answer, for the
+    // transcript — again without putting it into the item list.
+    let resolved = world
+        .context
+        .resolve_chain(&tenant(), &id, Default::default())
+        .await
+        .expect("resolve");
+    assert_eq!(resolved.reasoning, vec![None, Some("Let me think about this.".into())]);
+    assert_eq!(resolved.items.len(), 2, "input + answer, no reasoning item");
+}
+
+// ===== Heartbeat: long generation vs. reap (the fix for mid-flight reaping) =====
+
+/// A scheduler that blocks on a release signal, so a test can hold a generation
+/// open while it advances the clock and runs the sweeper's `reap` directly.
+struct GatedScheduler {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl CompletionsRequestScheduler for GatedScheduler {
+    fn name(&self) -> &str {
+        "gated"
+    }
+
+    async fn schedule(
+        &self,
+        _request: &CompletionsRequest,
+        sink: &mut dyn CompletionsSink,
+    ) -> Result<CompletionsOutcome, SchedulerError> {
+        self.started.notify_one();
+        self.release.notified().await;
+        let text = "done";
+        sink.text_delta(text).await?;
+        Ok(CompletionsOutcome::text(text, Usage::new(1, 1)))
+    }
+}
+
+/// Let the paused runtime drive the heartbeat task a few turns.
+async fn settle() {
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_long_generation_is_not_reaped_while_its_heartbeat_stays_fresh() {
+    let world = MemWorld::new();
+    let id = queue(&world, "long", true).await;
+
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let scheduler = Arc::new(GatedScheduler {
+        started: started.clone(),
+        release: release.clone(),
+    });
+
+    let cfg = AgentConfig {
+        heartbeat_interval_ms: 1_000,
+        ..AgentConfig::default()
+    };
+    let e = agent_with(&world, scheduler, Arc::new(NoopToolExecutor), cfg);
+    let clock = world.clock.clone();
+
+    let handle = tokio::spawn(async move { e.run_once(clock.now_ms().await).await });
+
+    // The claim happened and the scheduler is now holding the generation open.
+    started.notified().await;
+
+    // Two seconds pass: the heartbeat task wakes (tokio time) and stamps the
+    // freshest logical time (virtual clock), so the claim stays alive.
+    world.clock.advance(2_000);
+    tokio::time::advance(Duration::from_millis(2_000)).await;
+    settle().await;
+
+    // Heartbeat is fresh (≈2000), so a reap with a 1500ms TTL must not take it.
+    let aborted = world.ledger.reap(2_000, 1_500).await.expect("reap");
+    assert!(
+        aborted.is_empty(),
+        "a generation whose owner keeps heartbeating must not be reaped"
+    );
+
+    release.notify_one();
+    let result = handle.await.expect("join");
+    assert_eq!(result, Executed::Completed);
+
+    let rec = world.ledger.get(&id).await.expect("get").expect("present");
+    assert_eq!(rec.status, ResponseStatus::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_generation_is_reaped_once_its_heartbeat_stops() {
+    let world = MemWorld::new();
+    let id = queue(&world, "long", true).await;
+
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let scheduler = Arc::new(GatedScheduler {
+        started: started.clone(),
+        release: release.clone(),
+    });
+
+    // Heartbeat interval far beyond anything the test advances: the owner never
+    // heartbeats, so the sweeper sees it as lost.
+    let cfg = AgentConfig {
+        heartbeat_interval_ms: u64::MAX,
+        ..AgentConfig::default()
+    };
+    let e = agent_with(&world, scheduler, Arc::new(NoopToolExecutor), cfg);
+    let clock = world.clock.clone();
+
+    let handle = tokio::spawn(async move { e.run_once(clock.now_ms().await).await });
+
+    started.notified().await;
+
+    world.clock.advance(5_000);
+    tokio::time::advance(Duration::from_millis(5_000)).await;
+    settle().await;
+
+    // No heartbeat ever arrived, so a reap with a 2000ms TTL takes the claim.
+    let aborted = world.ledger.reap(5_000, 2_000).await.expect("reap");
+    assert_eq!(aborted.len(), 1, "a stopped heartbeat must be reaped");
+    assert_eq!(aborted[0].response_id, id);
+
+    // Releasing the scheduler lets the stale holder try to write, but the fence
+    // has moved, so its output is refused and the attempt is superseded.
+    release.notify_one();
+    let result = handle.await.expect("join");
+    assert_eq!(result, Executed::Superseded);
 }

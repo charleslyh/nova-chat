@@ -365,6 +365,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 instructions: instructions.clone(),
                 input_items: vec![ResponseItem::user_text(input)],
                 output_items: vec![],
+                reasoning: None,
                 status: ResponseStatus::Queued,
                 usage: Usage::default(),
                 created_at_ms: ctx.now_ms,
@@ -378,6 +379,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 owner: None,
                 attempt: Attempt::default(),
                 context: snapshot,
+                context_reasoning: Vec::new(),
                 context_depth: snapshot_depth,
             };
 
@@ -574,7 +576,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 )];
                 ctx.world
                     .context
-                    .append_output(&record.tenant_id, &id, items, usage, status, ctx.now_ms)
+                    .append_output(&record.tenant_id, &id, items, None, usage, status, ctx.now_ms)
                     .await?;
             }
 

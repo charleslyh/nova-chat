@@ -108,6 +108,20 @@ impl SessionStore for MemSessionClient {
         }
     }
 
+    async fn list(&self, tenant: &TenantId) -> Result<Vec<Session>, SessionError> {
+        match session_rpc(
+            &self.rpc,
+            Request::SessionList {
+                tenant: tenant.clone(),
+            },
+        )
+        .await?
+        {
+            Response::SessionList(s) => Ok(s),
+            other => Err(unexpected(other)),
+        }
+    }
+
     async fn delete(&self, tenant: &TenantId, id: &SessionId) -> Result<bool, SessionError> {
         self.guard_writable()?;
         match session_rpc(

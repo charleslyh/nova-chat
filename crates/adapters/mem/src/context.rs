@@ -94,9 +94,9 @@ impl MemContextStore {
 
 /// Signing input: the canonical encoding of both item lists.
 ///
-/// Instructions are excluded deliberately — they are metadata for echo, not
-/// content, and including them would make the tag depend on a field that never
-/// participates in chain resolution (INV-49).
+/// Instructions and reasoning are excluded deliberately — they are render-only
+/// metadata, not chain content, and including them would make the tag depend on
+/// fields that never participate in chain resolution (INV-49).
 fn canonical_payload(record: &StoredResponse) -> String {
     format!(
         "{}|{}",
@@ -129,6 +129,7 @@ impl ContextStore for MemContextStore {
         tenant: &TenantId,
         response_id: &ResponseId,
         items: Vec<ResponseItem>,
+        reasoning: Option<String>,
         usage: Usage,
         status: ResponseStatus,
         now_ms: u64,
@@ -147,6 +148,7 @@ impl ContextStore for MemContextStore {
         // Items arrive from the execution side already normalised; they are
         // never reconstructed from the event stream (INV-48).
         record.output_items = items;
+        record.reasoning = reasoning;
         record.usage = usage;
         record.status = status;
         record.completed_at_ms = Some(now_ms);
@@ -201,9 +203,9 @@ impl ContextStore for MemContextStore {
         self.verify(record)?;
 
         // History is a flat materialised copy (D24): the ancestors' snapshot plus
-        // this response's own items. No walk, no segmentation.
-        let mut items = record.context.clone();
-        items.extend(record.chain_items().cloned());
+        // this response's own items, with reasoning blocks aligned for rendering.
+        // No walk, no segmentation.
+        let (items, reasoning) = record.resolved_items_and_reasoning();
 
         let depth = record.context_depth.saturating_add(1);
         if depth > limits.max_depth {
@@ -225,6 +227,7 @@ impl ContextStore for MemContextStore {
 
         Ok(ResolvedContext {
             items,
+            reasoning,
             depth,
             bytes,
         })

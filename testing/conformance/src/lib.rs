@@ -95,6 +95,7 @@ fn record(
         instructions: Some("INSTRUCTIONS-MARKER".into()),
         input_items: vec![ResponseItem::user_text(format!("in-{}", id.uuid()))],
         output_items: vec![],
+        reasoning: None,
         status,
         usage: Usage::default(),
         created_at_ms: 1_000,
@@ -108,6 +109,7 @@ fn record(
         owner: None,
         attempt: Attempt::default(),
         context: Vec::new(),
+        context_reasoning: Vec::new(),
         context_depth: 0,
     }
 }
@@ -437,6 +439,7 @@ pub async fn assert_context_conformance(ports: &PortSet) {
             &tenant,
             &solo,
             vec![ResponseItem::assistant_text("answer")],
+            None,
             Usage::new(1, 2),
             ResponseStatus::Completed,
             2_000,
@@ -1116,6 +1119,7 @@ pub async fn assert_output_provenance(ports: &PortSet) {
             &tenant,
             &id,
             vec![ResponseItem::assistant_text("Stable answer")],
+            None,
             Usage::new(3, 4),
             ResponseStatus::Completed,
             2_000,
@@ -2136,6 +2140,23 @@ pub async fn assert_session_conformance(ports: &PortSet) {
         "deleting a session must not destroy the conversation it broadcast for"
     );
     assert_eq!(ports.session.delete(&tenant, &session.id).await, Ok(false));
+
+    // List (FR-42): every session of the tenant, none from another tenant. The
+    // capped session from the INV-59 block is still alive here alongside `extra`,
+    // so the list is whatever the tenant owns — the assertion is about membership
+    // and isolation, not an exact count.
+    let extra = ports.fresh_session(&tenant).await;
+    let foreign = ports.fresh_session(&other).await;
+    let listed = ports.session.list(&tenant).await.expect("list");
+    let ids: Vec<&SessionId> = listed.iter().map(|s| &s.id).collect();
+    assert!(
+        ids.contains(&&extra.id),
+        "list must include the tenant's sessions"
+    );
+    assert!(
+        !ids.contains(&&foreign.id),
+        "list must not cross the tenant boundary (SEC-2)"
+    );
 
     // Bulk erasure by tenant (FR-21).
     let a = ports.fresh_session(&tenant).await;

@@ -29,10 +29,17 @@ CREATE TABLE IF NOT EXISTS responses (
 
     input_items           JSONB       NOT NULL DEFAULT '[]'::jsonb,
     output_items          JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    -- Reasoning / thinking text, concatenated into one string. Persisted for
+    -- re-render but never fed back into model context (a model does not read its
+    -- own thinking).
+    reasoning             TEXT,
     -- Materialised history (D24): a flat copy of every ancestor's items. No
     -- source tag — deletion is record-level, not content-level, so nothing ever
     -- needs to strip a single ancestor out again.
     context               JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    -- Materialised reasoning of ancestors, aligned to `context` (one entry per
+    -- item, `Some` marking a block preceding that item). Render-only.
+    context_reasoning     JSONB       NOT NULL DEFAULT '[]'::jsonb,
     -- How many ancestors contributed to `context`. Kept separate because a flat
     -- item list cannot recover the turn count (one turn may hold several items).
     context_depth         BIGINT      NOT NULL DEFAULT 0,
@@ -45,7 +52,14 @@ CREATE TABLE IF NOT EXISTS responses (
 
     created_at_ms         BIGINT      NOT NULL,
     completed_at_ms       BIGINT,
-    expires_at_ms         BIGINT
+    expires_at_ms         BIGINT,
+
+    -- Which conversation a response advances, and which session held its turn
+    -- lock (D26 / D27). Recorded here because the execution side has only the
+    -- record when it reaches a terminal status. Neither column is indexed: they
+    -- are read from a row already fetched by primary key, never searched by.
+    conversation_id       TEXT,
+    session_id            TEXT
 );
 
 -- Tenant scoping and bulk purge (FR-21).

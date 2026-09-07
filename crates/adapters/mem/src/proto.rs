@@ -150,6 +150,7 @@ pub enum Request {
         tenant: TenantId,
         response_id: ResponseId,
         items: Vec<ResponseItem>,
+        reasoning: Option<String>,
         usage: Usage,
         status: ResponseStatus,
         now_ms: u64,
@@ -216,6 +217,9 @@ pub enum Request {
     SessionGet {
         tenant: TenantId,
         id: SessionId,
+    },
+    SessionList {
+        tenant: TenantId,
     },
     SessionGetByConversation {
         tenant: TenantId,
@@ -304,6 +308,7 @@ pub enum Response {
 
     SessionCreate(Session),
     SessionGet(Option<Session>),
+    SessionList(Vec<Session>),
     SessionDelete(bool),
     SessionDeleteByTenant(u64),
     SessionReleaseStaleLock(bool),

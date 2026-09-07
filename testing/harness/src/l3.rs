@@ -186,6 +186,7 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
             instructions: Some("L3-INSTRUCTIONS".into()),
             input_items: vec![ResponseItem::user_text(format!("q{turn}"))],
             output_items: vec![ResponseItem::assistant_text(format!("a{turn}"))],
+            reasoning: None,
             status: ResponseStatus::Completed,
             usage: Usage::new(1, 1),
             created_at_ms: 1_000 + turn,
@@ -199,6 +200,7 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
             owner: None,
             attempt: Attempt::default(),
             context: history.clone(),
+            context_reasoning: Vec::new(),
             context_depth: turn as usize,
         };
         let own: Vec<ResponseItem> = record.chain_items().cloned().collect();
@@ -243,6 +245,7 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
         instructions: None,
         input_items: vec![ResponseItem::user_text("pending")],
         output_items: vec![],
+        reasoning: None,
         status: ResponseStatus::Queued,
         usage: Usage::default(),
         created_at_ms: 3_000,
@@ -256,6 +259,7 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
         owner: None,
         attempt: Attempt::default(),
         context: Vec::new(),
+        context_reasoning: Vec::new(),
         context_depth: 0,
     };
     let in_flight_id = in_flight.response_id.clone();
@@ -320,6 +324,7 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
         instructions: None,
         input_items: vec![ResponseItem::user_text("temp")],
         output_items: vec![],
+        reasoning: None,
         status: ResponseStatus::Completed,
         usage: Usage::default(),
         created_at_ms: 1_000,
@@ -333,6 +338,7 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
         owner: None,
         attempt: Attempt::default(),
         context: Vec::new(),
+        context_reasoning: Vec::new(),
         context_depth: 0,
     };
     ports.context.put(rec.clone()).await?;
@@ -360,6 +366,7 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
             instructions: None,
             input_items: vec![ResponseItem::user_text("keep")],
             output_items: vec![],
+            reasoning: None,
             status: ResponseStatus::Completed,
             usage: Usage::default(),
             created_at_ms: 1_000,
@@ -373,6 +380,7 @@ async fn run_shared_store_checks(ports: &PortSet) -> Result<Vec<String>> {
             owner: None,
             attempt: Attempt::default(),
             context: Vec::new(),
+            context_reasoning: Vec::new(),
             context_depth: 0,
         })
         .await?;

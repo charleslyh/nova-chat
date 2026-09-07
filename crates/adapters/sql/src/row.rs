@@ -47,6 +47,14 @@ pub(crate) fn usage_to_json(usage: &Usage) -> Value {
     serde_json::to_value(usage).unwrap_or_else(|_| Value::Object(Default::default()))
 }
 
+pub(crate) fn reasoning_from_json(value: Value) -> Vec<Option<String>> {
+    serde_json::from_value(value).unwrap_or_default()
+}
+
+pub(crate) fn reasoning_to_json(reasoning: &[Option<String>]) -> Value {
+    serde_json::to_value(reasoning).unwrap_or_else(|_| Value::Array(vec![]))
+}
+
 /// Partial usage is keyed by attempt so repeated aborts accumulate rather than
 /// overwrite (INV-51).
 pub(crate) type PartialUsage = BTreeMap<String, Usage>;
@@ -105,6 +113,7 @@ pub(crate) fn record_from_row(row: &PgRow) -> Result<StoredResponse, SqlError> {
         instructions: row.try_get("instructions")?,
         input_items: items_from_json(row.try_get("input_items")?)?,
         output_items: items_from_json(row.try_get("output_items")?)?,
+        reasoning: row.try_get("reasoning")?,
         status: status_from_str(&status)?,
         usage: usage_from_json(row.try_get("usage")?),
         created_at_ms: row.try_get::<i64, _>("created_at_ms")? as u64,
@@ -131,6 +140,7 @@ pub(crate) fn record_from_row(row: &PgRow) -> Result<StoredResponse, SqlError> {
         },
         attempt: Attempt(row.try_get::<i64, _>("attempt")? as u64),
         context: items_from_json(row.try_get("context")?)?,
+        context_reasoning: reasoning_from_json(row.try_get("context_reasoning")?),
         context_depth: row.try_get::<i64, _>("context_depth")? as usize,
     })
 }
@@ -139,6 +149,6 @@ pub(crate) fn record_from_row(row: &PgRow) -> Result<StoredResponse, SqlError> {
 /// finds what it needs.
 pub(crate) const RECORD_COLUMNS: &str = "response_id, previous_response_id, tenant_id, model, \
      status, stored, node_tag, attempt, owner, idempotency_key, instructions, \
-     input_items, output_items, usage, integrity, integrity_alg, \
-     created_at_ms, completed_at_ms, expires_at_ms, context, context_depth, \
+     input_items, output_items, reasoning, usage, integrity, integrity_alg, \
+     created_at_ms, completed_at_ms, expires_at_ms, context, context_reasoning, context_depth, \
      conversation_id, session_id";
