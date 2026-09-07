@@ -15,10 +15,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use nova_responses_core::{
-    AbortedClaim, AgentId, Attempt, ChainLimits, ClaimedResponse, ContextError, Conversation,
-    ConversationError, ConversationEvent, ConversationEventKind, ConversationId, CreateOutcome,
-    EventLogError, IdempotencyKey, LedgerError, ResolvedContext, ResponseEvent, ResponseEventKind,
-    ResponseId, ResponseItem, ResponseStatus, StoredResponse, TenantId, Usage,
+    AbortedClaim, AgentId, AppendEvent, Attempt, ChainLimits, ClaimedResponse, ContextError,
+    Conversation, ConversationError, ConversationEvent, ConversationEventKind, ConversationId,
+    CreateOutcome, EventLogError, IdempotencyKey, LedgerError, ResolvedContext, ResponseEvent,
+    ResponseEventKind, ResponseId, ResponseItem, ResponseStatus, StoredResponse, TenantId, Usage,
 };
 
 /// Internal wire form of a stream event.
@@ -56,6 +56,44 @@ impl From<WireEvent> for ResponseEvent {
             attempt: w.attempt,
             sequence_number: w.sequence_number,
             kind: w.kind,
+            body: w.body,
+        }
+    }
+}
+
+/// Internal wire form of an event to append — the append-input counterpart of
+/// [`WireEvent`], with no `sequence_number` (the carrier assigns it, INV-11).
+///
+/// `AppendEvent`'s public `Serialize` omits `response_id` and `attempt`, so the
+/// cross-process carrier needs its own round-trippable form that preserves both,
+/// exactly as `WireEvent` does for the read path. The two are split on purpose:
+/// an append carries no number, a read returns one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppendWireEvent {
+    pub response_id: ResponseId,
+    pub attempt: Option<Attempt>,
+    pub kind: ResponseEventKind,
+    #[serde(flatten)]
+    pub body: nova_responses_core::EventBody,
+}
+
+impl From<AppendEvent> for AppendWireEvent {
+    fn from(e: AppendEvent) -> Self {
+        AppendWireEvent {
+            response_id: e.response_id,
+            attempt: e.attempt,
+            kind: e.kind,
+            body: e.body,
+        }
+    }
+}
+
+impl From<AppendWireEvent> for AppendEvent {
+    fn from(w: AppendWireEvent) -> Self {
+        AppendEvent {
+            response_id: w.response_id,
+            kind: w.kind,
+            attempt: w.attempt,
             body: w.body,
         }
     }
@@ -123,7 +161,7 @@ pub enum Request {
 
     // --- event log ---
     EventLogAppend {
-        event: WireEvent,
+        event: AppendWireEvent,
     },
     EventLogReadAfter {
         response_id: ResponseId,

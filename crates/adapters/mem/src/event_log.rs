@@ -23,7 +23,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use nova_responses_core::{
-    EventLogError, LedgerError, ResponseEvent, ResponseEventLog, ResponseId, ResponseLedger,
+    AppendEvent, EventLogError, LedgerError, ResponseEvent, ResponseEventLog, ResponseId,
+    ResponseLedger,
 };
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -123,7 +124,7 @@ impl MemResponseEventLog {
 
 #[async_trait]
 impl ResponseEventLog for MemResponseEventLog {
-    async fn append(&self, mut event: ResponseEvent) -> Result<u64, EventLogError> {
+    async fn append(&self, event: AppendEvent) -> Result<u64, EventLogError> {
         if self.ledger.is_read_only() {
             return Err(EventLogError::ReadOnly);
         }
@@ -155,9 +156,8 @@ impl ResponseEventLog for MemResponseEventLog {
                 return Err(EventLogError::Expired);
             }
             let seq = log.next_seq;
-            event.sequence_number = seq;
             log.next_seq += 1;
-            log.ring.push_back(event);
+            log.ring.push_back(event.with_seq(seq));
             while log.ring.len() > self.capacity_per_response {
                 log.ring.pop_front();
                 log.evicted_before += 1;

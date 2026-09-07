@@ -10,8 +10,8 @@ use adapters_mem::MemWorld;
 use anyhow::{bail, Context, Result};
 use nova_responses_core::protocol::{CreateResponseRequest, InputLimits};
 use nova_responses_core::{
-    canonical_items, AgentId, Attempt, ChainLimits, ContextError, ContextStore, ConversationStore,
-    CreateOutcome, EventLogError, IdempotencyKey, NodeTag, ResponseEvent, ResponseEventKind,
+    canonical_items, AgentId, AppendEvent, Attempt, ChainLimits, ContextError, ContextStore,
+    ConversationStore, CreateOutcome, EventLogError, IdempotencyKey, NodeTag, ResponseEventKind,
     ResponseEventLog, ResponseId, ResponseItem, ResponseLedger, ResponseStatus, StoredResponse,
     TenantId, Usage,
 };
@@ -424,7 +424,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 let seq = ctx
                     .world
                     .event_log
-                    .append(ResponseEvent::lifecycle(
+                    .append(AppendEvent::lifecycle(
                         resulting_id.clone(),
                         ResponseEventKind::Created,
                         serde_json::json!({
@@ -471,7 +471,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                     let seq = ctx
                         .world
                         .event_log
-                        .append(ResponseEvent::lifecycle_with_attempt(
+                        .append(AppendEvent::lifecycle_with_attempt(
                             c.record.response_id.clone(),
                             ResponseEventKind::InProgress,
                             c.attempt,
@@ -509,7 +509,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let result = ctx
                 .world
                 .event_log
-                .append(ResponseEvent::text_delta(
+                .append(AppendEvent::text_delta(
                     id.clone(),
                     attempt,
                     String::new(),
@@ -586,7 +586,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let seq = ctx
                 .world
                 .event_log
-                .append(ResponseEvent::lifecycle(
+                .append(AppendEvent::lifecycle(
                     id.clone(),
                     if ok {
                         ResponseEventKind::Completed

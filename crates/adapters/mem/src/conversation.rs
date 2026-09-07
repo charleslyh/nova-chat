@@ -13,7 +13,7 @@ use nova_responses_core::{
     ConversationStore, ResponseId, ResponseStatus, TenantId,
 };
 
-use crate::store::MemStore;
+use crate::store::{Inner, MemStore};
 
 pub struct MemConversationStore {
     store: Arc<MemStore>,
@@ -42,6 +42,22 @@ impl MemConversationStore {
 
     pub fn conversation_count(&self) -> usize {
         self.store.lock().conversations.len()
+    }
+
+    /// INV-59: refuse the append once the per-conversation event stream has
+    /// reached its bound, rather than evicting the oldest event. Checked before
+    /// any marker transition so a refused turn never leaves "occupied but no
+    /// event" behind (INV-58).
+    fn ensure_event_capacity(&self, g: &Inner, id: &ConversationId) -> Result<(), ConversationError> {
+        let next = g
+            .conversation_events
+            .get(id)
+            .map(|s| s.next_seq)
+            .unwrap_or(0);
+        if next as usize >= self.store.max_events_per_conversation() {
+            return Err(ConversationError::CapacityExceeded);
+        }
+        Ok(())
     }
 }
 
@@ -169,6 +185,9 @@ impl ConversationStore for MemConversationStore {
         }
         match existing.active_response_id.clone() {
             None => {
+                // INV-58: refuse before touching the marker, so a rejected turn
+                // never leaves "occupied but no event" behind.
+                self.ensure_event_capacity(&g, id)?;
                 let updated = Conversation {
                     active_response_id: Some(response_id.clone()),
                     ..existing.clone()
@@ -228,6 +247,7 @@ impl ConversationStore for MemConversationStore {
                 return Ok(seq);
             }
         }
+        self.ensure_event_capacity(&g, id)?;
         let updated = Conversation {
             active_response_id: None,
             ..existing.clone()
@@ -287,6 +307,7 @@ impl ConversationStore for MemConversationStore {
         if &existing.tenant_id != tenant {
             return Err(ConversationError::NotFound);
         }
+        self.ensure_event_capacity(&g, id)?;
         Ok(g.push_conversation_event(id, kind, now_ms))
     }
 
@@ -336,9 +357,8 @@ impl ConversationStore for MemConversationStore {
         Ok(out)
     }
 
-    fn set_max_events_per_conversation(&self, _limit: usize) {
-        // The in-memory carrier is bounded by `max_conversations`, not per-stream;
-        // the sql adapter enforces the per-stream bound. No-op here.
+    fn set_max_events_per_conversation(&self, limit: usize) {
+        self.store.set_max_events_per_conversation(limit);
     }
 
     async fn health(&self) -> Result<(), ConversationError> {

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nova_responses_core::{
-    Clock, ContextStore, ConversationStore, MetricsSink, ResponseEvent, ResponseEventKind,
+    AppendEvent, Clock, ContextStore, ConversationStore, MetricsSink, ResponseEventKind,
     ResponseEventLog, ResponseLedger, ResponseStatus,
 };
 use tracing::warn;
@@ -77,7 +77,7 @@ async fn tick(deps: &SweepDeps) -> anyhow::Result<()> {
         });
         let _ = deps
             .event_log
-            .append(ResponseEvent::lifecycle(
+            .append(AppendEvent::lifecycle(
                 claim.response_id.clone(),
                 ResponseEventKind::Failed,
                 response,

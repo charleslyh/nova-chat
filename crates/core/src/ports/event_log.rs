@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::events::ResponseEvent;
+use crate::events::{AppendEvent, ResponseEvent};
 use crate::ids::ResponseId;
 
 #[derive(Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +39,12 @@ pub enum EventLogError {
 #[async_trait]
 pub trait ResponseEventLog: Send + Sync {
     /// Append and return the assigned sequence number.
-    async fn append(&self, event: ResponseEvent) -> Result<u64, EventLogError>;
+    ///
+    /// The input is an [`AppendEvent`]: it carries no `sequence_number`, because
+    /// the number is this implementation's to assign (INV-11). A producer never
+    /// invents one, and a backend never has to overwrite or trust one supplied
+    /// by its caller.
+    async fn append(&self, event: AppendEvent) -> Result<u64, EventLogError>;
 
     /// Read events strictly after `starting_after`.
     ///

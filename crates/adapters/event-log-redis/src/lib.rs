@@ -28,8 +28,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nova_responses_core::{
-    EventBody, EventLogError, LedgerError, ResponseEvent, ResponseEventKind, ResponseEventLog,
-    ResponseId, ResponseLedger,
+    AppendEvent, EventBody, EventLogError, LedgerError, ResponseEvent, ResponseEventKind,
+    ResponseEventLog, ResponseId, ResponseLedger,
 };
 use redis::aio::MultiplexedConnection;
 
@@ -85,7 +85,7 @@ impl RedisResponseEventLog {
         format!("{}:meta:{id}", self.prefix)
     }
 
-    async fn check_append(&self, event: &ResponseEvent) -> Result<(), EventLogError> {
+    async fn check_append(&self, event: &AppendEvent) -> Result<(), EventLogError> {
         if self.ledger.is_read_only() {
             return Err(EventLogError::ReadOnly);
         }
@@ -249,7 +249,7 @@ async fn xread(
 
 #[async_trait]
 impl ResponseEventLog for RedisResponseEventLog {
-    async fn append(&self, event: ResponseEvent) -> Result<u64, EventLogError> {
+    async fn append(&self, event: AppendEvent) -> Result<u64, EventLogError> {
         self.check_append(&event).await?;
 
         let seq_key = self.seq_key(&event.response_id);
@@ -446,16 +446,15 @@ mod tests {
     fn wire_event_round_trips_without_losing_fields() {
         // Serialise a real event, then parse it back through the mirror type and
         // check that every field survives the round trip.
-        let event = ResponseEvent::text_delta(
+        let event = AppendEvent::text_delta(
             id(),
             Attempt(1),
             "msg_1".into(),
             0,
             0,
             "hello",
-        );
-        let mut event = event;
-        event.sequence_number = 3;
+        )
+        .with_seq(3);
         let json = serde_json::to_string(&event).unwrap();
 
         let wire: WireEvent = serde_json::from_str(&json).unwrap();

@@ -31,7 +31,7 @@ pub use context::{
 };
 pub use conversation::{Conversation, ConversationEvent, ConversationEventKind};
 pub use error::DomainError;
-pub use events::{EventBody, ResponseEvent, ResponseEventKind};
+pub use events::{AppendEvent, EventBody, ResponseEvent, ResponseEventKind};
 pub use ids::{
     AgentId, Attempt, ConversationId, IdError, IdempotencyKey, NodeTag, ResponseId, TenantId,
 };

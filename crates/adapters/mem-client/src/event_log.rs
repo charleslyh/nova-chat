@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nova_responses_core::{EventLogError, ResponseEvent, ResponseEventLog, ResponseId};
+use nova_responses_core::{AppendEvent, EventLogError, ResponseEvent, ResponseEventLog, ResponseId};
 
 use adapters_mem::proto::{ProtoError, Request, Response};
 
@@ -36,7 +36,7 @@ async fn event_rpc(rpc: &Rpc, req: Request) -> Result<Response, EventLogError> {
 
 #[async_trait]
 impl ResponseEventLog for MemEventLogClient {
-    async fn append(&self, event: ResponseEvent) -> Result<u64, EventLogError> {
+    async fn append(&self, event: AppendEvent) -> Result<u64, EventLogError> {
         if self.read_only.load(Ordering::SeqCst) {
             return Err(EventLogError::ReadOnly);
         }

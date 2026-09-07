@@ -54,9 +54,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use nova_responses_core::{
-    validate_outcome, AgentId, Attempt, ClaimedResponse, Clock, CompletionsRequest,
+    validate_outcome, AgentId, AppendEvent, Attempt, ClaimedResponse, Clock, CompletionsRequest,
     CompletionsRequestScheduler, CompletionsSink, ContextStore, ConversationStore, EventBody,
-    FinishReason, RequestProvenance, ResponseEvent, ResponseEventKind, ResponseEventLog,
+    FinishReason, RequestProvenance, ResponseEventKind, ResponseEventLog,
     ResponseId, ResponseItem, ResponseLedger, ResponseStatus, SchedulerError, SinkError,
     SinkVerdict, StoredResponse, TenantId, ToolExecutor, Usage,
 };
@@ -209,7 +209,7 @@ impl Agent {
         let _ = self
             .deps
             .event_log
-            .append(ResponseEvent::lifecycle_with_attempt(
+            .append(AppendEvent::lifecycle_with_attempt(
                 id.clone(),
                 ResponseEventKind::InProgress,
                 attempt,
@@ -645,7 +645,7 @@ impl Agent {
         let _ = self
             .deps
             .event_log
-            .append(ResponseEvent::lifecycle(id.clone(), kind, response))
+            .append(AppendEvent::lifecycle(id.clone(), kind, response))
             .await;
         let _ = self
             .deps
@@ -749,9 +749,8 @@ impl LedgerSink {
         // superseded holder (INV-6).
         match self
             .event_log
-            .append(ResponseEvent {
+            .append(AppendEvent {
                 response_id: self.response_id.clone(),
-                sequence_number: 0,
                 kind,
                 attempt: Some(self.attempt),
                 body,

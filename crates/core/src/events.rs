@@ -84,9 +84,38 @@ impl ResponseEventKind {
     }
 }
 
-/// A single event in one response's stream, serialised to the OpenAI Responses
-/// wire shape: `type`, `sequence_number`, plus kind-specific fields (`delta`,
-/// `item`, `arguments`). `response_id` and `attempt` never leave the process.
+/// An event a producer hands to the log, before it has a sequence number.
+///
+/// The sequence number is assigned by the `ResponseEventLog` implementation and
+/// returned from `append` (INV-11). A producer therefore never supplies one:
+/// this type has no `sequence_number` field, so there is nothing to invent, and
+/// nothing for a backend to overwrite or trust. This mirrors
+/// `ConversationStore::append_event`, whose input is a `ConversationEventKind`
+/// and whose seq is likewise returned rather than passed in — the number is the
+/// implementation's to assign, so it never appears on the append input.
+///
+/// Like [`ResponseEvent`], `response_id` and `attempt` are internal state and
+/// never serialised; a cross-process carrier that must preserve them uses its
+/// own wire type (see `adapters/mem/src/proto.rs`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AppendEvent {
+    #[serde(skip)]
+    pub response_id: ResponseId,
+    #[serde(rename = "type")]
+    pub kind: ResponseEventKind,
+    #[serde(skip)]
+    pub attempt: Option<Attempt>,
+    #[serde(flatten)]
+    pub body: EventBody,
+}
+
+/// A single stored or re-read event, serialised to the OpenAI Responses wire
+/// shape: `type`, `sequence_number`, plus kind-specific fields (`delta`,
+/// `item`, `arguments`).
+///
+/// This is the form produced by reads and serialised to the SSE wire — **not**
+/// the form handed to `append`. A producer builds an [`AppendEvent`]; the log
+/// assigns the sequence number and yields this type back on read.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ResponseEvent {
     /// Not on the wire: the response id lives in the SSE URL.
@@ -146,13 +175,12 @@ pub enum EventBody {
     Empty {},
 }
 
-impl ResponseEvent {
+impl AppendEvent {
     /// Lifecycle envelope (created / in_progress / completed / failed /
     /// incomplete), carrying the full response object.
     pub fn lifecycle(response_id: ResponseId, kind: ResponseEventKind, response: Value) -> Self {
         Self {
             response_id,
-            sequence_number: 0,
             kind,
             attempt: None,
             body: EventBody::Response { response },
@@ -170,7 +198,6 @@ impl ResponseEvent {
     ) -> Self {
         Self {
             response_id,
-            sequence_number: 0,
             kind,
             attempt: Some(attempt),
             body: EventBody::Response { response },
@@ -188,7 +215,6 @@ impl ResponseEvent {
     ) -> Self {
         Self {
             response_id,
-            sequence_number: 0,
             kind: ResponseEventKind::OutputTextDelta,
             attempt: Some(attempt),
             body: EventBody::Delta {
@@ -210,7 +236,6 @@ impl ResponseEvent {
     ) -> Self {
         Self {
             response_id,
-            sequence_number: 0,
             kind: ResponseEventKind::FunctionCallArgumentsDelta,
             attempt: Some(attempt),
             body: EventBody::Delta {
@@ -234,7 +259,6 @@ impl ResponseEvent {
     ) -> Self {
         Self {
             response_id,
-            sequence_number: 0,
             kind: ResponseEventKind::ReasoningTextDelta,
             attempt: Some(attempt),
             body: EventBody::Delta {
@@ -257,7 +281,6 @@ impl ResponseEvent {
     ) -> Self {
         Self {
             response_id,
-            sequence_number: 0,
             kind: ResponseEventKind::OutputTextDone,
             attempt: Some(attempt),
             body: EventBody::Text {
@@ -281,7 +304,6 @@ impl ResponseEvent {
     ) -> Self {
         Self {
             response_id,
-            sequence_number: 0,
             kind,
             attempt: Some(attempt),
             body: EventBody::Part {
@@ -303,7 +325,6 @@ impl ResponseEvent {
     ) -> Self {
         Self {
             response_id,
-            sequence_number: 0,
             kind,
             attempt: Some(attempt),
             body: EventBody::Item { output_index, item },
@@ -320,7 +341,6 @@ impl ResponseEvent {
     ) -> Self {
         Self {
             response_id,
-            sequence_number: 0,
             kind: ResponseEventKind::FunctionCallArgumentsDone,
             attempt: Some(attempt),
             body: EventBody::Arguments {
@@ -328,6 +348,19 @@ impl ResponseEvent {
                 item_id,
                 arguments,
             },
+        }
+    }
+
+    /// Attach the sequence number the log assigned, yielding the stored/wire
+    /// form. Called by `ResponseEventLog` implementations on append; producers
+    /// never do this themselves.
+    pub fn with_seq(self, sequence_number: u64) -> ResponseEvent {
+        ResponseEvent {
+            response_id: self.response_id,
+            sequence_number,
+            kind: self.kind,
+            attempt: self.attempt,
+            body: self.body,
         }
     }
 }
@@ -415,7 +448,7 @@ mod tests {
 
     #[test]
     fn event_serialises_with_protocol_field_names() {
-        let event = ResponseEvent::lifecycle(
+        let event = AppendEvent::lifecycle(
             ResponseId::new(NodeTag::parse("n1").unwrap()),
             ResponseEventKind::Created,
             serde_json::json!({
@@ -423,7 +456,8 @@ mod tests {
                 "object": "response",
                 "status": "queued",
             }),
-        );
+        )
+        .with_seq(0);
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["sequence_number"], 0);
         assert_eq!(json["type"], "response.created");
@@ -448,7 +482,7 @@ mod tests {
     #[test]
     fn delta_events_serialise_with_a_delta_field() {
         let id = ResponseId::new(NodeTag::parse("n1").unwrap());
-        let event = ResponseEvent::text_delta(id, Attempt(1), "msg_1".into(), 0, 0, "hello");
+        let event = AppendEvent::text_delta(id, Attempt(1), "msg_1".into(), 0, 0, "hello").with_seq(0);
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "response.output_text.delta");
         assert_eq!(json["item_id"], "msg_1");
@@ -461,7 +495,7 @@ mod tests {
     #[test]
     fn arguments_delta_has_no_content_index() {
         let id = ResponseId::new(NodeTag::parse("n1").unwrap());
-        let event = ResponseEvent::arguments_delta(id, Attempt(1), "call_1".into(), 0, "{}");
+        let event = AppendEvent::arguments_delta(id, Attempt(1), "call_1".into(), 0, "{}").with_seq(0);
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "response.function_call_arguments.delta");
         assert_eq!(json["item_id"], "call_1");
@@ -479,7 +513,7 @@ mod tests {
             "name": "get_weather",
             "arguments": ""
         });
-        let event = ResponseEvent::item(id, ResponseEventKind::OutputItemAdded, Attempt(1), 0, item);
+        let event = AppendEvent::item(id, ResponseEventKind::OutputItemAdded, Attempt(1), 0, item).with_seq(0);
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "response.output_item.added");
         assert_eq!(json["output_index"], 0);
@@ -491,13 +525,14 @@ mod tests {
     #[test]
     fn arguments_events_serialise_with_output_index_and_item_id() {
         let id = ResponseId::new(NodeTag::parse("n1").unwrap());
-        let event = ResponseEvent::arguments(
+        let event = AppendEvent::arguments(
             id,
             Attempt(1),
             0,
             "call_1".into(),
             r#"{"city":"Paris"}"#.into(),
-        );
+        )
+        .with_seq(0);
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "response.function_call_arguments.done");
         assert_eq!(json["output_index"], 0);

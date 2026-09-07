@@ -18,7 +18,7 @@ use std::time::Duration;
 use adapters_event_log_redis::RedisResponseEventLog;
 use adapters_mem::MemWorld;
 use nova_responses_core::{
-    EventLogError, ResponseEvent, ResponseEventKind, ResponseEventLog, ResponseId, ResponseLedger,
+    AppendEvent, EventLogError, ResponseEventKind, ResponseEventLog, ResponseId, ResponseLedger,
 };
 
 fn id() -> ResponseId {
@@ -27,8 +27,8 @@ fn id() -> ResponseId {
 
 /// A lifecycle event: no attempt fence, so the mem ledger's `check_attempt` is
 /// never reached and the test needs no claim setup.
-fn event(id: &ResponseId) -> ResponseEvent {
-    ResponseEvent::lifecycle(
+fn event(id: &ResponseId) -> AppendEvent {
+    AppendEvent::lifecycle(
         id.clone(),
         ResponseEventKind::Created,
         serde_json::json!({ "id": id.to_string(), "object": "response", "status": "queued" }),

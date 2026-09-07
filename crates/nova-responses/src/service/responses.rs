@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use nova_responses_core::protocol::CreateResponseRequest;
 use nova_responses_core::{
-    Attempt, Clock, CompletionsToolChoice, ContextError, ContextStore, ConversationError,
-    ConversationEventKind, ConversationId, CreateOutcome, EventLogError, IdempotencyKey,
-    LedgerError, MetricsSink, ResponseEvent, ResponseEventKind, ResponseEventLog, ResponseId,
+    AppendEvent, Attempt, Clock, CompletionsToolChoice, ContextError, ContextStore,
+    ConversationError, ConversationEventKind, ConversationId, CreateOutcome, EventLogError,
+    IdempotencyKey, LedgerError, MetricsSink, ResponseEventKind, ResponseEventLog, ResponseId,
     ResponseItem, ResponseLedger, ResponseStatus, StoredResponse, TenantId, ToolSpec, Usage,
 };
 
@@ -309,7 +309,7 @@ impl ResponsesService {
                 // 首事件，让立即订阅者看到确定起点。**携带完整 response 对象**
                 // （含 input），这正是「B 端在轮次进行中加入也能补齐全部内容」所依赖
                 // 的既有行为，不可回退为只带 id。
-                let created = ResponseEvent::lifecycle(
+                let created = AppendEvent::lifecycle(
                     response_id.clone(),
                     ResponseEventKind::Created,
                     record.to_response_value(),
@@ -467,7 +467,7 @@ impl ResponsesService {
             });
         let _ = self
             .event_log
-            .append(ResponseEvent::lifecycle(
+            .append(AppendEvent::lifecycle(
                 response_id.clone(),
                 ResponseEventKind::Failed,
                 response,

@@ -1,5 +1,5 @@
 name: conversation-transcript-http
-covers: [FR-41]
+covers: [FR-41, FR-45]
 oracles: []
 steps:
   # A conversation is the container (D28): the chain tail, the in-flight marker

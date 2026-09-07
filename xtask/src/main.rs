@@ -431,13 +431,15 @@ fn is_test_case_line(line: &str) -> bool {
     rest.contains(" ... ")
 }
 
-async fn coverage() -> Result<()> {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    // Baseline follows `docs/requirements/spec.md` v3. Keep in step with that
-    // document: an id here that no longer exists there would silently demand
-    // coverage for a requirement that was withdrawn.
-    let baseline: BTreeSet<&str> = [
+/// The requirement ids every automated gate must substantiate.
+///
+/// Follows `docs/requirements/spec.md` v3 and `docs/architecture/invariants.md`.
+/// A single source of truth, shared by `coverage` (which demands each id be
+/// substantiated) and `check_coverage_baseline_tracks_invariants` (which demands
+/// every invariant in `invariants.md` appear here). Keeping the two in one list
+/// means a newly added invariant cannot silently fall outside the coverage gate.
+fn coverage_baseline() -> std::collections::BTreeSet<&'static str> {
+    [
         // Lifecycle.
         "FR-1", "FR-2", "FR-3", "FR-4", "FR-5", "FR-6", "FR-7", "FR-8",
         // Streaming and resumption.
@@ -453,20 +455,26 @@ async fn coverage() -> Result<()> {
         // Conversation container (D28: the compatibility container plus the
         // event stream, turn lock and business events that were the D26 session
         // layer — merged into one resource).
-        "FR-40", "FR-41",
+        "FR-40", "FR-41", "FR-42", "FR-43", "FR-44", "FR-45",
         // Correctness.
         "CR-1", "CR-2", "CR-3", "CR-4", "CR-5", "CR-6", "CR-7", "CR-8", "CR-9", "CR-10",
-        "CR-11", "CR-12", "CR-13",
+        "CR-11", "CR-12", "CR-13", "CR-14", "CR-15", "CR-16",
         // Invariants still in force.
         "INV-1", "INV-2", "INV-5", "INV-6", "INV-11", "INV-12", "INV-16", "INV-29", "INV-30",
         "INV-32", "INV-33", "INV-34", "INV-35", "INV-40", "INV-41", "INV-42", "INV-43",
-        "INV-44", "INV-45", "INV-46", "INV-47", "INV-49", "INV-50", "INV-51", "INV-52",
-        "INV-54", "INV-55",
+        "INV-44", "INV-45", "INV-46", "INV-47", "INV-48", "INV-49", "INV-50", "INV-51",
+        "INV-52", "INV-54", "INV-55", "INV-56", "INV-57", "INV-58", "INV-59",
         // Security.
         "SEC-2", "SEC-3", "SEC-5", "SEC-6", "SEC-7",
     ]
     .into_iter()
-    .collect();
+    .collect()
+}
+
+async fn coverage() -> Result<()> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let baseline = coverage_baseline();
 
     // L0 coverage is obtained by **running the contract and asking what it
     // substantiated**, not from a literal list maintained alongside it.
@@ -893,6 +901,8 @@ fn check_deps() -> Result<()> {
     check_execution_claims_globally_through_the_port()?;
     check_service_and_gateway_boundaries()?;
     check_sdk_compat_is_python_only()?;
+    check_coverage_baseline_tracks_invariants()?;
+    check_inflight_separated_from_store()?;
     let spec_covers = check_protocol_spec_is_publishable()?;
 
     println!("check-deps OK ({} gated requirement(s))", spec_covers.len());
@@ -935,6 +945,79 @@ fn check_sdk_compat_is_python_only() -> Result<()> {
                  works unmodified\" untestable."
             );
         }
+    }
+    Ok(())
+}
+
+/// Every invariant in `docs/architecture/invariants.md` must appear in the
+/// coverage baseline. Without this, a newly added invariant silently falls
+/// outside the coverage gate — the gate only ever checks ids it already knows.
+///
+/// `INV-D11` is excluded here: it is the storage/separation rule, guarded
+/// structurally by [`check_inflight_separated_from_store`] rather than by a
+/// runtime contract.
+fn check_coverage_baseline_tracks_invariants() -> Result<()> {
+    let text = std::fs::read_to_string("docs/architecture/invariants.md")
+        .context("docs/architecture/invariants.md is the invariant authority")?;
+    let baseline = coverage_baseline();
+
+    // Only table rows of the form `| **INV-xx** | ...` are live invariants. The
+    // superseded ids (INV-3/10/13/14/15/53 …) appear only in prose like
+    // "`INV-10 / … 已废止`" or "`~~INV-53~~`", which a plain `INV-` scan would
+    // mistake for live ones.
+    let mut ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("| **INV-") else {
+            continue;
+        };
+        let id: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
+        if id.is_empty() {
+            continue;
+        }
+        ids.insert(format!("INV-{id}"));
+    }
+
+    if ids.is_empty() {
+        bail!(
+            "parsed no `INV-*` ids out of invariants.md; the parser and the document \
+             have diverged, so this gate is checking nothing"
+        );
+    }
+
+    let missing: Vec<&String> = ids
+        .iter()
+        .filter(|id| id.as_str() != "INV-D11" && !baseline.contains(id.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "invariants.md declares {} which is absent from the coverage baseline. \
+             Add it to `coverage_baseline()` and to the contract case / oracle that \
+             substantiates it, or the invariant silently escapes the coverage gate.",
+            missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// INV-D11: the high-frequency in-flight buffer and the low-frequency durable
+/// store must not share a carrier. Structurally, the SQL adapter (the durable
+/// store) must not implement `ResponseEventLog` — the in-flight buffer is a
+/// separate shared carrier (Redis Streams).
+fn check_inflight_separated_from_store() -> Result<()> {
+    let sql_lib = std::fs::read_to_string("crates/adapters/sql/src/lib.rs")?;
+    if sql_lib.contains("impl ResponseEventLog") {
+        bail!(
+            "the sql adapter must not implement ResponseEventLog (INV-D11): the \
+             in-flight buffer is a separate shared carrier, not the durable store. \
+             Putting the ~20k/s hot path on the ~70/s strong-consistency path would \
+             couple the two load classes this decision separates."
+        );
+    }
+    if !sql_lib.contains("pub struct SqlWorld") {
+        bail!("check-inflight-separated is out of date: SqlWorld no longer exists");
     }
     Ok(())
 }

@@ -7,8 +7,8 @@
 
 use adapters_mem::{MemWorld, MemWorldConfig};
 use nova_responses_core::{
-    Attempt, ChainLimits, ContextError, ContextStore, EventBody, EventLogError, IdempotencyKey,
-    NodeTag, ResponseEvent, ResponseEventKind, ResponseEventLog, ResponseId, ResponseItem,
+    AppendEvent, Attempt, ChainLimits, ContextError, ContextStore, EventBody, EventLogError,
+    IdempotencyKey, NodeTag, ResponseEventKind, ResponseEventLog, ResponseId, ResponseItem,
     ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
 };
 
@@ -56,7 +56,7 @@ fn record(
     }
 }
 
-fn event(id: &ResponseId, kind: ResponseEventKind, payload: &str) -> ResponseEvent {
+fn event(id: &ResponseId, kind: ResponseEventKind, payload: &str) -> AppendEvent {
     let body = if payload.is_empty() {
         EventBody::Empty {}
     } else {
@@ -67,9 +67,8 @@ fn event(id: &ResponseId, kind: ResponseEventKind, payload: &str) -> ResponseEve
             delta: payload.to_string(),
         }
     };
-    ResponseEvent {
+    AppendEvent {
         response_id: id.clone(),
-        sequence_number: 0,
         kind,
         attempt: None,
         body,

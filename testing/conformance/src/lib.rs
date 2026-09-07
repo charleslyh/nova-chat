@@ -12,10 +12,11 @@ use std::sync::Arc;
 
 use nova_responses_core::protocol::{CreateResponseRequest, InputLimits, ResponseItem};
 use nova_responses_core::{
-    canonical_items, AgentId, Attempt, ChainLimits, ContentIntegrity, ContextError, ContextStore,
-    Conversation, ConversationError, ConversationId, ConversationStore, CreateOutcome, EventBody,
-    EventLogError, IdempotencyKey, LedgerError, NodeTag, ResponseEvent, ResponseEventKind,
-    ResponseEventLog, ResponseId, ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
+    canonical_items, AgentId, AppendEvent, Attempt, ChainLimits, ContentIntegrity, ContextError,
+    ContextStore, Conversation, ConversationError, ConversationEventKind, ConversationId,
+    ConversationStore, CreateOutcome, EventBody, EventLogError, IdempotencyKey, LedgerError, NodeTag,
+    ResponseEventKind, ResponseEventLog, ResponseId, ResponseLedger, ResponseStatus, StoredResponse,
+    TenantId, Usage,
 };
 
 /// The set of ports under test. Backend-agnostic by construction.
@@ -101,7 +102,7 @@ fn record(
     }
 }
 
-fn event(id: &ResponseId, kind: ResponseEventKind, payload: &str) -> ResponseEvent {
+fn event(id: &ResponseId, kind: ResponseEventKind, payload: &str) -> AppendEvent {
     let body = if payload.is_empty() {
         EventBody::Empty {}
     } else {
@@ -112,9 +113,8 @@ fn event(id: &ResponseId, kind: ResponseEventKind, payload: &str) -> ResponseEve
             delta: payload.to_string(),
         }
     };
-    ResponseEvent {
+    AppendEvent {
         response_id: id.clone(),
-        sequence_number: 0,
         kind,
         attempt: None,
         body,
@@ -1071,8 +1071,8 @@ pub async fn assert_overload_integrity(ports: &PortSet) {
 
 // -------------------------------------------------------- output provenance
 
-/// FR-20 / INV-6 / CR-3 / CR-7: stored output comes from the executor's terminal
-/// submission, never from replaying the event stream.
+/// FR-20 / INV-48 / INV-6 / CR-3 / CR-7: stored output comes from the executor's
+/// terminal submission, never from replaying the event stream (INV-48).
 ///
 /// This is the load-bearing decision of the whole design (D20), and it had no
 /// verification at all — the id was listed against the cancel case, which does not
@@ -1093,9 +1093,8 @@ pub async fn assert_output_provenance(ports: &PortSet) {
         .expect("put");
 
     // The executor streams deltas for the caller's benefit...
-    for (i, chunk) in ["Sta", "ble ", "answer"].iter().enumerate() {
-        let mut ev = event(&id, ResponseEventKind::OutputTextDelta, chunk);
-        ev.sequence_number = i as u64;
+    for chunk in ["Sta", "ble ", "answer"].iter() {
+        let ev = event(&id, ResponseEventKind::OutputTextDelta, chunk);
         ports.event_log.append(ev).await.expect("append delta");
     }
 
@@ -1455,6 +1454,8 @@ pub async fn assert_concurrency_conformance(ports: &PortSet) {
 ///
 /// - **FR-40**: the four upstream operations round-trip; metadata replaces
 ///   wholesale so a key can be removed; deletion does not cascade.
+/// - **FR-42**: the list operation returns this tenant's conversations newest
+///   first and never crosses the tenant boundary.
 /// - **FR-21**: tenant-level bulk erasure reaches conversations, so a purge is
 ///   not a false claim.
 /// - **INV-54**: the conversation holds a pointer, never items.
@@ -1605,10 +1606,44 @@ pub async fn assert_conversation_conformance(ports: &PortSet) {
     );
 
     // Bulk erasure by tenant (FR-21) must reach conversations too, or a purge
-    // would leave them behind while reporting success.
-    let a = ports.fresh_conversation(&tenant).await;
-    let b = ports.fresh_conversation(&tenant).await;
+    // would leave them behind while reporting success. `a` and `b` get distinct
+    // timestamps so the list-order assertion below has a well-defined order.
+    let a = ports
+        .conversation
+        .create(Conversation::new(
+            ConversationId::new(),
+            tenant.clone(),
+            Default::default(),
+            1_000,
+        ))
+        .await
+        .expect("create a");
+    let b = ports
+        .conversation
+        .create(Conversation::new(
+            ConversationId::new(),
+            tenant.clone(),
+            Default::default(),
+            2_000,
+        ))
+        .await
+        .expect("create b");
     let untouched = ports.fresh_conversation(&other).await;
+
+    // FR-42: list returns this tenant's conversations, newest first, and never
+    // leaks another tenant's.
+    let listed = ports.conversation.list(&tenant).await.expect("list");
+    let ids: Vec<_> = listed.iter().map(|c| c.id.clone()).collect();
+    assert!(ids.contains(&a.id), "list must include this tenant's conversations");
+    assert!(ids.contains(&b.id), "list must include the second conversation");
+    assert!(
+        !ids.contains(&untouched.id),
+        "list must not return another tenant's conversation"
+    );
+    let pos_b = ids.iter().position(|id| *id == b.id).expect("b listed");
+    let pos_a = ids.iter().position(|id| *id == a.id).expect("a listed");
+    assert!(pos_b < pos_a, "list must be newest-first: {ids:?}");
+
     let removed = ports
         .conversation
         .delete_by_tenant(&tenant)
@@ -1627,6 +1662,254 @@ pub async fn assert_conversation_conformance(ports: &PortSet) {
             .is_some(),
         "a purge must not cross the tenant boundary"
     );
+}
+
+/// Conversation event-stream and turn-lock contract (D28).
+///
+/// - **INV-58 / CR-14**: acquiring the turn lock and announcing it are atomic —
+///   a reader never observes the marker without its `TurnStarted`, and a refused
+///   turn leaves no event and no half state.
+/// - **FR-44**: a second turn is refused with the holder named.
+/// - **CR-15**: releasing is conditional and idempotent — the marker clears
+///   exactly once, and a repeat release emits no second event.
+/// - **INV-57 / CR-16 / FR-43**: turn boundaries and business events share one
+///   0-based contiguous sequence space.
+/// - **INV-59**: reaching the per-conversation event bound refuses the append,
+///   never evicting the oldest event.
+/// - **INV-56**: a conversation event carries references only — its wire form
+///   never contains conversation content.
+/// - **SEC-2**: the lock is tenant-scoped; a foreign tenant reads as absent.
+pub async fn assert_conversation_events_conformance(ports: &PortSet) {
+    let tenant = fresh_tenant("conv-ev");
+    let other = fresh_tenant("conv-ev-other");
+    let conv = ports.fresh_conversation(&tenant).await;
+    let cid = conv.id.clone();
+
+    // INV-58 / CR-14: acquire_active sets the marker and emits TurnStarted
+    // atomically. A reader must never observe one without the other.
+    let r1 = ports.new_id();
+    let start_seq = ports
+        .conversation
+        .acquire_active(&tenant, &cid, &r1, 1_000)
+        .await
+        .expect("acquire");
+    let held = ports
+        .conversation
+        .get(&tenant, &cid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.active_response_id.as_ref(), Some(&r1), "marker must be set");
+    let events = ports
+        .conversation
+        .read_after(&tenant, &cid, None, 10, 0)
+        .await
+        .expect("read");
+    assert_eq!(events.len(), 1, "TurnStarted must be emitted with the acquire");
+    assert_eq!(events[0].seq, start_seq);
+    assert!(matches!(events[0].kind, ConversationEventKind::TurnStarted { .. }));
+
+    // FR-44 / INV-58: a second turn is refused with the holder named, and leaves
+    // no event and no half state (CR-14).
+    let r2 = ports.new_id();
+    match ports.conversation.acquire_active(&tenant, &cid, &r2, 1_100).await {
+        Err(ConversationError::Busy { holder }) => assert_eq!(holder, r1),
+        other => panic!("expected Busy, got {other:?}"),
+    }
+    let events = ports
+        .conversation
+        .read_after(&tenant, &cid, None, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1, "a refused turn must leave no event behind");
+
+    // Re-entrant: the same holder re-acquiring is an idempotent retry, not a
+    // second turn — it returns the original sequence and emits nothing.
+    let again = ports
+        .conversation
+        .acquire_active(&tenant, &cid, &r1, 1_200)
+        .await
+        .expect("re-entrant acquire");
+    assert_eq!(again, start_seq, "re-entrant acquire returns the original seq");
+    let events = ports
+        .conversation
+        .read_after(&tenant, &cid, None, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1, "re-entrant acquire must not emit a second TurnStarted");
+
+    // INV-58 / CR-15: release_active clears the marker and emits TurnCompleted
+    // atomically.
+    let done_seq = ports
+        .conversation
+        .release_active(&tenant, &cid, &r1, ResponseStatus::Completed, 1_300)
+        .await
+        .expect("release");
+    let released = ports
+        .conversation
+        .get(&tenant, &cid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(released.active_response_id.is_none(), "marker must be cleared");
+    let events = ports
+        .conversation
+        .read_after(&tenant, &cid, Some(start_seq), 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].seq, done_seq);
+    assert!(matches!(events[0].kind, ConversationEventKind::TurnCompleted { .. }));
+
+    // CR-15: releasing again is idempotent — no second event, no error.
+    let _ = ports
+        .conversation
+        .release_active(&tenant, &cid, &r1, ResponseStatus::Completed, 1_400)
+        .await
+        .expect("idempotent release");
+    let events = ports
+        .conversation
+        .read_after(&tenant, &cid, Some(done_seq), 10, 0)
+        .await
+        .unwrap();
+    assert!(events.is_empty(), "idempotent release must not emit a second TurnCompleted");
+
+    // INV-57 / CR-16 / FR-43: a business event shares the same contiguous
+    // sequence space as the turn boundaries.
+    let biz_seq = ports
+        .conversation
+        .append_event(
+            &tenant,
+            &cid,
+            ConversationEventKind::Business {
+                kind: "note".into(),
+                payload: serde_json::json!({ "k": "v" }),
+            },
+            1_500,
+        )
+        .await
+        .expect("business event");
+    assert!(
+        biz_seq > done_seq,
+        "a business event must follow the turn boundary in one sequence space"
+    );
+    let events = ports
+        .conversation
+        .read_after(&tenant, &cid, Some(done_seq), 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].seq, biz_seq);
+    assert!(matches!(events[0].kind, ConversationEventKind::Business { .. }));
+
+    // Full read-back is 0-based and contiguous (INV-57).
+    let all = ports
+        .conversation
+        .read_after(&tenant, &cid, None, 100, 0)
+        .await
+        .unwrap();
+    let seqs: Vec<u64> = all.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, vec![start_seq, done_seq, biz_seq], "sequences must be contiguous");
+
+    // release_stale_active clears a terminal holder without an event (its
+    // terminal event was already emitted by whoever completed it).
+    let r3 = ports.new_id();
+    ports
+        .conversation
+        .acquire_active(&tenant, &cid, &r3, 1_600)
+        .await
+        .expect("acquire r3");
+    let cleared = ports
+        .conversation
+        .release_stale_active(&tenant, &cid, &r3)
+        .await
+        .expect("stale release");
+    assert!(cleared, "stale holder must be cleared");
+    let held = ports
+        .conversation
+        .get(&tenant, &cid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(held.active_response_id.is_none());
+
+    // SEC-2: the lock is tenant-scoped — a foreign tenant reads as absent.
+    let r4 = ports.new_id();
+    assert!(matches!(
+        ports.conversation.acquire_active(&other, &cid, &r4, 1_700).await,
+        Err(ConversationError::NotFound)
+    ));
+
+    // INV-59: reaching the per-conversation event bound refuses the append
+    // rather than evicting the oldest event.
+    let capped = ports.fresh_conversation(&tenant).await;
+    ports.conversation.set_max_events_per_conversation(2);
+    for i in 0..2u64 {
+        ports
+            .conversation
+            .append_event(
+                &tenant,
+                &capped.id,
+                ConversationEventKind::Business {
+                    kind: "b".into(),
+                    payload: serde_json::json!({}),
+                },
+                2_000 + i,
+            )
+            .await
+            .expect("append within the cap");
+    }
+    assert!(
+        matches!(
+            ports
+                .conversation
+                .append_event(
+                    &tenant,
+                    &capped.id,
+                    ConversationEventKind::Business {
+                        kind: "b".into(),
+                        payload: serde_json::json!({}),
+                    },
+                    2_100,
+                )
+                .await,
+            Err(ConversationError::CapacityExceeded)
+        ),
+        "reaching the event bound must refuse the append, not evict (INV-59)"
+    );
+    // Restore the default bound so later cases are unaffected.
+    ports.conversation.set_max_events_per_conversation(100_000);
+
+    // INV-56: a conversation event carries references only. Its wire form must
+    // never contain conversation content — the envelope names a response or a
+    // business payload, never the items themselves.
+    for kind in [
+        ConversationEventKind::TurnStarted {
+            response_id: r1.clone(),
+        },
+        ConversationEventKind::TurnCompleted {
+            response_id: r1.clone(),
+            status: ResponseStatus::Completed,
+        },
+        ConversationEventKind::ResponseDeleted {
+            response_id: r1.clone(),
+        },
+        ConversationEventKind::Business {
+            kind: "k".into(),
+            payload: serde_json::json!({ "x": 1 }),
+        },
+    ] {
+        let obj = serde_json::to_value(&kind).unwrap();
+        let obj = obj.as_object().expect("event serialises to an object");
+        assert!(
+            !obj.contains_key("items"),
+            "conversation event must not carry items (INV-56): {obj:?}"
+        );
+        assert!(
+            !obj.contains_key("content"),
+            "conversation event must not carry content (INV-56): {obj:?}"
+        );
+    }
 }
 
 
@@ -1732,7 +2015,7 @@ pub fn cases() -> &'static [ContractCase] {
         },
         ContractCase {
             name: "output-provenance",
-            covers: &["FR-20", "CR-3", "CR-7", "INV-6"],
+            covers: &["FR-20", "CR-3", "CR-7", "INV-6", "INV-48"],
             scope: CaseScope::Backend,
             asserts: "assert_output_provenance",
         },
@@ -1779,9 +2062,18 @@ pub fn cases() -> &'static [ContractCase] {
             // FR-41 is *not* claimed here: this case can show the tail moves, but
             // "the next generation inherits it" is assembled in the service layer
             // and is covered by the L2 http scenarios.
-            covers: &["FR-40", "FR-21", "INV-54", "INV-55", "SEC-2"],
+            covers: &["FR-40", "FR-42", "FR-21", "INV-54", "INV-55", "SEC-2"],
             scope: CaseScope::Backend,
             asserts: "assert_conversation_conformance",
+        },
+        ContractCase {
+            name: "conversation-events",
+            covers: &[
+                "FR-43", "FR-44", "CR-14", "CR-15", "CR-16", "INV-56", "INV-57", "INV-58",
+                "INV-59", "SEC-2",
+            ],
+            scope: CaseScope::Backend,
+            asserts: "assert_conversation_events_conformance",
         },
     ]
 }
@@ -1847,6 +2139,7 @@ async fn run_case(ports: &PortSet, case: &ContractCase) -> CaseOutcome {
         "event-coalesce" => assert_event_coalescing(),
         "reconnect-backoff" => assert_reconnect_backoff(),
         "conversation" => assert_conversation_conformance(ports).await,
+        "conversation-events" => assert_conversation_events_conformance(ports).await,
         unknown => panic!(
             "contract case `{unknown}` is listed in cases() but has no dispatch arm; \
              it would be reported as covered without ever running"
@@ -1921,6 +2214,7 @@ pub async fn run_mem_suite_reported() -> SuiteReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nova_responses_core::ResponseEvent;
 
     #[tokio::test]
     async fn mem_backend_satisfies_the_contract() {
@@ -2072,7 +2366,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ResponseEventLog for RaceyEventLog {
-        async fn append(&self, mut event: ResponseEvent) -> Result<u64, EventLogError> {
+        async fn append(&self, event: AppendEvent) -> Result<u64, EventLogError> {
             use std::sync::atomic::Ordering;
             // Read...
             let seen = self.next.load(Ordering::SeqCst);
@@ -2080,8 +2374,7 @@ mod tests {
             tokio::task::yield_now().await;
             // ...then write. Two tasks can observe the same value.
             self.next.store(seen + 1, Ordering::SeqCst);
-            event.sequence_number = seen;
-            self.events.lock().expect("lock").push(event);
+            self.events.lock().expect("lock").push(event.with_seq(seen));
             Ok(seen)
         }
 
