@@ -37,7 +37,7 @@
 | 会话（conversation，D28） | `adapters-mem-client` → `mem-server` |
 | 执行位置 | **独立进程** `nova-agentd-mock` |
 | 维护（sweep） | **独立进程** `nova-responses-sweep` |
-| 时钟 | `SystemClock`（真实墙钟） |
+| 时钟 | `system_now()`（`Arc<dyn Fn() -> u64>`，真实墙钟） |
 | 用途 | 协议验证 · 本地开发 · L0–L2 · L4 |
 
 **进程拓扑**：gateway（HTTP 接入）+ `nova-agentd-mock`（执行）+ 独立 sweep（reap/过期清理）+ 独立载体。执行是独立进程，不内嵌于 gateway。
@@ -48,10 +48,10 @@
 
 - 载体数据面：`crates/adapters/mem/src/proto.rs`（`Request`/`Response`）与 `server.rs`（`dispatch`）；HTTP 装配在 `crates/mem-server/src/main.rs`（数据面 `/rpc` + 控制面 `/unavailable` `/tamper` `/advance_clock` `/set_clock`）
 - 客户端桩：`crates/adapters/mem-client/src/{ledger,event_log,context,conversation}.rs`
-- 执行：`crates/agentd/src/main.rs`（`mount_mem`，`--scheduler echo|scripted|http`）
+- 执行：`testing/agentd-mock/src/main.rs`（`mount_mem`，`--scheduler echo|scripted|http`）
 - 独立 sweep：`crates/sweep/src/main.rs`，复用 `nova-responses::sweeper::SweepDeps`
 - 能力层 / HTTP 层：都在 `nova-responses` library
-- 夹具：`testing/config/node-{a,b,c}.toml` 供 mem gateway 用；`xtask` 的 `procs up` 启动 mem-server + agentd + sweep + 三个 gateway
+- 夹具：`testing/config/node-{a,b,c}.toml` 供 mem gateway 用；`xtask` 的 `procs up` 启动 mem-server + agentd-mock + sweep + 三个 gateway
 
 ---
 
@@ -60,19 +60,16 @@
 ```mermaid
 graph BT
     subgraph L0["领域层（无 workspace 内依赖）"]
-        core["<b>nova-responses-core</b><br/>入站协议子集 · 出站 completions 形状<br/>全部端口 trait（Ledger · EventLog · Context · Conversation ·<br/>CompletionsScheduler · ToolExecutor · Integrity · Metrics · Clock）<br/>领域类型 · 规范化"]
+        core["<b>nova-responses-core</b><br/>入站协议子集<br/>全部端口 trait（Ledger · EventLog · Context ·<br/>Conversation · Integrity · Metrics）<br/>领域类型 · 规范化"]
     end
 
     subgraph L1["适配层（实现端口）"]
         mem["<b>adapters-mem</b><br/>数据本体 · proto · server"]
         memclient["<b>adapters-mem-client</b><br/>RPC 桩（数据面）"]
-        cmock["<b>adapters-completions-mock</b><br/>Echo · Scripted<br/>无模型 · 无 IO"]
-        chttp["<b>adapters-completions-http</b><br/>真实 chat-completions（HTTP）"]
-        tool["<b>adapters-tool-calculator</b><br/>ToolExecutor 实现"]
     end
 
-    subgraph L2["执行"]
-        agent["<b>nova-agent-runtime</b><br/>Agent · ReAct loop<br/>零 IO"]
+    subgraph L2["执行运行时（编排 + 可插拔 runner）"]
+        agent["<b>nova-agent-runtime</b><br/>AgentRuntime（claim→run→commit 编排）<br/>AgentRunner（trait） · EventSink<br/>零 IO"]
     end
 
     subgraph SRV["服务层（无具体 adapter 依赖）"]
@@ -81,9 +78,12 @@ graph BT
 
     subgraph L3["二进制"]
         gw["<b>nova-responses-gateway</b><br/>薄装配"]
-        agentd["<b>nova-agentd-mock</b><br/>执行进程"]
         memsrv["<b>nova-responses-mem-server</b><br/>共享载体（数据+控制面）"]
         sweep["<b>nova-responses-sweep</b><br/>独立维护进程"]
+    end
+
+    subgraph MOCK["验证执行进程（testing/）"]
+        agentd["<b>nova-agentd-mock</b><br/>MockAgentRunner（ReAct loop）<br/>Scheduler · ToolExecutor · completions 形状"]
     end
 
     subgraph T["验证层"]
@@ -95,21 +95,15 @@ graph BT
     mem --> core
     memclient --> core
     memclient --> mem
-    cmock --> core
-    chttp --> core
-    tool --> core
     agent --> core
     svc --> core
     agentd --> agent
     agentd --> memclient
-    agentd --> cmock
-    agentd --> chttp
-    agentd --> tool
     gw --> svc
     gw --> memclient
     memsrv --> mem
-    sweep --> memclient
     sweep --> svc
+    sweep --> memclient
     conf --> core
     conf --> mem
     harn --> conf
@@ -122,26 +116,24 @@ graph BT
     style agentd fill:#4a3a6b,stroke:#9b7fc7,color:#fff
     style svc fill:#2a5c2a,stroke:#4dd47a,color:#fff
     style gw fill:#5c3a1a,stroke:#d4a04d,color:#fff
-    style cmock fill:#1a5c2a,stroke:#4dd47a,color:#fff
-    style chttp fill:#3a3a3a,stroke:#777,color:#aaa
 ```
 
 **核对点**：
 
-- **端口在 `core`，实现在 `adapters/*`** —— `core/src/ports/mod.rs` 首行即此约定。`CompletionsRequestScheduler`、`ToolExecutor`、`ConversationStore`、`ContentIntegrity`、`MetricsSink` 都与 `ResponseLedger` 并列
+- **端口在 `core`，实现在 `adapters/*`** —— `core/src/ports/mod.rs` 首行即此约定。`ContextStore`、`ConversationStore`、`ResponseEventLog`、`ContentIntegrity`、`ResponseLedger`、`MetricsSink` 六个端口并列，**没有** `CompletionsRequestScheduler` / `ToolExecutor` / `Clock`
 - `core` 无 workspace 内依赖（`crates/core/Cargo.toml`），这是 `check-deps` 的不变量
-- **`nova-agent-runtime` 不依赖 HTTP / DB / 任何具体 scheduler**：`check-deps` 拒绝向它注入 `reqwest`/`hyper`/`axum`/`sqlx`（已实测门禁有效）。因此 claim → ReAct → submit 全路径可在无 socket、无模型的单测里跑完
+- **`nova-agent-runtime` 不依赖 HTTP / DB / 任何具体 scheduler**：`check-deps` 拒绝向它注入 `reqwest`/`hyper`/`axum`（已实测门禁有效）。因此 claim → run → commit 全路径可在无 socket、无模型的单测里跑完
 - **gateway 不依赖 `nova-agent-runtime`**：执行统一走独立进程 `nova-agentd-mock`，gateway 只做接入与投递
-- `adapters-completions-mock` 不得依赖 `reqwest`/`sqlx`/`nova-agent-runtime`（同门禁），否则一个测试可能悄悄发出真实调用
+- **`CompletionsRequestScheduler` / `ToolExecutor` 不再是 core 端口**：两者随 ReAct loop 下沉到 `nova-agentd-mock`（`Scheduler` trait 与 `ToolExecutor` trait 均在该 crate 内），因为只有 mock runner 用到它们，不属存储/领域契约。`adapters-completions-*` / `adapters-tool-calculator` 三个独立 crate 已合并进 `testing/agentd-mock`
 
-### 2.1 core 同时承载两个方向的协议，这是有意的
+### 2.1 入站与出站协议分属两个 crate，这是有意的
 
-| 模块 | 方向 | 所有者 | 违约含义 |
-|---|---|---|---|
-| `protocol/` | **入站** | 我们（已发布子集） | 返回 400 |
-| `completions/` | **出站** | provider | 我们的请求格式错误 |
+| 模块 | 方向 | 所有者 | 违约含义 | 位置 |
+|---|---|---|---|---|
+| `protocol/` | **入站** | 我们（已发布子集） | 返回 400 | `nova-responses-core` |
+| `completions/` | **出站** | provider | 我们的请求格式错误 | `nova-agentd-mock` |
 
-混淆二者会双向出错：要么因为某 provider 支持而开始接受一个字段，要么因为我们的子集不含而拒绝发送一个字段。
+出站 completions 形状（`CompletionsRequest` / `CompletionsOutcome` / `CompletionsMessage` 及 `items_to_messages` 翻译）不属存储/领域契约——只有 mock runner 发送 provider 请求——故随 `Scheduler` / `ToolExecutor` 一起放在 `nova-agentd-mock`，而非 `core`。混淆二者会双向出错：要么因为某 provider 支持而开始接受一个字段，要么因为我们的子集不含而拒绝发送一个字段。
 
 ---
 
@@ -168,7 +160,7 @@ graph BT
 | `POST` | `/v1/admin/pending_limit` | 过载阈值 |
 | `POST` | `/v1/tenants/{tenant}/purge` | 租户清除 |
 
-执行不是协议：`nova-agentd-mock` 经 `ResponseLedger` 端口领活，不经 `router()` 注册的 HTTP 端点。
+**没有** `/v1/agent/*`（执行不是协议，走端口）、**没有** `/v1/sessions/*`。前者由 `check-deps` 的 `check_execution_claims_globally_through_the_port` 守门。
 
 `/v1/conversations` 是 D28 引入的会话容器：CRUD 对齐上游，`/events`、`/transcript` 是自托管子资源（上游无对应协议）。会话**不存条目**——它只存链尾指针 + 轮次锁 + 事件流，上下文仍由 `resolve_chain` 单一入口装配。
 
@@ -178,9 +170,11 @@ graph BT
 
 ## 4. 无节点间转发
 
-存储是共享载体（`nova-responses-mem-server`），任意节点直读，因此**不存在**节点间转发。
+存储是共享载体（`nova-responses-mem-server`），任意节点直读，因此**不存在**节点间转发：没有 `routing.rs`、`peers` 对等表、节点间内部 token，也没有端口上的 `is_shared()` 能力位。
 
-核对点：`nova-responses/src/routes/responses.rs` 的 retrieve / stream / cancel / delete 委托给 `service` 层（`state.service`），由 service 直接读 `ledger` / `context` / `event_log` 端口（背后是共享的 `mem-server`）。
+核对点：`nova-responses/src/routes/responses.rs` 的 retrieve / stream / cancel / delete 委托给 `service` 层（`state.service`），不直接操作端口；`nova-responses/src/config.rs` 无 `peers` / `internal_token_env` 字段。
+
+因为没有转发，也就不存在任何「由请求字段推导转发地址」的路径（无 SSRF 攻击面）。
 
 ---
 
@@ -217,9 +211,9 @@ sequenceDiagram
     participant LG as ResponseLedger
     participant CX as ContextStore
     participant EV as ResponseEventLog
-    participant EN as Agent
-    participant SC as Scheduler
-    participant TE as ToolExecutor
+    participant EN as Agent（AgentRuntime 编排 + Runner 执行）
+    participant SC as Scheduler（runner 内）
+    participant TE as ToolExecutor（runner 内）
     participant PR as Provider
 
     rect rgba(26, 77, 92, 0.2)
@@ -292,7 +286,7 @@ sequenceDiagram
     end
 ```
 
-###### **这张图要传达的三件事**：
+**这张图要传达的三件事**：
 
 1. **两条写路径从不交汇**：增量走 `ResponseEventLog`（瞬态），输出条目走 `ContextStore`（持久）。`Agent` 是唯一同时触碰两者的组件，但它把「流式给订阅者看」和「终态提交存储」作为两次独立写入（§8）。
 2. **快照在创建时固化、执行时读取**：阶段二里 `previous` 的历史在 `create` 那一刻被解析成扁平快照，随后执行只是单次读取——这就是「祖先缺失不影响本环」的由来（D24）。
@@ -322,7 +316,7 @@ sequenceDiagram
     R->>R: 5 validate（规模 / URL / 条目类型）
     end
 
-    R->>V: create(tenant, request, input_items, previous, key)
+    R->>V: create(tenant, request, input_items, source, idempotency_key)
 
     rect rgba(26, 77, 92, 0.3)
     Note over V,S: 7 先解析前驱（或会话锚点），后创建
@@ -376,68 +370,74 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant E as Agent
+    participant RT as AgentRuntime（编排）
+    participant RN as Runner（ReAct loop）
     participant L as Ledger
     participant S as ContextStore
-    participant B as 在途缓冲
+    participant B as 在途缓冲（EventSink）
     participant T as ToolExecutor
-    participant P as provider
+    participant P as provider（Scheduler）
 
-    Note over E: 轮询领取。claim 频率 ≈ 账本写频率，<br/>与增量差三个数量级，不构成压力
-    E->>L: claim(agent_id, now_ms, exec_ttl_ms)
+    Note over RT: 轮询领取。claim 频率 ≈ 账本写频率，<br/>与增量差三个数量级，不构成压力
+    RT->>L: claim(agent_id, now_ms, exec_ttl_ms)
     Note over L: 单点原子转换，attempt 递增<br/><b>全局领取任意 queued</b>
-    L-->>E: ClaimedResponse{record, attempt}
-    E->>B: append(InProgress, attempt)
+    L-->>RT: ClaimedResponse{record, attempt, exec_deadline_ms}
+    RT->>B: append(InProgress, attempt)
 
-    Note right of E: 快照随 claim 返回（record.context）；<br/>历史已在创建时物化，零次额外读，<br/>不再回溯，祖先缺失不影响执行
-    Note over E: spawn_heartbeat：后台保活，<br/>防止长循环被 sweeper 误 reap
+    Note right of RT: 快照随 claim 返回（record.context）；<br/>历史已在创建时物化，零次额外读，<br/>不再回溯，祖先缺失不影响执行
+    Note over RT: spawn_heartbeat：后台保活，<br/>防止长循环被 sweeper 误 reap
+
+    RT->>RN: run(AgentTask, &mut sink)
+    Note right of RT: 组装 AgentTask：<br/>record.context + input_items + tools + max_tool_rounds
 
     loop ReAct loop（≤ max_tool_rounds）
-        E->>E: CompletionsRequest::from_context
-        E->>P: scheduler.schedule(request, sink)
+        RN->>RN: CompletionsRequest::from_context
+        RN->>P: scheduler.schedule(request, sink)
 
         loop 增量
-            P-->>E: text_delta
-            E->>B: append(delta, attempt)
+            P-->>RN: text_delta
+            RN->>B: sink.text_delta → append(delta, attempt)
             alt attempt 已被抬高
-                B-->>E: StaleAttempt
-                Note over E: SinkVerdict::Stop<br/>立即放弃，不再耗费 token
+                B-->>RN: StaleAttempt
+                Note over RN: SinkVerdict::Stop<br/>立即放弃，不再耗费 token
             end
         end
 
-        P-->>E: CompletionsOutcome{items, usage, finish}
-        E->>E: validate_outcome
-        Note right of E: 不可存的结果在此拒绝，<br/>日志点名是哪个 scheduler
+        P-->>RN: CompletionsOutcome{items, usage, finish}
+        RN->>RN: validate_outcome
+        Note right of RN: 不可存的结果在此拒绝，<br/>日志点名是哪个 scheduler
 
         alt finish = ToolCalls
-            E->>T: call(name, args)
-            T-->>E: output
-            E->>B: append(output_item.added / done)
+            RN->>T: call(name, args)
+            T-->>RN: output
+            RN->>B: sink.output_item_added / done
         else finish = Stop / Refusal
-            Note over E: 完成
+            Note over RN: 完成
         else finish = Length
-            Note over E: 截断 → Incomplete
+            Note over RN: 截断 → Incomplete
         end
     end
 
-    E->>L: complete(attempt, status, usage)
+    RN-->>RT: AgentOutcome{items, usage, status}
+    RT->>L: complete(id, expected_attempt, status, usage, now_ms)
     opt record.stored
-    E->>S: <b>append_output(call + output + answer)</b>
+    RT->>S: <b>append_output(items, reasoning, usage, status)</b>
     Note right of S: 第二条独立写入路径<br/>非事件流回放
     end
-    Note over E: settle：推进会话尾（advance）<br/>再释放轮次标记（release_active，D28）
-    E->>B: append(终态事件, attempt=None)
-    E->>B: close(retain_ms)
+    Note over RT: settle：推进会话尾（advance）<br/>再释放轮次标记（release_active，D28）
+    RT->>B: append(终态事件, attempt=None)
+    RT->>B: close(retain_ms)
 ```
 
-**核对点**（`crates/agent/src/engine.rs`）：
+**核对点**（编排：`crates/agent-runtime/src/runtime.rs`；ReAct loop：`testing/agentd-mock/src/mock_runner.rs`）：
 
 - **`claim` 无节点参数**：任意执行进程领取任意 queued 生成。`check-deps` 会拒绝 `claim` 重新带上 `NodeTag`
-- 上下文由**创建时固化**的快照提供：快照随 `claim` 返回（`record.context`），Agent 零次额外读取；scheduler 无租户上下文，不得自行解析历史
-- 栅栏：`append` 携带 attempt，被取代的持有者写入返回 `StaleAttempt` → `SinkVerdict::Stop`（见 `LedgerSink`）
+- 上下文由**创建时固化**的快照提供：快照随 `claim` 返回（`record.context`），Agent 零次额外读取；runner 无租户上下文，不得自行解析历史
+- **编排与 ReAct loop 分离**：`AgentRuntime` 只知道「何时领活、如何组装任务、结果放哪」，`AgentRunner` 才知道「怎么执行」（mock provider 与真实 SDK 同在此缝之后）。ReAct loop 在 `MockAgentRunner::run` 内，不在 orchestrator
+- 栅栏：`EventSink` 的 `append` 携带 attempt，被取代的持有者写入返回 `EventLogError::StaleAttempt` → `SinkVerdict::Stop`（`EventSink` 置 `stopped`，此后每次调用都返回 Stop）
 - **终态事件 `attempt: None`**：栅栏已由 ledger 转换校验过，此处再校验会拒掉宣告转换的那条事件，流将永不终止
 - `Executed` 的四个取值（`Idle`/`Completed`/`Superseded`/`Failed`）刻意区分，测试可断言走过哪条路径而非只看最终状态。特别地 **`Superseded` 不是失败**：活已归属新 attempt，报失败会终结一个正在被服务的响应
-- 并发上限约束**本进程**（`agentd` 的 `--max-concurrent`）；provider 侧限流属 scheduler
+- 并发上限约束**本进程**（`nova-agentd-mock` 的 `--max-concurrent`）；provider 侧限流属 scheduler
 
 ### 7.1 为何 attempt 栅栏不可删除
 
@@ -478,7 +478,7 @@ graph TB
 
 **核对点**：
 
-- 两条路径由 Agent **分别写入**，无派生关系：`engine.rs` 的 `complete` 中 `ledger.complete` / `context.append_output` / `event_log.append` 是三次独立写
+- 两条路径由 Agent **分别写入**，无派生关系：`runtime.rs` 的 `complete` 中 `ledger.complete` / `context.append_output` / `event_log.append` 是三次独立写
 - 若输出条目由事件流回放派生，则持久历史将依赖一个随时可被驱逐的有界缓存（INV-48）
 - 已由 L0 `output-provenance` 验证：**销毁事件流后，已存输出必须依然完整**（`conformance` 的 `assert_output_provenance`）
 
@@ -533,30 +533,37 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    subgraph AG["执行进程"]
-        ENG["<b>Agent</b><br/>全局 claim · 本进程并发上限<br/>栅栏 · 失败归类 · ReAct loop"]
+    subgraph AG["nova-agent-runtime（执行运行时）"]
+        RT["<b>AgentRuntime</b><br/>全局 claim · 本进程并发上限<br/>栅栏 · 失败归类"]
+        RUNNER["<b>AgentRunner</b>（trait）<br/>执行缝：ReAct loop 在此之后"]
+        SINK["EventSink"]
     end
 
-    subgraph CORE["core（端口）"]
-        PORTS["Ledger · EventLog · Context · Conversation"]
-        REQ["<b>CompletionsRequest</b>"]
-        SCH["<b>CompletionsRequestScheduler</b><br/>出站边界"]
+    subgraph CORE["nova-responses-core（端口）"]
+        PORTS["Ledger · EventLog · Context ·<br/>Conversation · Integrity · Metrics"]
+    end
+
+    subgraph MOCK["nova-agentd-mock（验证执行进程）"]
+        MR["<b>MockAgentRunner</b><br/>ReAct loop"]
+        SCH["<b>Scheduler</b><br/>出站边界"]
         TOOL["<b>ToolExecutor</b><br/>工具出站边界"]
-    end
-
-    subgraph AD["适配层"]
+        REQ["CompletionsRequest · CompletionsOutcome ·<br/>FinishReason"]
         M1["EchoScheduler"]
         M2["ScriptedScheduler"]
         M3["<b>HttpChatCompletionsScheduler</b><br/>真实 provider（HTTP）"]
-        M4["<b>CalculatorTool</b><br/>ToolExecutor 实现"]
+        M4["<b>CalculatorTool</b>"]
     end
 
     P(["provider"])
 
-    ENG -->|"claim / complete / append"| PORTS
-    ENG --> REQ
-    ENG -->|"finish=ToolCalls 时"| TOOL
-    REQ --> SCH
+    RT -->|"claim / complete"| PORTS
+    RT -->|"run(AgentTask)"| RUNNER
+    RT --> SINK
+    SINK -->|"append / StaleAttempt"| PORTS
+    RUNNER -.->|"实现"| MR
+    MR --> SCH
+    MR --> TOOL
+    MR --> REQ
     SCH -.-> M1
     SCH -.-> M2
     SCH -.-> M3
@@ -568,23 +575,25 @@ graph LR
     style M3 fill:#3a3a3a,stroke:#777,color:#aaa
 ```
 
-### 10.1 为何 Agent 与 scheduler 不能合并
+### 10.1 为何编排、执行、出站调度三者不能合并
 
 | 若合并方向 | 后果 |
 |---|---|
-| 领活循环并入 scheduler 端口 | 每个 provider 适配器都要重新实现领取、栅栏、失败归类 |
-| provider 关切放进 Agent | 限流成为**集群形状的属性**，换 provider 就要重新调部署 |
+| ReAct loop 并入 `AgentRuntime` | mock provider 与真实 agent SDK 无法共享同一编排，换执行实现就要重写领取、栅栏、失败归类 |
+| provider 关切放进 runner/编排 | 限流成为**集群形状的属性**，换 provider 就要重新调部署 |
+| `Scheduler` / `ToolExecutor` 提升回 core 端口 | 只有 mock runner 用到的出站形状污染存储/领域契约 |
 
 职责切分：
 
-- **Agent 决定**：何时领活、本进程并发上限、失败是否终结响应
-- **scheduler 决定**：一切与触达模型有关的事，**包括排队与限流**
+- **`AgentRuntime` 决定**：何时领活、本进程并发上限、失败是否终结响应
+- **`AgentRunner` 决定**：怎么把任务执行完（ReAct loop 的具体形态，mock provider 与真实 SDK 同在此缝之后）
+- **`Scheduler` 决定**：一切与触达模型有关的事，**包括排队与限流**
 
 ### 10.2 命名为 Scheduler 的实际后果
 
-`CompletionsRequestScheduler` 比 `Executor` 更宽——允许实现内部做排队、限流、批处理、连接池复用、跨 provider 重试。出站边界确实需要这些。
+`Scheduler` 比 `Executor` 更宽——允许实现内部做排队、限流、批处理、连接池复用、跨 provider 重试。出站边界确实需要这些。
 
-由此产生的规矩：**provider 侧并发策略属于端口之后**。`SchedulerError` 因此区分 `Refused`（队列已满，**未发出**，重试不额外花钱）与 `Unavailable`（已发出并耗费）。
+由此产生的规矩：**provider 侧并发策略属于 runner 之后**。`SchedulerError` 有 11 个变体，其中 `is_retryable` 把「换一个新 attempt 可能成功」的（`Unavailable`、`Refused`、`Sink`）与「换也没用」的（`Superseded`、`DeadlineExceeded`、`Rejected`、`QuotaExhausted`、`EmptyOutcome`、`UnusableOutput`、`InvalidOutput`、`Other`）分开。`Superseded` 是栅栏已动的信号，runner 据此返回 `AgentError::Superseded`，编排层归入 `Executed::Superseded` 而非失败。
 
 ---
 
@@ -625,11 +634,11 @@ graph TB
 |---|---|---|---|---|
 | **L0** | 直调端口，16 项契约用例 | mem | 端口语义：事件日志、账本、取消、上下文链、完整性、`global-claim`、输出溯源、持久化顺序、并发、协议子集、会话（conversation）… | `testing/conformance` |
 | **L1** | YAML 场景直驱端口 + Trace/Oracle | mem | 领域行为，**刻意绕过 HTTP**，故失败可定位到领域层 | `testing/scenarios/l1` |
-| **L2** | 真实多进程 + HTTP | mem（共享载体 `mem-server` + 独立 agentd + 独立 sweep） | 协议契约、幂等、只读、过载、跨节点订阅、上下文链、会话 | `testing/scenarios/l2` |
+| **L2** | 真实多进程 + HTTP | mem（共享载体 `mem-server` + 独立 agentd-mock + 独立 sweep） | 协议契约、幂等、只读、过载、跨节点订阅、上下文链、会话 | `testing/scenarios/l2` |
 | **L4** | 官方 Python SDK 驱动 conversation 端点 | mem（经 gateway HTTP） | 上游 SDK 兼容（D27） | `testing/sdk-compat/run.py` |
 
 - L0–L2 **不得需要数据库**（D17）；L4 无 python3/openai 时是**跳过而非失败**
-- gateway 另有 HTTP 契约测试（`crates/nova-responses/tests/http_contract.rs`），在进程内驱动 Agent 走完 claim → ReAct → complete
+- gateway 另有 HTTP 契约测试（`crates/nova-responses/tests/http_contract.rs`），在进程内以注入的 runner 驱动 `AgentRuntime` 走完 claim → run → complete
 
 ### 12.1 check-deps 守的是哪些结构性事实
 
@@ -638,9 +647,9 @@ graph TB
 | 门禁 | 若失效会怎样 |
 |---|---|
 | `core` 无 workspace 内依赖 | 领域层被适配器污染，分层失去意义 |
-| `nova-agent-runtime` 无 `reqwest`/`hyper`/`axum`/`sqlx` | 工作循环不再能脱离 socket 测试 |
-| `adapters-completions-mock` 无 HTTP/DB/`nova-agent-runtime` | 某个测试可能悄悄发出真实调用 |
-| 执行不经 HTTP 端点领活 | 执行走 HTTP 拉取协议，多一跳、多一处鉴权、多一处栅栏校验 |
+| `nova-agent-runtime` 无 `reqwest`/`hyper`/`axum` | 工作循环不再能脱离 socket 测试 |
+| `nova-responses` 无 `adapters-mem`/`nova-agent-runtime`/`nova-agentd-mock` | 服务层被具体适配器/执行实现耦合，装配点不再单一 |
+| 无 `/v1/agent/*` 路由 | 执行退回 HTTP 拉取协议，多一跳、多一处鉴权、多一处栅栏校验 |
 | `claim` 不带 `NodeTag` | 队列中的生成被搁死在没有执行端的节点上 |
 | 协议子集文档与代码一致 | 已发布子集与实现漂移 |
 
@@ -654,7 +663,7 @@ graph TB
 |---|---|---|
 | 1 | **`ResponseLedger` 缺少读取部分用量的方法** | `partial_usage_count` 只在 mem 具体类型上，不在 trait 内（trait 只有写方法 `record_partial_usage`），故只持有端口的计费方取不到已记账金额。CR-11 目前由 L1 经 Trace 覆盖，而非端口契约。若计费确需经端口取数，这是一处真实缺口 |
 
-真实 provider（`adapters-completions-http`）的实现约定：
+真实 provider（`HttpChatCompletionsScheduler`，`testing/agentd-mock/src/scheduler/http.rs`）的实现约定：
 
 | 决策 | 约定 |
 |---|---|
@@ -669,16 +678,16 @@ graph TB
 
 | 本文档章节 | 权威来源 |
 |---|---|
-| 1 部署形态 | `crates/gateway/src/main.rs`（`mount`）· `crates/agentd/src/main.rs` · `crates/mem-server/src/main.rs` · `crates/adapters/mem/src/proto.rs` · `crates/adapters/mem-client/src/lib.rs` |
+| 1 部署形态 | `crates/gateway/src/main.rs`（`mount`）· `testing/agentd-mock/src/main.rs` · `crates/mem-server/src/main.rs` · `crates/adapters/mem/src/proto.rs` · `crates/adapters/mem-client/src/lib.rs` |
 | 2 Crate 分层 | 各 `Cargo.toml` 的 `[dependencies]` |
 | 3 协议表面 | `nova-responses/src/routes/mod.rs` · [`06-protocol-subset.md`](./06-protocol-subset.md) |
 | 4 无转发 | `nova-responses/src/routes/responses.rs`（retrieve / stream / cancel / delete 委托 `state.service`）· `nova-responses/src/config.rs` |
 | 5 端到端总览 | 本文档 §6/§7/§9 的综合 · `decisions.md` D24 |
 | 6 创建时序 | [`01-responses-api.md`](./01-responses-api.md) · `nova-responses/src/routes/responses.rs` · `nova-responses/src/service/responses.rs` |
-| 7 执行时序 | `crates/agent/src/engine.rs` · `crates/agent/src/lib.rs` 模块注释 |
+| 7 执行时序 | `crates/agent-runtime/src/runtime.rs` · `testing/agentd-mock/src/mock_runner.rs` |
 | 8 两条写路径 | [`invariants.md`](../architecture/invariants.md) INV-48 · [`03-context-chain.md`](./03-context-chain.md) |
 | 9 订阅续订 | `nova-responses/src/sse.rs` |
-| 10 职责边界 | `core/src/ports/completions.rs` · `core/src/ports/conversation.rs` · `decisions.md` D25 · D28 |
+| 10 职责边界 | `crates/agent-runtime/src/runner.rs` · `testing/agentd-mock/src/scheduler/mod.rs` · `testing/agentd-mock/src/tool.rs` · `decisions.md` D25 · D28 |
 | 11 维护与停机 | [`05-reliability.md`](./05-reliability.md) · `nova-responses/src/sweeper.rs` · `crates/sweep/src/main.rs` |
 | 12 验证分层 | [`02-verification.md`](./02-verification.md) · `xtask/src/main.rs` |
 | 决策推导（本文档不重复） | [`decisions.md`](../architecture/decisions.md) |
