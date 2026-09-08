@@ -3,21 +3,11 @@
 //! Claims queued responses from the shared ledger, runs the ReAct loop, and
 //! streams increments into the shared event buffer. It is deliberately **not** an
 //! HTTP service: it reaches the ledger and event buffer through ports, so swapping
-//! the concrete adapters (Postgres / Redis / mem carrier) never touches this loop.
+//! the concrete adapter (the in-memory carrier) never touches this loop.
 //!
 //! The gateway only enqueues responses and serves delivery modes; execution is
 //! fully decoupled here, so the gateway can crash without interrupting a
 //! generation, and the fleet of agents can scale independently.
-//!
-//! Two backends behind features, exactly as the gateway:
-//! - `mem` (default): the shared in-memory carrier, for L2 verification.
-//! - `sql`: Postgres + Redis, the production carriers.
-
-#[cfg(all(feature = "sql", feature = "mem"))]
-compile_error!(
-    "mem and sql backends are mutually exclusive; build production with \
-     `--no-default-features --features sql`"
-);
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,15 +28,7 @@ use adapters_tool_calculator::CalculatorTool;
 
 #[derive(Debug, Parser)]
 struct Args {
-    /// Env var naming the database URL (SEC-4: never the URL itself).
-    #[arg(long, default_value = "NOVA_DATABASE_URL")]
-    database_url_env: String,
-
-    /// Env var naming the Redis URL.
-    #[arg(long, default_value = "NOVA_REDIS_URL")]
-    redis_url_env: String,
-
-    /// Env var naming the mem carrier's data-plane URL (verification only).
+    /// Env var naming the mem carrier's data-plane URL.
     #[arg(long, default_value = "NOVA_MEM_SERVER_URL")]
     mem_server_url_env: String,
 
@@ -166,26 +148,7 @@ fn build_scheduler(args: &Args) -> Result<Arc<dyn CompletionsRequestScheduler>> 
     }
 }
 
-/// Real carriers: Postgres + Redis.
-#[cfg(feature = "sql")]
-async fn mount_sql(args: &Args) -> Result<Backend> {
-    let sql = adapters_sql::SqlWorld::connect_from_env(&args.database_url_env, Default::default())
-        .await?;
-    let redis_url = std::env::var(&args.redis_url_env)
-        .with_context(|| format!("reading ${}", args.redis_url_env))?;
-    let event_log =
-        adapters_event_log_redis::RedisResponseEventLog::connect(&redis_url, sql.ledger.clone(), "resp")
-            .await?;
-    Ok(Backend {
-        ledger: sql.ledger.clone(),
-        event_log: Arc::new(event_log),
-        context: sql.context.clone(),
-        conversation: sql.conversation.clone(),
-    })
-}
-
-/// In-memory shared carrier (verification).
-#[cfg(feature = "mem")]
+/// In-memory shared carrier.
 async fn mount_mem(args: &Args) -> Result<Backend> {
     let url = std::env::var(&args.mem_server_url_env)
         .with_context(|| format!("reading ${}", args.mem_server_url_env))?;
@@ -208,9 +171,6 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    #[cfg(feature = "sql")]
-    let backend = mount_sql(&args).await?;
-    #[cfg(feature = "mem")]
     let backend = mount_mem(&args).await?;
 
     let scheduler = build_scheduler(&args)?;

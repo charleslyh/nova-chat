@@ -3,8 +3,8 @@
 //! These implement the same ports as the in-process [`adapters_mem`] types, but
 //! each operation is a `POST /rpc` round-trip to `nova-responses-mem-server`.
 //! The carrier owns the shared data; the client owns the **per-node** runtime
-//! controls (`read_only`, `pending_limit`), exactly as `SqlResponseLedger` holds
-//! them as process-local atomics (INV-32 / FR-33 are per-node, not per-carrier).
+//! controls (`read_only`, `pending_limit`) as process-local atomics (INV-32 /
+//! FR-33 are per-node, not per-carrier).
 
 mod context;
 mod conversation;

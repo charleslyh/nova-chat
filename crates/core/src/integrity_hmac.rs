@@ -1,9 +1,9 @@
 //! HMAC-SHA256 integrity implementation.
 //!
 //! Lives in the domain crate on purpose: it is pure computation with no
-//! carrier product behind it, and both the mem and sql adapters must use the
-//! *same* scheme. Duplicating it per adapter would let the two drift, which
-//! would surface as spurious integrity failures after a backend switch.
+//! carrier product behind it, and every adapter must use the *same* scheme.
+//! Duplicating it per adapter would let them drift, which would surface as
+//! spurious integrity failures after a backend switch.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;

@@ -3,11 +3,9 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/adapters/mem",
-    "crates/adapters/sql",
     "crates/adapters/completions-mock",
     "crates/adapters/completions-http",
     "crates/adapters/tool-calculator",
-    "crates/adapters/event-log-redis",
     "crates/adapters/mem-client",
     "crates/agent",
     "crates/agentd",
@@ -30,11 +28,9 @@ nova-responses-core = { path = "crates/core" }
 nova-responses = { path = "crates/nova-responses" }
 adapters-mem = { path = "crates/adapters/mem" }
 adapters-mem-client = { path = "crates/adapters/mem-client" }
-adapters-sql = { path = "crates/adapters/sql" }
 adapters-completions-mock = { path = "crates/adapters/completions-mock" }
 adapters-completions-http = { path = "crates/adapters/completions-http" }
 adapters-tool-calculator = { path = "crates/adapters/tool-calculator" }
-adapters-event-log-redis = { path = "crates/adapters/event-log-redis" }
 nova-agent = { path = "crates/agent" }
 conformance = { path = "testing/conformance" }
 harness = { path = "testing/harness" }
@@ -55,9 +51,6 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-# Shared in-flight event carrier (D25). Redis Streams is the first concrete
-# adapter; the port is interchangeable with TDMQ / other message buses.
-redis = { version = "1.6", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script"] }
 # Content integrity (D20 ⑧ / INV-44): canonicalisation + tamper detection.
 hmac = "0.12"
 sha2 = "0.10"
@@ -65,17 +58,3 @@ subtle = "2"
 unicode-normalization = "0.1"
 # SSRF defence in depth for image/file reference URLs (SEC-6).
 url = "2"
-# Production carrier for the context store and ledger (D21).
-#
-# `macros` is enabled only to get `sqlx::migrate!`, which embeds the migration
-# files at compile time and needs no database. The actual constraint from D17 is
-# that we do **not** use the `query!`/`query_as!` compile-time checking macros,
-# since those require a reachable DATABASE_URL during the build. All statements
-# in this workspace use the runtime `sqlx::query()` API with bound parameters.
-sqlx = { version = "0.8", default-features = false, features = [
-    "runtime-tokio-rustls",
-    "postgres",
-    "json",
-    "migrate",
-    "macros",
-] }

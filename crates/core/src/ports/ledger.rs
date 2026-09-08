@@ -82,9 +82,9 @@ pub trait ResponseLedger: Send + Sync {
     /// both succeed on the same response.
     ///
     /// Global claim (D25): any execution process may claim any queued response.
-    /// The in-flight buffer is shared (Redis Streams / TDMQ), so the producer is
-    /// no longer tied to the creating node. The attempt fence still protects
-    /// against double-claim and stale writes (INV-5/6).
+    /// The in-flight buffer is shared, so the producer is no longer tied to the
+    /// creating node. The attempt fence still protects against double-claim and
+    /// stale writes (INV-5/6).
     async fn claim(
         &self,
         agent_id: AgentId,

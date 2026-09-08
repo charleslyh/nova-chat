@@ -5,8 +5,6 @@ edition.workspace = true
 description = "L0 port contract, shared by every adapter"
 
 [dependencies]
-# Deliberately does not depend on adapters-sql: L0 must stay buildable without
-# a database driver. The sql backend is fed through `run_suite` by the L3 runner.
 nova-responses-core = { workspace = true }
 adapters-mem = { workspace = true }
 async-trait = { workspace = true }

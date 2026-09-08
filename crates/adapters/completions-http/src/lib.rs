@@ -8,7 +8,7 @@
 //!
 //! # Placement
 //!
-//! This is an **adapter**, in the same sense as `adapters-mem` / `adapters-sql`:
+//! This is an **adapter**, in the same sense as `adapters-mem`:
 //! it satisfies the `CompletionsRequestScheduler` port and nothing else. It is *not*
 //! a verification fixture — the verification UI lives in `verifier/` and reaches the
 //! running service only through its public HTTP API. The separation that matters is

@@ -1,7 +1,7 @@
 //! Real wall-clock, the production counterpart to `adapters_mem`'s virtual clock.
 //!
 //! `MemClock` starts at 0 and only advances when a test calls `advance` — it is
-//! the test clock. The sql backend must never use it: `created_at` / `expires_at`
+//! the test clock. Production must never use it: `created_at` / `expires_at`
 //! would be virtual, and the sweeper's `reap(now, …)` would compare a real
 //! heartbeat timestamp against a `now` of 0 and never time anything out.
 

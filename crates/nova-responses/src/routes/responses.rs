@@ -4,7 +4,7 @@
 //! （resolve_chain / 幂等 / 三种投递的领域语义 / 终态提交）委托给 `service` 层
 //! （D25 ⑤），本文件不直接操作端口。
 //!
-//! 存储是共享载体（Postgres + Redis），任意节点直读，无节点间转发。
+//! 存储是共享载体（`nova-responses-mem-server`），任意节点直读，无节点间转发。
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};

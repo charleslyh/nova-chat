@@ -2,29 +2,16 @@
 name = "nova-responses-gateway"
 version.workspace = true
 edition.workspace = true
-description = "Gateway binary over nova-responses: mem carrier client by default, real carriers (sql + redis) behind a feature"
+description = "Gateway binary over nova-responses: mounts the in-memory carrier client"
 
 [[bin]]
 name = "nova-responses-gateway"
 path = "src/main.rs"
 
-[features]
-# 默认 mem：协议兼容验证、本地开发与 L2 都不需要数据库（D17）。mem 形态下执行
-# 由独立 `nova-agentd` 承担，gateway 只挂共享载体的客户端桩，与生产同构。
-# 生产构建用 `--no-default-features --features sql`，静态排除 mem 客户端。
-default = ["mem"]
-mem = ["dep:adapters-mem-client"]
-sql = [
-    "dep:adapters-sql",
-    "dep:adapters-event-log-redis",
-]
-
 [dependencies]
 nova-responses = { workspace = true }
 nova-responses-core = { workspace = true }
-adapters-mem-client = { workspace = true, optional = true }
-adapters-sql = { workspace = true, optional = true }
-adapters-event-log-redis = { workspace = true, optional = true }
+adapters-mem-client = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }

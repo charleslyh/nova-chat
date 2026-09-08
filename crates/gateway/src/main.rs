@@ -1,25 +1,13 @@
 //! Gateway binary over [`nova_responses`]: thin assembly that mounts a backend.
 //!
-//! Which backend is mounted is a **compile-time** choice, not a runtime config
-//! switch:
-//!
-//! - `feature = "mem"` (default): the mem carrier **client** adapters, reaching
-//!   the shared `nova-responses-mem-server`. Execution is the separate
-//!   `nova-agentd` process — the same process topology as production, with the
-//!   carrier swapped for an in-memory double. This is what protocol-compatibility
-//!   checks, local development and L2 verification run.
-//! - `feature = "sql"`: the real carriers (Postgres + Redis); execution is the
-//!   separate `nova-agentd` process. Built with `--no-default-features
-//!   --features sql` so the release binary statically excludes mem.
+//! The backend is the mem carrier **client** adapters, reaching the shared
+//! `nova-responses-mem-server`. Execution is the separate `nova-agentd` process
+//! — the same process topology as production, with the carrier an in-memory
+//! double. This is what protocol-compatibility checks, local development and L2
+//! verification run.
 //!
 //! The `nova-responses` library and every port consumer below are unaware of
 //! which backend is mounted — the choice exists only at this injection point.
-
-#[cfg(all(feature = "sql", feature = "mem"))]
-compile_error!(
-    "mem and sql backends are mutually exclusive; build production with \
-     `--no-default-features --features sql`"
-);
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -36,9 +24,6 @@ use nova_responses::{
 };
 use tracing::info;
 
-#[cfg(feature = "sql")]
-const DEFAULT_CONFIG: &str = "testing/config/node-a-sql.toml";
-#[cfg(not(feature = "sql"))]
 const DEFAULT_CONFIG: &str = "testing/config/node-a.toml";
 
 #[derive(Debug, Parser)]
@@ -167,51 +152,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Real carriers: Postgres + Redis. Startup fails outright when the integrity key
-/// or the database is missing (INV-44 / INV-46).
-#[cfg(feature = "sql")]
-async fn mount(cfg: &Config) -> Result<Ports> {
-    let sql = adapters_sql::SqlWorld::connect_from_env(
-        &cfg.database_url_env,
-        adapters_sql::SqlConfig {
-            verify_integrity: cfg.verify_integrity,
-            ..Default::default()
-        },
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "connecting to the context store via ${}",
-            cfg.database_url_env
-        )
-    })?;
-
-    let redis_url = std::env::var(&cfg.redis_url_env)
-        .with_context(|| format!("reading ${}", cfg.redis_url_env))?;
-    let event_log = adapters_event_log_redis::RedisResponseEventLog::connect(
-        &redis_url,
-        sql.ledger.clone(),
-        "resp",
-    )
-    .await
-    .with_context(|| format!("connecting to the event buffer via ${}", cfg.redis_url_env))?;
-
-    Ok(Ports {
-        ledger: sql.ledger.clone(),
-        event_log: Arc::new(event_log),
-        context: sql.context.clone(),
-        conversation: sql.conversation.clone(),
-        // Real wall clock: created_at / reap deadlines must use wall time, not a
-        // frozen virtual clock.
-        clock: Arc::new(SystemClock),
-        metrics: Arc::new(CountingMetrics::default()),
-    })
-}
-
-/// In-memory shared carrier (verification). The ledger, event buffer and context
-/// are reached through the client adapters; execution is the separate
-/// `nova-agentd` process, not embedded here.
-#[cfg(feature = "mem")]
+/// In-memory shared carrier. The ledger, event buffer and context are reached
+/// through the client adapters; execution is the separate `nova-agentd` process,
+/// not embedded here.
 async fn mount(cfg: &Config) -> Result<Ports> {
     let url = std::env::var(&cfg.mem_server_url_env)
         .with_context(|| format!("reading ${}", cfg.mem_server_url_env))?;

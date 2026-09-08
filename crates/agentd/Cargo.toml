@@ -8,19 +8,10 @@ description = "Standalone execution daemon: claims from the shared ledger and ru
 name = "nova-agentd"
 path = "src/main.rs"
 
-[features]
-# 默认 mem：L2 验证用共享载体的客户端桩。生产构建用
-# `--no-default-features --features sql`，静态排除 mem 客户端。
-default = ["mem"]
-mem = ["dep:adapters-mem-client"]
-sql = ["dep:adapters-sql", "dep:adapters-event-log-redis"]
-
 [dependencies]
 nova-agent = { workspace = true }
 nova-responses-core = { workspace = true }
-adapters-mem-client = { workspace = true, optional = true }
-adapters-sql = { workspace = true, optional = true }
-adapters-event-log-redis = { workspace = true, optional = true }
+adapters-mem-client = { workspace = true }
 adapters-completions-mock = { workspace = true }
 adapters-completions-http = { workspace = true }
 adapters-tool-calculator = { workspace = true }

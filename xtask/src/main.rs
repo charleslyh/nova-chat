@@ -23,9 +23,6 @@ enum Cmd {
     Coverage,
     Unittest,
     CheckDeps,
-    Deploy {
-        action: String,
-    },
 }
 
 #[tokio::main]
@@ -46,7 +43,6 @@ async fn main() -> Result<()> {
         Cmd::Coverage => coverage().await?,
         Cmd::Unittest => unittest()?,
         Cmd::CheckDeps => check_deps()?,
-        Cmd::Deploy { action } => deploy(&action)?,
     }
     Ok(())
 }
@@ -73,17 +69,6 @@ async fn verify(level: &str) -> Result<()> {
             procs("down").await?;
             eprintln!("ok");
             println!("verify l2 OK");
-        }
-        "l3" => {
-            println!("verify l3");
-            // Skipped rather than failed when no database is configured, so a
-            // machine without infrastructure can still run everything else (D17).
-            let names = harness::run_l3_dir(Path::new("testing/scenarios/l3")).await?;
-            if names.is_empty() {
-                println!("verify l3 SKIPPED (no database configured)");
-            } else {
-                println!("verify l3 OK ({} checks)", names.len());
-            }
         }
         "l4" => verify_l4().await?,
         other => bail!("unknown level {other}"),
@@ -502,12 +487,10 @@ async fn coverage() -> Result<()> {
     let mut scenario_covers: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut l1 = 0usize;
     let mut l2 = 0usize;
-    let mut l3 = 0usize;
 
     for (label, dir) in [
         ("l1", "testing/scenarios/l1"),
         ("l2", "testing/scenarios/l2"),
-        ("l3", "testing/scenarios/l3"),
     ] {
         let path = Path::new(dir);
         if !path.exists() {
@@ -550,7 +533,7 @@ async fn coverage() -> Result<()> {
             match label {
                 "l1" => l1 += 1,
                 "l2" => l2 += 1,
-                _ => l3 += 1,
+                _ => {}
             }
         }
     }
@@ -608,7 +591,7 @@ async fn coverage() -> Result<()> {
         "  l0 cases      {} ran ({backend_cases} backend · {protocol_cases} protocol)",
         l0.passed.len()
     );
-    println!("  scenarios     {l1} L1 · {l2} L2 · {l3} L3");
+    println!("  scenarios     {l1} L1 · {l2} L2");
     println!(
         "  baseline hit  {}/{} ({}%)",
         covered_baseline.len(),
@@ -816,7 +799,6 @@ fn declared_dependencies(text: &str) -> Vec<String> {
 fn check_deps() -> Result<()> {
     const FORBIDDEN_IN_CORE: &[&str] = &[
         "adapters-mem",
-        "adapters-sql",
         "nova-responses-gateway",
         "harness",
         "conformance",
@@ -840,34 +822,16 @@ fn check_deps() -> Result<()> {
         );
     }
 
-    // The two adapters are alternatives, not layers.
-    let sql_deps = declared_dependencies(&std::fs::read_to_string(
-        "crates/adapters/sql/Cargo.toml",
-    )?);
-    if sql_deps.iter().any(|d| d == "adapters-mem") {
-        bail!("adapters-sql must not depend on adapters-mem");
-    }
-    let mem_deps = declared_dependencies(&std::fs::read_to_string(
-        "crates/adapters/mem/Cargo.toml",
-    )?);
-    if mem_deps.iter().any(|d| d == "adapters-sql") {
-        bail!("adapters-mem must not depend on adapters-sql");
-    }
-
-    // L0 must stay buildable without a database driver (D17).
-    let conformance_deps = declared_dependencies(&std::fs::read_to_string(
-        "testing/conformance/Cargo.toml",
-    )?);
     // The mock scheduler adapter must stay model-free and IO-free: its whole
     // purpose is to let integration tests run with no provider. An HTTP client
     // here would mean a test could silently start making real calls.
     let mock_sched = std::fs::read_to_string("crates/adapters/completions-mock/Cargo.toml")?;
     let mock_sched_deps = declared_dependencies(&mock_sched);
-    for forbidden in ["reqwest", "hyper", "adapters-sql", "sqlx", "nova-agent"] {
+    for forbidden in ["reqwest", "hyper", "nova-agent"] {
         if mock_sched_deps.iter().any(|d| d == forbidden) {
             bail!(
                 "adapters-completions-mock must not depend on `{forbidden}`: it exists so \
-                 tests need neither a provider nor a database"
+                 tests need no provider"
             );
         }
     }
@@ -876,7 +840,7 @@ fn check_deps() -> Result<()> {
     // a concrete scheduler adapter would invert that: the loop would then know
     // which provider it serves, and swapping one would mean changing the loop.
     let agent = std::fs::read_to_string("crates/agent/Cargo.toml")?;
-    for forbidden in ["reqwest", "hyper", "axum", "sqlx"] {
+    for forbidden in ["reqwest", "hyper", "axum"] {
         if declared_dependencies_in_section(&agent, "[dependencies]")
             .iter()
             .any(|d| d == forbidden)
@@ -888,21 +852,10 @@ fn check_deps() -> Result<()> {
         }
     }
 
-    for forbidden in ["adapters-sql", "sqlx"] {
-        if conformance_deps.iter().any(|d| d == forbidden) {
-            bail!(
-                "conformance must not depend on `{forbidden}`: L0 has to build without a \
-                 database driver (D17). Feed the sql backend through `run_suite` from the \
-                 L3 runner instead."
-            );
-        }
-    }
-
     check_execution_claims_globally_through_the_port()?;
     check_service_and_gateway_boundaries()?;
     check_sdk_compat_is_python_only()?;
     check_coverage_baseline_tracks_invariants()?;
-    check_inflight_separated_from_store()?;
     let spec_covers = check_protocol_spec_is_publishable()?;
 
     println!("check-deps OK ({} gated requirement(s))", spec_covers.len());
@@ -1002,26 +955,6 @@ fn check_coverage_baseline_tracks_invariants() -> Result<()> {
     Ok(())
 }
 
-/// INV-D11: the high-frequency in-flight buffer and the low-frequency durable
-/// store must not share a carrier. Structurally, the SQL adapter (the durable
-/// store) must not implement `ResponseEventLog` — the in-flight buffer is a
-/// separate shared carrier (Redis Streams).
-fn check_inflight_separated_from_store() -> Result<()> {
-    let sql_lib = std::fs::read_to_string("crates/adapters/sql/src/lib.rs")?;
-    if sql_lib.contains("impl ResponseEventLog") {
-        bail!(
-            "the sql adapter must not implement ResponseEventLog (INV-D11): the \
-             in-flight buffer is a separate shared carrier, not the durable store. \
-             Putting the ~20k/s hot path on the ~70/s strong-consistency path would \
-             couple the two load classes this decision separates."
-        );
-    }
-    if !sql_lib.contains("pub struct SqlWorld") {
-        bail!("check-inflight-separated is out of date: SqlWorld no longer exists");
-    }
-    Ok(())
-}
-
 /// D25: execution claims through the ledger port, never over HTTP; claim is global.
 ///
 /// Two things are guarded, and they are not the same thing.
@@ -1053,23 +986,7 @@ fn check_execution_claims_globally_through_the_port() -> Result<()> {
     if ledger_port.contains("node: &NodeTag") {
         bail!(
             "ResponseLedger::claim still takes a NodeTag. Claiming must be global (D25): \
-             the in-flight buffer is shared (Redis Streams / TDMQ), so a node filter \
-             would strand queued responses on other nodes."
-        );
-    }
-
-    // And the sql implementation must actually filter on it.
-    //
-    // Scoped to the claim statement, not the whole file: the first version of this
-    // check searched the file and was satisfied by the explanatory comment that
-    // mentions the predicate — so removing the predicate itself passed the gate. A
-    // gate that its own documentation can satisfy checks nothing.
-    let sql_ledger = std::fs::read_to_string("crates/adapters/sql/src/ledger.rs")?;
-    let has_predicate = sql_ledger.contains("WHERE status = 'queued' AND node_tag = $3");
-    if has_predicate {
-        bail!(
-            "the sql claim statement still filters by node_tag. Claiming must be global \
-             (D25): the in-flight buffer is shared, so a node filter would strand queued \
+             the in-flight buffer is shared, so a node filter would strand queued \
              responses on other nodes."
         );
     }
@@ -1077,23 +994,14 @@ fn check_execution_claims_globally_through_the_port() -> Result<()> {
     Ok(())
 }
 
-/// `nova-responses` is the adapter-free service layer; the gateway chooses its
-/// backend at compile time via features. Two boundaries must not blur:
-///
-/// 1. `nova-responses` must not depend on any concrete adapter — it talks to
-///    `nova-responses-core` ports only, so the mem/sql choice is made by the
-///    assembler, never by the library.
-/// 2. Every backend dependency of the gateway must be `optional` and therefore
-///    feature-gated. That is what makes the backend a compile-time choice: a mem
-///    build never compiles sql/redis, and a production build
-///    (`--no-default-features --features sql`) never carries mem/agent/mock.
+/// `nova-responses` is the adapter-free service layer. It must not depend on any
+/// concrete adapter — it talks to `nova-responses-core` ports only, so the
+/// adapter choice is made by the assembler (the gateway), never by the library.
 fn check_service_and_gateway_boundaries() -> Result<()> {
     let service = std::fs::read_to_string("crates/nova-responses/Cargo.toml")?;
     let service_deps = declared_dependencies_in_section(&service, "[dependencies]");
     for forbidden in [
         "adapters-mem",
-        "adapters-sql",
-        "adapters-event-log-redis",
         "adapters-completions-mock",
         "nova-agent",
     ] {
@@ -1101,21 +1009,6 @@ fn check_service_and_gateway_boundaries() -> Result<()> {
             bail!(
                 "nova-responses must not depend on `{forbidden}`: the service layer talks \
                  to ports only, and the adapter choice belongs to the assembler"
-            );
-        }
-    }
-
-    let gw = std::fs::read_to_string("crates/gateway/Cargo.toml")?;
-    for dep in [
-        "adapters-mem-client",
-        "adapters-sql",
-        "adapters-event-log-redis",
-    ] {
-        if !gw.contains(&format!("{dep} = {{ workspace = true, optional = true }}")) {
-            bail!(
-                "gateway's `{dep}` must be `optional = true` so the backend is chosen at \
-                 compile time via features — a non-optional backend would leak into every \
-                 build, defeating the static mem/sql split"
             );
         }
     }
@@ -1227,28 +1120,4 @@ fn check_protocol_spec_is_publishable() -> Result<&'static [&'static str]> {
     }
 
     Ok(&["FR-23", "FR-27"])
-}
-
-fn deploy(action: &str) -> Result<()> {
-    let compose = Path::new("deploy/docker/docker-compose.yml");
-    if !compose.exists() {
-        bail!("missing {}", compose.display());
-    }
-    let docker = Command::new("docker").arg("version").output();
-    match docker {
-        Ok(o) if o.status.success() => {
-            let status = Command::new("docker")
-                .args(["compose", "--project-directory", "deploy/docker", action])
-                .status()?;
-            if !status.success() {
-                bail!("docker compose {action} failed");
-            }
-        }
-        _ => {
-            println!(
-                "deploy skipped: Docker unavailable (D17). L0–L2 verification does not require it."
-            );
-        }
-    }
-    Ok(())
 }

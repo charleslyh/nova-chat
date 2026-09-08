@@ -4,8 +4,8 @@
 //! operation. The carrier exposes the *shared* ledger / event log / context
 //! operations only. The per-node runtime controls (`read_only`,
 //! `pending_limit`) are **not** here — they are process-local admission state
-//! held by the client adapter, exactly as `SqlResponseLedger` holds them as
-//! atomics (FR-33 / INV-32 are per-node, not per-carrier).
+//! held by the client adapter as atomics (FR-33 / INV-32 are per-node, not
+//! per-carrier).
 //!
 //! The control plane (fault injection) lives in [`crate::control`] and is a
 //! separate surface, owned by the test controller.

@@ -1,8 +1,8 @@
 //! Shared application state.
 //!
 //! Every port is held as a trait object: the ingress layer must not know which
-//! backend is mounted. Storage is a shared carrier (Postgres + Redis), so any
-//! node serves any request directly — there is no node-to-node forwarding and
+//! backend is mounted. Storage is a shared carrier (`nova-responses-mem-server`),
+//! so any node serves any request directly — there is no node-to-node forwarding and
 //! therefore no topology flag here.
 
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -2,8 +2,8 @@
 //!
 //! **The same assertions run against every backend.** That is the acceptance
 //! criterion for the ports being real abstractions rather than descriptions of
-//! the in-memory implementation: `run_suite` takes trait objects, and both the
-//! mem and sql adapters are fed through it unchanged.
+//! the in-memory implementation: `run_suite` takes trait objects, so any
+//! adapter implementing the ports is fed through it unchanged.
 //!
 //! Each case uses a freshly generated tenant so the suite is safe to run
 //! repeatedly against a persistent backend without cleanup between passes.
@@ -813,9 +813,9 @@ pub fn assert_reconnect_backoff() {
 
 /// D25: any execution process may claim any queued response (FR-4).
 ///
-/// Replaces the D23 `claim-locality` case. The in-flight buffer is now shared
-/// (Redis Streams / TDMQ), so there is no "wrong process" for increments to land
-/// in — a node filter would instead strand queued responses on other nodes. The
+/// Replaces the D23 `claim-locality` case. The in-flight buffer is now shared,
+/// so there is no "wrong process" for increments to land in — a node filter
+/// would instead strand queued responses on other nodes. The
 /// two-handed assertion also verifies CR-1: each response is handed out exactly
 /// once, never to two concurrent claimers.
 pub async fn assert_global_claim(ports: &PortSet) {

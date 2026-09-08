@@ -1,16 +1,9 @@
 //! `nova-responses-sweep` — the standalone maintenance process.
 //!
-//! Under a shared carrier (mem or sql) there is a single owner for reaping lost
+//! Under the shared in-memory carrier there is a single owner for reaping lost
 //! claims, releasing expired event buffers and clearing expired content. Running
 //! it as its own process keeps that ownership explicit and matches the production
-//! deployment shape. The gateway does not run the loop in the L2 mem fixtures
-//! (and the same is the target topology for sql once `run_sweeper` is retired).
-
-#[cfg(all(feature = "sql", feature = "mem"))]
-compile_error!(
-    "mem and sql backends are mutually exclusive; build production with \
-     `--no-default-features --features sql`"
-);
+//! deployment shape. The gateway does not run the loop in the L2 fixtures.
 
 use std::sync::Arc;
 
@@ -21,15 +14,7 @@ use nova_responses_core::{ContextStore, ConversationStore, ResponseEventLog, Res
 
 #[derive(Debug, Parser)]
 struct Args {
-    /// Env var naming the database URL (SEC-4: never the URL itself).
-    #[arg(long, default_value = "NOVA_DATABASE_URL")]
-    database_url_env: String,
-
-    /// Env var naming the Redis URL.
-    #[arg(long, default_value = "NOVA_REDIS_URL")]
-    redis_url_env: String,
-
-    /// Env var naming the mem carrier's data-plane URL (verification only).
+    /// Env var naming the mem carrier's data-plane URL.
     #[arg(long, default_value = "NOVA_MEM_SERVER_URL")]
     mem_server_url_env: String,
 
@@ -55,29 +40,7 @@ struct Backend {
     conversation: Arc<dyn ConversationStore>,
 }
 
-/// Real carriers: Postgres + Redis.
-#[cfg(feature = "sql")]
-async fn mount_sql(args: &Args) -> Result<Backend> {
-    let sql = adapters_sql::SqlWorld::connect_from_env(&args.database_url_env, Default::default())
-        .await?;
-    let redis_url = std::env::var(&args.redis_url_env)
-        .with_context(|| format!("reading ${}", args.redis_url_env))?;
-    let event_log = adapters_event_log_redis::RedisResponseEventLog::connect(
-        &redis_url,
-        sql.ledger.clone(),
-        "resp",
-    )
-    .await?;
-    Ok(Backend {
-        ledger: sql.ledger.clone(),
-        event_log: Arc::new(event_log),
-        context: sql.context.clone(),
-        conversation: sql.conversation.clone(),
-    })
-}
-
-/// In-memory shared carrier (verification).
-#[cfg(feature = "mem")]
+/// In-memory shared carrier.
 async fn mount_mem(args: &Args) -> Result<Backend> {
     let url = std::env::var(&args.mem_server_url_env)
         .with_context(|| format!("reading ${}", args.mem_server_url_env))?;
@@ -101,9 +64,6 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    #[cfg(feature = "sql")]
-    let backend = mount_sql(&args).await?;
-    #[cfg(feature = "mem")]
     let backend = mount_mem(&args).await?;
 
     nova_responses::sweeper::spawn(nova_responses::sweeper::SweepDeps {

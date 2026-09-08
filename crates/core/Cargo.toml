@@ -14,8 +14,8 @@ uuid = { workspace = true }
 unicode-normalization = { workspace = true }
 # https-only + private-range rejection for reference URLs (SEC-6).
 url = { workspace = true }
-# Integrity primitives live here rather than in each adapter so the mem and sql
-# backends cannot drift apart on the signing scheme.
+# Integrity primitives live here rather than in each adapter so backends cannot
+# drift apart on the signing scheme.
 hmac = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
