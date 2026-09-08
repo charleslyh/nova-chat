@@ -22,11 +22,6 @@ pub struct RawConfig {
     pub node_tag: String,
     pub listen: String,
 
-    /// Name of the environment variable holding the mem carrier's data-plane
-    /// URL.
-    #[serde(default = "default_mem_server_url_env")]
-    pub mem_server_url_env: String,
-
     /// Name of the environment variable holding `key:tenant` pairs.
     #[serde(default = "default_api_keys_env")]
     pub api_keys_env: String,
@@ -103,9 +98,6 @@ pub struct RawConfig {
     pub heartbeat_ttl_ms: u64,
 }
 
-fn default_mem_server_url_env() -> String {
-    "NOVA_MEM_SERVER_URL".into()
-}
 fn default_api_keys_env() -> String {
     "NOVA_API_KEYS".into()
 }
@@ -171,7 +163,6 @@ fn default_heartbeat_ttl_ms() -> u64 {
 pub struct Config {
     pub node_tag: NodeTag,
     pub listen: String,
-    pub mem_server_url_env: String,
     pub api_keys_env: String,
     pub pending_limit: usize,
     pub max_events_per_response: usize,
@@ -225,7 +216,6 @@ impl Config {
         Ok(Self {
             node_tag,
             listen: raw.listen,
-            mem_server_url_env: raw.mem_server_url_env,
             api_keys_env: raw.api_keys_env,
             pending_limit: raw.pending_limit,
             max_events_per_response: raw.max_events_per_response,
@@ -271,8 +261,6 @@ mod tests {
         assert_eq!(cfg.chain_limits.max_bytes, 1024 * 1024);
         assert!(cfg.verify_integrity);
         assert!(cfg.run_sweeper);
-        // Config must not carry secret values, only variable names.
-        assert_eq!(cfg.mem_server_url_env, "NOVA_MEM_SERVER_URL");
     }
 
     #[test]

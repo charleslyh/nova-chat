@@ -20,9 +20,12 @@ use nova_responses_core::{
     Clock, ContextStore, ConversationStore, MetricsSink, ResponseEventLog, ResponseLedger,
 };
 use nova_responses::{
-    AppState, Config, ConversationsService, CountingMetrics, KeyTable, ResponsesService, SystemClock,
+    AppState, ConversationsService, CountingMetrics, KeyTable, ResponsesService, SystemClock,
 };
 use tracing::info;
+
+mod config;
+use config::GatewayConfig;
 
 const DEFAULT_CONFIG: &str = "testing/config/node-a.toml";
 
@@ -55,7 +58,9 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let cfg = Arc::new(Config::load(&args.config)?);
+    let gateway_cfg = GatewayConfig::load(&args.config)?;
+    let mem_server_url_env = gateway_cfg.mem_server_url_env.clone();
+    let cfg = Arc::new(gateway_cfg.responses);
     let addr: SocketAddr = cfg
         .listen
         .parse()
@@ -66,7 +71,7 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("api keys from ${}: {e}", cfg.api_keys_env))?,
     );
 
-    let ports = mount(&cfg).await?;
+    let ports = mount(&mem_server_url_env).await?;
     ports.ledger.set_pending_limit(cfg.pending_limit);
 
     // Liveness probe before serving: a node that cannot store would refuse every
@@ -155,9 +160,9 @@ async fn main() -> Result<()> {
 /// In-memory shared carrier. The ledger, event buffer and context are reached
 /// through the client adapters; execution is the separate `nova-agentd` process,
 /// not embedded here.
-async fn mount(cfg: &Config) -> Result<Ports> {
-    let url = std::env::var(&cfg.mem_server_url_env)
-        .with_context(|| format!("reading ${}", cfg.mem_server_url_env))?;
+async fn mount(mem_server_url_env: &str) -> Result<Ports> {
+    let url = std::env::var(mem_server_url_env)
+        .with_context(|| format!("reading ${mem_server_url_env}"))?;
     let world = adapters_mem_client::MemClientWorld::new(&url);
 
     Ok(Ports {

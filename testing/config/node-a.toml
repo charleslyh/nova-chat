@@ -4,6 +4,11 @@
 #
 # Secrets are absent by design — only the *names* of environment variables appear
 # here (SEC-4).
+#
+# Top-level keys are assembly-layer knobs (which backend, how to reach it); the
+# capability layer's config lives under `[responses]`.
+
+[responses]
 node_tag = "node-a"
 listen = "127.0.0.1:18080"
 

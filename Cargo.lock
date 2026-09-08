@@ -985,7 +985,9 @@ dependencies = [
  "clap",
  "nova-responses",
  "nova-responses-core",
+ "serde",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
