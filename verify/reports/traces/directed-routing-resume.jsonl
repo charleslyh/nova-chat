@@ -1,0 +1,7 @@
+{"type":"api_call","method":"POST","url":"http://127.0.0.1:18080/v1/responses","status_ok":true,"detail":"HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 352\r\nconnection: close\r\nda","at_ms":1}
+{"type":"clock","now_ms":2}
+{"type":"clock","now_ms":602}
+{"type":"api_call","method":"SSE_COLLECT","url":"http://127.0.0.1:18081/v1/responses/resp_node-a_44fa8271-67ca-45df-81a1-eba384e8b926?stream=true","status_ok":true,"detail":"events=4 last_seq=3 sample={\"sequence_number\":3,\"type\":\"response.content_part.added\",\"item_id\":\"msg_f03aba9","at_ms":602}
+{"type":"clock","now_ms":603}
+{"type":"api_call","method":"SSE_COLLECT","url":"http://127.0.0.1:18081/v1/responses/resp_node-a_44fa8271-67ca-45df-81a1-eba384e8b926?stream=true&starting_after=3","status_ok":true,"detail":"events=2 last_seq=5 sample={\"sequence_number\":5,\"type\":\"response.output_text.delta\",\"item_id\":\"msg_f03aba96","at_ms":603}
+{"type":"clock","now_ms":604}

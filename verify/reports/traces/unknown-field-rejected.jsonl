@@ -1,0 +1,5 @@
+{"type":"protocol_rejected","reason":"outside_subset","at_ms":1000}
+{"type":"clock","now_ms":1001}
+{"type":"protocol_rejected","reason":"outside_subset","at_ms":1001}
+{"type":"clock","now_ms":1002}
+{"type":"clock","now_ms":1003}

@@ -3,28 +3,6 @@
 version = 4
 
 [[package]]
-name = "adapters-mem"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "nova-responses-core",
- "parking_lot",
- "serde",
- "tokio",
-]
-
-[[package]]
-name = "adapters-mem-client"
-version = "0.1.0"
-dependencies = [
- "adapters-mem",
- "async-trait",
- "nova-responses-core",
- "reqwest",
- "tokio",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -274,9 +252,9 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 name = "conformance"
 version = "0.1.0"
 dependencies = [
- "adapters-mem",
  "async-trait",
- "nova-responses-core",
+ "mock-server",
+ "nova-responses",
  "serde_json",
  "tokio",
  "uuid",
@@ -492,10 +470,10 @@ dependencies = [
 name = "harness"
 version = "0.1.0"
 dependencies = [
- "adapters-mem",
  "anyhow",
  "conformance",
- "nova-responses-core",
+ "mock-server",
+ "nova-responses",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -866,31 +844,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "nova-agent-runtime"
+name = "mock-agentd"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "nova-responses-core",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "nova-agentd-mock"
-version = "0.1.0"
-dependencies = [
- "adapters-mem",
- "adapters-mem-client",
  "anyhow",
  "async-trait",
  "clap",
  "futures",
+ "mock-client",
+ "mock-server",
  "nova-agent-runtime",
- "nova-responses-core",
+ "nova-responses",
  "reqwest",
  "serde",
  "serde_json",
@@ -903,32 +867,66 @@ dependencies = [
 ]
 
 [[package]]
-name = "nova-responses"
+name = "mock-client"
 version = "0.1.0"
 dependencies = [
- "adapters-mem",
- "anyhow",
  "async-trait",
- "axum",
- "futures",
- "nova-agent-runtime",
- "nova-agentd-mock",
- "nova-responses-core",
+ "mock-server",
+ "nova-responses",
  "reqwest",
- "serde",
- "serde_json",
- "subtle",
- "thiserror",
  "tokio",
- "toml",
- "tower-http",
- "tracing",
 ]
 
 [[package]]
-name = "nova-responses-core"
+name = "mock-server"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "clap",
+ "nova-responses",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mock-sweep"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "mock-client",
+ "nova-responses",
+ "nova-responses-sweep",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "nova-agent-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "nova-responses",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "nova-responses"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "async-trait",
  "hmac",
  "serde",
@@ -936,6 +934,9 @@ dependencies = [
  "sha2",
  "subtle",
  "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
  "unicode-normalization",
  "url",
  "uuid",
@@ -945,31 +946,24 @@ dependencies = [
 name = "nova-responses-gateway"
 version = "0.1.0"
 dependencies = [
- "adapters-mem-client",
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
+ "futures",
+ "mock-agentd",
+ "mock-client",
+ "mock-server",
+ "nova-agent-runtime",
  "nova-responses",
- "nova-responses-core",
- "serde",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "nova-responses-mem-server"
-version = "0.1.0"
-dependencies = [
- "adapters-mem",
- "anyhow",
- "axum",
- "clap",
- "nova-responses-core",
+ "nova-responses-sweep",
+ "reqwest",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
+ "toml",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
@@ -978,14 +972,11 @@ dependencies = [
 name = "nova-responses-sweep"
 version = "0.1.0"
 dependencies = [
- "adapters-mem-client",
  "anyhow",
- "clap",
  "nova-responses",
- "nova-responses-core",
+ "serde_json",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

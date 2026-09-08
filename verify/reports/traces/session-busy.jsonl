@@ -1,0 +1,28 @@
+{"type":"session_created","session_id":"21c63d40-b8b8-4b1e-86a7-76213baf7fb6","at_ms":1000}
+{"type":"clock","now_ms":1001}
+{"type":"turn_submitted","session_id":"21c63d40-b8b8-4b1e-86a7-76213baf7fb6","turn_id":"bd2c3b5c-f0f7-4a89-9c07-347cd5ea7aa6","key":"k-busy-1","outcome":"accepted","at_ms":1001}
+{"type":"stream_appended","session_id":"21c63d40-b8b8-4b1e-86a7-76213baf7fb6","turn_id":"bd2c3b5c-f0f7-4a89-9c07-347cd5ea7aa6","attempt":null,"seq":1,"kind":"turn_begin","at_ms":1001}
+{"type":"mock_state","component":"meta","detail":"lock=Busy","at_ms":1001}
+{"type":"clock","now_ms":1002}
+{"type":"mock_state","component":"meta","detail":"lock=Busy expect=Busy","at_ms":1002}
+{"type":"clock","now_ms":1003}
+{"type":"turn_submitted","session_id":"21c63d40-b8b8-4b1e-86a7-76213baf7fb6","turn_id":"00000000-0000-0000-0000-000000000000","key":"k-busy-2","outcome":"busy","at_ms":1003}
+{"type":"mock_state","component":"meta","detail":"lock=Busy","at_ms":1003}
+{"type":"clock","now_ms":1004}
+{"type":"turn_claimed","session_id":"21c63d40-b8b8-4b1e-86a7-76213baf7fb6","turn_id":"bd2c3b5c-f0f7-4a89-9c07-347cd5ea7aa6","agent_id":"6d912eff-b525-4c6d-9f97-c5ce0ac3caf5","attempt":1,"at_ms":1004}
+{"type":"stream_appended","session_id":"21c63d40-b8b8-4b1e-86a7-76213baf7fb6","turn_id":"bd2c3b5c-f0f7-4a89-9c07-347cd5ea7aa6","attempt":1,"seq":2,"kind":"text_delta","at_ms":1004}
+{"type":"stream_appended","session_id":"21c63d40-b8b8-4b1e-86a7-76213baf7fb6","turn_id":"bd2c3b5c-f0f7-4a89-9c07-347cd5ea7aa6","attempt":1,"seq":3,"kind":"text_delta","at_ms":1004}
+{"type":"stream_appended","session_id":"21c63d40-b8b8-4b1e-86a7-76213baf7fb6","turn_id":"bd2c3b5c-f0f7-4a89-9c07-347cd5ea7aa6","attempt":1,"seq":4,"kind":"turn_done","at_ms":1004}
+{"type":"turn_terminal","turn_id":"bd2c3b5c-f0f7-4a89-9c07-347cd5ea7aa6","status":"done","at_ms":1004}
+{"type":"clock","now_ms":1005}
+{"type":"mock_state","component":"meta","detail":"lock=Idle expect=Idle","at_ms":1005}
+{"type":"clock","now_ms":1006}
+{"type":"turn_submitted","session_id":"21c63d40-b8b8-4b1e-86a7-76213baf7fb6","turn_id":"1560d48c-f9c3-41aa-a208-01981966e088","key":"k-busy-3","outcome":"accepted","at_ms":1006}
+{"type":"stream_appended","session_id":"21c63d40-b8b8-4b1e-86a7-76213baf7fb6","turn_id":"1560d48c-f9c3-41aa-a208-01981966e088","attempt":null,"seq":5,"kind":"turn_begin","at_ms":1006}
+{"type":"mock_state","component":"meta","detail":"lock=Busy","at_ms":1006}
+{"type":"clock","now_ms":1007}
+{"type":"turn_claimed","session_id":"21c63d40-b8b8-4b1e-86a7-76213baf7fb6","turn_id":"1560d48c-f9c3-41aa-a208-01981966e088","agent_id":"abc4a408-ea97-488c-a49b-11312b1c4c66","attempt":1,"at_ms":1007}
+{"type":"stream_appended","session_id":"21c63d40-b8b8-4b1e-86a7-76213baf7fb6","turn_id":"1560d48c-f9c3-41aa-a208-01981966e088","attempt":1,"seq":6,"kind":"text_delta","at_ms":1007}
+{"type":"stream_appended","session_id":"21c63d40-b8b8-4b1e-86a7-76213baf7fb6","turn_id":"1560d48c-f9c3-41aa-a208-01981966e088","attempt":1,"seq":7,"kind":"turn_done","at_ms":1007}
+{"type":"turn_terminal","turn_id":"1560d48c-f9c3-41aa-a208-01981966e088","status":"done","at_ms":1007}
+{"type":"clock","now_ms":1008}

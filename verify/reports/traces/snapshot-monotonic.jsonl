@@ -1,0 +1,18 @@
+{"type":"session_created","session_id":"63eb8b17-e70a-4630-8e60-0fff8045b33f","at_ms":1000}
+{"type":"clock","now_ms":1001}
+{"type":"mock_state","component":"snapshot","detail":"get expect_seq=None none=true","at_ms":1001}
+{"type":"clock","now_ms":1002}
+{"type":"mock_state","component":"snapshot","detail":"put seq=2 ok","at_ms":1002}
+{"type":"clock","now_ms":1003}
+{"type":"mock_state","component":"snapshot","detail":"get expect_seq=Some(2) none=false","at_ms":1003}
+{"type":"clock","now_ms":1004}
+{"type":"mock_state","component":"snapshot","detail":"put seq=1 stale","at_ms":1004}
+{"type":"clock","now_ms":1005}
+{"type":"mock_state","component":"snapshot","detail":"get expect_seq=Some(2) none=false","at_ms":1005}
+{"type":"clock","now_ms":1006}
+{"type":"mock_state","component":"snapshot","detail":"put seq=2 ok","at_ms":1006}
+{"type":"clock","now_ms":1007}
+{"type":"mock_state","component":"snapshot","detail":"put seq=5 ok","at_ms":1007}
+{"type":"clock","now_ms":1008}
+{"type":"mock_state","component":"snapshot","detail":"get expect_seq=Some(5) none=false","at_ms":1008}
+{"type":"clock","now_ms":1009}

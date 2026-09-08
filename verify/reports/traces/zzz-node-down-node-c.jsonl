@@ -1,0 +1,8 @@
+{"type":"api_call","method":"POST","url":"http://127.0.0.1:18082/v1/responses","status_ok":true,"detail":"HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 360\r\nconnection: close\r\nda","at_ms":1}
+{"type":"clock","now_ms":2}
+{"type":"clock","now_ms":302}
+{"type":"fault_injected","kind":"kill_listener","target":"port:18082","at_ms":302}
+{"type":"clock","now_ms":303}
+{"type":"clock","now_ms":903}
+{"type":"api_call","method":"GET","url":"http://127.0.0.1:18080/v1/responses/resp_node-c_031ec4cd-6bb2-46b7-aef1-dd4d13fdeb92?stream=true","status_ok":true,"detail":"HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 176\r\nconnection: close\r","at_ms":903}
+{"type":"clock","now_ms":904}

@@ -1,0 +1,10 @@
+{"type":"api_call","method":"POST","url":"http://127.0.0.1:18081/v1/sessions","status_ok":true,"detail":"HTTP/1.1 201 Created\r\ncontent-type: application/octet-stream\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 53\r\nconnection: clo","at_ms":1}
+{"type":"clock","now_ms":2}
+{"type":"api_call","method":"POST","url":"http://127.0.0.1:18081/v1/sessions/5f558004-ea85-46ea-94a0-e0232d38088d/turns","status_ok":true,"detail":"HTTP/1.1 202 Accepted\r\ncontent-type: application/octet-stream\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 50\r\nconnection: cl","at_ms":2}
+{"type":"clock","now_ms":3}
+{"type":"api_call","method":"GET_UNTIL","url":"http://127.0.0.1:18080/v1/sessions/5f558004-ea85-46ea-94a0-e0232d38088d/snapshot","status_ok":true,"detail":"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 281\r\nconnection: close\r\ndate: Th","at_ms":3}
+{"type":"clock","now_ms":4}
+{"type":"api_call","method":"SSE_COLLECT","url":"http://127.0.0.1:18081/v1/sessions/5f558004-ea85-46ea-94a0-e0232d38088d/stream?from_seq=1","status_ok":true,"detail":"events=2 last_seq=2 sample={\"session_id\":\"5f558004-ea85-46ea-94a0-e0232d38088d\",\"seq\":2,\"kind\":\"turn_begin\"","at_ms":4}
+{"type":"clock","now_ms":5}
+{"type":"api_call","method":"SSE_COLLECT","url":"http://127.0.0.1:18080/v1/sessions/5f558004-ea85-46ea-94a0-e0232d38088d/stream?from_seq=3","status_ok":true,"detail":"events=8 last_seq=10 sample={\"session_id\":\"5f558004-ea85-46ea-94a0-e0232d38088d\",\"seq\":10,\"kind\":\"text_delta","at_ms":5}
+{"type":"clock","now_ms":6}

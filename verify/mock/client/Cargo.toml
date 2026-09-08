@@ -1,0 +1,12 @@
+[package]
+name = "mock-client"
+version.workspace = true
+edition.workspace = true
+description = "IPC client adapters (data plane) for the mem shared carrier"
+
+[dependencies]
+nova-responses = { workspace = true }
+mock-server = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }

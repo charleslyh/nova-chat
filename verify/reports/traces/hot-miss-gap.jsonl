@@ -1,0 +1,28 @@
+{"type":"session_created","session_id":"bef7a8f1-946e-44e5-843e-8eef8e35e870","at_ms":1000}
+{"type":"clock","now_ms":1001}
+{"type":"turn_submitted","session_id":"bef7a8f1-946e-44e5-843e-8eef8e35e870","turn_id":"7d329faa-76bd-4b4e-a78e-41b5e9df5b83","key":"k-gap-1","outcome":"accepted","at_ms":1001}
+{"type":"stream_appended","session_id":"bef7a8f1-946e-44e5-843e-8eef8e35e870","turn_id":"7d329faa-76bd-4b4e-a78e-41b5e9df5b83","attempt":null,"seq":1,"kind":"turn_begin","at_ms":1001}
+{"type":"mock_state","component":"meta","detail":"lock=Busy","at_ms":1001}
+{"type":"clock","now_ms":1002}
+{"type":"turn_claimed","session_id":"bef7a8f1-946e-44e5-843e-8eef8e35e870","turn_id":"7d329faa-76bd-4b4e-a78e-41b5e9df5b83","agent_id":"f3a58c33-e5b3-4f82-a3c0-aee26e46ab5d","attempt":1,"at_ms":1002}
+{"type":"stream_appended","session_id":"bef7a8f1-946e-44e5-843e-8eef8e35e870","turn_id":"7d329faa-76bd-4b4e-a78e-41b5e9df5b83","attempt":1,"seq":2,"kind":"text_delta","at_ms":1002}
+{"type":"stream_appended","session_id":"bef7a8f1-946e-44e5-843e-8eef8e35e870","turn_id":"7d329faa-76bd-4b4e-a78e-41b5e9df5b83","attempt":1,"seq":3,"kind":"text_delta","at_ms":1002}
+{"type":"stream_appended","session_id":"bef7a8f1-946e-44e5-843e-8eef8e35e870","turn_id":"7d329faa-76bd-4b4e-a78e-41b5e9df5b83","attempt":1,"seq":4,"kind":"text_delta","at_ms":1002}
+{"type":"stream_appended","session_id":"bef7a8f1-946e-44e5-843e-8eef8e35e870","turn_id":"7d329faa-76bd-4b4e-a78e-41b5e9df5b83","attempt":1,"seq":5,"kind":"turn_done","at_ms":1002}
+{"type":"turn_terminal","turn_id":"7d329faa-76bd-4b4e-a78e-41b5e9df5b83","status":"done","at_ms":1002}
+{"type":"clock","now_ms":1003}
+{"type":"mock_state","component":"snapshot","detail":"put seq=5 ok","at_ms":1003}
+{"type":"clock","now_ms":1004}
+{"type":"stream_trimmed","session_id":"bef7a8f1-946e-44e5-843e-8eef8e35e870","new_earliest":3,"at_ms":1004}
+{"type":"fault_injected","kind":"trim_hot","target":"earliest=3","at_ms":1004}
+{"type":"clock","now_ms":1005}
+{"type":"mock_state","component":"stream_cold","detail":"cold_len=2 min=2","at_ms":1005}
+{"type":"clock","now_ms":1006}
+{"type":"stream_read","session_id":"bef7a8f1-946e-44e5-843e-8eef8e35e870","from_seq":1,"count":0,"gap":true,"at_ms":1006}
+{"type":"clock","now_ms":1007}
+{"type":"stream_read","session_id":"bef7a8f1-946e-44e5-843e-8eef8e35e870","from_seq":3,"count":1,"gap":false,"at_ms":1007}
+{"type":"clock","now_ms":1008}
+{"type":"mock_state","component":"snapshot","detail":"get expect_seq=Some(5) none=false","at_ms":1008}
+{"type":"clock","now_ms":1009}
+{"type":"stream_read","session_id":"bef7a8f1-946e-44e5-843e-8eef8e35e870","from_seq":5,"count":1,"gap":false,"at_ms":1009}
+{"type":"clock","now_ms":1010}

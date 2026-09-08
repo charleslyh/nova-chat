@@ -1,0 +1,10 @@
+{"type":"mock_state","component":"ledger","detail":"read_only=true","at_ms":1000}
+{"type":"clock","now_ms":1001}
+{"type":"response_created","response_id":"resp_node-a_202978e6-3d4d-4fc6-8e6b-744d6ce740f2","key":"ro-1","outcome":"read_only","store":true,"previous":null,"at_ms":1001}
+{"type":"clock","now_ms":1002}
+{"type":"mock_state","component":"ledger","detail":"read_only=false","at_ms":1002}
+{"type":"clock","now_ms":1003}
+{"type":"response_created","response_id":"resp_node-a_cf1a94e0-fd6c-4440-a2d5-b20fef9450ef","key":"ro-2","outcome":"accepted","store":true,"previous":null,"at_ms":1003}
+{"type":"content_stored","response_id":"resp_node-a_cf1a94e0-fd6c-4440-a2d5-b20fef9450ef","stored":true,"at_ms":1003}
+{"type":"event_appended","response_id":"resp_node-a_cf1a94e0-fd6c-4440-a2d5-b20fef9450ef","attempt":null,"sequence_number":0,"kind":"response.created","at_ms":1003}
+{"type":"clock","now_ms":1004}

@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use nova_responses_core::{
+use nova_responses::{
     AgentId, AppendEvent, Attempt, ChainLimits, ClaimedResponse, ContextStore,
     ConversationStore, LedgerError, RequestProvenance, ResponseEventKind, ResponseEventLog,
     ResponseId, ResponseItem, ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,

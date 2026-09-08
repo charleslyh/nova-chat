@@ -1,0 +1,10 @@
+{"type":"api_call","method":"POST","url":"http://127.0.0.1:18080/v1/responses","status_ok":true,"detail":"HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 401\r\nconnection: close\r\nda","at_ms":1}
+{"type":"clock","now_ms":2}
+{"type":"drain_started","node_tag":"port:18081","in_flight":0,"at_ms":2}
+{"type":"clock","now_ms":3}
+{"type":"api_call","method":"POST","url":"http://127.0.0.1:18081/v1/responses","status_ok":true,"detail":"HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 90\r\nconnection:","at_ms":3}
+{"type":"clock","now_ms":4}
+{"type":"api_call","method":"GET","url":"http://127.0.0.1:18081/health","status_ok":true,"detail":"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 127\r\nconnection: close\r\ndate: Tu","at_ms":4}
+{"type":"clock","now_ms":5}
+{"type":"api_call","method":"GET","url":"http://127.0.0.1:18080/v1/responses/resp_node-a_df8d9845-813b-47b4-8078-9fd416b7f807","status_ok":true,"detail":"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 406\r\nconnection: close\r\ndate: Tu","at_ms":5}
+{"type":"clock","now_ms":6}

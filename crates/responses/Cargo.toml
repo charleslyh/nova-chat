@@ -1,0 +1,25 @@
+[package]
+name = "nova-responses"
+version.workspace = true
+edition.workspace = true
+description = "Responses 领域 + 能力层 + 后台维护，不含具体存储适配器（经端口注入）"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+# NFC normalisation for stable content fingerprints (INV-44).
+unicode-normalization = { workspace = true }
+# https-only + private-range rejection for reference URLs (SEC-6).
+url = { workspace = true }
+# Integrity primitives live here rather than in each adapter so backends cannot
+# drift apart on the signing scheme.
+hmac = { workspace = true }
+sha2 = { workspace = true }

@@ -1,18 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/core",
-    "crates/adapters/mem",
-    "crates/adapters/mem-client",
     "crates/agent-runtime",
-    "crates/mem-server",
     "crates/sweep",
-    "crates/nova-responses",
-    "crates/gateway",
-    "testing/agentd-mock",
-    "testing/conformance",
-    "testing/harness",
-    "xtask",
+    "crates/responses",
+    "gateway",
+    "verify/mock/server",
+    "verify/mock/client",
+    "verify/mock/agentd",
+    "verify/mock/sweep",
+    "verify/conformance",
+    "verify/harness",
+    "verify/xtask",
 ]
 
 [workspace.package]
@@ -21,14 +20,15 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-nova-responses-core = { path = "crates/core" }
-nova-responses = { path = "crates/nova-responses" }
-adapters-mem = { path = "crates/adapters/mem" }
-adapters-mem-client = { path = "crates/adapters/mem-client" }
+nova-responses = { path = "crates/responses" }
+nova-responses-sweep = { path = "crates/sweep" }
+mock-server = { path = "verify/mock/server" }
+mock-client = { path = "verify/mock/client" }
+mock-agentd = { path = "verify/mock/agentd" }
+mock-sweep = { path = "verify/mock/sweep" }
 nova-agent-runtime = { path = "crates/agent-runtime" }
-nova-agentd-mock = { path = "testing/agentd-mock" }
-conformance = { path = "testing/conformance" }
-harness = { path = "testing/harness" }
+conformance = { path = "verify/conformance" }
+harness = { path = "verify/harness" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "process", "signal", "fs"] }
 serde = { version = "1", features = ["derive"] }

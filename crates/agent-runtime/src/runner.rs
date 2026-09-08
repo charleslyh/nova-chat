@@ -11,8 +11,8 @@
 //! into every provider adapter.
 
 use async_trait::async_trait;
-use nova_responses_core::protocol::{Tool, ToolChoice};
-use nova_responses_core::{RequestProvenance, ResponseItem, ResponseStatus, Usage};
+use nova_responses::protocol::{Tool, ToolChoice};
+use nova_responses::{RequestProvenance, ResponseItem, ResponseStatus, Usage};
 
 /// One agent execution task, assembled by the orchestrator after a claim.
 #[derive(Debug, Clone)]

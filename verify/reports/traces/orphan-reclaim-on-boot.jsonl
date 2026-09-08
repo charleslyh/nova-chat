@@ -1,0 +1,12 @@
+{"type":"response_created","response_id":"resp_node-a_7ef205da-c1b1-4465-8d0a-3d7adea6ae97","key":"orb-1","outcome":"accepted","store":true,"previous":null,"at_ms":1000}
+{"type":"content_stored","response_id":"resp_node-a_7ef205da-c1b1-4465-8d0a-3d7adea6ae97","stored":true,"at_ms":1000}
+{"type":"event_appended","response_id":"resp_node-a_7ef205da-c1b1-4465-8d0a-3d7adea6ae97","attempt":null,"sequence_number":0,"kind":"response.created","at_ms":1000}
+{"type":"clock","now_ms":1001}
+{"type":"response_claimed","response_id":"resp_node-a_7ef205da-c1b1-4465-8d0a-3d7adea6ae97","agent_id":"efbbcd4c-3728-49df-8cd9-3f1e2744da86","attempt":1,"at_ms":1001}
+{"type":"event_appended","response_id":"resp_node-a_7ef205da-c1b1-4465-8d0a-3d7adea6ae97","attempt":1,"sequence_number":1,"kind":"response.in_progress","at_ms":1001}
+{"type":"clock","now_ms":1002}
+{"type":"event_appended","response_id":"resp_node-a_7ef205da-c1b1-4465-8d0a-3d7adea6ae97","attempt":1,"sequence_number":2,"kind":"response.output_text.delta","at_ms":1002}
+{"type":"clock","now_ms":1003}
+{"type":"response_terminal","response_id":"resp_node-a_7ef205da-c1b1-4465-8d0a-3d7adea6ae97","status":"failed","at_ms":1003}
+{"type":"orphan_reclaimed","node_tag":"node-a","count":1,"at_ms":1003}
+{"type":"clock","now_ms":1004}

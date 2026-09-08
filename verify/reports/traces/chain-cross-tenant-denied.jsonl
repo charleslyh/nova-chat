@@ -1,0 +1,6 @@
+{"type":"response_created","response_id":"resp_node-a_97090261-c690-4b5e-b61d-0bb132967d0c","key":"cct-1","outcome":"accepted","store":true,"previous":null,"at_ms":1000}
+{"type":"content_stored","response_id":"resp_node-a_97090261-c690-4b5e-b61d-0bb132967d0c","stored":true,"at_ms":1000}
+{"type":"event_appended","response_id":"resp_node-a_97090261-c690-4b5e-b61d-0bb132967d0c","attempt":null,"sequence_number":0,"kind":"response.created","at_ms":1000}
+{"type":"clock","now_ms":1001}
+{"type":"chain_rejected","response_id":"resp_node-a_97090261-c690-4b5e-b61d-0bb132967d0c","reason":"chain_broken","at_ms":1001}
+{"type":"clock","now_ms":1002}

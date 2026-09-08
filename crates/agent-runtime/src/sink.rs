@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nova_responses_core::{
+use nova_responses::{
     AppendEvent, Attempt, EventBody, EventLogError, ResponseEventKind, ResponseEventLog,
     ResponseId, ResponseItem,
 };

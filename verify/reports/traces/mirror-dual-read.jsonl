@@ -1,0 +1,21 @@
+{"type":"session_created","session_id":"397ac30e-777b-4a95-8fc7-c58cfaff74ec","at_ms":1000}
+{"type":"clock","now_ms":1001}
+{"type":"turn_submitted","session_id":"397ac30e-777b-4a95-8fc7-c58cfaff74ec","turn_id":"05120f03-8d0c-4027-b84b-f122bfc3b111","key":"k-m1","outcome":"accepted","at_ms":1001}
+{"type":"stream_appended","session_id":"397ac30e-777b-4a95-8fc7-c58cfaff74ec","turn_id":"05120f03-8d0c-4027-b84b-f122bfc3b111","attempt":null,"seq":1,"kind":"turn_begin","at_ms":1001}
+{"type":"mock_state","component":"meta","detail":"lock=Busy","at_ms":1001}
+{"type":"clock","now_ms":1002}
+{"type":"turn_claimed","session_id":"397ac30e-777b-4a95-8fc7-c58cfaff74ec","turn_id":"05120f03-8d0c-4027-b84b-f122bfc3b111","agent_id":"2ca14cd2-c085-49ad-84de-9ff956f02e8e","attempt":1,"at_ms":1002}
+{"type":"stream_appended","session_id":"397ac30e-777b-4a95-8fc7-c58cfaff74ec","turn_id":"05120f03-8d0c-4027-b84b-f122bfc3b111","attempt":1,"seq":2,"kind":"text_delta","at_ms":1002}
+{"type":"stream_appended","session_id":"397ac30e-777b-4a95-8fc7-c58cfaff74ec","turn_id":"05120f03-8d0c-4027-b84b-f122bfc3b111","attempt":1,"seq":3,"kind":"text_delta","at_ms":1002}
+{"type":"stream_appended","session_id":"397ac30e-777b-4a95-8fc7-c58cfaff74ec","turn_id":"05120f03-8d0c-4027-b84b-f122bfc3b111","attempt":1,"seq":4,"kind":"text_delta","at_ms":1002}
+{"type":"stream_appended","session_id":"397ac30e-777b-4a95-8fc7-c58cfaff74ec","turn_id":"05120f03-8d0c-4027-b84b-f122bfc3b111","attempt":1,"seq":5,"kind":"turn_done","at_ms":1002}
+{"type":"turn_terminal","turn_id":"05120f03-8d0c-4027-b84b-f122bfc3b111","status":"done","at_ms":1002}
+{"type":"clock","now_ms":1003}
+{"type":"mock_state","component":"mirror","detail":"sync_from_authority","at_ms":1003}
+{"type":"clock","now_ms":1004}
+{"type":"mock_state","component":"mirror","detail":"observe_both auth=[1, 2, 3, 4, 5] mir=[1, 2, 3, 4, 5]","at_ms":1004}
+{"type":"clock","now_ms":1005}
+{"type":"mock_state","component":"mirror","detail":"append read_only","at_ms":1005}
+{"type":"clock","now_ms":1006}
+{"type":"mock_state","component":"mirror","detail":"snapshot_put read_only","at_ms":1006}
+{"type":"clock","now_ms":1007}

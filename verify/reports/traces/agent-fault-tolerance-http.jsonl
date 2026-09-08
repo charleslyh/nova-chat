@@ -1,0 +1,22 @@
+{"type":"fault_injected","kind":"kill_process","target":"target/nova-procs/agentd-b.pid","at_ms":1}
+{"type":"clock","now_ms":2}
+{"type":"fault_injected","kind":"kill_process","target":"target/nova-procs/agentd-c.pid","at_ms":2}
+{"type":"clock","now_ms":3}
+{"type":"api_call","method":"POST","url":"http://127.0.0.1:18080/v1/responses","status_ok":true,"detail":"HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 368\r\nconnection: close\r\nda","at_ms":3}
+{"type":"clock","now_ms":4}
+{"type":"api_call","method":"GET_UNTIL","url":"http://127.0.0.1:18080/v1/responses/resp_node-a_f0a23401-9057-411f-9439-0ea282bc5bbe","status_ok":true,"detail":"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 373\r\nconnection: close\r\ndate: Tu","at_ms":4}
+{"type":"clock","now_ms":5}
+{"type":"fault_injected","kind":"start_agentd","target":"target/nova-procs/agentd-b.pid","at_ms":5}
+{"type":"clock","now_ms":6}
+{"type":"api_call","method":"POST","url":"http://127.0.0.1:18080/v1/responses","status_ok":true,"detail":"HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 379\r\nconnection: close\r\nda","at_ms":6}
+{"type":"clock","now_ms":7}
+{"type":"api_call","method":"GET_UNTIL","url":"http://127.0.0.1:18080/v1/responses/resp_node-a_c471345c-74f1-4821-b98d-33001bfa6c97","status_ok":true,"detail":"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 543\r\nconnection: close\r\ndate: Tu","at_ms":7}
+{"type":"clock","now_ms":8}
+{"type":"fault_injected","kind":"kill_process","target":"target/nova-procs/agentd-a.pid","at_ms":8}
+{"type":"clock","now_ms":9}
+{"type":"api_call","method":"GET_UNTIL","url":"http://127.0.0.1:18080/v1/responses/resp_node-a_f0a23401-9057-411f-9439-0ea282bc5bbe","status_ok":true,"detail":"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 368\r\nconnection: close\r\ndate: Tu","at_ms":9}
+{"type":"clock","now_ms":10}
+{"type":"api_call","method":"POST","url":"http://127.0.0.1:18080/v1/responses","status_ok":true,"detail":"HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 376\r\nconnection: close\r\nda","at_ms":10}
+{"type":"clock","now_ms":11}
+{"type":"api_call","method":"GET_UNTIL","url":"http://127.0.0.1:18080/v1/responses/resp_node-a_5b72541c-b30e-4f73-8d01-02212abce960","status_ok":true,"detail":"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 540\r\nconnection: close\r\ndate: Tu","at_ms":11}
+{"type":"clock","now_ms":12}
