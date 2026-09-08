@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use nova_responses_core::{
-    Clock, ContextError, ContextStore, Conversation, ConversationError, ConversationEvent,
+    ContextError, ContextStore, Conversation, ConversationError, ConversationEvent,
     ConversationEventKind, ConversationId, ConversationStore, MetricsSink, ResolvedContext,
     ResponseId, ResponseStatus, TenantId,
 };
@@ -45,7 +45,7 @@ pub struct ConversationsService {
     conversations: Arc<dyn ConversationStore>,
     /// 读对话历史用：容器只存链尾指针，内容在响应链的物化快照里（D24）。
     context: Arc<dyn ContextStore>,
-    clock: Arc<dyn Clock>,
+    now: Arc<dyn Fn() -> u64 + Send + Sync>,
     metrics: Arc<dyn MetricsSink>,
     cfg: Arc<Config>,
 }
@@ -54,14 +54,14 @@ impl ConversationsService {
     pub fn new(
         conversations: Arc<dyn ConversationStore>,
         context: Arc<dyn ContextStore>,
-        clock: Arc<dyn Clock>,
+        now: Arc<dyn Fn() -> u64 + Send + Sync>,
         metrics: Arc<dyn MetricsSink>,
         cfg: Arc<Config>,
     ) -> Self {
         Self {
             conversations,
             context,
-            clock,
+            now,
             metrics,
             cfg,
         }
@@ -74,7 +74,7 @@ impl ConversationsService {
     ) -> Result<Conversation, ConversationError> {
         // 不写前探活（D28）：库不可用由失败返回错误直接暴露，低概率失败用「治疗」
         // 而非「预防」。启动探活（fail-fast）仍在 gateway 装配处。
-        let now_ms = self.clock.now_ms().await;
+        let now_ms = (self.now)();
         let conversation = Conversation::new(
             ConversationId::new(),
             tenant.clone(),
@@ -156,7 +156,7 @@ impl ConversationsService {
         id: &ConversationId,
         response_id: &ResponseId,
     ) -> Result<u64, ConversationError> {
-        let now_ms = self.clock.now_ms().await;
+        let now_ms = (self.now)();
         self.conversations
             .acquire_active(tenant, id, response_id, now_ms)
             .await
@@ -170,7 +170,7 @@ impl ConversationsService {
         response_id: &ResponseId,
         status: ResponseStatus,
     ) -> Result<u64, ConversationError> {
-        let now_ms = self.clock.now_ms().await;
+        let now_ms = (self.now)();
         self.conversations
             .release_active(tenant, id, response_id, status, now_ms)
             .await
@@ -195,7 +195,7 @@ impl ConversationsService {
         id: &ConversationId,
         kind: ConversationEventKind,
     ) -> Result<u64, ConversationError> {
-        let now_ms = self.clock.now_ms().await;
+        let now_ms = (self.now)();
         self.conversations.append_event(tenant, id, kind, now_ms).await
     }
 

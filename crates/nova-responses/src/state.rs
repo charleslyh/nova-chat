@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use nova_responses_core::{
-    Clock, ContextStore, ConversationStore, MetricsSink, ResponseEventLog, ResponseLedger,
+    ContextStore, ConversationStore, MetricsSink, ResponseEventLog, ResponseLedger,
 };
 
 use crate::auth::KeyTable;
@@ -27,7 +27,7 @@ pub struct AppState {
     /// through the capability layer would mean a service method whose only job is
     /// to hand a port back out.
     pub conversation_store: Arc<dyn ConversationStore>,
-    pub clock: Arc<dyn Clock>,
+    pub now: Arc<dyn Fn() -> u64 + Send + Sync>,
     pub metrics: Arc<dyn MetricsSink>,
     pub keys: Arc<KeyTable>,
     pub service: Arc<ResponsesService>,
@@ -46,7 +46,7 @@ impl AppState {
         self.accepting.store(false, Ordering::SeqCst);
     }
 
-    pub async fn now_ms(&self) -> u64 {
-        self.clock.now_ms().await
+    pub fn now_ms(&self) -> u64 {
+        (self.now)()
     }
 }

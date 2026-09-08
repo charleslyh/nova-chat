@@ -1,0 +1,16 @@
+[package]
+name = "nova-agent-runtime"
+version.workspace = true
+edition.workspace = true
+description = "Agent execution orchestrator: claims tasks, runs them via a pluggable AgentRunner, commits results"
+
+[dependencies]
+nova-responses-core = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Background heartbeat task and the claim/poll loop (spawn / sleep / abort).
+tokio = { workspace = true }
+uuid = { workspace = true }

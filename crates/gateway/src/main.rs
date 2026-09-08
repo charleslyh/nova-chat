@@ -1,7 +1,7 @@
 //! Gateway binary over [`nova_responses`]: thin assembly that mounts a backend.
 //!
 //! The backend is the mem carrier **client** adapters, reaching the shared
-//! `nova-responses-mem-server`. Execution is the separate `nova-agentd` process
+//! `nova-responses-mem-server`. Execution is the separate `nova-agentd-mock` process
 //! — the same process topology as production, with the carrier an in-memory
 //! double. This is what protocol-compatibility checks, local development and L2
 //! verification run.
@@ -17,10 +17,10 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use nova_responses_core::{
-    Clock, ContextStore, ConversationStore, MetricsSink, ResponseEventLog, ResponseLedger,
+    ContextStore, ConversationStore, MetricsSink, ResponseEventLog, ResponseLedger,
 };
 use nova_responses::{
-    AppState, ConversationsService, CountingMetrics, KeyTable, ResponsesService, SystemClock,
+    system_now, AppState, ConversationsService, CountingMetrics, KeyTable, ResponsesService,
 };
 use tracing::info;
 
@@ -44,7 +44,7 @@ struct Ports {
     event_log: Arc<dyn ResponseEventLog>,
     context: Arc<dyn ContextStore>,
     conversation: Arc<dyn ConversationStore>,
-    clock: Arc<dyn Clock>,
+    now: Arc<dyn Fn() -> u64 + Send + Sync>,
     metrics: Arc<dyn MetricsSink>,
 }
 
@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
     let conversations = Arc::new(ConversationsService::new(
         ports.conversation.clone(),
         ports.context.clone(),
-        ports.clock.clone(),
+        ports.now.clone(),
         ports.metrics.clone(),
         cfg.clone(),
     ));
@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
         ports.event_log.clone(),
         ports.context.clone(),
         conversations.clone(),
-        ports.clock.clone(),
+        ports.now.clone(),
         ports.metrics.clone(),
         cfg.clone(),
     ));
@@ -111,7 +111,7 @@ async fn main() -> Result<()> {
         event_log: ports.event_log.clone(),
         context: ports.context.clone(),
         conversation_store: ports.conversation.clone(),
-        clock: ports.clock.clone(),
+        now: ports.now.clone(),
         metrics: ports.metrics.clone(),
         keys,
         service,
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
             event_log: state.event_log.clone(),
             context: state.context.clone(),
             conversations: state.conversation_store.clone(),
-            clock: state.clock.clone(),
+            now: state.now.clone(),
             metrics: state.metrics.clone(),
             heartbeat_ttl_ms: state.cfg.heartbeat_ttl_ms,
             retain_after_terminal_ms: state.cfg.retain_after_terminal_ms,
@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
 }
 
 /// In-memory shared carrier. The ledger, event buffer and context are reached
-/// through the client adapters; execution is the separate `nova-agentd` process,
+/// through the client adapters; execution is the separate `nova-agentd-mock` process,
 /// not embedded here.
 async fn mount(mem_server_url_env: &str) -> Result<Ports> {
     let url = std::env::var(mem_server_url_env)
@@ -170,7 +170,7 @@ async fn mount(mem_server_url_env: &str) -> Result<Ports> {
         event_log: world.event_log.clone(),
         context: world.context.clone(),
         conversation: world.conversation.clone(),
-        clock: Arc::new(SystemClock),
+        now: system_now(),
         metrics: Arc::new(CountingMetrics::default()),
     })
 }

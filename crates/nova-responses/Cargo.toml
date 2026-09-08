@@ -24,8 +24,8 @@ tracing = { workspace = true }
 # agent injected in process — these are test-only and never part of the library's
 # production dependency surface.
 adapters-mem = { workspace = true }
-adapters-completions-mock = { workspace = true }
-nova-agent = { workspace = true }
+nova-agent-runtime = { workspace = true }
+nova-agentd-mock = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }

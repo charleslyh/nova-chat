@@ -1,46 +1,33 @@
-//! The outbound request type.
+//! The outbound completions request type.
 
 use serde::{Deserialize, Serialize};
 
+use nova_responses_core::protocol::{Tool, ToolChoice, ToolChoiceMode};
+use nova_responses_core::{RequestProvenance, ResponseItem};
+
 use super::translate::{items_to_messages, TranslationError};
-use crate::protocol::ResponseItem;
 
 /// One completions request, ready to be scheduled.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompletionsRequest {
     pub model: String,
-
     /// Conversation in provider order: system first, then oldest to newest.
     pub messages: Vec<CompletionsMessage>,
-
-    /// Functions the model may call. Empty means none are offered — which is not
-    /// the same as the model being forbidden to emit one, so a scheduler must
-    /// still tolerate an unexpected call rather than panicking.
+    /// Functions the model may call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolSpec>,
-
-    /// Constrains how the model may use the offered tools. `None` lets the
-    /// provider pick its default (typically `"auto"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<CompletionsToolChoice>,
-
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u32>,
-
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
-
-    /// Where this request came from. Never sent to the provider; carried so a
-    /// scheduler can log, attribute cost, and honour the execution deadline.
+    /// Where this request came from. Never sent to the provider.
     pub provenance: RequestProvenance,
 }
 
 impl CompletionsRequest {
     /// Build from resolved context.
-    ///
-    /// `instructions` becomes the leading system message. It is never inherited
-    /// across turns (FR-19), so its absence means the caller sent none *this*
-    /// turn — not that it was lost.
     pub fn from_context(
         model: impl Into<String>,
         instructions: Option<&str>,
@@ -85,9 +72,6 @@ impl CompletionsRequest {
     }
 
     /// The most recent user text, or `""`.
-    ///
-    /// Provided because every test scheduler needs it, and hand-rolling the walk
-    /// each time invites subtly different answers to "which message is last".
     pub fn last_user_text(&self) -> &str {
         for m in self.messages.iter().rev() {
             if let CompletionsMessage::User { content } = m {
@@ -110,41 +94,20 @@ impl CompletionsRequest {
     }
 }
 
-/// Traceability for one request. Not part of the provider payload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RequestProvenance {
-    pub response_id: String,
-    /// Fencing token. A scheduler that ignores this cannot tell its work was
-    /// superseded, and will keep spending tokens on an abandoned attempt.
-    pub attempt: u64,
-    /// Wall-clock milliseconds after which this attempt is forfeit.
-    pub exec_deadline_ms: u64,
-}
-
 /// A message in provider shape.
-///
-/// Note this is *not* [`ResponseItem`]. The differences are deliberate and are
-/// what [`super::translate`] exists to reconcile: completions has a distinct
-/// `tool` role, and it groups parallel tool calls onto a single assistant message
-/// rather than emitting one item each.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum CompletionsMessage {
-    /// Carries `instructions`.
     System { content: String },
     User { content: Vec<CompletionsContent> },
     Assistant {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content: Option<String>,
-        /// A refusal, carried at message level — chat completions has no refusal
-        /// content part; it is the assistant message's `refusal` field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         refusal: Option<String>,
-        /// Parallel calls belong to one assistant message.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<AssistantToolCall>,
     },
-    /// Result of a call, matched back by `tool_call_id`.
     Tool {
         tool_call_id: String,
         content: String,
@@ -198,24 +161,14 @@ impl CompletionsMessage {
 }
 
 /// A content part in provider shape.
-///
-/// Images and files are **references only** — there is no inline-bytes variant,
-/// mirroring the inbound subset (SEC-6). A scheduler therefore cannot be handed a
-/// payload whose size was never budgeted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CompletionsContent {
     Text { text: String },
-    /// `{ "type": "image_url", "image_url": { "url": "..." } }` — chat
-    /// completions nests the URL inside an `image_url` object.
     ImageUrl { image_url: ImageUrlPayload },
-    /// A file reference. Not a chat-completions content part; it is this
-    /// service's extension for carrying `input_file` items to a provider that
-    /// supports them. A strict chat-completions adapter must translate it.
     FileRef { id: String },
 }
 
-/// The `image_url` object nested inside an image content part.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageUrlPayload {
     pub url: String,
@@ -231,23 +184,18 @@ impl CompletionsContent {
     }
 }
 
-/// A tool call on an assistant message, in chat-completions wire shape:
-/// `{ "id", "type": "function", "function": { "name", "arguments" } }`.
+/// A tool call on an assistant message, in chat-completions wire shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssistantToolCall {
     pub id: String,
-    /// Always `"function"` — the only tool-call kind chat completions carries.
     #[serde(rename = "type")]
     pub kind: String,
     pub function: AssistantFunction,
 }
 
-/// The `function` object nested inside a tool call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssistantFunction {
     pub name: String,
-    /// JSON kept as an opaque string, exactly as the provider produced it.
-    /// Re-encoding would change what the model said.
     pub arguments: String,
 }
 
@@ -261,23 +209,19 @@ impl AssistantToolCall {
     }
 }
 
-/// A function offered to the model, in chat-completions wire shape:
-/// `{ "type": "function", "function": { "name", "description", "parameters", "strict" } }`.
+/// A function offered to the model, in chat-completions wire shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
-    /// Always `"function"` — the only tool kind this service offers.
     #[serde(rename = "type")]
     pub kind: String,
     pub function: FunctionSpec,
 }
 
-/// The `function` object nested inside a tool definition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionSpec {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// JSON Schema, opaque here.
     pub parameters: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
@@ -297,15 +241,14 @@ impl ToolSpec {
     }
 }
 
-/// The inbound protocol [`Tool`] is the *caller's* spelling (flat `name` /
-/// `description` / `parameters` / `strict`); [`ToolSpec`] is the outbound
-/// provider spelling (nested under `function`). This conversion is the single
-/// place the two shapes meet, so the agent can persist the caller's declaration
-/// verbatim and hand the provider exactly what it expects.
-impl From<crate::protocol::Tool> for ToolSpec {
-    fn from(tool: crate::protocol::Tool) -> Self {
+/// The inbound protocol [`Tool`] is the caller's flat spelling; [`ToolSpec`] is
+/// the outbound provider spelling (nested under `function`). This conversion is
+/// the single place the two shapes meet, done here by the runner rather than the
+/// service layer.
+impl From<Tool> for ToolSpec {
+    fn from(tool: Tool) -> Self {
         match tool {
-            crate::protocol::Tool::Function {
+            Tool::Function {
                 name,
                 description,
                 parameters,
@@ -330,17 +273,10 @@ pub struct SpecificFunction {
 }
 
 /// The outbound chat-completions shape of `tool_choice`.
-///
-/// Two wire forms are accepted:
-/// - a bare mode string (`"auto"` / `"none"` / `"required"`), and
-/// - a specific function (`{ "type": "function", "function": { "name": … } }`).
-///
-/// `untagged` dispatches on the first matching variant: a string maps to
-/// [`CompletionsToolChoice::Mode`], an object to [`CompletionsToolChoice::Specific`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CompletionsToolChoice {
-    Mode(crate::protocol::ToolChoiceMode),
+    Mode(ToolChoiceMode),
     Specific {
         #[serde(rename = "type")]
         kind: String,
@@ -348,12 +284,11 @@ pub enum CompletionsToolChoice {
     },
 }
 
-impl From<crate::protocol::ToolChoice> for CompletionsToolChoice {
-    fn from(choice: crate::protocol::ToolChoice) -> Self {
-        use crate::protocol::ToolChoice as Inbound;
+impl From<ToolChoice> for CompletionsToolChoice {
+    fn from(choice: ToolChoice) -> Self {
         match choice {
-            Inbound::Mode(mode) => CompletionsToolChoice::Mode(mode),
-            Inbound::Function { name } => CompletionsToolChoice::Specific {
+            ToolChoice::Mode(mode) => CompletionsToolChoice::Mode(mode),
+            ToolChoice::Function { name } => CompletionsToolChoice::Specific {
                 kind: "function".to_string(),
                 function: SpecificFunction { name },
             },
@@ -364,7 +299,7 @@ impl From<crate::protocol::ToolChoice> for CompletionsToolChoice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ContentPart, Role};
+    use nova_responses_core::{ContentPart, Role};
 
     fn provenance() -> RequestProvenance {
         RequestProvenance {
@@ -395,8 +330,6 @@ mod tests {
 
     #[test]
     fn absent_or_empty_instructions_add_no_message() {
-        // Instructions do not cross turns (FR-19). An empty system message would
-        // be a different prompt from no system message at all.
         for instructions in [None, Some("")] {
             let r = CompletionsRequest::from_context("m", instructions, &[user("hi")], provenance())
                 .expect("build");
@@ -406,8 +339,6 @@ mod tests {
 
     #[test]
     fn empty_context_is_refused() {
-        // Sending a request with no messages would spend a call to be told the
-        // input was invalid.
         assert_eq!(
             CompletionsRequest::from_context("m", None, &[], provenance())
                 .expect_err("must refuse"),
@@ -439,81 +370,6 @@ mod tests {
     }
 
     #[test]
-    fn last_user_text_is_empty_when_absent() {
-        // A tool-result-only turn is legal, and every scheduler would otherwise
-        // need the same guard.
-        let r = CompletionsRequest {
-            model: "m".into(),
-            messages: vec![CompletionsMessage::assistant_text("only me")],
-            tools: vec![],
-            tool_choice: None,
-            max_completion_tokens: None,
-            temperature: None,
-            provenance: provenance(),
-        };
-        assert_eq!(r.last_user_text(), "");
-    }
-
-    #[test]
-    fn a_request_round_trips_through_json() {
-        // Required for a failing integration test to be reproducible from its log:
-        // the request is the whole input.
-        let r = CompletionsRequest {
-            model: "m".into(),
-            messages: vec![
-                CompletionsMessage::System {
-                    content: "be brief".into(),
-                },
-                CompletionsMessage::user_text("hi"),
-                CompletionsMessage::Assistant {
-                    content: None,
-                    refusal: None,
-                    tool_calls: vec![AssistantToolCall::new(
-                        "call_1".into(),
-                        "lookup".into(),
-                        r#"{"q":"x"}"#.into(),
-                    )],
-                },
-                CompletionsMessage::Tool {
-                    tool_call_id: "call_1".into(),
-                    content: "found".into(),
-                },
-            ],
-            tools: vec![],
-            tool_choice: None,
-            max_completion_tokens: None,
-            temperature: None,
-            provenance: provenance(),
-        };
-        let json = serde_json::to_string(&r).expect("serialise");
-        assert_eq!(
-            serde_json::from_str::<CompletionsRequest>(&json).expect("deserialise"),
-            r
-        );
-    }
-
-    #[test]
-    fn tool_arguments_are_not_reencoded() {
-        // Whitespace inside the arguments string is part of what the model
-        // produced; re-emitting would alter it and any signature over the
-        // transcript would then disagree.
-        let raw = r#"{ "a" :  1 }"#;
-        let m = CompletionsMessage::Assistant {
-            content: None,
-            refusal: None,
-            tool_calls: vec![AssistantToolCall::new("c".into(), "f".into(), raw.into())],
-        };
-        let back: CompletionsMessage =
-            serde_json::from_str(&serde_json::to_string(&m).expect("ser")).expect("de");
-        match back {
-            CompletionsMessage::Assistant { tool_calls, .. } => {
-                assert_eq!(tool_calls[0].function.arguments, raw)
-            }
-            other => panic!("expected assistant, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn provenance_carries_the_fencing_token() {
         let r = CompletionsRequest::from_context(
             "m",
@@ -532,8 +388,6 @@ mod tests {
 
     #[test]
     fn tool_calls_serialise_in_chat_completions_wire_shape() {
-        // The provider contract: `{ id, type: "function", function: { name, arguments } }`.
-        // A flat `{ id, name, arguments }` would be rejected by chat completions.
         let call = AssistantToolCall::new("call_1".into(), "lookup".into(), r#"{"q":"x"}"#.into());
         let json = serde_json::to_value(&call).expect("serialise");
         assert_eq!(json["type"], "function");

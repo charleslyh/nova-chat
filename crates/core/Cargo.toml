@@ -19,8 +19,3 @@ url = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
-
-[dev-dependencies]
-# Needed only to drive the async port traits declared here (CompletionsSink).
-# Not a production dependency: core itself performs no IO and spawns nothing.
-tokio = { workspace = true }

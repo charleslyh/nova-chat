@@ -6,13 +6,13 @@
 
 ## 拓扑
 
-两种**载体**（mem / sql）共享**同一进程拓扑**：gateway（接入）+ `nova-agentd`（执行）+ `nova-responses-sweep`（维护）+ 独立载体。唯一差异是载体。
+两种**载体**（mem / sql）共享**同一进程拓扑**：gateway（接入）+ `nova-agentd-mock`（执行）+ `nova-responses-sweep`（维护）+ 独立载体。唯一差异是载体。
 
 ```mermaid
 %%{init: {"flowchart": {"curve": "basis", "rankSpacing": 72, "nodeSpacing": 28}}}%%
 flowchart TB
     client(["调用方"]) -->|"POST /v1/responses<br/>GET /{id}?stream&starting_after"| gw["<b>nova-responses-gateway ×N</b><br/>HTTP 接入 · 能力层 · 优雅停机"]
-    agentd["<b>nova-agentd ×M</b><br/>执行 · claim → ReAct → submit"]
+    agentd["<b>nova-agentd-mock ×M</b><br/>执行 · claim → ReAct → submit"]
     sweep["<b>nova-responses-sweep</b><br/>维护 · reap · 过期清理"]
     carrier[("共享载体<br/>验证：nova-responses-mem-server<br/>生产：Postgres + Redis Streams")]
 
@@ -31,7 +31,7 @@ flowchart TB
 |---|---|---|
 | `nova-responses-gateway` | HTTP 接入、三种响应模式、优雅停机 | **薄装配**；后端是编译期 feature（mem / sql），`check-deps` 强制依赖 `optional` |
 | `nova-responses` | 能力层 + HTTP 层 + 后台维护（sweeper / shutdown） | 只依赖 core 端口，不依赖任何 adapter |
-| `nova-agentd` | 执行进程：全局 claim → ReAct → submit | 经端口连共享载体，零 HTTP；`nova-agent` 无 socket/DB 依赖 |
+| `nova-agentd-mock` | 执行进程：全局 claim → ReAct → submit | 经端口连共享载体，零 HTTP；`nova-agent-runtime` 无 socket/DB 依赖 |
 | `nova-responses-sweep` | 独立维护进程：reap / 过期清理 | 共享载体下单一收口方 |
 | `nova-responses-core` | 领域类型、协议封闭子集、端口 trait、规范化与 HMAC | 不依赖任何适配器（`check-deps` 强制） |
 | `adapters-mem` + `adapters-mem-client` | 验证载体：`mem-server` 数据本体 + 客户端 RPC 桩 | 不持久化；L0/L1 进程内直用，L2 经 mem-server 共享 |
@@ -62,7 +62,7 @@ flowchart TB
 | `SessionSnapshot.bubbles` | 升格为 `ContextStore`，脱离流式序号协议 |
 | 权威区 / 边缘区 + 只读镜像 | 对等节点 + 共享载体直读（无转发） |
 | per-session 1 基序号 | **per-response 0 基连续** |
-| 网关内嵌执行 | **独立执行进程** `nova-agentd`（D25） |
+| 网关内嵌执行 | **独立执行进程** `nova-agentd-mock`（D25） |
 | 进程内在途缓冲 | **共享载体**在途缓冲（D25） |
 | — | **新增** `ContextStore` / `ContentIntegrity` |
 

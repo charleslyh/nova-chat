@@ -15,6 +15,12 @@ use serde_json::{json, Value};
 // process instead of a real carrier.
 use nova_responses::{AppState, Config, ConversationsService, KeyTable, RawConfig, ResponsesService};
 
+use nova_agent_runtime::{
+    AgentEventSink, AgentRuntime, AgentRuntimeConfig, AgentRuntimeDeps, Executed,
+};
+use nova_agentd_mock::completions::{CompletionsOutcome, CompletionsRequest, FinishReason};
+use nova_agentd_mock::{MockAgentRunner, NoopToolExecutor, Scheduler, SchedulerError};
+
 struct Harness {
     base: String,
     client: reqwest::Client,
@@ -33,25 +39,22 @@ struct Harness {
 /// history is assembled server-side and handed to the execution side complete — but
 /// the boundary moved in process (D23), so the assertion moves with it.
 struct CapturingScheduler {
-    seen: std::sync::Arc<std::sync::Mutex<Option<nova_responses_core::CompletionsRequest>>>,
+    seen: std::sync::Arc<std::sync::Mutex<Option<CompletionsRequest>>>,
 }
 
 #[async_trait::async_trait]
-impl nova_responses_core::CompletionsRequestScheduler for CapturingScheduler {
+impl Scheduler for CapturingScheduler {
     fn name(&self) -> &str {
         "capturing-test"
     }
 
     async fn schedule(
         &self,
-        request: &nova_responses_core::CompletionsRequest,
-        _sink: &mut dyn nova_responses_core::CompletionsSink,
-    ) -> Result<nova_responses_core::CompletionsOutcome, nova_responses_core::SchedulerError> {
+        request: &CompletionsRequest,
+        _sink: &mut dyn AgentEventSink,
+    ) -> Result<CompletionsOutcome, SchedulerError> {
         *self.seen.lock().expect("lock") = Some(request.clone());
-        Ok(nova_responses_core::CompletionsOutcome::text(
-            "ok",
-            nova_responses_core::Usage::new(1, 1),
-        ))
+        Ok(CompletionsOutcome::text("ok", nova_responses_core::Usage::new(1, 1)))
     }
 }
 
@@ -59,22 +62,22 @@ impl nova_responses_core::CompletionsRequestScheduler for CapturingScheduler {
 struct InvalidOutcomeScheduler;
 
 #[async_trait::async_trait]
-impl nova_responses_core::CompletionsRequestScheduler for InvalidOutcomeScheduler {
+impl Scheduler for InvalidOutcomeScheduler {
     fn name(&self) -> &str {
         "invalid-test"
     }
 
     async fn schedule(
         &self,
-        _request: &nova_responses_core::CompletionsRequest,
-        _sink: &mut dyn nova_responses_core::CompletionsSink,
-    ) -> Result<nova_responses_core::CompletionsOutcome, nova_responses_core::SchedulerError> {
+        _request: &CompletionsRequest,
+        _sink: &mut dyn AgentEventSink,
+    ) -> Result<CompletionsOutcome, SchedulerError> {
         // A message with no content. Note what is no longer expressible: the previous
         // version of this test posted a `reasoning` item as raw JSON, but the item
         // enum is closed, so an out-of-subset type cannot be constructed at all. That
         // half of INV-47 is now enforced by the type system and asserted by the L0
         // `chain-closure` case.
-        Ok(nova_responses_core::CompletionsOutcome {
+        Ok(CompletionsOutcome {
             items: vec![nova_responses_core::ResponseItem::Message {
                 role: nova_responses_core::Role::Assistant,
                 content: vec![],
@@ -82,7 +85,7 @@ impl nova_responses_core::CompletionsRequestScheduler for InvalidOutcomeSchedule
                 status: None,
             }],
             usage: nova_responses_core::Usage::new(1, 1),
-            finish: nova_responses_core::FinishReason::Stop,
+            finish: FinishReason::Stop,
         })
     }
 }
@@ -100,22 +103,22 @@ struct DivergentScheduler {
 }
 
 #[async_trait::async_trait]
-impl nova_responses_core::CompletionsRequestScheduler for DivergentScheduler {
+impl Scheduler for DivergentScheduler {
     fn name(&self) -> &str {
         "divergent-test"
     }
 
     async fn schedule(
         &self,
-        _request: &nova_responses_core::CompletionsRequest,
-        sink: &mut dyn nova_responses_core::CompletionsSink,
-    ) -> Result<nova_responses_core::CompletionsOutcome, nova_responses_core::SchedulerError> {
+        _request: &CompletionsRequest,
+        sink: &mut dyn AgentEventSink,
+    ) -> Result<CompletionsOutcome, SchedulerError> {
         for d in &self.deltas {
             if sink.text_delta(d).await?.should_stop() {
-                return Err(nova_responses_core::SchedulerError::Superseded);
+                return Err(SchedulerError::Superseded);
             }
         }
-        Ok(nova_responses_core::CompletionsOutcome::text(
+        Ok(CompletionsOutcome::text(
             self.output_text.clone(),
             nova_responses_core::Usage::new(5, 7),
         ))
@@ -143,7 +146,7 @@ async fn start() -> Harness {
     let conversations = Arc::new(ConversationsService::new(
         world.conversation.clone(),
         world.context.clone(),
-        world.clock.clone(),
+        world.now_fn(),
         world.metrics.clone(),
         cfg.clone(),
     ));
@@ -152,7 +155,7 @@ async fn start() -> Harness {
         world.event_log.clone(),
         world.context.clone(),
         conversations.clone(),
-        world.clock.clone(),
+        world.now_fn(),
         world.metrics.clone(),
         cfg.clone(),
     ));
@@ -163,7 +166,7 @@ async fn start() -> Harness {
         event_log: world.event_log.clone(),
         context: world.context.clone(),
         conversation_store: world.conversation.clone(),
-        clock: world.clock.clone(),
+        now: world.now_fn(),
         metrics: world.metrics.clone(),
         keys,
         service,
@@ -270,26 +273,24 @@ impl Harness {
         out
     }
 
-    /// Build an engine over this harness's ports with a caller-supplied scheduler.
-    fn engine_with(
-        &self,
-        scheduler: Arc<dyn nova_responses_core::CompletionsRequestScheduler>,
-    ) -> nova_agent::Agent {
-        nova_agent::Agent::new(
-            nova_agent::AgentDeps {
+    /// Build an orchestrator over this harness's ports with a caller-supplied
+    /// scheduler wrapped in a [`MockAgentRunner`].
+    fn engine_with(&self, scheduler: Arc<dyn Scheduler>) -> AgentRuntime {
+        let runner = Arc::new(MockAgentRunner::new(scheduler, Arc::new(NoopToolExecutor)));
+        AgentRuntime::new(
+            AgentRuntimeDeps {
                 ledger: self.world.ledger.clone(),
                 event_log: self.world.event_log.clone(),
                 context: self.world.context.clone(),
-                scheduler,
-                tools: Arc::new(nova_responses_core::NoopToolExecutor),
-                clock: self.world.clock.clone(),
+                runner,
+                now: self.world.now_fn(),
                 // Mounted, not `None`: with the port absent every terminal path
                 // would skip the marker release and the tail advance, and this
                 // harness could not tell working bookkeeping from missing
                 // bookkeeping.
                 conversations: Some(self.world.conversation.clone()),
             },
-            nova_agent::AgentConfig::default(),
+            AgentRuntimeConfig::default(),
         )
     }
 
@@ -305,7 +306,7 @@ impl Harness {
 
         assert_eq!(
             engine.run_once(2_000).await,
-            nova_agent::Executed::Completed,
+            Executed::Completed,
             "the turn must complete; every caller of this helper depends on it"
         );
     }
@@ -400,7 +401,7 @@ async fn multi_turn_chain_assembles_history_server_side() {
     // `previous_response_id`.
     let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
     let engine = h.engine_with(Arc::new(CapturingScheduler { seen: seen.clone() }));
-    assert_eq!(engine.run_once(3_000).await, nova_agent::Executed::Completed);
+    assert_eq!(engine.run_once(3_000).await, Executed::Completed);
 
     let request = seen.lock().expect("lock").clone().expect("a request was built");
     assert_eq!(
@@ -448,7 +449,7 @@ async fn instructions_are_echoed_but_never_inherited() {
 
     let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
     let engine = h.engine_with(Arc::new(CapturingScheduler { seen: seen.clone() }));
-    assert_eq!(engine.run_once(3_000).await, nova_agent::Executed::Completed);
+    assert_eq!(engine.run_once(3_000).await, Executed::Completed);
     let request = seen.lock().expect("lock").clone().expect("a request was built");
 
     // Not carried over: neither inside a message nor as a leading system message.
@@ -723,7 +724,7 @@ async fn an_unusable_outcome_fails_the_response_instead_of_storing_it() {
     let engine = h.engine_with(Arc::new(InvalidOutcomeScheduler));
     assert_eq!(
         engine.run_once(2_000).await,
-        nova_agent::Executed::Failed,
+        Executed::Failed,
         "an unusable outcome must not complete the response"
     );
 

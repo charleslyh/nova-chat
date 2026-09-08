@@ -1,51 +1,38 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use async_trait::async_trait;
-use nova_responses_core::Clock;
-use tokio::sync::Notify;
-
+/// A virtual clock that starts at 0 and only advances when the test calls
+/// [`advance`](Self::advance) / [`set`](Self::set) (D15).
+///
+/// Production must never mount this: `created_at` / `expires_at` would be
+/// virtual, and the sweeper would compare real heartbeat timestamps against a
+/// frozen `0` and never time anything out. The production timestamp function is
+/// `nova_responses::system_now`.
 pub struct MemClock {
     now_ms: AtomicU64,
-    notify: Notify,
 }
 
 impl MemClock {
     pub fn new() -> Self {
         Self {
             now_ms: AtomicU64::new(0),
-            notify: Notify::new(),
         }
     }
 
     pub fn advance(&self, delta_ms: u64) {
         self.now_ms.fetch_add(delta_ms, Ordering::SeqCst);
-        self.notify.notify_waiters();
     }
 
     pub fn set(&self, ms: u64) {
         self.now_ms.store(ms, Ordering::SeqCst);
-        self.notify.notify_waiters();
+    }
+
+    pub fn now_ms(&self) -> u64 {
+        self.now_ms.load(Ordering::SeqCst)
     }
 }
 
 impl Default for MemClock {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[async_trait]
-impl Clock for MemClock {
-    async fn now_ms(&self) -> u64 {
-        self.now_ms.load(Ordering::SeqCst)
-    }
-
-    async fn sleep_until_ms(&self, deadline_ms: u64) {
-        loop {
-            if self.now_ms.load(Ordering::SeqCst) >= deadline_ms {
-                return;
-            }
-            self.notify.notified().await;
-        }
     }
 }

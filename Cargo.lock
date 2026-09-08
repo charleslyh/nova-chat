@@ -3,31 +3,6 @@
 version = 4
 
 [[package]]
-name = "adapters-completions-http"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "nova-responses-core",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "adapters-completions-mock"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "nova-responses-core",
- "serde",
- "serde_json",
- "serde_yaml",
- "tokio",
-]
-
-[[package]]
 name = "adapters-mem"
 version = "0.1.0"
 dependencies = [
@@ -46,17 +21,6 @@ dependencies = [
  "async-trait",
  "nova-responses-core",
  "reqwest",
- "tokio",
-]
-
-[[package]]
-name = "adapters-tool-calculator"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "nova-responses-core",
- "serde",
- "serde_json",
  "tokio",
 ]
 
@@ -902,11 +866,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "nova-agent"
+name = "nova-agent-runtime"
 version = "0.1.0"
 dependencies = [
- "adapters-completions-mock",
- "adapters-mem",
  "async-trait",
  "nova-responses-core",
  "serde",
@@ -918,34 +880,39 @@ dependencies = [
 ]
 
 [[package]]
-name = "nova-agentd"
+name = "nova-agentd-mock"
 version = "0.1.0"
 dependencies = [
- "adapters-completions-http",
- "adapters-completions-mock",
+ "adapters-mem",
  "adapters-mem-client",
- "adapters-tool-calculator",
  "anyhow",
  "async-trait",
  "clap",
- "nova-agent",
+ "futures",
+ "nova-agent-runtime",
  "nova-responses-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
 name = "nova-responses"
 version = "0.1.0"
 dependencies = [
- "adapters-completions-mock",
  "adapters-mem",
  "anyhow",
  "async-trait",
  "axum",
  "futures",
- "nova-agent",
+ "nova-agent-runtime",
+ "nova-agentd-mock",
  "nova-responses-core",
  "reqwest",
  "serde",
@@ -969,7 +936,6 @@ dependencies = [
  "sha2",
  "subtle",
  "thiserror",
- "tokio",
  "unicode-normalization",
  "url",
  "uuid",

@@ -1,30 +1,24 @@
-//! `nova-agentd` — the standalone execution daemon (D25).
+//! `nova-agentd-mock` — the mock verification process.
 //!
-//! Claims queued responses from the shared ledger, runs the ReAct loop, and
-//! streams increments into the shared event buffer. It is deliberately **not** an
-//! HTTP service: it reaches the ledger and event buffer through ports, so swapping
-//! the concrete adapter (the in-memory carrier) never touches this loop.
-//!
-//! The gateway only enqueues responses and serves delivery modes; execution is
-//! fully decoupled here, so the gateway can crash without interrupting a
-//! generation, and the fleet of agents can scale independently.
+//! Assembles the storage clients (mem), a mock agent runner (completions-mock /
+//! completions-http + calculator), and the [`AgentRuntime`] orchestrator, then
+//! runs the claim/poll loop. This is a verification fixture, not a production
+//! carrier: production execution integrates a real agent SDK against redis/mq.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use nova_agent::{Agent, AgentConfig, AgentDeps, Executed};
+use nova_agent_runtime::{AgentRuntime, AgentRuntimeConfig, AgentRuntimeDeps};
 use nova_responses_core::{
-    ChainLimits, Clock, CompletionsRequestScheduler, ContextStore, ConversationStore,
-    ResponseEventLog, ResponseLedger,
+    ChainLimits, ContextStore, ConversationStore, ResponseEventLog, ResponseLedger,
 };
-use tokio::sync::Semaphore;
 use tracing::info;
 
-use adapters_completions_http::HttpChatCompletionsScheduler;
-use adapters_completions_mock::{EchoScheduler, ScriptedScheduler};
-use adapters_tool_calculator::CalculatorTool;
+use nova_agentd_mock::{
+    CalculatorTool, EchoScheduler, HttpChatCompletionsScheduler, MockAgentRunner, Scheduler,
+    ScriptedScheduler, ToolExecutor,
+};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -36,13 +30,15 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     max_concurrent: usize,
 
+    /// Claim poll interval, in milliseconds.
+    #[arg(long, default_value_t = 100)]
+    poll_interval_ms: u64,
+
     /// Execution deadline per claim, in milliseconds.
     #[arg(long, default_value_t = 3_600_000)]
     exec_ttl_ms: u64,
 
     /// Keep-alive heartbeat interval while a generation runs, in milliseconds.
-    /// Must be shorter than the sweeper's heartbeat TTL, otherwise long
-    /// generations get reaped mid-flight.
     #[arg(long, default_value_t = 30_000)]
     heartbeat_interval_ms: u64,
 
@@ -50,7 +46,11 @@ struct Args {
     #[arg(long, default_value_t = 60_000)]
     retain_after_terminal_ms: u64,
 
-    /// Chain limits fed to the agent (D24).
+    /// Graceful shutdown drain budget, in milliseconds.
+    #[arg(long, default_value_t = 60_000)]
+    drain_timeout_ms: u64,
+
+    /// Chain limits fed to the orchestrator (D24).
     #[arg(long, default_value_t = 50)]
     chain_max_depth: usize,
     #[arg(long, default_value_t = 1000)]
@@ -71,22 +71,16 @@ struct Args {
     /// Env var naming the chat-completions API key (SEC-4: never the key itself).
     #[arg(long, default_value = "NOVA_CHAT_API_KEY")]
     http_api_key_env: String,
-    /// Env var naming the fallback model (for `--scheduler http`). Optional — the
-    /// request's own `model` wins when the env is unset.
+    /// Env var naming the fallback model (for `--scheduler http`).
     #[arg(long, default_value = "NOVA_CHAT_MODEL")]
     http_model_env: String,
 }
 
-/// The mounted ports, all as trait objects. The concrete adapter is gone past
-/// this struct, so the agent loop never knows which carrier it is on.
+/// The mounted storage ports, all as trait objects.
 struct Backend {
     ledger: Arc<dyn ResponseLedger>,
     event_log: Arc<dyn ResponseEventLog>,
     context: Arc<dyn ContextStore>,
-    /// Needed at terminal, not during generation: releasing the in-flight marker
-    /// and advancing the conversation tail (D28). Mounted unconditionally — the
-    /// *record* says whether a given response has an association, so a missing
-    /// port here would silently skip the release for every response.
     conversation: Arc<dyn ConversationStore>,
 }
 
@@ -97,26 +91,7 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Wall clock for the agent's background heartbeat task (production source).
-/// The agent only reads it through the `Clock` port, so the virtual `MemClock`
-/// used in tests plugs in unchanged.
-struct WallClock;
-
-#[async_trait::async_trait]
-impl Clock for WallClock {
-    async fn now_ms(&self) -> u64 {
-        now_ms()
-    }
-
-    async fn sleep_until_ms(&self, deadline_ms: u64) {
-        let now = now_ms();
-        if deadline_ms > now {
-            tokio::time::sleep(std::time::Duration::from_millis(deadline_ms - now)).await;
-        }
-    }
-}
-
-fn build_scheduler(args: &Args) -> Result<Arc<dyn CompletionsRequestScheduler>> {
+fn build_scheduler(args: &Args) -> Result<Arc<dyn Scheduler>> {
     match args.scheduler.as_str() {
         "echo" => Ok(Arc::new(EchoScheduler::new(8))),
         "scripted" => {
@@ -148,7 +123,6 @@ fn build_scheduler(args: &Args) -> Result<Arc<dyn CompletionsRequestScheduler>> 
     }
 }
 
-/// In-memory shared carrier.
 async fn mount_mem(args: &Args) -> Result<Backend> {
     let url = std::env::var(&args.mem_server_url_env)
         .with_context(|| format!("reading ${}", args.mem_server_url_env))?;
@@ -159,6 +133,22 @@ async fn mount_mem(args: &Args) -> Result<Backend> {
         context: world.context.clone(),
         conversation: world.conversation.clone(),
     })
+}
+
+async fn wait_for_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[tokio::main]
@@ -173,19 +163,21 @@ async fn main() -> Result<()> {
 
     let backend = mount_mem(&args).await?;
 
+    // Assembly order: toolbox → runner (injecting toolbox + scheduler) → runtime.
+    let toolbox: Arc<dyn ToolExecutor> = Arc::new(CalculatorTool);
     let scheduler = build_scheduler(&args)?;
+    let runner = Arc::new(MockAgentRunner::new(scheduler, toolbox));
 
-    let agent = Arc::new(Agent::new(
-        AgentDeps {
+    let runtime = Arc::new(AgentRuntime::new(
+        AgentRuntimeDeps {
             ledger: backend.ledger,
             event_log: backend.event_log,
             context: backend.context,
-            scheduler,
-            tools: Arc::new(CalculatorTool),
-            clock: Arc::new(WallClock),
+            runner,
+            now: Arc::new(now_ms),
             conversations: Some(backend.conversation),
         },
-        AgentConfig {
+        AgentRuntimeConfig {
             exec_ttl_ms: args.exec_ttl_ms,
             heartbeat_interval_ms: args.heartbeat_interval_ms,
             chain_limits: ChainLimits {
@@ -194,39 +186,21 @@ async fn main() -> Result<()> {
                 max_bytes: args.chain_max_bytes,
             },
             retain_after_terminal_ms: args.retain_after_terminal_ms,
-            ..AgentConfig::default()
+            ..AgentRuntimeConfig::default()
         },
     ));
 
     info!(
         max_concurrent = args.max_concurrent,
-        exec_ttl_ms = args.exec_ttl_ms,
-        "execution daemon starting"
+        poll_interval_ms = args.poll_interval_ms,
+        "mock execution daemon starting"
     );
 
-    // Bounded concurrency: a backlog of queued generations must not spawn one
-    // outbound call each. Provider-side limits live in the scheduler adapter.
-    let permits = Arc::new(Semaphore::new(args.max_concurrent));
-    loop {
-        // Poll interval. Claim is a low-frequency operation (~ ledger write rate),
-        // so a short sleep is enough to keep first-token latency low without a
-        // tight spin; the incremental stream itself is pushed to the shared buffer.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let handle = runtime.start(args.max_concurrent, args.poll_interval_ms);
 
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
-            continue; // at capacity; retry next tick
-        };
-
-        let agent = agent.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let now = now_ms();
-            match agent.run_once(now).await {
-                Executed::Idle => {}
-                Executed::Completed => info!("generation completed"),
-                Executed::Superseded => {}
-                Executed::Failed => info!("generation failed"),
-            }
-        });
-    }
+    wait_for_signal().await;
+    info!("shutdown signal received; draining");
+    handle.stop(args.drain_timeout_ms).await;
+    info!("shutdown complete");
+    Ok(())
 }

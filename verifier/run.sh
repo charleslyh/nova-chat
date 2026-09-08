@@ -69,7 +69,7 @@ echo "==> 编译能力服务（mem 后端）..."
 cargo build -q \
   --bin nova-responses-mem-server \
   --bin nova-responses-sweep \
-  --bin nova-agentd \
+  --bin nova-agentd-mock \
   --bin nova-responses-gateway
 
 echo "==> 清理残留端口（19000 / 19001 / 18080 / 8083）"
@@ -94,7 +94,7 @@ PIDS+=($!)
 
 echo "==> 起 agentd（--scheduler http，读 NOVA_CHAT_* 与 NOVA_MEM_SERVER_URL）"
 # sweep 的回收 TTL 是 2000ms，心跳必须远短于它，否则生成稍慢就被中途回收。
-"$BIN/nova-agentd" --scheduler http --heartbeat-interval-ms 500 &
+"$BIN/nova-agentd-mock" --scheduler http --heartbeat-interval-ms 500 &
 PIDS+=($!)
 
 echo "==> 起 gateway（监听 127.0.0.1:18080）"

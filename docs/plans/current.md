@@ -1,8 +1,8 @@
-# 当期计划 · Y/Z 期（能力层独立成 crate + 验证拓扑同构）
+# 当期计划 · Agent 结构重构（编排器 + AgentRunner + 模拟验证进程）
 
 > 状态：**已完成**
-> 依据：[D25](../architecture/decisions.md#d25-执行进程独立与在途缓冲共享化能力层抽离)（「分两步」的第二步 + 验证拓扑同构）
-> 上一期（X 期）成果见 §3
+> 依据：[D29](../architecture/decisions.md#d29-agent-结构解耦编排器--agentrunner--模拟验证进程)（Agent 结构解耦）
+> 上一期（Y/Z 期）成果见 §3
 
 ---
 
@@ -10,28 +10,26 @@
 
 | # | 交付 | 状态 |
 |---|---|---|
-| **Y1** | 新建 `nova-responses` library，平移 gateway 的能力层 + HTTP 层 + 后台维护，`crate::` 引用不变 | ✅ |
-| **Y2** | gateway 后端改为**编译期 feature 门控**：`mem`（默认，内嵌执行）与 `sql`（`--no-default-features --features sql`，执行 = agentd）互斥，后端依赖全部 `optional` | ✅ |
-| **Y3** | `http_contract.rs` 从 gateway 移入 `nova-responses` 测试，去 `#[path]` 重编译，复用 library | ✅ |
-| **Y4** | `check-deps` 新增「服务层无 adapter」「gateway 后端依赖 optional」门禁；workspace / justfile / 文档收口 | ✅ |
+| **1** | crate `nova-agent` 改名 `nova-agent-runtime`，新增 `AgentRunner` trait + `AgentTask` / `AgentOutcome` / `AgentEventSink`（强类型契约，字段用 core 稳定类型） | ✅ |
+| **2** | 拆分编排器：`AgentRuntime`（claim → 组装 → 提交）+ `EventSink`（事件 append）；`new` / `start` 分离以支持缩扩容 | ✅ |
+| **3** | completions 出站抽象（`CompletionsRequestScheduler` / `CompletionsSink` / `ToolExecutor` 及 completions 类型）从 core 下沉到 `testing/agentd-mock` | ✅ |
+| **4** | 模拟验证进程 `nova-agentd-mock` 移到 `testing/` 下，装配 mem-server + `MockAgentRunner`（React 循环）+ `AgentRuntime` | ✅ |
+| **5** | `StoredResponse.tools` 改存 inbound 形状（单一数据源）；测试迁移（`engine_end_to_end` → `agent_runtime_e2e`，`http_contract` 改用 `AgentRuntime` + `MockAgentRunner`） | ✅ |
 
 ## 2. 成果
 
-- **能力层独立**：`nova-responses` 承载用例编排 + HTTP 接入 + 后台维护，只依赖 `nova-responses-core` 端口，不依赖任何具体 adapter——D25 决策里「分两步，第二步独立成 crate」的落地。
-- **后端编译期门控**：gateway 的 `mount()` 按 `#[cfg(feature)]` 静态分派，`mem` 与 `sql` 互斥（`compile_error!`），没有 `store_backend` 运行时配置。默认 `cargo build` 得到 mem 形态（协议兼容验证、本地开发、L2 都不需要数据库）；`just release` 用 `--no-default-features --features sql` 构建生产形态，release 二进制静态排除 mem / agent / completions-mock。
-- **门禁守边界**：`check-deps` 拒绝 `nova-responses` 依赖任何 adapter、强制 gateway 的后端依赖 `optional = true`（防止某个后端泄漏进所有构建）。
+- **三层解耦**：进程壳（agentd-mock）只装配；编排器（`AgentRuntime`）负责 claim / 组装 / 提交；执行（`AgentRunner` 实现）负责 React 循环。换 provider / 换 agent SDK 不再改编排器。
+- **completions 下沉**：core 只保留存储 / 领域 / 协议契约（`ResponseItem` / `EventBody` / `StoredResponse` / `protocol::Tool` / `RequestProvenance` 等）；completions 出站抽象归入验证进程，抽象与否由具体 runner 实现自决。
+- **取消正确性 / 及时性分离**：fence（`attempt`）保证正确性（拒绝过期写入），sink `Stop` 单一传导取消及时性（流式场景几 ms 内传导并中断模型调用），heartbeat 仅保活、不承担取消通知。
+- 生产 agentd 只预留 `AgentRunner` 抽象，本期不落地：未来对接真实 agent SDK（Moray）+ redis/mq。
+- 全部测试通过（含 103 个 conformance 契约用例、18 个 agent_runtime_e2e、21 个 http_contract）。
 
-### Z 期（验证拓扑同构）
+## 3. 上一期（Y/Z 期）成果
 
-Y 期的 mem 形态仍把执行内嵌在 gateway（`execution.rs`），与生产（独立 `nova-agentd`）进程拓扑不一致——验证测不到进程隔离、跨进程 claim、崩溃恢复等路径。Z 期落地了**验证拓扑与生产同构**：
+Y/Z 期（能力层独立成 crate + 验证拓扑同构）已完成：
 
-- **mem 改为共享载体**：`nova-responses-mem-server`（数据面 `/rpc` + 控制面 `/control/*`）持有数据本体，`adapters-mem-client` 是实现了同样端口的 RPC 桩。gateway / agentd / sweep 各自持有一份客户端，连同一个 mem-server——与「gateway/agentd 都是 Postgres/Redis 的 client」完全同构。
-- **执行与维护独立进程**：mem 形态摘掉内嵌执行（`execution.rs` 删除），统一走独立 `nova-agentd`；维护走独立 `nova-responses-sweep`（mem/sql 双 feature）。
-- **数据面 / 控制面分离**：数据面走端口 RPC（生产路径），控制面（`unavailable` / `tamper` / `advance_clock`）是测试控制器独有的故障注入面。
-- **L2 覆盖提升到 baseline 100%**：共享载体让之前只能 defer 到 L3 的性质（FR-11/14/30/31 跨节点订阅、FR-32 无粘性续订、FR-34 优雅停机）全部在 L2 落地。
+- **Y1** 新建 `nova-responses` library，平移 gateway 的能力层 + HTTP 层 + 后台维护。
+- **Y2** gateway 后端改为编译期 feature 门控（mem / sql 互斥）。
+- **Z 期** 验证拓扑与生产同构：mem 改为共享载体（`nova-responses-mem-server` + `adapters-mem-client`），执行 / 维护独立进程（`nova-agentd-mock` / `nova-responses-sweep`），L2 覆盖提升到 baseline 100%。
 
-## 3. 上一期（X 期）成果
-
-X 期（D25 执行进程独立 + 在途缓冲共享化）已完成：能力层抽离第一步（gateway 内 service 模块）、`adapters-event-log-redis`、`nova-agentd`、claim 全局化、gateway 拆薄、验证体系更新。本期的 `nova-responses` 独立 crate 即其「第二步」。
-
-更早的 W 期（D20/21/22 子集重构）成果与缺陷清单见归档。
+更早的 X 期（D25 执行进程独立 + 在途缓冲共享化）与 W 期（D20/21/22 子集重构）成果见归档。

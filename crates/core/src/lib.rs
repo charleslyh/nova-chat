@@ -10,7 +10,6 @@
 //!   replaying events (INV-48)
 
 mod canonical;
-pub mod completions;
 mod context;
 mod conversation;
 mod error;
@@ -19,13 +18,10 @@ mod ids;
 mod integrity_hmac;
 mod ports;
 pub mod protocol;
+mod provenance;
 mod reconnect;
 
 pub use canonical::{canonical_items, canonical_json, canonical_output_text, nfc};
-pub use completions::{
-    assistant_text_message, CompletionsMessage, CompletionsOutcome, CompletionsRequest,
-    CompletionsToolChoice, FinishReason, RequestProvenance, SpecificFunction, ToolCall, ToolSpec,
-};
 pub use context::{
     ChainLimits, ResolvedContext, ResponseStatus, StoredResponse, Usage,
 };
@@ -38,12 +34,11 @@ pub use ids::{
 pub use integrity_hmac::{HmacSha256Integrity, ALG as INTEGRITY_ALG, KEY_ENV as INTEGRITY_KEY_ENV};
 /// Re-exported for convenience: items are the unit both ports traffic in.
 pub use protocol::{ContentPart, ResponseItem, Role};
+pub use provenance::RequestProvenance;
 pub use reconnect::JitteredBackoff;
 
 pub use ports::{
-    validate_outcome, AbortedClaim, ClaimedResponse, Clock, CollectingSink, ContentIntegrity,
-    ContextError, ContextStore, ConversationError, ConversationStore, CompletionsRequestScheduler,
-    CompletionsSink, CreateOutcome, EventLogError, IntegrityError, LedgerError, MetricsSink,
-    NoopToolExecutor, ResponseEventLog, ResponseLedger, SchedulerError, SinkError, SinkVerdict,
-    ToolError, ToolExecutor,
+    AbortedClaim, ClaimedResponse, ContentIntegrity, ContextError, ContextStore,
+    ConversationError, ConversationStore, CreateOutcome, EventLogError, IntegrityError, LedgerError,
+    MetricsSink, ResponseEventLog, ResponseLedger,
 };

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nova_responses_core::{
-    AppendEvent, Clock, ContextStore, ConversationStore, MetricsSink, ResponseEventKind,
+    AppendEvent, ContextStore, ConversationStore, MetricsSink, ResponseEventKind,
     ResponseEventLog, ResponseLedger, ResponseStatus,
 };
 use tracing::warn;
@@ -32,7 +32,7 @@ pub struct SweepDeps {
     /// is refused as stale. Without this the conversation stays busy forever. A
     /// reaped turn committed no output, so there is no tail to advance.
     pub conversations: Arc<dyn ConversationStore>,
-    pub clock: Arc<dyn Clock>,
+    pub now: Arc<dyn Fn() -> u64 + Send + Sync>,
     pub metrics: Arc<dyn MetricsSink>,
     pub heartbeat_ttl_ms: u64,
     pub retain_after_terminal_ms: u64,
@@ -52,7 +52,7 @@ pub fn spawn(deps: SweepDeps) {
 }
 
 async fn tick(deps: &SweepDeps) -> anyhow::Result<()> {
-    let now = deps.clock.now_ms().await;
+    let now = (deps.now)();
 
     // 1. Reap claims whose holder stopped heartbeating. The ledger raises the
     //    attempt fence, so the dead holder cannot append afterwards (INV-6).

@@ -3,16 +3,13 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/adapters/mem",
-    "crates/adapters/completions-mock",
-    "crates/adapters/completions-http",
-    "crates/adapters/tool-calculator",
     "crates/adapters/mem-client",
-    "crates/agent",
-    "crates/agentd",
+    "crates/agent-runtime",
     "crates/mem-server",
     "crates/sweep",
     "crates/nova-responses",
     "crates/gateway",
+    "testing/agentd-mock",
     "testing/conformance",
     "testing/harness",
     "xtask",
@@ -28,10 +25,8 @@ nova-responses-core = { path = "crates/core" }
 nova-responses = { path = "crates/nova-responses" }
 adapters-mem = { path = "crates/adapters/mem" }
 adapters-mem-client = { path = "crates/adapters/mem-client" }
-adapters-completions-mock = { path = "crates/adapters/completions-mock" }
-adapters-completions-http = { path = "crates/adapters/completions-http" }
-adapters-tool-calculator = { path = "crates/adapters/tool-calculator" }
-nova-agent = { path = "crates/agent" }
+nova-agent-runtime = { path = "crates/agent-runtime" }
+nova-agentd-mock = { path = "testing/agentd-mock" }
 conformance = { path = "testing/conformance" }
 harness = { path = "testing/harness" }
 async-trait = "0.1"

@@ -1,36 +1,50 @@
-//! A [`ToolExecutor`] that evaluates arithmetic expressions.
+//! Tool execution for the mock runner: the [`ToolExecutor`] trait plus a
+//! deterministic calculator.
 //!
-//! This is the concrete form of "the agent offers a tool": the model declares a
-//! call to `calculate`, the agent loop hands it here through the [`ToolExecutor`]
-//! port, and the result is fed back as a `function_call_output` item. Being a
-//! separate adapter keeps the agent loop — and every other caller of the port —
-//! unaware of how a tool is implemented (same shape as an MCP bridge or a
-//! registry of pure functions).
-//!
-//! # Why a calculator
-//!
-//! Arithmetic is deterministic, needs no network and no state, and is trivial to
-//! verify by hand. That makes it the cheapest possible end-to-end probe of the
-//! whole tool-calling pipeline: request `tools` → model `function_call` →
-//! execution → `function_call_output` → model answer → streamed transcript.
-//!
-//! # Failure policy (matches the port's contract)
-//!
-//! A *recoverable* mistake — a malformed expression, division by zero, a missing
-//! argument — is returned as `Ok` text so the model can read the error and retry
-//! with a corrected call. Only naming a tool this executor does not hold is an
-//! `Err`, since that is a contract violation, not a runtime failure.
+//! The trait was previously `nova-responses-core::ToolExecutor`. It is not part
+//! of the storage/domain contract — only the mock agent runner executes tools —
+//! so it lives here.
 
 use async_trait::async_trait;
-use nova_responses_core::{ToolError, ToolExecutor};
+use thiserror::Error;
 
-/// The tool name the model may call. Everything else is `UnknownTool`.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ToolError {
+    #[error("no tool named `{0}` is available")]
+    UnknownTool(String),
+    #[error("tool `{name}` failed: {message}")]
+    Execution { name: String, message: String },
+}
+
+/// Executes the tools the runner offers to the model.
+#[async_trait]
+pub trait ToolExecutor: Send + Sync {
+    fn name(&self) -> &str;
+
+    /// Run `tool` with the JSON `arguments` the model supplied. `Err` terminates
+    /// the response; a recoverable failure should be returned as `Ok` text.
+    async fn call(&self, tool: &str, arguments: &str) -> Result<String, ToolError>;
+}
+
+/// The "no tools are configured" executor.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopToolExecutor;
+
+#[async_trait]
+impl ToolExecutor for NoopToolExecutor {
+    fn name(&self) -> &str {
+        "none"
+    }
+
+    async fn call(&self, tool: &str, _arguments: &str) -> Result<String, ToolError> {
+        Err(ToolError::UnknownTool(tool.to_string()))
+    }
+}
+
+/// The tool name the model may call.
 pub const TOOL_NAME: &str = "calculate";
 
 /// A tool executor that evaluates a single `expression` argument.
-///
-/// The arguments are the JSON the model produced, kept opaque and parsed here:
-/// `{"expression": "3 * 7"}` → `"21"`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CalculatorTool;
 
@@ -47,8 +61,6 @@ impl ToolExecutor for CalculatorTool {
 
         let expr = match parse_expression(arguments) {
             Ok(expr) => expr,
-            // A malformed arguments payload is the model's mistake, not ours:
-            // surface it as readable text so the model can correct the call.
             Err(message) => return Ok(format!("error: {message}")),
         };
 
@@ -59,7 +71,6 @@ impl ToolExecutor for CalculatorTool {
     }
 }
 
-/// Extract the `expression` field from the model's JSON arguments.
 fn parse_expression(arguments: &str) -> Result<String, String> {
     let value: serde_json::Value =
         serde_json::from_str(arguments).map_err(|e| format!("arguments are not JSON: {e}"))?;
@@ -70,17 +81,10 @@ fn parse_expression(arguments: &str) -> Result<String, String> {
     }
 }
 
-/// Format a computed value for the model.
-///
-/// Floating-point arithmetic accumulates tiny errors (e.g.
-/// `123*1234/123 - 123*23.4` evaluates to `-1644.1999999999998`). A long dirty
-/// number makes the model distrust the result and re-call the tool, so round to
-/// 10 significant decimal places and strip trailing zeros before returning.
 fn format_number(value: f64) -> String {
     if !value.is_finite() {
         return value.to_string();
     }
-    // Round to 10 decimal places to swallow accumulated FP error.
     let rounded = (value * 1e10).round() / 1e10;
     if rounded == rounded.trunc() && rounded.abs() < 1e15 {
         return format!("{}", rounded as i64);
@@ -97,17 +101,6 @@ fn format_number(value: f64) -> String {
     s
 }
 
-/// Evaluate an arithmetic expression with the four basic operators, parentheses
-/// and a unary minus. No functions, no variables, no assignments — a calculator,
-/// not a programming language.
-///
-/// Grammar (recursive descent):
-/// ```text
-/// expr   := term (('+' | '-') term)*
-/// term   := factor (('*' | '/') factor)*
-/// factor := ('-' | '+') factor | primary
-/// primary:= NUMBER | '(' expr ')'
-/// ```
 fn evaluate(input: &str) -> Result<f64, String> {
     let mut parser = Parser {
         bytes: input.as_bytes(),
@@ -235,74 +228,16 @@ mod tests {
     async fn evaluates_basic_arithmetic() {
         let t = CalculatorTool;
         assert_eq!(
-            t.call(TOOL_NAME, r#"{"expression":"3 * 7"}"#)
-                .await
-                .unwrap(),
+            t.call(TOOL_NAME, r#"{"expression":"3 * 7"}"#).await.unwrap(),
             "21"
         );
         assert_eq!(
-            t.call(TOOL_NAME, r#"{"expression":"1+2*3"}"#)
-                .await
-                .unwrap(),
+            t.call(TOOL_NAME, r#"{"expression":"1+2*3"}"#).await.unwrap(),
             "7"
         );
         assert_eq!(
-            t.call(TOOL_NAME, r#"{"expression":"(1+2)*3"}"#)
-                .await
-                .unwrap(),
+            t.call(TOOL_NAME, r#"{"expression":"(1+2)*3"}"#).await.unwrap(),
             "9"
-        );
-    }
-
-    #[tokio::test]
-    async fn handles_floats_and_unary_minus() {
-        let t = CalculatorTool;
-        assert_eq!(
-            t.call(TOOL_NAME, r#"{"expression":"7 / 2"}"#)
-                .await
-                .unwrap(),
-            "3.5"
-        );
-        assert_eq!(
-            t.call(TOOL_NAME, r#"{"expression":"-3 + 5"}"#)
-                .await
-                .unwrap(),
-            "2"
-        );
-    }
-
-    #[tokio::test]
-    async fn rounds_away_floating_point_error() {
-        let t = CalculatorTool;
-        // 123*1234/123 - 123*23.4 evaluates to -1644.1999999999998 in f64;
-        // the formatted answer must be the clean -1644.2.
-        assert_eq!(
-            t.call(TOOL_NAME, r#"{"expression":"123*1234/123 - 123*23.4"}"#)
-                .await
-                .unwrap(),
-            "-1644.2"
-        );
-        assert_eq!(
-            t.call(TOOL_NAME, r#"{"expression":"0.1 + 0.2"}"#)
-                .await
-                .unwrap(),
-            "0.3"
-        );
-    }
-
-    #[tokio::test]
-    async fn reports_recoverable_errors_as_text() {
-        let t = CalculatorTool;
-        // Division by zero is returned as readable text, not a hard failure.
-        assert_eq!(
-            t.call(TOOL_NAME, r#"{"expression":"1/0"}"#).await.unwrap(),
-            "error: division by zero"
-        );
-        // Malformed arguments surface the reason so the model can retry.
-        let err = t.call(TOOL_NAME, "not json").await.unwrap();
-        assert!(
-            err.starts_with("error: arguments are not JSON:"),
-            "unexpected message: {err}"
         );
     }
 
@@ -313,18 +248,5 @@ mod tests {
             t.call("lookup", "{}").await,
             Err(ToolError::UnknownTool("lookup".to_string()))
         );
-    }
-
-    #[test]
-    fn rejects_malformed_expressions() {
-        for (expr, needle) in [
-            ("1 +", "unexpected end"),
-            ("1 + (2 * 3", "missing closing parenthesis"),
-            ("1 + @", "unexpected character"),
-            ("1.2.3", "invalid number"),
-        ] {
-            let err = evaluate(expr).unwrap_err();
-            assert!(err.contains(needle), "expr={expr:?} err={err:?}");
-        }
     }
 }

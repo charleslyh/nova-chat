@@ -25,6 +25,7 @@
 | [D26](#d26-自研会话层状态如何广播) | session = 状态广播：事件流 + 轮次锁 + 业务事件，绝不存内容 | ⛔ SUPERSEDED BY D28 |
 | [D27](#d27-会话容器退化为链尾指针) | conversation = 指向响应链尾的指针，不存条目 | ⛔ SUPERSEDED BY D28 |
 | [D28](#d28-会话能力下沉数据层conversation-吸收-session) | conversation 单实体承载链尾 + 互斥 + 事件流；互斥下沉数据层；端点统一 conversations | ✅ 生效 |
+| [D29](#d29-agent-结构解耦编排器--agentrunner--模拟验证进程) | 编排器 AgentRuntime + AgentRunner trait；completions 出站抽象下沉到模拟验证进程 | ✅ 生效 |
 
 其余条目多为任务系统时代决策，已 ⛔ SUPERSEDED BY D19，正文保留备查。D18 / D19 中的会话资源、开屏快照、热→冷、跨区镜像条款由 D20–D22 收口，正文同样保留备查。
 
@@ -62,6 +63,7 @@
 | [D26](#d26-自研会话层状态如何广播) | 会话层 | 状态广播：事件流 + 锁 + 业务事件 | ⛔ SUPERSEDED BY D28 |
 | [D27](#d27-会话容器退化为链尾指针) | 兼容层 | conversation = 链尾指针 | ⛔ SUPERSEDED BY D28 |
 | [D28](#d28-会话能力下沉数据层conversation-吸收-session) | 会话层 | conversation 单实体：链尾 + 互斥 + 事件流 | ✅ 生效 |
+| [D29](#d29-agent-结构解耦编排器--agentrunner--模拟验证进程) | Agent 结构 | 编排器 + AgentRunner；completions 下沉验证进程 | ✅ 生效 |
 
 ---
 
@@ -1138,3 +1140,25 @@ conversation 退化为指针后，`resolve_chain` 仍是上下文装配的唯一
 | session 独立保留（D26 原案） | `find_by_conversation` 反查 + `responses → session → response` 概念纠缠 |
 | 写前探活 | 延迟 + 压力，低概率失败不值得预防 |
 | 自研能力塞进官方 conversation 对象 | 官方 SDK 见未知字段（`active_response_id` 等），污染协议 |
+
+---
+
+## D29 Agent 结构解耦：编排器 + AgentRunner + 模拟验证进程
+
+| | |
+|---|---|
+| **需求** | 把「进程壳 / 任务编排 / Agent 执行（React 循环）」三层解耦；completions 出站抽象不再是主结构 |
+| **结论** | ① **编排器 `AgentRuntime`**（crate `nova-agent` → `nova-agent-runtime`）只负责 claim → 组装 `AgentTask` → 调 `AgentRunner` → 提交结果（complete / fail），**不含 React 循环**。② **`AgentRunner` trait** 承载执行抽象（定义在 nova-agent-runtime），React 循环落在实现里；增量事件经 `AgentEventSink` 回传，`Stop` 传导 fence 移动；编排器与 runner 之间以强类型 `AgentTask` / `AgentOutcome` / `AgentEventSink` 契约约束，字段全部用 core 的稳定类型。③ **completions 出站抽象下沉**：`CompletionsRequestScheduler` / `CompletionsSink` / `ToolExecutor` 及 `CompletionsRequest` / `CompletionsOutcome` 等类型从 core 移除，`StoredResponse.tools` 改存 inbound 形状（单一数据源，provider 转换由 runner 内部做）；这些并入 `testing/agentd-mock`，不再是主结构端口。④ **模拟验证进程 `nova-agentd-mock`** 移到 `testing/` 下，装配 mem-server 客户端 + `MockAgentRunner`（React 循环：completions-mock/http + calculator）+ `AgentRuntime`；`new` / `start` 分离以支持缩扩容。⑤ **取消正确性与及时性分离**：fence（`attempt`）保证正确性（拒绝过期写入），sink `Stop` 单一传导取消及时性；heartbeat 仅保活，不承担取消通知。⑥ 生产 agentd 另行建设，对接真实 agent SDK（Moray）+ redis/mq，本期只预留 `AgentRunner` 抽象。 |
+| **代价** | core 移除 completions 模块与两个端口；`completions-mock` / `completions-http` / `tool-calculator` 三 adapter 并入 agentd-mock；测试迁移 |
+
+### 为何编排与执行分离，而非继续内嵌
+
+编排器关心「何时 claim、如何组装、结果落到哪」，执行关心「如何跑完一次 React 循环」。把后者留在编排器里，换 provider / 换 agent SDK 都要改编排器；抽成 `AgentRunner` 后，编排器只见一个 trait，mock provider 与真实 agent SDK 落在同一接缝两侧。
+
+### 为何 completions 出站抽象下沉，而非留在 core
+
+completions 出站（`CompletionsRequest` / `CompletionsRequestScheduler` 等）是「如何调模型 provider」的实现细节，生产 agent 走真实 SDK（Moray）用不到。留在 core 会让主结构（存储 / 领域 / 协议契约）背负一个只服务验证的 provider 抽象。下沉到 `testing/agentd-mock` 后，core 只保留存储 / 领域 / 协议契约，抽象与否由具体 `AgentRunner` 实现自决。
+
+### 取消正确性与及时性分离
+
+fence（`attempt`）保证**正确性**——过期 attempt 的写入被拒绝。但 fence 无法让一段正在进行的模型调用停下（期间无 append，感知不到取消）。及时性由 sink `Stop` 单一承担：流式场景（tokens/sec 100~200）下每个 token 都 append，几 ms 内传导取消并让 scheduler 停止模型调用；heartbeat 是低频保活，不承担取消通知通道。模型 / tool 的「无输出等待期」取消靠 `exec_deadline` 超时 + 输出开始后的 `Stop` + reap 兜底。

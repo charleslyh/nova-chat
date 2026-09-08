@@ -13,10 +13,10 @@ use std::sync::Arc;
 
 use nova_responses_core::protocol::CreateResponseRequest;
 use nova_responses_core::{
-    AppendEvent, Attempt, Clock, CompletionsToolChoice, ContextError, ContextStore,
-    ConversationError, ConversationEventKind, ConversationId, CreateOutcome, EventLogError,
-    IdempotencyKey, LedgerError, MetricsSink, ResponseEventKind, ResponseEventLog, ResponseId,
-    ResponseItem, ResponseLedger, ResponseStatus, StoredResponse, TenantId, ToolSpec, Usage,
+    AppendEvent, Attempt, ContextError, ContextStore, ConversationError,
+    ConversationEventKind, ConversationId, CreateOutcome, EventLogError, IdempotencyKey,
+    LedgerError, MetricsSink, ResponseEventKind, ResponseEventLog, ResponseId, ResponseItem,
+    ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
 };
 
 use crate::config::Config;
@@ -69,7 +69,7 @@ pub struct ResponsesService {
     event_log: Arc<dyn ResponseEventLog>,
     context: Arc<dyn ContextStore>,
     conversations: Arc<ConversationsService>,
-    clock: Arc<dyn Clock>,
+    now: Arc<dyn Fn() -> u64 + Send + Sync>,
     metrics: Arc<dyn MetricsSink>,
     cfg: Arc<Config>,
 }
@@ -81,7 +81,7 @@ impl ResponsesService {
         event_log: Arc<dyn ResponseEventLog>,
         context: Arc<dyn ContextStore>,
         conversations: Arc<ConversationsService>,
-        clock: Arc<dyn Clock>,
+        now: Arc<dyn Fn() -> u64 + Send + Sync>,
         metrics: Arc<dyn MetricsSink>,
         cfg: Arc<Config>,
     ) -> Self {
@@ -90,14 +90,14 @@ impl ResponsesService {
             event_log,
             context,
             conversations,
-            clock,
+            now,
             metrics,
             cfg,
         }
     }
 
-    pub async fn now_ms(&self) -> u64 {
-        self.clock.now_ms().await
+    pub fn now_ms(&self) -> u64 {
+        (self.now)()
     }
 
     /// 创建生成：解析锚点 → 固化快照 → 取会话锁 → 写账本 → 写内容 → 发 `Created`。
@@ -115,7 +115,7 @@ impl ResponsesService {
         source: ContextSource,
         idempotency_key: Option<IdempotencyKey>,
     ) -> Result<CreateResult, ServiceError> {
-        let now_ms = self.now_ms().await;
+        let now_ms = self.now_ms();
 
         // 会话标识收敛为锚点：容器存的就是链尾指针，所以下面只有一条装配路径。
         let (previous, conversation_id) = match source {
@@ -179,16 +179,10 @@ impl ResponsesService {
             // 仅用于检索回显，永不进入链（INV-49）。
             instructions: request.instructions.clone(),
             // 本轮的工具体声明：由调用方 `tools` 参数逐请求声明（而非静态部署
-            // 配置），落进 record 供执行端喂给模型。协议 `Tool`（扁平）在此转成
-            // 出站 `ToolSpec`（嵌套 function），是两种线形的唯一交汇点。
-            tools: request
-                .tools
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .map(ToolSpec::from)
-                .collect(),
-            tool_choice: request.tool_choice.clone().map(CompletionsToolChoice::from),
+            // 配置），原样落进 record（inbound 形状），provider 转换由执行端的
+            // runner 内部完成（单一数据源：存调用方声明，不做双向转换）。
+            tools: request.tools.clone().unwrap_or_default(),
+            tool_choice: request.tool_choice.clone(),
             input_items,
             output_items: Vec::new(),
             reasoning: None,
@@ -419,7 +413,7 @@ impl ResponsesService {
         tenant: &TenantId,
         response_id: &ResponseId,
     ) -> Result<Option<StoredResponse>, ServiceError> {
-        let now_ms = self.now_ms().await;
+        let now_ms = self.now_ms();
 
         self.ledger.cancel(tenant, response_id, now_ms).await?;
 

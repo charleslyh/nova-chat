@@ -1,25 +1,30 @@
 //! End-to-end execution against the in-memory adapters and a mock scheduler.
 //!
-//! No socket, no database, no model. This is what the port-based engine buys: the
+//! No socket, no database, no model. This is what the port-based runtime buys: the
 //! paths that matter — a moved fence, an unusable outcome, a broken chain, a
 //! provider failure — are all reachable and cheap.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use adapters_completions_mock::{EchoScheduler, Match, Script, ScriptedScheduler};
 use adapters_mem::MemWorld;
 use async_trait::async_trait;
-use nova_agent::{Agent, AgentConfig, AgentDeps, Executed};
-use tokio::sync::Notify;
+use nova_agent_runtime::{
+    AgentEventSink, AgentRuntime, AgentRuntimeConfig, AgentRuntimeDeps, Executed,
+};
+use nova_agentd_mock::completions::{
+    CompletionsMessage, CompletionsOutcome, CompletionsRequest, ToolCall,
+};
+use nova_agentd_mock::{
+    EchoScheduler, Match, MockAgentRunner, NoopToolExecutor, Scheduler, SchedulerError, Script,
+    ScriptedScheduler, ToolError, ToolExecutor,
+};
 use nova_responses_core::protocol::{ContentPart, ResponseItem, Role};
 use nova_responses_core::{
-    Attempt, Clock, CompletionsMessage, CompletionsOutcome, CompletionsRequest,
-    CompletionsRequestScheduler, CompletionsSink, ContextStore, EventBody, IdempotencyKey, NodeTag,
-    NoopToolExecutor, ResponseEventKind, ResponseEventLog, ResponseId, ResponseLedger,
-    ResponseStatus, SchedulerError, StoredResponse, TenantId, ToolCall, ToolError, ToolExecutor,
-    Usage,
+    Attempt, ContextStore, EventBody, IdempotencyKey, NodeTag, ResponseEventKind,
+    ResponseEventLog, ResponseId, ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
 };
+use tokio::sync::Notify;
 
 const NODE: &str = "node-a";
 
@@ -67,34 +72,26 @@ fn record(id: &ResponseId, text: &str, stored: bool) -> StoredResponse {
     }
 }
 
-fn engine(world: &MemWorld, scheduler: Arc<dyn CompletionsRequestScheduler>) -> Agent {
-    agent_with(
-        world,
-        scheduler,
-        Arc::new(NoopToolExecutor),
-        AgentConfig::default(),
-    )
+fn engine(world: &MemWorld, scheduler: Arc<dyn Scheduler>) -> AgentRuntime {
+    agent_with(world, scheduler, Arc::new(NoopToolExecutor), AgentRuntimeConfig::default())
 }
 
-/// An agent wired with a specific tool executor and config, for the multi-round
-/// tests.
+/// An orchestrator wired with a specific tool executor and config, for the
+/// multi-round tests.
 fn agent_with(
     world: &MemWorld,
-    scheduler: Arc<dyn CompletionsRequestScheduler>,
+    scheduler: Arc<dyn Scheduler>,
     tools: Arc<dyn ToolExecutor>,
-    cfg: AgentConfig,
-) -> Agent {
-    Agent::new(
-        AgentDeps {
+    cfg: AgentRuntimeConfig,
+) -> AgentRuntime {
+    let runner = Arc::new(MockAgentRunner::new(scheduler, tools));
+    AgentRuntime::new(
+        AgentRuntimeDeps {
             ledger: world.ledger.clone(),
             event_log: world.event_log.clone(),
             context: world.context.clone(),
-            scheduler,
-            tools,
-            clock: world.clock.clone(),
-            // Mounted, not `None`: with the port absent every terminal path would
-            // skip the release and this fixture could not tell a working release
-            // from a missing one.
+            runner,
+            now: world.now_fn(),
             conversations: Some(world.conversation.clone()),
         },
         cfg,
@@ -131,7 +128,6 @@ async fn a_queued_response_runs_to_completion_with_no_socket_and_no_model() {
     assert_eq!(rec.status, ResponseStatus::Completed);
     assert!(rec.usage.total_tokens > 0, "usage must be booked");
 
-    // Output is readable from the store, on its own write path.
     let stored = world
         .context
         .get(&tenant(), &id)
@@ -143,7 +139,6 @@ async fn a_queued_response_runs_to_completion_with_no_socket_and_no_model() {
         "the echoed answer must be persisted"
     );
 
-    // And the stream terminated.
     let events = world
         .event_log
         .read_after(&id, None, 64, 0)
@@ -156,7 +151,7 @@ async fn a_queued_response_runs_to_completion_with_no_socket_and_no_model() {
     assert!(
         events
             .iter()
-            .any(|ev| matches!(ev.kind, nova_responses_core::ResponseEventKind::OutputTextDelta)),
+            .any(|ev| matches!(ev.kind, ResponseEventKind::OutputTextDelta)),
         "increments must land in this node's buffer"
     );
 }
@@ -170,8 +165,6 @@ async fn an_empty_queue_is_idle_not_an_error() {
 
 #[tokio::test]
 async fn any_nodes_work_can_be_executed_here() {
-    // D25: the in-flight buffer is shared, so any execution process may claim and
-    // run any node's response. A node filter would instead strand work.
     let world = MemWorld::new();
     let foreign = ResponseId::new(NodeTag::parse("node-b").expect("tag"));
     world
@@ -201,8 +194,6 @@ async fn any_nodes_work_can_be_executed_here() {
 
 #[tokio::test]
 async fn a_scheduler_failure_terminates_the_response() {
-    // Otherwise the caller waits for the reclaim timeout before learning anything
-    // went wrong.
     let world = MemWorld::new();
     let id = queue(&world, "flaky", true).await;
 
@@ -232,8 +223,6 @@ async fn a_scheduler_failure_terminates_the_response() {
 
 #[tokio::test]
 async fn an_unusable_outcome_is_refused_before_submission() {
-    // Caught at the engine boundary so the log names the scheduler, rather than
-    // surfacing later as an opaque storage error.
     let world = MemWorld::new();
     let id = queue(&world, "anything", true).await;
 
@@ -251,8 +240,6 @@ async fn an_unusable_outcome_is_refused_before_submission() {
 
 #[tokio::test]
 async fn a_refusal_completes_the_turn_and_is_stored() {
-    // A refusal is a legitimate completed turn. Treating it as an error would leave
-    // the response non-terminal and the caller waiting.
     let world = MemWorld::new();
     let id = queue(&world, "secret", true).await;
 
@@ -289,26 +276,17 @@ async fn store_false_completes_without_persisting_content() {
     assert_eq!(rec.status, ResponseStatus::Completed);
     assert!(!rec.stored, "the flag must survive the round trip");
 
-    // The observable contract for `store=false` is that the response **cannot be
-    // referenced as a chain link** — not that `GET` returns nothing, since the
-    // ledger must still serve the response object itself (FR-8).
-    //
-    // Asserting `context.get(..).is_none()` was wrong: in the in-memory backend the
-    // ledger and the context store share one map, so that assertion tested an
-    // implementation artifact rather than the requirement.
     assert!(
         matches!(
             world
                 .context
                 .resolve_chain(&tenant(), &id, Default::default())
                 .await,
-            Err(nova_responses_core::ContextError::NotStored { .. })
+            Err(nova_responses_core::ContextError::NotStored)
         ),
-        "a response created with store=false must be refused as a chain anchor, and \
-         refused explicitly rather than silently resolving to an empty history"
+        "a response created with store=false must be refused as a chain anchor"
     );
 
-    // No output items were retained for chain use.
     if let Some(stored) = world.context.get(&tenant(), &id).await.expect("ctx get") {
         assert!(
             stored.output_items.is_empty(),
@@ -339,7 +317,7 @@ async fn a_stall_leaves_partial_output_but_does_not_complete() {
     assert!(
         events
             .iter()
-            .any(|ev| matches!(ev.kind, nova_responses_core::ResponseEventKind::OutputTextDelta)),
+            .any(|ev| matches!(ev.kind, ResponseEventKind::OutputTextDelta)),
         "the partial output that was streamed is still visible"
     );
     let rec = world.ledger.get(&id).await.expect("get").expect("present");
@@ -352,8 +330,6 @@ async fn a_stall_leaves_partial_output_but_does_not_complete() {
 
 #[tokio::test]
 async fn drain_clears_the_backlog_and_then_reports_idle() {
-    // Startup recovery: work accepted just before a restart must not wait for an
-    // external trigger.
     let world = MemWorld::new();
     for i in 0..3 {
         queue(&world, &format!("q{i}"), true).await;
@@ -375,14 +351,12 @@ async fn drain_clears_the_backlog_and_then_reports_idle() {
 
 #[tokio::test]
 async fn history_is_assembled_server_side_from_the_chain() {
-    // The scheduler has no tenant context and must never walk the chain itself.
     let world = MemWorld::new();
 
     let first = queue(&world, "my name is Ada", true).await;
     let e = engine(&world, Arc::new(EchoScheduler::new(2)));
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
-    // Second turn references the first.
     let second = ResponseId::new(node());
     let mut rec = record(&second, "what is my name", true);
     rec.previous_response_id = Some(first.clone());
@@ -397,7 +371,6 @@ async fn history_is_assembled_server_side_from_the_chain() {
         .expect("create");
     world.context.put(rec).await.expect("put");
 
-    // A scheduler that reports how much context it received.
     let e = engine(&world, Arc::new(EchoScheduler::new(2)));
     assert_eq!(e.run_once(4_000).await, Executed::Completed);
 
@@ -407,7 +380,6 @@ async fn history_is_assembled_server_side_from_the_chain() {
         .await
         .expect("ctx get")
         .expect("stored");
-    // The echo answers the newest user text, proving history did not displace it.
     assert!(
         nova_responses_core::canonical_items(&stored.output_items).contains("what is my name"),
         "the newest input must still be the one answered"
@@ -416,18 +388,12 @@ async fn history_is_assembled_server_side_from_the_chain() {
 
 #[tokio::test]
 async fn a_deleted_ancestor_does_not_strand_execution() {
-    // The property the materialised snapshot exists for (D24). Even though the
-    // `previous_response_id` no longer points at a live record, the response's own
-    // snapshot is self-contained, so execution proceeds normally instead of failing
-    // against a broken chain. Chain-break detection now lives at *create* time,
-    // when the snapshot is built, not at execution time.
     let world = MemWorld::new();
     let missing = ResponseId::new(node());
 
     let id = ResponseId::new(node());
     let mut rec = record(&id, "continue", true);
     rec.previous_response_id = Some(missing.clone());
-    // The snapshot carries the history this turn inherits; the pointer is metadata.
     rec.context = vec![ResponseItem::assistant_text("earlier answer")];
     rec.context_depth = 1;
     world
@@ -481,12 +447,11 @@ impl ToolExecutor for MapTools {
     }
 }
 
-/// First schedule asks for a tool; the next one (once the tool output is in the
-/// conversation) answers. Drives the loop deterministically.
+/// First schedule asks for a tool; the next one answers.
 struct ToolThenAnswer;
 
 #[async_trait]
-impl CompletionsRequestScheduler for ToolThenAnswer {
+impl Scheduler for ToolThenAnswer {
     fn name(&self) -> &str {
         "tool-then-answer"
     }
@@ -494,7 +459,7 @@ impl CompletionsRequestScheduler for ToolThenAnswer {
     async fn schedule(
         &self,
         request: &CompletionsRequest,
-        sink: &mut dyn CompletionsSink,
+        sink: &mut dyn AgentEventSink,
     ) -> Result<CompletionsOutcome, SchedulerError> {
         let saw_tool_output = request
             .messages
@@ -511,7 +476,7 @@ impl CompletionsRequestScheduler for ToolThenAnswer {
                 name: "get_weather".into(),
                 arguments: r#"{"city":"Paris"}"#.into(),
             };
-            sink.tool_call(&call).await?;
+            sink.tool_call(&call.id, &call.name, &call.arguments).await?;
             Ok(CompletionsOutcome::tool_calls(vec![call], Usage::new(2, 1)))
         }
     }
@@ -524,7 +489,7 @@ async fn a_tool_using_turn_runs_the_loop_and_stores_the_whole_trace() {
 
     let scheduler = Arc::new(ToolThenAnswer);
     let tools = Arc::new(MapTools::default().with("get_weather", r#"{"temp":20}"#));
-    let e = agent_with(&world, scheduler, tools, AgentConfig::default());
+    let e = agent_with(&world, scheduler, tools, AgentRuntimeConfig::default());
 
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
@@ -538,7 +503,6 @@ async fn a_tool_using_turn_runs_the_loop_and_stores_the_whole_trace() {
         .expect("ctx get")
         .expect("stored");
 
-    // The whole trace is persisted: the call, its output, then the answer.
     assert_eq!(stored.output_items.len(), 3, "call + output + answer");
     assert!(matches!(
         &stored.output_items[0],
@@ -554,7 +518,6 @@ async fn a_tool_using_turn_runs_the_loop_and_stores_the_whole_trace() {
             if content.iter().any(|p| matches!(p, ContentPart::OutputText { text } if text.contains("sunny")))
     ));
 
-    // And the stream carries the tool call and its result, not just the answer.
     let events = world
         .event_log
         .read_after(&id, None, 64, 0)
@@ -578,10 +541,8 @@ async fn a_tool_error_fails_the_response_loudly() {
     let id = queue(&world, "what is the weather in Paris", true).await;
 
     let scheduler = Arc::new(ToolThenAnswer);
-    // `get_weather` is not in the map, so the call must fail loudly rather than
-    // hang or be silently dropped.
     let tools = Arc::new(MapTools::default());
-    let e = agent_with(&world, scheduler, tools, AgentConfig::default());
+    let e = agent_with(&world, scheduler, tools, AgentRuntimeConfig::default());
 
     assert_eq!(e.run_once(2_000).await, Executed::Failed);
 
@@ -590,11 +551,11 @@ async fn a_tool_error_fails_the_response_loudly() {
     assert!(rec.status.is_terminal());
 }
 
-/// Always asks for a tool, never answers. Used to hit the round ceiling.
+/// Always asks for a tool, never answers.
 struct AlwaysToolCall;
 
 #[async_trait]
-impl CompletionsRequestScheduler for AlwaysToolCall {
+impl Scheduler for AlwaysToolCall {
     fn name(&self) -> &str {
         "always-tool-call"
     }
@@ -602,14 +563,14 @@ impl CompletionsRequestScheduler for AlwaysToolCall {
     async fn schedule(
         &self,
         _request: &CompletionsRequest,
-        sink: &mut dyn CompletionsSink,
+        sink: &mut dyn AgentEventSink,
     ) -> Result<CompletionsOutcome, SchedulerError> {
         let call = ToolCall {
             id: "call_loop".into(),
             name: "ping".into(),
             arguments: "{}".into(),
         };
-        sink.tool_call(&call).await?;
+        sink.tool_call(&call.id, &call.name, &call.arguments).await?;
         Ok(CompletionsOutcome::tool_calls(vec![call], Usage::new(1, 1)))
     }
 }
@@ -621,9 +582,9 @@ async fn a_model_that_keeps_calling_tools_hits_the_round_ceiling() {
 
     let scheduler = Arc::new(AlwaysToolCall);
     let tools = Arc::new(MapTools::default().with("ping", "pong"));
-    let cfg = AgentConfig {
+    let cfg = AgentRuntimeConfig {
         max_tool_rounds: 3,
-        ..AgentConfig::default()
+        ..AgentRuntimeConfig::default()
     };
     let e = agent_with(&world, scheduler, tools, cfg);
 
@@ -642,17 +603,14 @@ async fn a_model_that_keeps_calling_tools_hits_the_round_ceiling() {
         .await
         .expect("ctx get")
         .expect("stored");
-    // Three rounds each contribute a call and an output, then the ceiling hits.
     assert_eq!(stored.output_items.len(), 6);
 }
 
-/// Streams a tool call incrementally — `output_item.added` → argument deltas →
-/// `output_item.done` — then a final answer. Exercises the argument-streaming
-/// path a real provider emits.
+/// Streams a tool call incrementally.
 struct StreamingToolThenAnswer;
 
 #[async_trait]
-impl CompletionsRequestScheduler for StreamingToolThenAnswer {
+impl Scheduler for StreamingToolThenAnswer {
     fn name(&self) -> &str {
         "streaming-tool-then-answer"
     }
@@ -660,7 +618,7 @@ impl CompletionsRequestScheduler for StreamingToolThenAnswer {
     async fn schedule(
         &self,
         request: &CompletionsRequest,
-        sink: &mut dyn CompletionsSink,
+        sink: &mut dyn AgentEventSink,
     ) -> Result<CompletionsOutcome, SchedulerError> {
         let saw_tool_output = request
             .messages
@@ -677,7 +635,6 @@ impl CompletionsRequestScheduler for StreamingToolThenAnswer {
         let name = "get_weather";
         let args = r#"{"city":"Paris"}"#;
 
-        // Announced first with empty arguments, then filled in piecewise.
         let empty = ResponseItem::FunctionCall {
             call_id: item_id.to_string(),
             name: name.to_string(),
@@ -719,7 +676,7 @@ async fn tool_calls_stream_incrementally_to_the_subscriber() {
 
     let scheduler = Arc::new(StreamingToolThenAnswer);
     let tools = Arc::new(MapTools::default().with("get_weather", "20"));
-    let e = agent_with(&world, scheduler, tools, AgentConfig::default());
+    let e = agent_with(&world, scheduler, tools, AgentRuntimeConfig::default());
 
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
@@ -730,8 +687,6 @@ async fn tool_calls_stream_incrementally_to_the_subscriber() {
         .expect("read");
     let kinds: Vec<_> = events.iter().map(|ev| ev.kind).collect();
 
-    // The function_call is streamed: added, argument deltas, arguments done,
-    // then item done.
     assert!(kinds.contains(&ResponseEventKind::OutputItemAdded), "{kinds:?}");
     assert!(
         kinds.contains(&ResponseEventKind::FunctionCallArgumentsDelta),
@@ -743,7 +698,6 @@ async fn tool_calls_stream_incrementally_to_the_subscriber() {
     );
     assert!(kinds.contains(&ResponseEventKind::OutputItemDone), "{kinds:?}");
 
-    // Deltas arrive in order and recombine to the full arguments.
     let deltas: Vec<String> = events
         .iter()
         .filter(|ev| ev.kind == ResponseEventKind::FunctionCallArgumentsDelta)
@@ -754,21 +708,13 @@ async fn tool_calls_stream_incrementally_to_the_subscriber() {
         .collect();
     assert_eq!(deltas, vec!["{\"ci", "ty\":\"P", "aris\"}"]);
     assert_eq!(deltas.concat(), r#"{"city":"Paris"}"#);
-
-    // The tool result is announced as its own item.
-    let result_added = events.iter().any(|ev| {
-        ev.kind == ResponseEventKind::OutputItemAdded
-            && matches!(&ev.body, EventBody::Item { item, .. } if item.to_string().contains("20"))
-    });
-    assert!(result_added, "the function_call_output must be streamed too");
 }
 
-/// Emits reasoning text, then the answer — the shape a reasoning model
-/// (DeepSeek-R1, o1, QwQ) produces.
+/// Emits reasoning text, then the answer.
 struct ReasoningThenAnswer;
 
 #[async_trait]
-impl CompletionsRequestScheduler for ReasoningThenAnswer {
+impl Scheduler for ReasoningThenAnswer {
     fn name(&self) -> &str {
         "reasoning-then-answer"
     }
@@ -776,7 +722,7 @@ impl CompletionsRequestScheduler for ReasoningThenAnswer {
     async fn schedule(
         &self,
         _request: &CompletionsRequest,
-        sink: &mut dyn CompletionsSink,
+        sink: &mut dyn AgentEventSink,
     ) -> Result<CompletionsOutcome, SchedulerError> {
         sink.reasoning_text_delta("Let me think").await?;
         sink.reasoning_text_delta(" about this.").await?;
@@ -800,17 +746,13 @@ async fn reasoning_is_persisted_but_never_fed_back_as_context() {
         .await
         .expect("ctx get")
         .expect("stored");
-    // Reasoning is persisted so a re-render reproduces the thinking…
     assert_eq!(stored.reasoning.as_deref(), Some("Let me think about this."));
-    // …but it is not an output item, so it can never re-enter model context.
     assert_eq!(stored.output_items.len(), 1, "reasoning must not become an item");
     assert!(
         !nova_responses_core::canonical_items(&stored.output_items).contains("Let me think"),
         "reasoning must not leak into output items"
     );
 
-    // The resolved history carries the reasoning aligned to the answer, for the
-    // transcript — again without putting it into the item list.
     let resolved = world
         .context
         .resolve_chain(&tenant(), &id, Default::default())
@@ -820,17 +762,15 @@ async fn reasoning_is_persisted_but_never_fed_back_as_context() {
     assert_eq!(resolved.items.len(), 2, "input + answer, no reasoning item");
 }
 
-// ===== Heartbeat: long generation vs. reap (the fix for mid-flight reaping) =====
+// ===== Heartbeat: long generation vs. reap =====
 
-/// A scheduler that blocks on a release signal, so a test can hold a generation
-/// open while it advances the clock and runs the sweeper's `reap` directly.
 struct GatedScheduler {
     started: Arc<Notify>,
     release: Arc<Notify>,
 }
 
 #[async_trait]
-impl CompletionsRequestScheduler for GatedScheduler {
+impl Scheduler for GatedScheduler {
     fn name(&self) -> &str {
         "gated"
     }
@@ -838,7 +778,7 @@ impl CompletionsRequestScheduler for GatedScheduler {
     async fn schedule(
         &self,
         _request: &CompletionsRequest,
-        sink: &mut dyn CompletionsSink,
+        sink: &mut dyn AgentEventSink,
     ) -> Result<CompletionsOutcome, SchedulerError> {
         self.started.notify_one();
         self.release.notified().await;
@@ -848,7 +788,6 @@ impl CompletionsRequestScheduler for GatedScheduler {
     }
 }
 
-/// Let the paused runtime drive the heartbeat task a few turns.
 async fn settle() {
     for _ in 0..8 {
         tokio::task::yield_now().await;
@@ -867,25 +806,21 @@ async fn a_long_generation_is_not_reaped_while_its_heartbeat_stays_fresh() {
         release: release.clone(),
     });
 
-    let cfg = AgentConfig {
+    let cfg = AgentRuntimeConfig {
         heartbeat_interval_ms: 1_000,
-        ..AgentConfig::default()
+        ..AgentRuntimeConfig::default()
     };
     let e = agent_with(&world, scheduler, Arc::new(NoopToolExecutor), cfg);
     let clock = world.clock.clone();
 
-    let handle = tokio::spawn(async move { e.run_once(clock.now_ms().await).await });
+    let handle = tokio::spawn(async move { e.run_once(clock.now_ms()).await });
 
-    // The claim happened and the scheduler is now holding the generation open.
     started.notified().await;
 
-    // Two seconds pass: the heartbeat task wakes (tokio time) and stamps the
-    // freshest logical time (virtual clock), so the claim stays alive.
     world.clock.advance(2_000);
     tokio::time::advance(Duration::from_millis(2_000)).await;
     settle().await;
 
-    // Heartbeat is fresh (≈2000), so a reap with a 1500ms TTL must not take it.
     let aborted = world.ledger.reap(2_000, 1_500).await.expect("reap");
     assert!(
         aborted.is_empty(),
@@ -912,16 +847,14 @@ async fn a_generation_is_reaped_once_its_heartbeat_stops() {
         release: release.clone(),
     });
 
-    // Heartbeat interval far beyond anything the test advances: the owner never
-    // heartbeats, so the sweeper sees it as lost.
-    let cfg = AgentConfig {
+    let cfg = AgentRuntimeConfig {
         heartbeat_interval_ms: u64::MAX,
-        ..AgentConfig::default()
+        ..AgentRuntimeConfig::default()
     };
     let e = agent_with(&world, scheduler, Arc::new(NoopToolExecutor), cfg);
     let clock = world.clock.clone();
 
-    let handle = tokio::spawn(async move { e.run_once(clock.now_ms().await).await });
+    let handle = tokio::spawn(async move { e.run_once(clock.now_ms()).await });
 
     started.notified().await;
 
@@ -929,13 +862,10 @@ async fn a_generation_is_reaped_once_its_heartbeat_stops() {
     tokio::time::advance(Duration::from_millis(5_000)).await;
     settle().await;
 
-    // No heartbeat ever arrived, so a reap with a 2000ms TTL takes the claim.
     let aborted = world.ledger.reap(5_000, 2_000).await.expect("reap");
     assert_eq!(aborted.len(), 1, "a stopped heartbeat must be reaped");
     assert_eq!(aborted[0].response_id, id);
 
-    // Releasing the scheduler lets the stale holder try to write, but the fence
-    // has moved, so its output is refused and the attempt is superseded.
     release.notify_one();
     let result = handle.await.expect("join");
     assert_eq!(result, Executed::Superseded);

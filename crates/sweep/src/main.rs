@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use nova_responses::{CountingMetrics, SystemClock};
+use nova_responses::{system_now, CountingMetrics};
 use nova_responses_core::{ContextStore, ConversationStore, ResponseEventLog, ResponseLedger};
 
 #[derive(Debug, Parser)]
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
         event_log: backend.event_log,
         context: backend.context,
         conversations: backend.conversation,
-        clock: Arc::new(SystemClock),
+        now: system_now(),
         metrics: Arc::new(CountingMetrics::default()),
         heartbeat_ttl_ms: args.heartbeat_ttl_ms,
         retain_after_terminal_ms: args.retain_after_terminal_ms,

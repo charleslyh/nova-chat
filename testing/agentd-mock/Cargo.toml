@@ -1,0 +1,35 @@
+[package]
+name = "nova-agentd-mock"
+version.workspace = true
+edition.workspace = true
+description = "Mock verification process: mem carrier + completions-mock/http + calculator, orchestrated by AgentRuntime"
+
+[lib]
+name = "nova_agentd_mock"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nova-agentd-mock"
+path = "src/main.rs"
+
+[dependencies]
+nova-agent-runtime = { workspace = true }
+nova-responses-core = { workspace = true }
+adapters-mem-client = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+adapters-mem = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

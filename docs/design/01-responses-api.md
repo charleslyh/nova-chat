@@ -20,7 +20,7 @@
 **已删除**：
 
 - 全部 `/v1/sessions/*` 与 `/v1/admin/trim_hot` —— 随会话资源与冷层一并移除（D20）。
-- `/v1/agent/{claim,heartbeat,append,complete}` —— 外部执行端拉取协议。D25 起生成由**独立执行进程 `nova-agentd`** 经 `ResponseLedger` 端口直连共享账本领活（claim 全局），该 HTTP 协议不再存在。执行侧的 FR-4~6 仍有效，由执行工作循环满足，而非任何 HTTP 端点。
+- `/v1/agent/{claim,heartbeat,append,complete}` —— 外部执行端拉取协议。D25 起生成由**独立执行进程 `nova-agentd-mock`** 经 `ResponseLedger` 端口直连共享账本领活（claim 全局），该 HTTP 协议不再存在。执行侧的 FR-4~6 仍有效，由执行工作循环满足，而非任何 HTTP 端点。
 
 ---
 

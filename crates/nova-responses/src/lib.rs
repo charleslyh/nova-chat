@@ -20,7 +20,7 @@ pub mod sweeper;
 pub mod shutdown;
 
 pub use auth::KeyTable;
-pub use clock::SystemClock;
+pub use clock::system_now;
 pub use config::{Config, RawConfig};
 pub use metrics::CountingMetrics;
 pub use service::{ContextSource, ConversationsService, CreateResult, ResponsesService, ServiceError};

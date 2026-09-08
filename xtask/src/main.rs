@@ -178,7 +178,7 @@ async fn procs(action: &str) -> Result<()> {
             // 3. Execution daemon over the shared carrier, with a scripted scheduler
             //    (normal answers plus a `hang` rule for overload scenarios).
             start_bin(
-                "nova-agentd",
+                "nova-agentd-mock",
                 &[
                     "--scheduler",
                     "scripted",
@@ -822,32 +822,18 @@ fn check_deps() -> Result<()> {
         );
     }
 
-    // The mock scheduler adapter must stay model-free and IO-free: its whole
-    // purpose is to let integration tests run with no provider. An HTTP client
-    // here would mean a test could silently start making real calls.
-    let mock_sched = std::fs::read_to_string("crates/adapters/completions-mock/Cargo.toml")?;
-    let mock_sched_deps = declared_dependencies(&mock_sched);
-    for forbidden in ["reqwest", "hyper", "nova-agent"] {
-        if mock_sched_deps.iter().any(|d| d == forbidden) {
-            bail!(
-                "adapters-completions-mock must not depend on `{forbidden}`: it exists so \
-                 tests need no provider"
-            );
-        }
-    }
-
-    // The execution-side worker faces our gateway, not a provider. A dependency on
-    // a concrete scheduler adapter would invert that: the loop would then know
-    // which provider it serves, and swapping one would mean changing the loop.
-    let agent = std::fs::read_to_string("crates/agent/Cargo.toml")?;
+    // The orchestrator crate stays IO-free: it talks to core ports only, so the
+    // whole claim/stream/commit path can be tested without a socket or a model.
+    let agent = std::fs::read_to_string("crates/agent-runtime/Cargo.toml")?;
     for forbidden in ["reqwest", "hyper", "axum"] {
         if declared_dependencies_in_section(&agent, "[dependencies]")
             .iter()
             .any(|d| d == forbidden)
         {
             bail!(
-                "nova-agent must not depend on `{forbidden}`: the work loop is kept IO-free so \
-                 the whole claim/stream/submit path can be tested without a socket"
+                "nova-agent-runtime must not depend on `{forbidden}`: the orchestrator is \
+                 kept IO-free so the whole claim/stream/commit path can be tested without \
+                 a socket"
             );
         }
     }
@@ -1002,8 +988,8 @@ fn check_service_and_gateway_boundaries() -> Result<()> {
     let service_deps = declared_dependencies_in_section(&service, "[dependencies]");
     for forbidden in [
         "adapters-mem",
-        "adapters-completions-mock",
-        "nova-agent",
+        "nova-agent-runtime",
+        "nova-agentd-mock",
     ] {
         if service_deps.iter().any(|d| d == forbidden) {
             bail!(

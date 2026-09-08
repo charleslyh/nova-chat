@@ -16,11 +16,11 @@
 
 | # | 事实 | 常见误解 |
 |---|---|---|
-| 1 | **执行是独立进程 `nova-agentd`**，经 `ResponseLedger` 端口直连共享账本领活 | 以为执行在网关进程内，或以为执行经 HTTP 拉取 |
+| 1 | **执行是独立进程 `nova-agentd-mock`**，经 `ResponseLedger` 端口直连共享账本领活 | 以为执行在网关进程内，或以为执行经 HTTP 拉取 |
 | 2 | **claim 是全局的**：任意执行进程可领取任意 queued 生成 | 以为领取限定「创建它的那个节点」 |
 | 3 | **两条写路径彼此独立**：增量走事件缓冲（有界瞬态），输出条目走上下文库（持久） | 以为输出条目由事件流回放派生 |
 | 4 | **没有节点间转发**：存储是共享载体，任意节点直读 | 以为仍有节点间转发 |
-| 5 | **唯一运行时载体是 mem**：执行分离为独立 `nova-agentd`，共享载体是 `nova-responses-mem-server`（进程内数据 + HTTP 数据面/控制面） | 以为 mem 仍单进程内嵌执行 |
+| 5 | **唯一运行时载体是 mem**：执行分离为独立 `nova-agentd-mock`，共享载体是 `nova-responses-mem-server`（进程内数据 + HTTP 数据面/控制面） | 以为 mem 仍单进程内嵌执行 |
 
 第 5 条最容易漏，它是理解 §1 与 §4 的前提。
 
@@ -35,12 +35,12 @@
 | 账本 / 上下文库 | `adapters-mem-client` → `mem-server` |
 | 在途事件缓冲 | `adapters-mem-client` → `mem-server` |
 | 会话（conversation，D28） | `adapters-mem-client` → `mem-server` |
-| 执行位置 | **独立进程** `nova-agentd` |
+| 执行位置 | **独立进程** `nova-agentd-mock` |
 | 维护（sweep） | **独立进程** `nova-responses-sweep` |
 | 时钟 | `SystemClock`（真实墙钟） |
 | 用途 | 协议验证 · 本地开发 · L0–L2 · L4 |
 
-**进程拓扑**：gateway（HTTP 接入）+ `nova-agentd`（执行）+ 独立 sweep（reap/过期清理）+ 独立载体。执行是独立进程，不内嵌于 gateway。
+**进程拓扑**：gateway（HTTP 接入）+ `nova-agentd-mock`（执行）+ 独立 sweep（reap/过期清理）+ 独立载体。执行是独立进程，不内嵌于 gateway。
 
 **mem 载体如何跨进程**：`adapters-mem` 拆成两半——数据本体（`MemWorld`）留在 `nova-responses-mem-server` 进程，对外经 `proto`/`server` 模块暴露 `POST /rpc` 数据面（另有 `/unavailable`、`/tamper`、`/advance_clock`、`/set_clock` 控制面，仅供测试注入故障）；`adapters-mem-client` 是实现了四个端口（`ResponseLedger`/`ResponseEventLog`/`ContextStore`/`ConversationStore`）的 RPC 桩，gateway/agentd/sweep 各自持有一份，连同一个 `mem-server`。
 
@@ -72,7 +72,7 @@ graph BT
     end
 
     subgraph L2["执行"]
-        agent["<b>nova-agent</b><br/>Agent · ReAct loop<br/>零 IO"]
+        agent["<b>nova-agent-runtime</b><br/>Agent · ReAct loop<br/>零 IO"]
     end
 
     subgraph SRV["服务层（无具体 adapter 依赖）"]
@@ -81,7 +81,7 @@ graph BT
 
     subgraph L3["二进制"]
         gw["<b>nova-responses-gateway</b><br/>薄装配"]
-        agentd["<b>nova-agentd</b><br/>执行进程"]
+        agentd["<b>nova-agentd-mock</b><br/>执行进程"]
         memsrv["<b>nova-responses-mem-server</b><br/>共享载体（数据+控制面）"]
         sweep["<b>nova-responses-sweep</b><br/>独立维护进程"]
     end
@@ -130,9 +130,9 @@ graph BT
 
 - **端口在 `core`，实现在 `adapters/*`** —— `core/src/ports/mod.rs` 首行即此约定。`CompletionsRequestScheduler`、`ToolExecutor`、`ConversationStore`、`ContentIntegrity`、`MetricsSink` 都与 `ResponseLedger` 并列
 - `core` 无 workspace 内依赖（`crates/core/Cargo.toml`），这是 `check-deps` 的不变量
-- **`nova-agent` 不依赖 HTTP / DB / 任何具体 scheduler**：`check-deps` 拒绝向它注入 `reqwest`/`hyper`/`axum`/`sqlx`（已实测门禁有效）。因此 claim → ReAct → submit 全路径可在无 socket、无模型的单测里跑完
-- **gateway 不依赖 `nova-agent`**：执行统一走独立进程 `nova-agentd`，gateway 只做接入与投递
-- `adapters-completions-mock` 不得依赖 `reqwest`/`sqlx`/`nova-agent`（同门禁），否则一个测试可能悄悄发出真实调用
+- **`nova-agent-runtime` 不依赖 HTTP / DB / 任何具体 scheduler**：`check-deps` 拒绝向它注入 `reqwest`/`hyper`/`axum`/`sqlx`（已实测门禁有效）。因此 claim → ReAct → submit 全路径可在无 socket、无模型的单测里跑完
+- **gateway 不依赖 `nova-agent-runtime`**：执行统一走独立进程 `nova-agentd-mock`，gateway 只做接入与投递
+- `adapters-completions-mock` 不得依赖 `reqwest`/`sqlx`/`nova-agent-runtime`（同门禁），否则一个测试可能悄悄发出真实调用
 
 ### 2.1 core 同时承载两个方向的协议，这是有意的
 
@@ -168,7 +168,7 @@ graph BT
 | `POST` | `/v1/admin/pending_limit` | 过载阈值 |
 | `POST` | `/v1/tenants/{tenant}/purge` | 租户清除 |
 
-执行不是协议：`nova-agentd` 经 `ResponseLedger` 端口领活，不经 `router()` 注册的 HTTP 端点。
+执行不是协议：`nova-agentd-mock` 经 `ResponseLedger` 端口领活，不经 `router()` 注册的 HTTP 端点。
 
 `/v1/conversations` 是 D28 引入的会话容器：CRUD 对齐上游，`/events`、`/transcript` 是自托管子资源（上游无对应协议）。会话**不存条目**——它只存链尾指针 + 轮次锁 + 事件流，上下文仍由 `resolve_chain` 单一入口装配。
 
@@ -198,7 +198,7 @@ graph BT
 | **ContextStore** | 工单的正文与附件 | input/output 条目 + 物化快照 | 这段对话的**历史是什么**？ | 持久（保留期可配） |
 | **ResponseEventLog** | 现场的实时直播流 | 正在产生的增量事件 | 订阅者**此刻看到了哪些增量**？ | 瞬态（终态后按 `retain_ms` 释放） |
 | **ConversationStore** | 会话的登记簿 | 链尾指针 + 轮次锁 + 会话事件流 | 这段对话**归到哪个会话、当前轮到谁**？ | 持久（D28） |
-| **Agent** | 干活的工人 | 不拥有数据，只驱动流转 | **谁把活干完**？ | 独立进程（`nova-agentd`） |
+| **Agent** | 干活的工人 | 不拥有数据，只驱动流转 | **谁把活干完**？ | 独立进程（`nova-agentd-mock`） |
 | **Gateway** | 前台 | — | 请求该不该进 | — |
 | **Scheduler** | 外包渠道 | — | 怎么触达模型（含排队限流） | — |
 | **ToolExecutor** | 工具间 | — | 模型要调的工具怎么落地 | — |
@@ -292,7 +292,7 @@ sequenceDiagram
     end
 ```
 
-**这张图要传达的三件事**：
+###### **这张图要传达的三件事**：
 
 1. **两条写路径从不交汇**：增量走 `ResponseEventLog`（瞬态），输出条目走 `ContextStore`（持久）。`Agent` 是唯一同时触碰两者的组件，但它把「流式给订阅者看」和「终态提交存储」作为两次独立写入（§8）。
 2. **快照在创建时固化、执行时读取**：阶段二里 `previous` 的历史在 `create` 那一刻被解析成扁平快照，随后执行只是单次读取——这就是「祖先缺失不影响本环」的由来（D24）。
@@ -368,7 +368,7 @@ sequenceDiagram
 - 幂等重放返回**原生成**，不产生第二个（`CreateResult::Duplicate`）
 - `Created` 事件 `seq=0`，是「0 基连续」的起点
 - 三模式共用**同一条内部事件流**；同步模式只是服务端替调用方等这条流的终态
-- 网关创建后即返回，**不通知执行端**：`nova-agentd` 轮询领取，与创建节点无关
+- 网关创建后即返回，**不通知执行端**：`nova-agentd-mock` 轮询领取，与创建节点无关
 
 ---
 
@@ -615,7 +615,7 @@ graph TB
 - 部分用量在回收时由 ledger 自身记账，故两步之间崩溃不会丢失（INV-51）
 - reap 是**失联执行的唯一收口**（INV-45）。执行进程独立后没有「启动时扫自己的孤儿」这一步可依赖——崩掉的 worker 不会再启动，只能由 sweep 进程抬 fence 并置失败；回收也是终态迁移，故同时释放会话轮次标记（D28）
 - drain 期间**读与订阅继续服务**（`AppState::accepting`）——这是滚动发布不中断在途流的原因
-- **网关 drain 不影响执行**：`nova-agentd` 是独立进程，故障域已分离；sweep 也是独立进程（`nova-responses-sweep`）
+- **网关 drain 不影响执行**：`nova-agentd-mock` 是独立进程，故障域已分离；sweep 也是独立进程（`nova-responses-sweep`）
 
 ---
 
@@ -638,8 +638,8 @@ graph TB
 | 门禁 | 若失效会怎样 |
 |---|---|
 | `core` 无 workspace 内依赖 | 领域层被适配器污染，分层失去意义 |
-| `nova-agent` 无 `reqwest`/`hyper`/`axum`/`sqlx` | 工作循环不再能脱离 socket 测试 |
-| `adapters-completions-mock` 无 HTTP/DB/`nova-agent` | 某个测试可能悄悄发出真实调用 |
+| `nova-agent-runtime` 无 `reqwest`/`hyper`/`axum`/`sqlx` | 工作循环不再能脱离 socket 测试 |
+| `adapters-completions-mock` 无 HTTP/DB/`nova-agent-runtime` | 某个测试可能悄悄发出真实调用 |
 | 执行不经 HTTP 端点领活 | 执行走 HTTP 拉取协议，多一跳、多一处鉴权、多一处栅栏校验 |
 | `claim` 不带 `NodeTag` | 队列中的生成被搁死在没有执行端的节点上 |
 | 协议子集文档与代码一致 | 已发布子集与实现漂移 |

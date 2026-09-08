@@ -18,7 +18,7 @@
 //! the owning conversation and takes its turn lock.
 //!
 //! Gone with D23, and still gone under D25: `/v1/agent/claim`, `/heartbeat`,
-//! `/append`, `/complete`. Execution is not a protocol — `nova-agentd` claims
+//! `/append`, `/complete`. Execution is not a protocol — `nova-agentd-mock` claims
 //! from the shared ledger through the `ResponseLedger` port, so an HTTP pull
 //! surface would only add a hop, a second authorisation path and a second place
 //! for the attempt fence to be checked.

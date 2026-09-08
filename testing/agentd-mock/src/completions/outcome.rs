@@ -1,7 +1,6 @@
 //! What a scheduled completions request produced.
 
-use crate::protocol::{ContentPart, ResponseItem, Role};
-use crate::Usage;
+use nova_responses_core::{ContentPart, ResponseItem, Role, Usage};
 
 /// Why generation ended.
 ///
@@ -19,9 +18,6 @@ pub enum FinishReason {
 
 impl FinishReason {
     /// Whether the answer can be treated as a complete reply.
-    ///
-    /// `Length` is deliberately **not** complete: storing a truncated answer as if
-    /// it were whole silently corrupts every later turn that builds on it.
     pub fn is_complete_answer(self) -> bool {
         matches!(self, FinishReason::Stop | FinishReason::ToolCalls)
     }
@@ -36,27 +32,15 @@ pub struct ToolCall {
 }
 
 /// The result of one completions request, in **our** vocabulary.
-///
-/// The conversion back from provider shape happens inside the scheduler, so
-/// nothing downstream ever sees a provider type. That is what keeps provider
-/// coupling from spreading past the adapter.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletionsOutcome {
     /// The final items, submitted explicitly.
-    ///
-    /// Never reconstructed from streamed deltas by the caller: the delta stream is
-    /// a bounded transient buffer, and durable history may not depend on it
-    /// (FR-20 / INV-48).
     pub items: Vec<ResponseItem>,
     pub usage: Usage,
     pub finish: FinishReason,
 }
 
 /// An assistant text message with a freshly generated item id.
-///
-/// The id is generated here — not in the sink — so the streamed
-/// `output_item.added` / `output_text.delta` and the submitted outcome carry the
-/// *same* id (one id per produced message, matching the provider).
 pub fn assistant_text_message(text: impl Into<String>) -> ResponseItem {
     let text = text.into();
     ResponseItem::Message {
@@ -68,7 +52,7 @@ pub fn assistant_text_message(text: impl Into<String>) -> ResponseItem {
 }
 
 /// A content-derived id, stable across runs, so a deterministic scheduler stays
-/// deterministic (the CI-oracle property) without reaching for a random source.
+/// deterministic (the CI-oracle property) without a random source.
 fn stable_id(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in text.bytes() {
@@ -89,10 +73,6 @@ impl CompletionsOutcome {
     }
 
     /// A refusal.
-    ///
-    /// Separate constructor because a refusal is a legitimate *completed* turn, not
-    /// an error, and must be storable as such — treating it as a failure would
-    /// leave the response non-terminal and the caller waiting.
     pub fn refusal(reason: impl Into<String>, usage: Usage) -> Self {
         let reason = reason.into();
         Self {
@@ -139,8 +119,6 @@ mod tests {
 
     #[test]
     fn truncation_is_not_a_complete_answer() {
-        // The distinction that matters: `Length` succeeded at the transport level.
-        // Storing it as complete would corrupt every turn that builds on it.
         assert!(!FinishReason::Length.is_complete_answer());
         assert!(FinishReason::Stop.is_complete_answer());
         assert!(FinishReason::ToolCalls.is_complete_answer());
@@ -148,8 +126,6 @@ mod tests {
 
     #[test]
     fn every_constructor_yields_chain_closed_items() {
-        // Our own context chain breaks with no external caller involved if an
-        // outcome carries an item we cannot accept as input.
         assert!(CompletionsOutcome::text("hi", Usage::default()).is_chain_closed());
         assert!(CompletionsOutcome::refusal("no", Usage::default()).is_chain_closed());
         assert!(CompletionsOutcome::tool_calls(
@@ -168,7 +144,6 @@ mod tests {
         let o = CompletionsOutcome::refusal("cannot help", Usage::new(1, 0));
         assert_eq!(o.finish, FinishReason::Refusal);
         assert!(!o.finish.is_complete_answer());
-        // Still storable: the caller must be able to read why it was refused.
         assert!(o.is_chain_closed());
         assert_eq!(o.items.len(), 1);
     }

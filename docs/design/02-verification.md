@@ -242,7 +242,7 @@ fn saw_relevant_data(&self, trace: &Trace) -> bool;   // 无默认实现
 
 ## 7. L2 场景（13 个）与进程拓扑
 
-**fixture 进程**（`xtask procs up` 启动）：`nova-responses-mem-server`（数据面 19000 + 控制面 19001）· `nova-responses-sweep`（短 heartbeat TTL）· `nova-agentd`（scripted scheduler，含 `hang` 规则）· 三个**对等** gateway（node-a/b/c，18080/18081/18082）。
+**fixture 进程**（`xtask procs up` 启动）：`nova-responses-mem-server`（数据面 19000 + 控制面 19001）· `nova-responses-sweep`（短 heartbeat TTL）· `nova-agentd-mock`（scripted scheduler，含 `hang` 规则）· 三个**对等** gateway（node-a/b/c，18080/18081/18082）。
 
 三节点共享同一载体，执行由全局 agentd 完成，节点之间完全对等——不再有「node-c 挂起」「node-b 路由」这种固定分工。
 
