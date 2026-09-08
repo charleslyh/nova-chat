@@ -18,6 +18,7 @@ use nova_responses_core::{
     ResponseId, StoredResponse, TenantId, Usage,
 };
 use parking_lot::{Mutex, MutexGuard};
+use tokio::sync::Notify;
 
 /// A conversation's event stream (D28). Held beside the conversation under the
 /// same mutex so the in-flight marker and the turn boundary events land together.
@@ -64,6 +65,10 @@ pub struct MemStore {
     max_records: AtomicUsize,
     max_conversations: AtomicUsize,
     max_events_per_conversation: AtomicUsize,
+    /// Wakes conversation-event subscribers (the SSE `read_after` long poll) when
+    /// a new event is appended. Without it the poll would have to busy-wait, which
+    /// is exactly the CPU-100% hot loop this prevents.
+    conversation_notify: Notify,
 }
 
 impl MemStore {
@@ -87,11 +92,23 @@ impl MemStore {
             max_records: AtomicUsize::new(100_000),
             max_conversations: AtomicUsize::new(100_000),
             max_events_per_conversation: AtomicUsize::new(100_000),
+            conversation_notify: Notify::new(),
         }
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock()
+    }
+
+    /// Wake every conversation-event subscriber after an append. Non-blocking, so
+    /// it is safe to call while the store mutex is still held.
+    pub(crate) fn notify_conversation_event(&self) {
+        self.conversation_notify.notify_waiters();
+    }
+
+    /// Wait for the next conversation-event append (spurious wakeups allowed).
+    pub(crate) async fn wait_conversation_event(&self) {
+        self.conversation_notify.notified().await;
     }
 
     /// INV-32: read-only degrade rejects writes while reads keep working.

@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use nova_responses_core::{
@@ -203,6 +204,7 @@ impl ConversationStore for MemConversationStore {
                 if let Some(stream) = g.conversation_events.get_mut(id) {
                     stream.lock_seq = Some(seq);
                 }
+                self.store.notify_conversation_event();
                 Ok(seq)
             }
             Some(holder) if holder == *response_id => {
@@ -264,6 +266,7 @@ impl ConversationStore for MemConversationStore {
         if let Some(stream) = g.conversation_events.get_mut(id) {
             stream.last_completed = Some((response_id.clone(), seq));
         }
+        self.store.notify_conversation_event();
         Ok(seq)
     }
 
@@ -308,7 +311,9 @@ impl ConversationStore for MemConversationStore {
             return Err(ConversationError::NotFound);
         }
         self.ensure_event_capacity(&g, id)?;
-        Ok(g.push_conversation_event(id, kind, now_ms))
+        let seq = g.push_conversation_event(id, kind, now_ms);
+        self.store.notify_conversation_event();
+        Ok(seq)
     }
 
     async fn read_after(
@@ -317,27 +322,46 @@ impl ConversationStore for MemConversationStore {
         id: &ConversationId,
         starting_after: Option<u64>,
         limit: usize,
-        _wait_ms: u64,
+        wait_ms: u64,
     ) -> Result<Vec<ConversationEvent>, ConversationError> {
         self.guard_available()?;
-        let g = self.store.lock();
-        let Some(existing) = g.conversations.get(id) else {
-            return Err(ConversationError::NotFound);
-        };
-        if &existing.tenant_id != tenant {
-            return Err(ConversationError::NotFound);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+        loop {
+            {
+                let g = self.store.lock();
+                let Some(existing) = g.conversations.get(id) else {
+                    return Err(ConversationError::NotFound);
+                };
+                if &existing.tenant_id != tenant {
+                    return Err(ConversationError::NotFound);
+                }
+                let start = starting_after.map(|s| (s + 1) as usize).unwrap_or(0);
+                // No stream yet means "created but nothing appended": wait for the
+                // first event rather than immediately returning empty, or the SSE
+                // skeleton would busy-loop on a freshly created conversation.
+                if let Some(stream) = g.conversation_events.get(id) {
+                    let batch: Vec<_> = stream
+                        .events
+                        .iter()
+                        .skip(start)
+                        .take(limit)
+                        .cloned()
+                        .collect();
+                    if !batch.is_empty() {
+                        return Ok(batch);
+                    }
+                }
+            }
+            // Long-poll deadline hit with nothing new: report empty and let the
+            // caller (the SSE skeleton) decide whether to wait again.
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(vec![]);
+            }
+            tokio::select! {
+                _ = self.store.wait_conversation_event() => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
         }
-        let Some(stream) = g.conversation_events.get(id) else {
-            return Ok(Vec::new());
-        };
-        let start = starting_after.map(|s| (s + 1) as usize).unwrap_or(0);
-        Ok(stream
-            .events
-            .iter()
-            .skip(start)
-            .take(limit)
-            .cloned()
-            .collect())
     }
 
     async fn list(&self, tenant: &TenantId) -> Result<Vec<Conversation>, ConversationError> {
