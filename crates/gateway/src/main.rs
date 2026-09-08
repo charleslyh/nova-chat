@@ -60,11 +60,11 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let gateway_cfg = GatewayConfig::load(&args.config)?;
     let mem_server_url_env = gateway_cfg.mem_server_url_env.clone();
-    let cfg = Arc::new(gateway_cfg.responses);
-    let addr: SocketAddr = cfg
+    let addr: SocketAddr = gateway_cfg
         .listen
         .parse()
-        .with_context(|| format!("listen address `{}`", cfg.listen))?;
+        .with_context(|| format!("listen address `{}`", gateway_cfg.listen))?;
+    let cfg = Arc::new(gateway_cfg.responses);
 
     let keys = Arc::new(
         KeyTable::from_env(&cfg.api_keys_env, ADMIN_KEY_ENV)

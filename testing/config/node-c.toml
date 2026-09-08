@@ -1,6 +1,7 @@
+listen = "127.0.0.1:18082"
+
 [responses]
 node_tag = "node-c"
-listen = "127.0.0.1:18082"
 
 run_sweeper = false
 drain_timeout_ms = 3000

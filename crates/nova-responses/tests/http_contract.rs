@@ -126,7 +126,6 @@ async fn start() -> Harness {
     let raw: RawConfig = toml::from_str(
         r#"
         node_tag = "node-a"
-        listen = "127.0.0.1:0"
         run_sweeper = false
         sync_wait_timeout_ms = 1500
         content_retention_ms = 600000

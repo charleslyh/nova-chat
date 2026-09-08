@@ -25,6 +25,10 @@ pub struct RawGatewayConfig {
     #[serde(default = "default_mem_server_url_env")]
     pub mem_server_url_env: String,
 
+    /// Socket address this gateway binds. Assembly-only: the capability layer
+    /// never opens a listener.
+    pub listen: String,
+
     pub responses: RawConfig,
 }
 
@@ -32,6 +36,7 @@ pub struct RawGatewayConfig {
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     pub mem_server_url_env: String,
+    pub listen: String,
     pub responses: Config,
 }
 
@@ -47,6 +52,7 @@ impl GatewayConfig {
     pub fn from_raw(raw: RawGatewayConfig) -> Result<Self> {
         Ok(Self {
             mem_server_url_env: raw.mem_server_url_env,
+            listen: raw.listen,
             responses: Config::from_raw(raw.responses)?,
         })
     }
@@ -64,14 +70,15 @@ mod tests {
     fn composes_capability_and_assembly_config() {
         let raw: RawGatewayConfig = toml::from_str(
             r#"
+            listen = "127.0.0.1:18080"
             [responses]
             node_tag = "node-a"
-            listen = "127.0.0.1:18080"
             "#,
         )
         .expect("parse");
         let cfg = GatewayConfig::from_raw(raw).expect("validate");
         assert_eq!(cfg.responses.node_tag.as_str(), "node-a");
+        assert_eq!(cfg.listen, "127.0.0.1:18080");
         assert_eq!(cfg.mem_server_url_env, "NOVA_MEM_SERVER_URL");
     }
 
@@ -80,9 +87,9 @@ mod tests {
         // A typo in the `[responses]` table must be rejected by `RawConfig`'s
         // own `deny_unknown_fields`.
         let text = r#"
+            listen = "127.0.0.1:18080"
             [responses]
             node_tag = "node-a"
-            listen = "127.0.0.1:18080"
             role = "home"
             "#;
         assert!(
@@ -97,9 +104,9 @@ mod tests {
         // capability config.
         let text = r#"
             mem_server_url_evn = "NOVA_MEM_SERVER_URL"
+            listen = "127.0.0.1:18080"
             [responses]
             node_tag = "node-a"
-            listen = "127.0.0.1:18080"
             "#;
         assert!(toml::from_str::<RawGatewayConfig>(text).is_err());
     }

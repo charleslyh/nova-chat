@@ -5,12 +5,13 @@
 # Secrets are absent by design — only the *names* of environment variables appear
 # here (SEC-4).
 #
-# Top-level keys are assembly-layer knobs (which backend, how to reach it); the
-# capability layer's config lives under `[responses]`.
+# Top-level keys are assembly-layer knobs (which backend, how to reach it, which
+# address to bind); the capability layer's config lives under `[responses]`.
+
+listen = "127.0.0.1:18080"
 
 [responses]
 node_tag = "node-a"
-listen = "127.0.0.1:18080"
 
 # The sweep loop is a standalone process; the gateway must not run it.
 run_sweeper = false

@@ -1,13 +1,13 @@
-//! Gateway configuration.
+//! Capability-layer configuration.
+//!
+//! This is the config the capability layer itself consumes. Backend choice and
+//! how to reach a specific carrier are assembly concerns and live in the
+//! gateway's own `GatewayConfig`, not here (D25).
 //!
 //! One rule governs this file: **secrets are never values here.** Config carries
 //! the *name* of an environment variable; the value is read at startup (SEC-4).
 //! A connection string or API key in a TOML file ends up in version control,
 //! logs and container images.
-//!
-//! There is no node-to-node forwarding: storage is a shared carrier, so an
-//! address is never derived from a request field (the former SEC-5 surface is
-//! gone entirely).
 
 use std::path::Path;
 
@@ -20,7 +20,6 @@ use serde::Deserialize;
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
     pub node_tag: String,
-    pub listen: String,
 
     /// Name of the environment variable holding `key:tenant` pairs.
     #[serde(default = "default_api_keys_env")]
@@ -28,23 +27,6 @@ pub struct RawConfig {
 
     #[serde(default = "default_pending_limit")]
     pub pending_limit: usize,
-
-    #[serde(default = "default_events_per_response")]
-    pub max_events_per_response: usize,
-
-    #[serde(default = "default_max_logs")]
-    pub max_event_logs: usize,
-
-    /// Upper bound on one conversation's event stream (D28).
-    ///
-    /// Reaching it **refuses the append** rather than evicting the oldest events,
-    /// unlike `max_events_per_response`. The two differ because what they hold
-    /// differs: dropping a token delta costs a subscriber some replay, while
-    /// dropping a turn boundary or a business event loses the only record that it
-    /// happened. Three orders of magnitude smaller for the same reason — a turn
-    /// contributes two or three envelopes, not thousands of deltas.
-    #[serde(default = "default_events_per_conversation")]
-    pub max_events_per_conversation: usize,
 
     /// How many conversation events one subscription read may return.
     ///
@@ -89,9 +71,6 @@ pub struct RawConfig {
     pub drain_timeout_ms: u64,
 
     #[serde(default = "default_true")]
-    pub verify_integrity: bool,
-
-    #[serde(default = "default_true")]
     pub run_sweeper: bool,
 
     #[serde(default = "default_heartbeat_ttl_ms")]
@@ -103,17 +82,6 @@ fn default_api_keys_env() -> String {
 }
 fn default_pending_limit() -> usize {
     10_000
-}
-fn default_events_per_response() -> usize {
-    20_000
-}
-fn default_max_logs() -> usize {
-    100_000
-}
-fn default_events_per_conversation() -> usize {
-    // Two or three envelopes per turn plus business events: room for tens of
-    // thousands of turns before the bound is anywhere near.
-    100_000
 }
 fn default_conversation_events_page() -> usize {
     256
@@ -162,12 +130,8 @@ fn default_heartbeat_ttl_ms() -> u64 {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub node_tag: NodeTag,
-    pub listen: String,
     pub api_keys_env: String,
     pub pending_limit: usize,
-    pub max_events_per_response: usize,
-    pub max_event_logs: usize,
-    pub max_events_per_conversation: usize,
     pub conversation_events_page: usize,
     pub retain_after_terminal_ms: u64,
     pub content_retention_ms: u64,
@@ -175,7 +139,6 @@ pub struct Config {
     pub input_limits: InputLimits,
     pub sync_wait_timeout_ms: u64,
     pub drain_timeout_ms: u64,
-    pub verify_integrity: bool,
     pub run_sweeper: bool,
     pub heartbeat_ttl_ms: u64,
 }
@@ -196,12 +159,6 @@ impl Config {
         if raw.chain_max_depth == 0 {
             bail!("chain_max_depth must be at least 1");
         }
-        if raw.max_events_per_response == 0 {
-            bail!("max_events_per_response must be at least 1");
-        }
-        if raw.max_events_per_conversation == 0 {
-            bail!("max_events_per_conversation must be at least 1");
-        }
         // A zero page would make every subscription return nothing forever, which
         // reads as "the conversation is quiet" rather than as a misconfiguration.
         if raw.conversation_events_page == 0 {
@@ -215,12 +172,8 @@ impl Config {
 
         Ok(Self {
             node_tag,
-            listen: raw.listen,
             api_keys_env: raw.api_keys_env,
             pending_limit: raw.pending_limit,
-            max_events_per_response: raw.max_events_per_response,
-            max_event_logs: raw.max_event_logs,
-            max_events_per_conversation: raw.max_events_per_conversation,
             conversation_events_page: raw.conversation_events_page,
             retain_after_terminal_ms: raw.retain_after_terminal_ms,
             content_retention_ms: raw.content_retention_ms,
@@ -237,7 +190,6 @@ impl Config {
             },
             sync_wait_timeout_ms: raw.sync_wait_timeout_ms,
             drain_timeout_ms: raw.drain_timeout_ms,
-            verify_integrity: raw.verify_integrity,
             run_sweeper: raw.run_sweeper,
             heartbeat_ttl_ms: raw.heartbeat_ttl_ms,
         })
@@ -250,7 +202,7 @@ mod tests {
     use super::*;
 
     fn raw(extra: &str) -> RawConfig {
-        let text = format!("node_tag = \"node-a\"\nlisten = \"127.0.0.1:18080\"\n{extra}");
+        let text = format!("node_tag = \"node-a\"\n{extra}");
         toml::from_str(&text).expect("parse")
     }
 
@@ -259,13 +211,12 @@ mod tests {
         let cfg = Config::from_raw(raw("")).unwrap();
         assert_eq!(cfg.chain_limits.max_depth, 50);
         assert_eq!(cfg.chain_limits.max_bytes, 1024 * 1024);
-        assert!(cfg.verify_integrity);
         assert!(cfg.run_sweeper);
     }
 
     #[test]
     fn rejects_unknown_config_keys() {
-        let text = "node_tag = \"node-a\"\nlisten = \"1.2.3.4:1\"\nrole = \"home\"\n";
+        let text = "node_tag = \"node-a\"\nrole = \"home\"\n";
         assert!(
             toml::from_str::<RawConfig>(text).is_err(),
             "stale keys such as `role` must be rejected loudly, not ignored"
@@ -280,18 +231,6 @@ mod tests {
     #[test]
     fn rejects_zero_bounds() {
         assert!(Config::from_raw(raw("chain_max_depth = 0\n")).is_err());
-        assert!(Config::from_raw(raw("max_events_per_response = 0\n")).is_err());
-        assert!(Config::from_raw(raw("max_events_per_conversation = 0\n")).is_err());
         assert!(Config::from_raw(raw("conversation_events_page = 0\n")).is_err());
-    }
-
-    #[test]
-    fn conversation_bounds_have_workable_defaults() {
-        let cfg = Config::from_raw(raw("")).expect("defaults are valid");
-        assert!(cfg.max_events_per_conversation > 0);
-        assert!(cfg.conversation_events_page > 0);
-        // A page larger than the stream bound would be pointless, and a page
-        // equal to it would make one read able to return the whole stream.
-        assert!(cfg.conversation_events_page < cfg.max_events_per_conversation);
     }
 }
