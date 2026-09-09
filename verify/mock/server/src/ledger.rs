@@ -1,20 +1,23 @@
 //! Generation ledger over the shared in-memory store.
 //!
-//! Preserved from the previous meta store: single-point conditional claim
-//! (INV-1), TTL-free idempotency gate (INV-2), monotonic attempts (INV-5),
-//! reaping that raises the fence, read-only degrade, overload rejection.
+//! Single-point conditional claim (INV-1), TTL-free idempotency gate (INV-2), monotonic
+//! attempts (INV-5), reaping that raises the fence, read-only degrade, overload rejection.
 //!
-//! Gone: session rows, session locks, `Busy` outcomes.
-//! New: cancel, node ownership, startup orphan reclaim, partial usage.
+//! The node-local degrade switches are a separate impl block ([`AdmissionControl`]) from
+//! the persistence operations, matching the port split: flipping `read_only` has nothing
+//! to do with writing a row.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use nova_responses::ports::{
+    AbortedClaim, AdmissionControl, ClaimedResponse, ContentIntegrity, CreateOutcome, LedgerError,
+    ResponseLedger, StoreError,
+};
 use nova_responses::{
-    canonical_items, AbortedClaim, AgentId, Attempt, ClaimedResponse, ContentIntegrity,
-    CreateOutcome, IdempotencyKey, IntegrityTag, LedgerError, ResponseId, ResponseItem,
-    ResponseLedger,
-    ResponseRecord, ResponseStatus, StoreError, TenantId, Usage,
+    canonical_items, AgentId, Attempt, IdempotencyKey, IntegrityTag, ResponseId, ResponseItem,
+    ResponseRecord, ResponseStatus, TenantId, Usage,
 };
 
 use crate::store::MemStore;
@@ -32,7 +35,10 @@ impl MemResponseLedger {
         }
     }
 
-    pub fn with_integrity(store: Arc<MemStore>, integrity: Option<Arc<dyn ContentIntegrity>>) -> Self {
+    pub fn with_integrity(
+        store: Arc<MemStore>,
+        integrity: Option<Arc<dyn ContentIntegrity>>,
+    ) -> Self {
         Self { store, integrity }
     }
 
@@ -40,8 +46,8 @@ impl MemResponseLedger {
         &self.store
     }
 
-    /// Synchronous fence check, used by the event log on the append path where
-    /// an `.await` would mean releasing and reacquiring the lock.
+    /// Synchronous fence check, used by the event log on the append path where an
+    /// `.await` would mean releasing and reacquiring the lock.
     pub fn check_attempt_sync(
         &self,
         response_id: &ResponseId,
@@ -54,10 +60,7 @@ impl MemResponseLedger {
         let Some(rec) = g.records.get(response_id) else {
             return Err(LedgerError::NotFound);
         };
-        if rec.attempt != attempt {
-            return Err(LedgerError::StaleAttempt);
-        }
-        if rec.status != ResponseStatus::InProgress {
+        if rec.attempt != attempt || rec.status != ResponseStatus::InProgress {
             return Err(LedgerError::StaleAttempt);
         }
         Ok(())
@@ -70,6 +73,22 @@ impl MemResponseLedger {
             Ok(())
         }
     }
+
+    /// Sign the stored input so tampering is detectable (CR-13).
+    fn sign(&self, record: &mut ResponseRecord) -> Result<(), LedgerError> {
+        let Some(integrity) = &self.integrity else {
+            return Ok(());
+        };
+        let canonical = canonical_items(&record.spec.input_items);
+        let tag = integrity
+            .sign(&canonical)
+            .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
+        record.integrity = Some(IntegrityTag {
+            alg: integrity.alg().to_string(),
+            tag,
+        });
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -80,61 +99,58 @@ impl ResponseLedger for MemResponseLedger {
         idempotency_key: IdempotencyKey,
         _now_ms: u64,
     ) -> Result<CreateOutcome, LedgerError> {
-        // A replay of an accepted key stays idempotent even while read-only:
-        // the caller already got a success for it (INV-2).
-        {
-            let g = self.store.lock();
-            if let Some(existing) = g.idem.get(&idempotency_key.0) {
-                return Ok(CreateOutcome::Duplicate {
-                    response_id: existing.clone(),
-                });
-            }
+        // Signing needs no lock, so it happens first and the critical section below stays
+        // a single uninterrupted decision.
+        let mut record = record;
+        self.sign(&mut record)?;
+
+        // **One lock for the whole decision** (INV-2). Checking the idempotency gate and
+        // inserting under two separate locks lets four concurrent retries of one key each
+        // miss the check and each insert — which is exactly the case the gate exists for,
+        // since concurrent retries are what a client that timed out does.
+        let mut g = self.store.lock();
+
+        // A replay of an accepted key stays idempotent even while read-only: the caller
+        // already got a success for it. The original record is returned, so the caller
+        // never has to read back a row this statement already had in hand.
+        if let Some(existing) = g.idem.get(&idempotency_key) {
+            let existing = g
+                .records
+                .get(existing)
+                .cloned()
+                .ok_or(LedgerError::NotFound)?;
+            return Ok(CreateOutcome::duplicate(existing));
         }
         if self.store.is_read_only() {
             return Ok(CreateOutcome::ReadOnly);
         }
-
-        let mut g = self.store.lock();
         if g.in_flight_count() >= self.store.pending_limit() {
             return Ok(CreateOutcome::Overloaded);
         }
         if g.records.len() >= self.store.max_records() {
-            // Refuse rather than evict: dropping an existing record would break
-            // a chain silently (INV-43).
+            // Refuse rather than evict: dropping an existing record would break a chain
+            // silently (INV-43).
             return Err(LedgerError::Store(StoreError::Unavailable));
         }
-        let mut record = record;
-        // Sign the input items before storing, so tampering is detectable (CR-13).
-        if let Some(integrity) = &self.integrity {
-            let canonical = canonical_items(&record.input_items);
-            let tag = integrity
-                .sign(&canonical)
-                .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
-            record.integrity = Some(IntegrityTag {
-                alg: integrity.alg().to_string(),
-                tag,
-            });
-        }
-        let response_id = record.response_id.clone();
-        g.queued.push_back(response_id.clone());
-        g.idem.insert(idempotency_key.0, response_id.clone());
-        g.insert_record(record);
-        Ok(CreateOutcome::Accepted { response_id })
+        g.queued.push_back(record.response_id.clone());
+        g.idem.insert(idempotency_key, record.response_id.clone());
+        g.insert_record(record.clone());
+        Ok(CreateOutcome::accepted(record))
     }
 
     async fn claim(
         &self,
         agent_id: AgentId,
         now_ms: u64,
-        exec_ttl_ms: u64,
+        exec_ttl: Duration,
     ) -> Result<Option<ClaimedResponse>, LedgerError> {
         self.guard_writable()?;
         let mut g = self.store.lock();
-        // Pop-and-verify in one lock: the check and the transition are a single
-        // atomic step, so two callers cannot both win (INV-1).
+        // Pop-and-verify in one lock: the check and the transition are a single atomic
+        // step, so two callers cannot both win (INV-1).
         //
-        // Global claim (D25): no node filter — any execution process may take any
-        // queued response, because the in-flight buffer is shared.
+        // Global claim (D25): no node filter — any execution process may take any queued
+        // response, because the in-flight buffer is shared.
         loop {
             let Some(id) = g.queued.pop_front() else {
                 return Ok(None);
@@ -145,17 +161,14 @@ impl ResponseLedger for MemResponseLedger {
             if rec.status != ResponseStatus::Queued {
                 continue;
             }
-            let attempt = rec.attempt.next();
-            rec.attempt = attempt;
+            rec.attempt = rec.attempt.next();
             rec.status = ResponseStatus::InProgress;
             rec.owner = Some(agent_id);
-            let deadline = now_ms.saturating_add(exec_ttl_ms);
             let record = rec.clone();
             g.heartbeats.insert(agent_id, now_ms);
             return Ok(Some(ClaimedResponse {
                 record,
-                attempt,
-                exec_deadline_ms: deadline,
+                exec_deadline_ms: now_ms.saturating_add(exec_ttl.as_millis() as u64),
             }));
         }
     }
@@ -184,10 +197,7 @@ impl ResponseLedger for MemResponseLedger {
         let Some(rec) = g.records.get_mut(response_id) else {
             return Err(LedgerError::NotFound);
         };
-        if rec.attempt != expected_attempt {
-            return Err(LedgerError::StaleAttempt);
-        }
-        if rec.status != ResponseStatus::InProgress {
+        if rec.attempt != expected_attempt || rec.status != ResponseStatus::InProgress {
             return Err(LedgerError::StaleAttempt);
         }
         rec.status = status;
@@ -208,8 +218,8 @@ impl ResponseLedger for MemResponseLedger {
         let Some(rec) = g.records.get_mut(response_id) else {
             return Err(LedgerError::NotFound);
         };
-        // Cross-tenant looks identical to missing, so ids cannot be probed
-        // (SEC-2); the edge maps both to 404.
+        // Cross-tenant looks identical to missing, so ids cannot be probed (SEC-2); the
+        // edge maps both to 404.
         if &rec.tenant_id != tenant {
             return Err(LedgerError::NotFound);
         }
@@ -224,8 +234,8 @@ impl ResponseLedger for MemResponseLedger {
         rec.status = ResponseStatus::Cancelled;
         rec.owner = None;
         rec.completed_at_ms = Some(now_ms);
-        // Tokens already burnt on the running attempt still have to be booked
-        // (INV-51), otherwise billing silently under-counts.
+        // Tokens already burnt on the running attempt still have to be booked (INV-51),
+        // otherwise billing silently under-counts.
         if !partial.is_zero() {
             g.partial_usage
                 .insert((response_id.clone(), attempt), partial);
@@ -236,8 +246,9 @@ impl ResponseLedger for MemResponseLedger {
     async fn reap(
         &self,
         now_ms: u64,
-        heartbeat_ttl_ms: u64,
+        heartbeat_ttl: Duration,
     ) -> Result<Vec<AbortedClaim>, LedgerError> {
+        let ttl_ms = heartbeat_ttl.as_millis() as u64;
         let mut g = self.store.lock();
         let mut to_fail = Vec::new();
         for (id, rec) in g.records.iter() {
@@ -247,7 +258,7 @@ impl ResponseLedger for MemResponseLedger {
             let lost = rec
                 .owner
                 .and_then(|a| g.heartbeats.get(&a).copied())
-                .map(|hb| now_ms.saturating_sub(hb) > heartbeat_ttl_ms)
+                .map(|hb| now_ms.saturating_sub(hb) > ttl_ms)
                 .unwrap_or(true);
             if lost {
                 to_fail.push(id.clone());
@@ -261,11 +272,11 @@ impl ResponseLedger for MemResponseLedger {
             };
             let previous_attempt = rec.attempt;
             let partial = rec.usage;
-            // Read the association out while the record is in hand: the reap
-            // caller needs it to release the turn lock, and a follow-up read
-            // would be a second look at a row this loop already holds.
+            // Read the association out while the record is in hand: the reap caller needs
+            // it to release the turn lock, and a follow-up read would be a second look at
+            // a row this loop already holds.
             let tenant_id = rec.tenant_id.clone();
-            let conversation_id = rec.conversation_id.clone();
+            let conversation_id = rec.conversation_id().cloned();
             // Raise the fence first so the stale holder's next append fails.
             rec.attempt = previous_attempt.next();
             rec.status = ResponseStatus::Failed;
@@ -341,7 +352,9 @@ impl ResponseLedger for MemResponseLedger {
     async fn in_flight(&self) -> Result<usize, LedgerError> {
         Ok(self.store.lock().in_flight_count())
     }
+}
 
+impl AdmissionControl for MemResponseLedger {
     fn set_read_only(&self, enabled: bool) {
         self.store.set_read_only(enabled);
     }
@@ -374,13 +387,13 @@ impl MemResponseLedger {
             .count()
     }
 
-    /// Test hook: corrupt stored input without updating the tag, to prove
-    /// tampering is detectable (CR-13).
+    /// Test hook: corrupt stored input without updating the tag, to prove tampering is
+    /// detectable (CR-13).
     pub fn tamper_for_test(&self, response_id: &ResponseId, replacement: Vec<ResponseItem>) -> bool {
         let mut g = self.store.lock();
         match g.records.get_mut(response_id) {
             Some(rec) => {
-                rec.input_items = replacement;
+                rec.spec.input_items = replacement;
                 true
             }
             None => false,

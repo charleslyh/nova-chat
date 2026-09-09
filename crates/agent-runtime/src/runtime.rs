@@ -3,23 +3,22 @@
 //!
 //! # Why the ReAct loop is not here
 //!
-//! The orchestrator knows *when* to claim, *how* to assemble the task, and *where*
-//! to put the result. It deliberately does **not** know *how* a task is executed
-//! — that is the [`AgentRunner`] implementation's business, and it is what lets a
-//! mock provider and a real agent SDK sit behind the same seam. Everything the
-//! runner produces flows back through the [`crate::EventSink`] (increments) and
-//! the returned [`crate::AgentOutcome`] (final items).
+//! The orchestrator knows *when* to claim, *how* to assemble the task, and *where* to
+//! put the result. It deliberately does **not** know *how* a task is executed — that is
+//! the [`AgentRunner`] implementation's business, and it is what lets a mock provider
+//! and a real agent SDK sit behind the same seam. Everything the runner produces flows
+//! back through the [`crate::EventSink`] (increments) and the returned
+//! [`crate::AgentOutcome`] (final items).
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use nova_responses::{
-    response_object, AgentId, AppendEvent, Attempt, ChainLimits, ClaimedResponse,
-    ConversationError, ConversationStore, LedgerError, RequestProvenance, ResolvedContext,
-    ResponseEventKind, ResponseEventLog, ResponseId, ResponseItem, ResponseLedger, ResponseRecord,
-    ResponseStatus, SnapshotRef, StoreError, TenantId, TurnCommit, Usage,
+use nova_responses::ports::{
+    ClaimedResponse, ConversationError, ConversationStore, LedgerError, ResponseEventLog,
+    ResponseLedger, StoreError,
 };
-use serde_json::Value;
+use nova_responses::protocol::ResponseObject;
+use nova_responses::{AgentId, AppendEvent, Attempt, Clock, ContextAnchor, ConversationId, ResolvedContext, ResponseEventKind, ResponseId, ResponseItem, ResponseRecord, ResponseStatus, TenantId, TurnCommit, Usage};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
@@ -27,9 +26,28 @@ use tracing::{debug, info, warn};
 use crate::runner::{AgentError, AgentRunner, AgentTask};
 use crate::sink::EventSink;
 
-/// What a finished run produced, bundled so the terminal funnels take one
-/// value instead of four parallel parameters (the fields are one fact: the
-/// outcome of this attempt).
+/// Events per read while replaying a bare response's stream.
+const EVENT_REPLAY_PAGE: usize = 256;
+
+/// Floor for the heartbeat interval, so a misconfigured zero cannot turn the
+/// background task into a hot spin.
+const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Why the history a claim should run against could not be assembled.
+///
+/// Distinct from [`ConversationError`]: "this chain has no durable home" is the
+/// execution side's own conclusion, not something a conversation store ever reports.
+#[derive(Debug, thiserror::Error)]
+enum SnapshotUnavailable {
+    #[error("chain broken at {0}")]
+    ChainBroken(ResponseId),
+    #[error(transparent)]
+    Conversation(#[from] ConversationError),
+}
+
+/// What a finished run produced, bundled so the terminal funnels take one value
+/// instead of four parallel parameters (the fields are one fact: the outcome of this
+/// attempt).
 struct TerminalOutput {
     produced: Vec<ResponseItem>,
     reasoning: String,
@@ -43,34 +61,40 @@ pub struct AgentRuntimeDeps {
     pub event_log: Arc<dyn ResponseEventLog>,
     /// The execution seam. The orchestrator never sees how a task runs.
     pub runner: Arc<dyn AgentRunner>,
-    /// Timestamp source: `SystemTime` in production, a virtual clock the test
-    /// can advance (D15).
-    pub now: Arc<dyn Fn() -> u64 + Send + Sync>,
-    /// Conversation bookkeeping at terminal (D28). `None` when no conversation
-    /// port is mounted.
+    /// Timestamp source: the system clock in production, a virtual one the test can
+    /// advance (D15). The trait object is the seam: production mounts
+    /// [`nova_responses::SystemClock`], verification mounts a clock that also has
+    /// `advance`/`set`.
+    pub clock: Arc<dyn Clock>,
+    /// Conversation bookkeeping at terminal (D28). `None` when no conversation port is
+    /// mounted.
     pub conversations: Option<Arc<dyn ConversationStore>>,
 }
 
+/// Execution-side knobs.
+///
+/// No chain limits here: they are enforced once, at admission, by the capability
+/// layer. The copy that used to sit on this struct was never read — and had it been,
+/// two configurable versions of one rule would eventually disagree about whether a
+/// chain is acceptable, which is worse than having a single owner.
 #[derive(Debug, Clone)]
 pub struct AgentRuntimeConfig {
-    pub exec_ttl_ms: u64,
-    pub chain_limits: ChainLimits,
-    pub retain_after_terminal_ms: u64,
+    pub exec_ttl: Duration,
+    pub retain_after_terminal: Duration,
     /// Hard ceiling on tool-calling rounds per response.
     pub max_tool_rounds: usize,
-    /// Interval between keep-alive heartbeats sent while the (possibly long)
-    /// ReAct loop runs.
-    pub heartbeat_interval_ms: u64,
+    /// Interval between keep-alive heartbeats sent while the (possibly long) ReAct
+    /// loop runs.
+    pub heartbeat_interval: Duration,
 }
 
 impl Default for AgentRuntimeConfig {
     fn default() -> Self {
         Self {
-            exec_ttl_ms: 300_000,
-            chain_limits: ChainLimits::default(),
-            retain_after_terminal_ms: 60_000,
+            exec_ttl: Duration::from_secs(300),
+            retain_after_terminal: Duration::from_secs(60),
             max_tool_rounds: 20,
-            heartbeat_interval_ms: 30_000,
+            heartbeat_interval: Duration::from_secs(30),
         }
     }
 }
@@ -78,7 +102,7 @@ impl Default for AgentRuntimeConfig {
 /// What one execution attempt did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Executed {
-    /// Nothing was queued for this node.
+    /// Nothing was queued.
     Idle,
     Completed,
     /// Abandoned because the fence moved (reap or cancel). Not a failure.
@@ -103,19 +127,14 @@ impl AgentRuntime {
     }
 
     fn now_ms(&self) -> u64 {
-        (self.deps.now)()
+        self.deps.clock.now_ms()
     }
 
     /// Take one queued response and run it to a terminal state.
     pub async fn run_once(&self, now_ms: u64) -> Executed {
-        let agent = AgentId(uuid::Uuid::new_v4());
+        let agent = AgentId::new();
 
-        let claimed = match self
-            .deps
-            .ledger
-            .claim(agent, now_ms, self.cfg.exec_ttl_ms)
-            .await
-        {
+        let claimed = match self.deps.ledger.claim(agent, now_ms, self.cfg.exec_ttl).await {
             Ok(Some(c)) => c,
             Ok(None) => return Executed::Idle,
             Err(LedgerError::Store(StoreError::ReadOnly)) => {
@@ -147,8 +166,12 @@ impl AgentRuntime {
 
     /// Start the claim/poll loop as a background task, returning a handle whose
     /// [`AgentRuntimeHandle::stop`] stops it gracefully.
-    pub fn start(self: &Arc<Self>, max_concurrent: usize, poll_interval_ms: u64) -> AgentRuntimeHandle {
-        let (stop_tx, mut stop_rx) = watch::channel(None::<u64>);
+    pub fn start(
+        self: &Arc<Self>,
+        max_concurrent: usize,
+        poll_interval: Duration,
+    ) -> AgentRuntimeHandle {
+        let (stop_tx, mut stop_rx) = watch::channel(None::<Duration>);
         let runtime = self.clone();
         let join = tokio::spawn(async move {
             let permits = Arc::new(Semaphore::new(max_concurrent));
@@ -156,7 +179,7 @@ impl AgentRuntime {
 
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(poll_interval_ms)) => {
+                    _ = tokio::time::sleep(poll_interval) => {
                         if let Ok(permit) = permits.clone().try_acquire_owned() {
                             let runtime = runtime.clone();
                             tasks.spawn(async move {
@@ -175,14 +198,14 @@ impl AgentRuntime {
                 }
             }
 
-            // Drain in-flight work, bounded by the stop budget. Anything still
-            // running past the budget is abandoned (aborted on JoinSet drop) and
-            // reclaimed by the next startup's orphan reclaim (INV-45).
-            let budget_ms = *stop_rx.borrow();
+            // Drain in-flight work, bounded by the stop budget. Anything still running
+            // past the budget is abandoned (aborted on JoinSet drop) and reclaimed by
+            // the next startup's orphan reclaim (INV-45).
+            let budget = *stop_rx.borrow();
             while !tasks.is_empty() {
-                match budget_ms {
-                    Some(ms) => {
-                        let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+                match budget {
+                    Some(budget) => {
+                        let deadline = tokio::time::Instant::now() + budget;
                         match tokio::time::timeout_at(deadline, tasks.join_next()).await {
                             Ok(Some(_)) => continue,
                             Ok(None) => break,
@@ -201,16 +224,19 @@ impl AgentRuntime {
     }
 
     async fn serve(&self, claimed: ClaimedResponse, agent_id: AgentId, now_ms: u64) -> Executed {
+        // Traceability derived from the claim, so the fence the runner sees is the one
+        // the ledger actually raised.
+        let provenance = claimed.provenance();
         let record = claimed.record;
         let id = record.response_id.clone();
-        let attempt = claimed.attempt;
+        let attempt = record.attempt;
 
         // Keep the claim alive across the whole (possibly long) run.
         let _heartbeat = spawn_heartbeat(
             self.deps.ledger.clone(),
             agent_id,
-            self.deps.now.clone(),
-            self.cfg.heartbeat_interval_ms,
+            self.deps.clock.clone(),
+            self.cfg.heartbeat_interval,
         );
 
         // Announce the transition so a subscriber sees a defined progression.
@@ -221,7 +247,7 @@ impl AgentRuntime {
                 id.clone(),
                 ResponseEventKind::InProgress,
                 attempt,
-                response_object(&record, &[]),
+                ResponseObject::without_output(&record),
             ))
             .await;
 
@@ -231,23 +257,18 @@ impl AgentRuntime {
             Ok(ctx) => ctx,
             Err(e) => {
                 warn!(response = %id, error = %e, "could not resolve context snapshot");
-                return self.fail(&record, attempt, Usage::default(), &e.to_string(), now_ms).await;
+                return self
+                    .fail(&record, attempt, Usage::default(), &e.to_string(), now_ms)
+                    .await;
             }
         };
-        let mut items: Vec<ResponseItem> = snapshot.items;
-        items.extend(record.input_items.clone());
+        let mut items: Vec<ResponseItem> = snapshot.into_items();
+        items.extend(record.spec.input_items.clone());
 
         let task = AgentTask {
-            model: record.model.clone(),
-            instructions: record.instructions.clone(),
-            tools: record.tools.clone(),
-            tool_choice: record.tool_choice.clone(),
+            params: record.spec.params.clone(),
             items,
-            provenance: RequestProvenance {
-                response_id: id.clone(),
-                attempt,
-                exec_deadline_ms: claimed.exec_deadline_ms,
-            },
+            provenance,
             max_tool_rounds: self.cfg.max_tool_rounds,
         };
 
@@ -318,21 +339,18 @@ impl AgentRuntime {
         // Durable output goes to the conversation snapshot (D30), sourced from the
         // runner's final items — never from replaying the event stream (INV-48).
         //
-        // A conversation-anchored response must persist its turn to the snapshot;
-        // a bare response (no conversation) has no snapshot to append to, but it is
-        // still "stored": its record and the terminal event (carrying the full
-        // object, output included) are its retention under D30.
-        let output_stored = if record.stored {
-            if record.conversation_id.is_none() {
-                true
-            } else {
-                let reasoning = if reasoning.is_empty() {
-                    None
-                } else {
-                    Some(reasoning.clone())
-                };
-                self.append_turn(record, &produced, reasoning, usage, status, now_ms)
-                    .await
+        // A conversation-anchored response must persist its turn to the snapshot; a
+        // bare response (no conversation) has no snapshot to append to, but it is still
+        // "stored": its record and the terminal event (carrying the full object, output
+        // included) are its retention under D30.
+        let output_stored = if record.is_stored() {
+            match record.conversation_id() {
+                None => true,
+                Some(_) => {
+                    let reasoning = (!reasoning.is_empty()).then(|| reasoning.clone());
+                    self.append_turn(record, &produced, reasoning, usage, status, now_ms)
+                        .await
+                }
             }
         } else {
             false
@@ -340,7 +358,7 @@ impl AgentRuntime {
 
         self.settle(record, status, output_stored, now_ms).await;
 
-        if record.stored && !output_stored {
+        if record.is_stored() && !output_stored {
             return Executed::Failed;
         }
 
@@ -348,9 +366,9 @@ impl AgentRuntime {
             ResponseStatus::Incomplete => ResponseEventKind::Incomplete,
             _ => ResponseEventKind::Completed,
         };
-        // Re-read the record: `ledger.complete` has written the terminal status
-        // and usage, and the terminal event must carry them (the claimed record
-        // still says `in_progress`).
+        // Re-read the record: `ledger.complete` has written the terminal status and
+        // usage, and the terminal event must carry them (the claimed record still says
+        // `in_progress`).
         let updated = self
             .deps
             .ledger
@@ -359,8 +377,8 @@ impl AgentRuntime {
             .ok()
             .flatten()
             .unwrap_or_else(|| record.clone());
-        let value = response_object(&updated, &produced);
-        self.close_stream(id, kind, value, now_ms).await;
+        self.close_stream(id, kind, ResponseObject::new(&updated, produced), now_ms)
+            .await;
         info!(response = %id, "completed");
         Executed::Completed
     }
@@ -390,8 +408,8 @@ impl AgentRuntime {
             .await;
 
         debug!(response = %id, reason, "failed");
-        // Re-read for the same reason as the completion path: `ledger.complete`
-        // holds the terminal status the failure event must report.
+        // Re-read for the same reason as the completion path: `ledger.complete` holds
+        // the terminal status the failure event must report.
         let updated = self
             .deps
             .ledger
@@ -400,93 +418,93 @@ impl AgentRuntime {
             .ok()
             .flatten()
             .unwrap_or_else(|| record.clone());
-        let value = response_object(&updated, &[]);
-        self.close_stream(id, ResponseEventKind::Failed, value, now_ms)
-            .await;
+        self.close_stream(
+            id,
+            ResponseEventKind::Failed,
+            ResponseObject::without_output(&updated),
+            now_ms,
+        )
+        .await;
         Executed::Failed
     }
 
     /// Resolve the context a claim inherits, from the record's anchor (D30).
     ///
-    /// `Previous` bare chains are mapped through the ledger to their conversation,
-    /// then read here. `Root` yields empty. A bare chain with no conversation has
-    /// no durable snapshot and is reported as broken.
-    async fn resolve_snapshot(&self, record: &ResponseRecord) -> Result<ResolvedContext, ConversationError> {
+    /// `Previous` bare chains are mapped through the ledger to their conversation, then
+    /// read here. `Root` yields empty. A bare chain with no conversation has no durable
+    /// snapshot and is reported as broken.
+    async fn resolve_snapshot(
+        &self,
+        record: &ResponseRecord,
+    ) -> Result<ResolvedContext, SnapshotUnavailable> {
         let tenant = &record.tenant_id;
-        let anchor = record.anchor();
-        let resolved = match &anchor {
-            SnapshotRef::Root => ResolvedContext::default(),
-            SnapshotRef::Conversation(id) => self.read_snapshot(tenant, id).await?,
-            SnapshotRef::Previous(id) => {
+        match record.anchor() {
+            ContextAnchor::Root => Ok(ResolvedContext::default()),
+            ContextAnchor::Conversation(id) => Ok(self.read_snapshot(tenant, id).await?),
+            ContextAnchor::Previous(id) => {
                 let prev = self
                     .deps
                     .ledger
                     .get(id)
                     .await
-                    .map_err(|_| ConversationError::ChainBroken(id.clone()))?
-                    .ok_or_else(|| ConversationError::ChainBroken(id.clone()))?;
+                    .map_err(|_| SnapshotUnavailable::ChainBroken(id.clone()))?
+                    .ok_or_else(|| SnapshotUnavailable::ChainBroken(id.clone()))?;
                 match prev.anchor() {
-                    SnapshotRef::Conversation(cid) => self.read_snapshot(tenant, &cid).await?,
+                    ContextAnchor::Conversation(cid) => Ok(self.read_snapshot(tenant, cid).await?),
                     // Bare response: reconstruct its own input+output from the stream.
-                    SnapshotRef::Root => self.reconstruct_bare(&prev).await?,
-                    SnapshotRef::Previous(_) => {
-                        return Err(ConversationError::ChainBroken(id.clone()));
-                    }
+                    ContextAnchor::Root => self.reconstruct_bare(&prev).await,
+                    ContextAnchor::Previous(_) => Err(SnapshotUnavailable::ChainBroken(id.clone())),
                 }
             }
-        };
-        Ok(resolved)
+        }
     }
 
-    /// Reconstruct a bare (conversation-less) response's input+output from the
-    /// event stream: input from the record, output from the terminal event.
+    /// Reconstruct a bare (conversation-less) response's input+output from the event
+    /// stream: input from the record, output from the terminal event.
     async fn reconstruct_bare(
         &self,
         record: &ResponseRecord,
-    ) -> Result<ResolvedContext, ConversationError> {
-        let mut items = record.input_items.clone();
-        let mut bytes = items.iter().map(ResponseItem::byte_len).sum::<usize>();
+    ) -> Result<ResolvedContext, SnapshotUnavailable> {
+        let mut items = record.spec.input_items.clone();
         let mut cursor: Option<u64> = None;
         loop {
             let batch = self
                 .deps
                 .event_log
-                .read_after(&record.response_id, cursor, 256, 0)
+                .read_after(
+                    &record.response_id,
+                    cursor,
+                    EVENT_REPLAY_PAGE,
+                    Duration::ZERO,
+                )
                 .await
-                .map_err(|e| ConversationError::Store(StoreError::Internal(e.to_string())))?;
+                .map_err(|_| SnapshotUnavailable::ChainBroken(record.response_id.clone()))?;
             if batch.is_empty() {
                 break;
             }
-            let terminal = batch.iter().any(|e| e.kind.is_terminal());
-            cursor = batch.last().map(|e| e.sequence_number);
+            let terminal = batch.iter().any(|e| e.kind().is_terminal());
+            cursor = batch.last().map(|e| e.sequence_number());
             for event in &batch {
-                if let nova_responses::EventBody::Response { response } = &event.body {
-                    if let Ok(output) = serde_json::from_value::<Vec<ResponseItem>>(
-                        response.get("output").cloned().unwrap_or_default(),
-                    ) {
-                        bytes += output.iter().map(ResponseItem::byte_len).sum::<usize>();
-                        items.extend(output);
-                    }
+                // The lifecycle payload is a typed response object, so the output comes
+                // back as items — no reaching into a JSON map by string key, and so no
+                // parse failure to swallow either.
+                if let Some(object) = event.response_object() {
+                    items.extend(object.output.iter().cloned());
                 }
             }
             if terminal {
                 break;
             }
         }
-        Ok(ResolvedContext {
-            items,
-            reasoning: Vec::new(),
-            depth: 1,
-            bytes,
-        })
+        Ok(ResolvedContext::from_items(items, 1))
     }
 
-    /// Read a conversation snapshot, returning `Unavailable` when no conversation
-    /// port is mounted (the runtime can then fail the turn explicitly).
+    /// Read a conversation snapshot, reporting `Unavailable` when no conversation port
+    /// is mounted (the runtime then fails the turn explicitly).
     async fn read_snapshot(
         &self,
         tenant: &TenantId,
-        id: &nova_responses::ConversationId,
+        id: &ConversationId,
     ) -> Result<ResolvedContext, ConversationError> {
         match &self.deps.conversations {
             Some(store) => store.read_snapshot(tenant, id).await,
@@ -496,7 +514,7 @@ impl AgentRuntime {
 
     /// Append this turn's output to its conversation snapshot. Returns `true` when
     /// durably stored; `false` when there is no conversation to store into (a bare
-    /// response has no durable home, so `stored` cannot be honoured).
+    /// response has no durable home, so `store` cannot be honoured).
     async fn append_turn(
         &self,
         record: &ResponseRecord,
@@ -507,7 +525,7 @@ impl AgentRuntime {
         now_ms: u64,
     ) -> bool {
         let (Some(store), Some(conversation_id)) =
-            (&self.deps.conversations, &record.conversation_id)
+            (&self.deps.conversations, record.conversation_id())
         else {
             return false;
         };
@@ -517,7 +535,7 @@ impl AgentRuntime {
                 conversation_id,
                 &record.response_id,
                 TurnCommit {
-                    input_items: record.input_items.clone(),
+                    input_items: record.spec.input_items.clone(),
                     output_items: produced.to_vec(),
                     reasoning,
                     usage,
@@ -551,77 +569,75 @@ impl AgentRuntime {
         let tenant = &record.tenant_id;
         let id = &record.response_id;
 
-        if let (Some(conversations), Some(conversation_id)) =
-            (&self.deps.conversations, &record.conversation_id)
-        {
-            if advance_tail {
-                if let Err(e) = conversations.advance(tenant, conversation_id, id).await {
-                    warn!(
-                        response = %id,
-                        conversation = %conversation_id,
-                        error = %e,
-                        "could not advance the conversation tail; the next turn will \
-                         inherit the previous turn's context"
-                    );
-                }
-            }
-            if let Err(e) = conversations
-                .release_active(tenant, conversation_id, id, status, now_ms)
-                .await
-            {
+        let (Some(conversations), Some(conversation_id)) =
+            (&self.deps.conversations, record.conversation_id())
+        else {
+            return;
+        };
+
+        if advance_tail {
+            if let Err(e) = conversations.advance(tenant, conversation_id, id).await {
                 warn!(
                     response = %id,
                     conversation = %conversation_id,
                     error = %e,
-                    "could not release the turn marker; the conversation stays busy \
-                     until a later terminal path releases it"
+                    "could not advance the conversation tail; the next turn will \
+                     inherit the previous turn's context"
                 );
             }
         }
+        if let Err(e) = conversations
+            .release_active(tenant, conversation_id, id, status, now_ms)
+            .await
+        {
+            warn!(
+                response = %id,
+                conversation = %conversation_id,
+                error = %e,
+                "could not release the turn marker; the conversation stays busy \
+                 until a later terminal path releases it"
+            );
+        }
     }
 
-    /// Emit the terminal event (carrying the full response object, output included)
-    /// and start the retention window.
+    /// Emit the terminal event (carrying the full response object, output included) and
+    /// start the retention window.
     async fn close_stream(
         &self,
         id: &ResponseId,
         kind: ResponseEventKind,
-        value: Value,
+        object: ResponseObject,
         now_ms: u64,
     ) {
         let _ = self
             .deps
             .event_log
-            .append(AppendEvent::lifecycle(id.clone(), kind, value))
+            .append(AppendEvent::lifecycle(id.clone(), kind, object))
             .await;
         let _ = self
             .deps
             .event_log
-            .close(id, now_ms, self.cfg.retain_after_terminal_ms)
+            .close(id, now_ms, self.cfg.retain_after_terminal)
             .await;
     }
 }
 
 /// Handle returned by [`AgentRuntime::start`].
 pub struct AgentRuntimeHandle {
-    stop_tx: watch::Sender<Option<u64>>,
+    stop_tx: watch::Sender<Option<Duration>>,
     join: tokio::task::JoinHandle<()>,
 }
 
 impl AgentRuntimeHandle {
-    /// Stop gracefully: stop claiming new work, then wait for in-flight work to
-    /// drain up to `drain_timeout_ms`. Returns when the loop has exited.
-    pub async fn stop(self, drain_timeout_ms: u64) {
-        let _ = self.stop_tx.send(Some(drain_timeout_ms));
+    /// Stop gracefully: stop claiming new work, then wait for in-flight work to drain
+    /// up to `drain_timeout`. Returns when the loop has exited.
+    pub async fn stop(self, drain_timeout: Duration) {
+        let _ = self.stop_tx.send(Some(drain_timeout));
         if let Err(e) = self.join.await {
             warn!(error = %e, "serve loop task failed");
         }
     }
 }
-
-/// Floor for the heartbeat interval, so a misconfigured `0` cannot turn the
-/// background task into a hot spin.
-const MIN_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 
 /// RAII guard that aborts the background heartbeat task when dropped.
 struct HeartbeatGuard {
@@ -634,19 +650,19 @@ impl Drop for HeartbeatGuard {
     }
 }
 
-/// Spawn a background task that keeps the claim's heartbeat fresh while the
-/// runner executes the (possibly long) ReAct loop.
+/// Spawn a background task that keeps the claim's heartbeat fresh while the runner
+/// executes the (possibly long) ReAct loop.
 fn spawn_heartbeat(
     ledger: Arc<dyn ResponseLedger>,
     agent_id: AgentId,
-    now: Arc<dyn Fn() -> u64 + Send + Sync>,
-    interval_ms: u64,
+    clock: Arc<dyn Clock>,
+    interval: Duration,
 ) -> HeartbeatGuard {
-    let interval_ms = interval_ms.max(MIN_HEARTBEAT_INTERVAL_MS);
+    let interval = interval.max(MIN_HEARTBEAT_INTERVAL);
     let handle = tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-            match ledger.heartbeat(agent_id, (now)()).await {
+            tokio::time::sleep(interval).await;
+            match ledger.heartbeat(agent_id, clock.now_ms()).await {
                 Ok(()) => {}
                 Err(LedgerError::Store(StoreError::ReadOnly)) => break,
                 Err(e) => warn!(error = %e, "heartbeat failed"),

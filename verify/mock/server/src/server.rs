@@ -4,14 +4,17 @@
 //! Pure logic, no transport: the HTTP wiring lives in the `nova-responses-mem-server`
 //! binary, so this stays unit-testable without a socket.
 
-use nova_responses::{ConversationStore, ResponseEventLog, ResponseLedger, TurnCommit};
+use nova_responses::ports::{
+    ConversationEvents, ConversationRepo, ConversationSnapshots, ResponseEventLog, ResponseLedger,
+    TurnLock,
+};
 
 use crate::proto::{ProtoError, Request, Response};
 use crate::MemWorld;
 
 /// Execute one request against the shared world and produce the response.
 ///
-/// `EventLogReadAfter` and `ConversationReadAfter` may block up to their `wait_ms`
+/// `EventLogReadAfter` and `ConversationReadAfter` may block up to their `wait` budget
 /// (long poll); everything else returns promptly.
 pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
     match req {
@@ -26,8 +29,8 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
         Request::LedgerClaim {
             agent_id,
             now_ms,
-            exec_ttl_ms,
-        } => match world.ledger.claim(agent_id, now_ms, exec_ttl_ms).await {
+            exec_ttl,
+        } => match world.ledger.claim(agent_id, now_ms, exec_ttl).await {
             Ok(o) => Response::Claim(o),
             Err(e) => Response::Err(ProtoError::Ledger(e)),
         },
@@ -61,8 +64,8 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
         },
         Request::LedgerReap {
             now_ms,
-            heartbeat_ttl_ms,
-        } => match world.ledger.reap(now_ms, heartbeat_ttl_ms).await {
+            heartbeat_ttl,
+        } => match world.ledger.reap(now_ms, heartbeat_ttl).await {
             Ok(aborted) => Response::Reap(aborted),
             Err(e) => Response::Err(ProtoError::Ledger(e)),
         },
@@ -114,10 +117,10 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
             response_id,
             starting_after,
             limit,
-            wait_ms,
+            wait,
         } => match world
             .event_log
-            .read_after(&response_id, starting_after, limit, wait_ms)
+            .read_after(&response_id, starting_after, limit, wait)
             .await
         {
             Ok(events) => Response::EventLogReadAfter(events.into_iter().map(Into::into).collect()),
@@ -126,8 +129,8 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
         Request::EventLogClose {
             response_id,
             now_ms,
-            retain_ms,
-        } => match world.event_log.close(&response_id, now_ms, retain_ms).await {
+            retain,
+        } => match world.event_log.close(&response_id, now_ms, retain).await {
             Ok(()) => Response::EventLogClose,
             Err(e) => Response::Err(ProtoError::EventLog(e)),
         },
@@ -235,10 +238,10 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
             id,
             starting_after,
             limit,
-            wait_ms,
+            wait,
         } => match world
             .conversation
-            .read_after(&tenant, &id, starting_after, limit, wait_ms)
+            .read_after(&tenant, &id, starting_after, limit, wait)
             .await
         {
             Ok(events) => Response::ConversationReadAfter(events),
@@ -258,27 +261,11 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
             tenant,
             id,
             response_id,
-            input_items,
-            output_items,
-            reasoning,
-            usage,
-            status,
+            commit,
             now_ms,
         } => match world
             .conversation
-            .append_turn(
-                &tenant,
-                &id,
-                &response_id,
-                TurnCommit {
-                    input_items,
-                    output_items,
-                    reasoning,
-                    usage,
-                    status,
-                },
-                now_ms,
-            )
+            .append_turn(&tenant, &id, &response_id, commit, now_ms)
             .await
         {
             Ok(idx) => Response::ConversationAppendTurn(idx),

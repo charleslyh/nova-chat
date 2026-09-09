@@ -16,6 +16,7 @@ use strum::AsRefStr;
 use thiserror::Error;
 
 use super::content::{ContentPart, ContentViolation};
+use super::limits::ProtocolLimits;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,13 +86,26 @@ impl ResponseItem {
         self.as_ref()
     }
 
+    /// The stream identity of an item: a tool `call_id` for tool items, the message
+    /// id otherwise.
+    ///
+    /// Lives here rather than in the producer that streams it, because "which id
+    /// does this item answer to" is a property of the item.
+    pub fn stream_item_id(&self) -> &str {
+        match self {
+            ResponseItem::FunctionCall { call_id, .. }
+            | ResponseItem::FunctionCallOutput { call_id, .. } => call_id,
+            ResponseItem::Message { id, .. } => id.as_deref().unwrap_or_default(),
+        }
+    }
+
     /// Chain closure predicate (INV-47 / CR-12).
     ///
-    /// Every item this service can *emit* must be acceptable as *input* on the
-    /// next turn, otherwise our own context chain breaks without any external
-    /// caller being involved. Because the enum is closed and every variant is
-    /// accepted on input, this is total — the L0 assertion exists to catch a
-    /// future variant being added on the output side only.
+    /// Every item this service can *emit* must be acceptable as *input* on the next
+    /// turn, otherwise our own context chain breaks without any external caller
+    /// being involved. Because the enum is closed and every variant is accepted on
+    /// input, this is total — the assertion exists to catch a future variant being
+    /// added on the output side only.
     pub fn is_acceptable_as_input(&self) -> bool {
         match self {
             ResponseItem::Message { .. }
@@ -118,14 +132,14 @@ impl ResponseItem {
         }
     }
 
-    pub fn validate(&self) -> Result<(), ItemViolation> {
+    pub fn validate(&self, limits: &ProtocolLimits) -> Result<(), ItemViolation> {
         match self {
             ResponseItem::Message { content, .. } => {
                 if content.is_empty() {
                     return Err(ItemViolation::EmptyMessageContent);
                 }
                 for part in content {
-                    part.validate_references()?;
+                    part.validate_references(limits)?;
                 }
                 Ok(())
             }
@@ -172,6 +186,10 @@ impl ResponseItem {
 mod tests {
     use super::*;
 
+    fn limits() -> ProtocolLimits {
+        ProtocolLimits::default()
+    }
+
     #[test]
     fn round_trips_message() {
         let item = ResponseItem::user_text("hello");
@@ -217,7 +235,7 @@ mod tests {
 
     #[test]
     fn every_variant_is_valid_input_chain_closure() {
-        let items = [
+        for item in [
             ResponseItem::user_text("a"),
             ResponseItem::assistant_text("b"),
             ResponseItem::FunctionCall {
@@ -233,8 +251,7 @@ mod tests {
                 id: None,
                 status: None,
             },
-        ];
-        for item in items {
+        ] {
             assert!(
                 item.is_acceptable_as_input(),
                 "chain closure violated by {}",
@@ -255,8 +272,35 @@ mod tests {
             status: None,
         };
         assert_eq!(
-            empty.validate(),
+            empty.validate(&limits()),
             Err(ItemViolation::EmptyMessageContent)
         );
+        assert_eq!(
+            ResponseItem::FunctionCall {
+                call_id: String::new(),
+                name: "n".into(),
+                arguments: "{}".into(),
+                id: None,
+                status: None,
+            }
+            .validate(&limits()),
+            Err(ItemViolation::EmptyCallId)
+        );
+    }
+
+    #[test]
+    fn stream_item_id_prefers_the_call_id() {
+        assert_eq!(
+            ResponseItem::FunctionCall {
+                call_id: "call_1".into(),
+                name: "n".into(),
+                arguments: String::new(),
+                id: Some("ignored".into()),
+                status: None,
+            }
+            .stream_item_id(),
+            "call_1"
+        );
+        assert_eq!(ResponseItem::user_text("x").stream_item_id(), "");
     }
 }

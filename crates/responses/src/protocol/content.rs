@@ -1,13 +1,14 @@
 //! Content parts — closed set (D22 §subset).
 //!
-//! Inline binary is absent *by construction*: images and files carry a file id
-//! or an `https` reference, never bytes. That is what keeps the chain byte
-//! budget (`parameters.md` §4.5) meaningful.
+//! Inline binary is absent *by construction*: images and files carry a file id or
+//! an `https` reference, never bytes. That is what keeps the chain byte budget
+//! (`parameters.md` §4.5) meaningful.
 
 use serde::{Deserialize, Serialize};
 use strum::AsRefStr;
 use thiserror::Error;
 
+use super::limits::ProtocolLimits;
 use super::url_guard::{ensure_public_https, UrlRejection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,8 +69,8 @@ impl ContentPart {
         self.as_ref()
     }
 
-    /// Byte cost counted against the chain budget. References are short, which
-    /// is precisely why the 1 MiB chain ceiling remains effective.
+    /// Byte cost counted against the chain budget. References are short, which is
+    /// precisely why the 1 MiB chain ceiling remains effective.
     pub fn byte_len(&self) -> usize {
         match self {
             ContentPart::InputText { text } | ContentPart::OutputText { text } => text.len(),
@@ -87,42 +88,28 @@ impl ContentPart {
 
     /// Validate reference shape and URL safety.
     ///
-    /// Ownership of a `file_id` is **not** checked here: that is the file
-    /// service's responsibility and is explicitly outside this service's
-    /// boundary (`spec.md` §4.3).
-    pub fn validate_references(&self) -> Result<(), ContentViolation> {
-        match self {
+    /// Ownership of a `file_id` is **not** checked here: that is the file service's
+    /// responsibility and is explicitly outside this service's boundary
+    /// (`spec.md` §4.3).
+    pub fn validate_references(&self, limits: &ProtocolLimits) -> Result<(), ContentViolation> {
+        let (part, url, file_id) = match self {
             ContentPart::InputImage {
                 image_url, file_id, ..
-            } => {
-                match (image_url.as_deref(), file_id.as_deref()) {
-                    (None, None) => Err(ContentViolation::MissingReference {
-                        part: "input_image",
-                    }),
-                    (Some(url), _) => ensure_public_https(url).map_err(|source| {
-                        ContentViolation::RejectedUrl {
-                            part: "input_image",
-                            source,
-                        }
-                    }),
-                    (None, Some(_)) => Ok(()),
-                }
-            }
+            } => ("input_image", image_url.as_deref(), file_id.as_deref()),
             ContentPart::InputFile {
-                file_id, file_url, ..
-            } => match (file_url.as_deref(), file_id.as_deref()) {
-                (None, None) => Err(ContentViolation::MissingReference { part: "input_file" }),
-                (Some(url), _) => {
-                    ensure_public_https(url).map_err(|source| ContentViolation::RejectedUrl {
-                        part: "input_file",
-                        source,
-                    })
-                }
-                (None, Some(_)) => Ok(()),
-            },
+                file_url, file_id, ..
+            } => ("input_file", file_url.as_deref(), file_id.as_deref()),
             ContentPart::InputText { .. }
             | ContentPart::OutputText { .. }
-            | ContentPart::Refusal { .. } => Ok(()),
+            | ContentPart::Refusal { .. } => return Ok(()),
+        };
+        match (url, file_id) {
+            (None, None) => Err(ContentViolation::MissingReference { part }),
+            // A url is checked whenever present: a part carrying both must not slip
+            // an unvetted url through on the strength of its file id.
+            (Some(url), _) => ensure_public_https(url, limits.max_url_bytes)
+                .map_err(|source| ContentViolation::RejectedUrl { part, source }),
+            (None, Some(_)) => Ok(()),
         }
     }
 }
@@ -134,6 +121,10 @@ fn opt_len(v: &Option<String>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn limits() -> ProtocolLimits {
+        ProtocolLimits::default()
+    }
 
     #[test]
     fn round_trips_text_parts() {
@@ -160,27 +151,41 @@ mod tests {
     #[test]
     fn rejects_inline_base64_image() {
         // No `b64_json`/`data` field exists at all …
-        assert!(serde_json::from_str::<ContentPart>(
-            r#"{"type":"input_image","image_data":"AAAA"}"#
-        )
-        .is_err());
+        assert!(
+            serde_json::from_str::<ContentPart>(r#"{"type":"input_image","image_data":"AAAA"}"#)
+                .is_err()
+        );
         // … and a data: URL is stopped by the scheme guard.
         let part: ContentPart = serde_json::from_str(
             r#"{"type":"input_image","image_url":"data:image/png;base64,AAAA"}"#,
         )
         .unwrap();
         assert!(matches!(
-            part.validate_references(),
+            part.validate_references(&limits()),
             Err(ContentViolation::RejectedUrl { .. })
         ));
     }
 
     #[test]
     fn requires_at_least_one_reference() {
-        let part: ContentPart = serde_json::from_str(r#"{"type":"input_image"}"#).unwrap();
+        for json in [r#"{"type":"input_image"}"#, r#"{"type":"input_file"}"#] {
+            let part: ContentPart = serde_json::from_str(json).unwrap();
+            assert!(matches!(
+                part.validate_references(&limits()),
+                Err(ContentViolation::MissingReference { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_file_id_does_not_excuse_an_unsafe_url() {
+        let part: ContentPart = serde_json::from_str(
+            r#"{"type":"input_image","image_url":"https://127.0.0.1/x.png","file_id":"f1"}"#,
+        )
+        .unwrap();
         assert!(matches!(
-            part.validate_references(),
-            Err(ContentViolation::MissingReference { .. })
+            part.validate_references(&limits()),
+            Err(ContentViolation::RejectedUrl { .. })
         ));
     }
 
@@ -191,11 +196,18 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            part.validate_references(),
+            part.validate_references(&limits()),
             Err(ContentViolation::RejectedUrl {
                 source: UrlRejection::PrivateAddress,
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_file_reference_alone_is_accepted() {
+        let part: ContentPart =
+            serde_json::from_str(r#"{"type":"input_file","file_id":"file_1"}"#).unwrap();
+        assert!(part.validate_references(&limits()).is_ok());
     }
 }

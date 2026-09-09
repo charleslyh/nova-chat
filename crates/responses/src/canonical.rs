@@ -10,17 +10,18 @@
 //! - all strings normalised to NFC
 //! - numbers use `serde_json`'s shortest-round-trip rendering
 //!
-//! This is a **Nova-private canonical form, not RFC 8785 (JCS)**: JCS renders
-//! numbers with ECMAScript `Number::toString` semantics, which differs from
-//! Rust's rendering for some floating-point values. Tags produced here verify
-//! only against this implementation. That is sufficient because signing and
-//! verification always run the same code (every adapter shares this module);
-//! if a cross-implementation check is ever needed, switch to a real JCS crate
-//! rather than patching this one.
+//! This is a **Nova-private canonical form, not RFC 8785 (JCS)**: JCS renders numbers
+//! with ECMAScript `Number::toString` semantics, which differs from Rust's rendering
+//! for some floating-point values. Tags produced here verify only against this
+//! implementation. That is sufficient because signing and verification always run the
+//! same code (every adapter shares this module); if a cross-implementation check is
+//! ever needed, switch to a real JCS crate rather than patching this one.
 //!
-//! Recursion depth is bounded by the parser limit and by
-//! [`crate::protocol::InputLimits::validate_depth`], both of which run before
-//! anything reaches this module.
+//! Recursion is bounded by the parser limit and by
+//! [`crate::protocol::ProtocolLimits::validate_depth`], both of which run before
+//! anything reaches this module — the same reason the depth *measurement* is
+//! iterative while this writer is not: a value that got here has already been proven
+//! shallow.
 
 use serde_json::{Map, Value};
 use unicode_normalization::UnicodeNormalization;
@@ -84,8 +85,13 @@ fn write_json_string(s: &str, out: &mut String) {
 
 /// Canonical encoding of an item list, used as the signing input for stored
 /// input/output items.
+///
+/// Items are a closed set of plain data, so encoding them cannot fail; saying so with
+/// `expect` rather than `unwrap_or(Value::Null)` matters, because the fallback would
+/// have quietly signed the string `"null"` for every item list — a fingerprint that
+/// verifies against any tampering at all.
 pub fn canonical_items(items: &[ResponseItem]) -> String {
-    let value = serde_json::to_value(items).unwrap_or(Value::Null);
+    let value = serde_json::to_value(items).expect("response items are plain data");
     canonical_json(&value)
 }
 

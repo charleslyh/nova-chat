@@ -1,42 +1,22 @@
-//! In-process counter sink used when no real metrics backend is mounted.
+//! The gateway's default metrics sink.
 //!
-//! Lives here rather than in `nova-responses` because a concrete `MetricsSink`
-//! is an assembly concern (D25): the domain crate defines the port, the gateway
-//! supplies the default implementation.
+//! A no-op: the gateway process has no metrics consumer of its own, and this keeps the
+//! assembly identical whether or not an operator wires a real backend later (D25 — the
+//! domain crate defines the port, the assembler supplies the implementation).
+//!
+//! This used to be a `CountingMetrics` with a `get` readback for test assertions, marked
+//! `#[allow(dead_code)]`. A readback is a *verification* capability — a real backend
+//! (Prometheus, OTel) cannot answer "what is the current counter" for a name it only ever
+//! increments — so it belongs on the verification-side double (`MemMetrics` in
+//! `verify/mock`), not in the production assembly crate. Stripped of the readback, a
+//! counter that accumulates into a map nobody reads is just a no-op that costs memory, so
+//! the honest default is to do nothing.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use nova_responses::ports::MetricsSink;
 
-use nova_responses::MetricsSink;
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopMetrics;
 
-/// A process-local counter, the default when no metrics backend is wired. Test
-/// harnesses can inject their own (or this one) to assert counters.
-#[derive(Default)]
-pub struct CountingMetrics {
-    inner: Mutex<HashMap<String, u64>>,
-}
-
-impl CountingMetrics {
-    /// Readback for test assertions. Kept off the `MetricsSink` trait: the port
-    /// is write-only, since a real backend cannot answer counter reads.
-    #[allow(dead_code)]
-    pub fn get(&self, name: &str) -> u64 {
-        self.inner
-            .lock()
-            .expect("metrics lock poisoned")
-            .get(name)
-            .copied()
-            .unwrap_or(0)
-    }
-}
-
-impl MetricsSink for CountingMetrics {
-    fn incr(&self, name: &str, value: u64) {
-        *self
-            .inner
-            .lock()
-            .expect("metrics lock poisoned")
-            .entry(name.to_string())
-            .or_insert(0) += value;
-    }
+impl MetricsSink for NoopMetrics {
+    fn incr(&self, _name: &str, _value: u64) {}
 }

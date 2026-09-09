@@ -22,9 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nova_responses::{
-    AppendEvent, EventLogError, LedgerError, ResponseEvent, ResponseEventLog, ResponseId,
-    ResponseLedger, StoreError,
+use nova_responses::{AppendEvent, ResponseEvent, ResponseId};
+use nova_responses::ports::{
+    AdmissionControl, EventLogError, LedgerError, ResponseEventLog, StoreError,
 };
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -130,9 +130,9 @@ impl ResponseEventLog for MemResponseEventLog {
         }
         // Attempt fence before the write (INV-6): a reaped holder must not be
         // able to inject events after its attempt was superseded.
-        if let Some(attempt) = event.attempt {
+        if let Some(attempt) = event.attempt() {
             self.ledger
-                .check_attempt_sync(&event.response_id, attempt)
+                .check_attempt_sync(event.response_id(), attempt)
                 .map_err(|e| match e {
                     LedgerError::StaleAttempt => EventLogError::StaleAttempt,
                     LedgerError::Store(StoreError::ReadOnly) => {
@@ -145,14 +145,14 @@ impl ResponseEventLog for MemResponseEventLog {
 
         let seq = {
             let mut g = self.inner.lock();
-            if !g.logs.contains_key(&event.response_id) && g.logs.len() >= self.max_logs {
+            if !g.logs.contains_key(event.response_id()) && g.logs.len() >= self.max_logs {
                 // Node-level memory protection. Distinct from per-response
                 // eviction: here we refuse to take on new work at all.
                 return Err(EventLogError::CapacityExceeded);
             }
             let log = g
                 .logs
-                .entry(event.response_id.clone())
+                .entry(event.response_id().clone())
                 .or_insert_with(|| ResponseLog::new(self.capacity_per_response));
             if log.swept {
                 return Err(EventLogError::Expired);
@@ -175,9 +175,9 @@ impl ResponseEventLog for MemResponseEventLog {
         response_id: &ResponseId,
         starting_after: Option<u64>,
         limit: usize,
-        wait_ms: u64,
+        wait: Duration,
     ) -> Result<Vec<ResponseEvent>, EventLogError> {
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+        let deadline = tokio::time::Instant::now() + wait;
         loop {
             {
                 let g = self.inner.lock();
@@ -227,13 +227,13 @@ impl ResponseEventLog for MemResponseEventLog {
         &self,
         response_id: &ResponseId,
         now_ms: u64,
-        retain_ms: u64,
+        retain: Duration,
     ) -> Result<(), EventLogError> {
         let mut g = self.inner.lock();
         let Some(log) = g.logs.get_mut(response_id) else {
             return Err(EventLogError::Unknown);
         };
-        log.retain_ms = retain_ms;
+        log.retain_ms = retain.as_millis() as u64;
         log.terminal_at_ms = Some(now_ms);
         Ok(())
     }

@@ -4,7 +4,7 @@
 
 ## 原则：验证结构与能力服务分离
 
-- **能力服务**（`crates/responses`、`crates/gateway`、`crates/agent-runtime`、`crates/sweep`）
+- **能力服务**（`crates/responses`、`crates/gateway`、`crates/agent-runtime`）
   不包含任何验证专用代码。本目录只通过它们的公开接口驱动：
   - 页面 → gateway 的公开 HTTP API（`/v1/conversations`、`/v1/responses`、…）
   - 验证进程 → `verify/mock/agentd`（`--scheduler http`，真实 chat completions）
@@ -23,8 +23,8 @@ export NOVA_CHAT_MODEL="gpt-4o"                          # 可选：固定模型
 
 然后打开 http://127.0.0.1:8083
 
-`run.sh` 会依次拉起 mem 后端的 mock-server、mock-sweep、mock-agentd
-（`--scheduler http`）、gateway，以及一个 `python3 -m http.server` 静态服务承载页面。
+`run.sh` 会依次拉起 mem 后端的 mock-server、mock-agentd
+（`--scheduler http`）、gateway（内嵌 sweep），以及一个 `python3 -m http.server` 静态服务承载页面。
 Ctrl+C 全部停止。
 
 > 需要 Python3（仅用于静态页面服务）。没有 Python3 也可以：直接用浏览器打开

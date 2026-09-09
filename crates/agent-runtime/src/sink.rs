@@ -3,33 +3,31 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nova_responses::{
-    AppendEvent, Attempt, EventBody, EventLogError, ResponseEventKind, ResponseEventLog,
-    ResponseId, ResponseItem,
-};
+use nova_responses::ports::{EventLogError, ResponseEventLog};
+use nova_responses::{AppendEvent, Attempt, ContentPart, ResponseId, ResponseItem};
 
 use crate::runner::{AgentEventSink, SinkError, SinkVerdict};
 
 /// Streams agent events into this response's event log.
 ///
-/// Owns the per-stream state (output index, current item id, content index,
-/// accumulated reasoning) and the fencing `attempt`: an append refused as stale
-/// flips `stopped`, and every later call returns [`SinkVerdict::Stop`].
+/// Owns the per-stream state (output index, current item id, content index, accumulated
+/// reasoning) and the fencing `attempt`: an append refused as stale flips `stopped`, and
+/// every later call returns [`SinkVerdict::Stop`].
 pub struct EventSink {
     event_log: Arc<dyn ResponseEventLog>,
     response_id: ResponseId,
     attempt: Attempt,
     stopped: bool,
-    /// Index of the output item currently being streamed, mirroring the
-    /// OpenAI `response.output_item.*` events' `output_index`.
+    /// Index of the output item currently being streamed, mirroring the OpenAI
+    /// `response.output_item.*` events' `output_index`.
     output_index: u32,
-    /// Id of the output item currently being streamed, carried on delta events
-    /// as `item_id`.
+    /// Id of the output item currently being streamed, carried on delta events as
+    /// `item_id`.
     current_item_id: Option<String>,
     /// Index of the content part currently being streamed.
     current_content_index: Option<u32>,
-    /// Reasoning / thinking text accumulated across the whole loop, persisted
-    /// with the final output (render-only, never re-enters context).
+    /// Reasoning / thinking text accumulated across the whole loop, persisted with the
+    /// final output (render-only, never re-enters context).
     reasoning: String,
 }
 
@@ -61,24 +59,30 @@ impl EventSink {
         &self.reasoning
     }
 
-    async fn push(
-        &mut self,
-        kind: ResponseEventKind,
-        body: EventBody,
-    ) -> Result<SinkVerdict, SinkError> {
+    fn id(&self) -> ResponseId {
+        self.response_id.clone()
+    }
+
+    /// The index of the item currently open. `output_index` counts items *added*, so
+    /// the open one is the previous number.
+    fn current_output_index(&self) -> u32 {
+        self.output_index.saturating_sub(1)
+    }
+
+    fn current_item(&self) -> String {
+        self.current_item_id.clone().unwrap_or_default()
+    }
+
+    /// Append one already-well-formed event.
+    ///
+    /// Every caller below builds its event through an [`AppendEvent`] constructor, so
+    /// there is no path here that can pair an event name with a body that does not
+    /// belong to it.
+    async fn push(&mut self, event: AppendEvent) -> Result<SinkVerdict, SinkError> {
         if self.stopped {
             return Ok(SinkVerdict::Stop);
         }
-        match self
-            .event_log
-            .append(AppendEvent {
-                response_id: self.response_id.clone(),
-                kind,
-                attempt: Some(self.attempt),
-                body,
-            })
-            .await
-        {
+        match self.event_log.append(event).await {
             Ok(_) => Ok(SinkVerdict::Continue),
             Err(EventLogError::StaleAttempt) => {
                 self.stopped = true;
@@ -87,70 +91,45 @@ impl EventSink {
             Err(e) => Err(SinkError::Transport(e.to_string())),
         }
     }
-
-    async fn push_item(
-        &mut self,
-        kind: ResponseEventKind,
-        output_index: u32,
-        item: &ResponseItem,
-    ) -> Result<SinkVerdict, SinkError> {
-        let item = serde_json::to_value(item).unwrap_or_default();
-        self.push(kind, EventBody::Item { output_index, item })
-            .await
-    }
-}
-
-/// The stream identity of an output item: a tool `call_id` for tool items, the
-/// message id otherwise.
-fn item_id_of(item: &ResponseItem) -> String {
-    match item {
-        ResponseItem::FunctionCall { call_id, .. }
-        | ResponseItem::FunctionCallOutput { call_id, .. } => call_id.clone(),
-        ResponseItem::Message { id, .. } => id.clone().unwrap_or_default(),
-    }
 }
 
 #[async_trait]
 impl AgentEventSink for EventSink {
     async fn text_delta(&mut self, text: &str) -> Result<SinkVerdict, SinkError> {
-        self.push(
-            ResponseEventKind::OutputTextDelta,
-            EventBody::Delta {
-                item_id: self.current_item_id.clone().unwrap_or_default(),
-                output_index: self.output_index.saturating_sub(1),
-                content_index: self.current_content_index,
-                delta: text.to_string(),
-            },
-        )
-        .await
+        let event = AppendEvent::text_delta(
+            self.id(),
+            self.attempt,
+            self.current_item(),
+            self.current_output_index(),
+            self.current_content_index.unwrap_or_default(),
+            text,
+        );
+        self.push(event).await
     }
 
     async fn reasoning_text_delta(&mut self, text: &str) -> Result<SinkVerdict, SinkError> {
         self.reasoning.push_str(text);
-        self.push(
-            ResponseEventKind::ReasoningTextDelta,
-            EventBody::Delta {
-                item_id: String::new(),
-                output_index: 0,
-                content_index: None,
-                delta: text.to_string(),
-            },
-        )
-        .await
+        let event = AppendEvent::reasoning_text_delta(self.id(), self.attempt, text);
+        self.push(event).await
     }
 
     async fn output_item_added(&mut self, item: &ResponseItem) -> Result<SinkVerdict, SinkError> {
         let index = self.output_index;
         self.output_index += 1;
-        self.current_item_id = Some(item_id_of(item));
-        self.push_item(ResponseEventKind::OutputItemAdded, index, item)
-            .await
+        self.current_item_id = Some(item.stream_item_id().to_string());
+        let event = AppendEvent::item(self.id(), self.attempt, false, index, item.clone());
+        self.push(event).await
     }
 
     async fn output_item_done(&mut self, item: &ResponseItem) -> Result<SinkVerdict, SinkError> {
-        let index = self.output_index.saturating_sub(1);
-        self.push_item(ResponseEventKind::OutputItemDone, index, item)
-            .await
+        let event = AppendEvent::item(
+            self.id(),
+            self.attempt,
+            true,
+            self.current_output_index(),
+            item.clone(),
+        );
+        self.push(event).await
     }
 
     async fn function_call_arguments_delta(
@@ -158,16 +137,14 @@ impl AgentEventSink for EventSink {
         item_id: &str,
         delta: &str,
     ) -> Result<SinkVerdict, SinkError> {
-        self.push(
-            ResponseEventKind::FunctionCallArgumentsDelta,
-            EventBody::Delta {
-                item_id: item_id.to_string(),
-                output_index: self.output_index.saturating_sub(1),
-                content_index: None,
-                delta: delta.to_string(),
-            },
-        )
-        .await
+        let event = AppendEvent::arguments_delta(
+            self.id(),
+            self.attempt,
+            item_id,
+            self.current_output_index(),
+            delta,
+        );
+        self.push(event).await
     }
 
     async fn function_call_arguments_done(
@@ -175,16 +152,14 @@ impl AgentEventSink for EventSink {
         item_id: &str,
         arguments: &str,
     ) -> Result<SinkVerdict, SinkError> {
-        let index = self.output_index.saturating_sub(1);
-        self.push(
-            ResponseEventKind::FunctionCallArgumentsDone,
-            EventBody::Arguments {
-                output_index: index,
-                item_id: item_id.to_string(),
-                arguments: arguments.to_string(),
-            },
-        )
-        .await
+        let event = AppendEvent::arguments(
+            self.id(),
+            self.attempt,
+            self.current_output_index(),
+            item_id,
+            arguments,
+        );
+        self.push(event).await
     }
 
     async fn content_part_added(
@@ -193,30 +168,30 @@ impl AgentEventSink for EventSink {
         content_index: u32,
     ) -> Result<SinkVerdict, SinkError> {
         self.current_content_index = Some(content_index);
-        let part = serde_json::json!({ "type": "output_text", "text": "" });
-        self.push(
-            ResponseEventKind::ContentPartAdded,
-            EventBody::Part {
-                item_id: item_id.to_string(),
-                output_index: self.output_index.saturating_sub(1),
-                content_index,
-                part,
+        let event = AppendEvent::content_part(
+            self.id(),
+            self.attempt,
+            false,
+            item_id,
+            self.current_output_index(),
+            content_index,
+            ContentPart::OutputText {
+                text: String::new(),
             },
-        )
-        .await
+        );
+        self.push(event).await
     }
 
     async fn output_text_done(&mut self, text: &str) -> Result<SinkVerdict, SinkError> {
-        self.push(
-            ResponseEventKind::OutputTextDone,
-            EventBody::Text {
-                item_id: self.current_item_id.clone().unwrap_or_default(),
-                output_index: self.output_index.saturating_sub(1),
-                content_index: self.current_content_index.unwrap_or_default(),
-                text: text.to_string(),
-            },
-        )
-        .await
+        let event = AppendEvent::output_text_done(
+            self.id(),
+            self.attempt,
+            self.current_item(),
+            self.current_output_index(),
+            self.current_content_index.unwrap_or_default(),
+            text,
+        );
+        self.push(event).await
     }
 
     async fn content_part_done(
@@ -225,16 +200,17 @@ impl AgentEventSink for EventSink {
         content_index: u32,
         text: &str,
     ) -> Result<SinkVerdict, SinkError> {
-        let part = serde_json::json!({ "type": "output_text", "text": text });
-        self.push(
-            ResponseEventKind::ContentPartDone,
-            EventBody::Part {
-                item_id: item_id.to_string(),
-                output_index: self.output_index.saturating_sub(1),
-                content_index,
-                part,
+        let event = AppendEvent::content_part(
+            self.id(),
+            self.attempt,
+            true,
+            item_id,
+            self.current_output_index(),
+            content_index,
+            ContentPart::OutputText {
+                text: text.to_string(),
             },
-        )
-        .await
+        );
+        self.push(event).await
     }
 }

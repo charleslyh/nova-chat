@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use nova_agent_runtime::{AgentEventSink, SinkError};
+use nova_responses::protocol::ProtocolLimits;
 
 use crate::completions::{CompletionsOutcome, CompletionsRequest};
 
@@ -69,7 +70,14 @@ impl SchedulerError {
 }
 
 /// Reject an outcome that cannot be stored, before it is submitted.
-pub fn validate_outcome(outcome: &CompletionsOutcome) -> Result<(), SchedulerError> {
+///
+/// `limits` are the same bounds the ingress applies to caller input: our own output has to
+/// clear them too, or the chain would break on the next turn without any external caller
+/// being involved (INV-47).
+pub fn validate_outcome(
+    outcome: &CompletionsOutcome,
+    limits: &ProtocolLimits,
+) -> Result<(), SchedulerError> {
     if outcome.items.is_empty() {
         return Err(SchedulerError::EmptyOutcome);
     }
@@ -79,7 +87,7 @@ pub fn validate_outcome(outcome: &CompletionsOutcome) -> Result<(), SchedulerErr
                 item_type: item.item_type().to_string(),
             });
         }
-        item.validate()
+        item.validate(limits)
             .map_err(|e| SchedulerError::InvalidOutput(e.to_string()))?;
     }
     Ok(())

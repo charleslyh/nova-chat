@@ -2,13 +2,11 @@
 resolver = "2"
 members = [
     "crates/agent-runtime",
-    "crates/sweep",
     "crates/responses",
     "gateway",
     "verify/mock/server",
     "verify/mock/client",
     "verify/mock/agentd",
-    "verify/mock/sweep",
     "verify/conformance",
     "verify/harness",
     "verify/xtask",
@@ -21,11 +19,9 @@ license = "MIT"
 
 [workspace.dependencies]
 nova-responses = { path = "crates/responses" }
-nova-responses-sweep = { path = "crates/sweep" }
 mock-server = { path = "verify/mock/server" }
 mock-client = { path = "verify/mock/client" }
 mock-agentd = { path = "verify/mock/agentd" }
-mock-sweep = { path = "verify/mock/sweep" }
 nova-agent-runtime = { path = "crates/agent-runtime" }
 conformance = { path = "verify/conformance" }
 harness = { path = "verify/harness" }
@@ -54,5 +50,6 @@ unicode-normalization = "0.1"
 # SSRF defence in depth for image/file reference URLs (SEC-6).
 url = "2"
 # Hex encoding for integrity tags.
+hex = "0.4"
 # Enum-to-string derivation so wire names have one source of truth.
 strum = { version = "0.26", features = ["derive"] }

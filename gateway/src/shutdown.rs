@@ -25,14 +25,14 @@ pub async fn drain(state: AppState) {
 
     state.stop_accepting();
     info!(
-        node_tag = state.cfg.node_tag.as_str(),
+        node_tag = state.responses_cfg().node_tag.as_str(),
         drain_timeout_ms = state.cfg.drain_timeout_ms,
         "shutdown signal received; refusing new responses and draining"
     );
     state.metrics.incr("drain_started", 1);
 
     let deadline =
-        tokio::time::Instant::now() + Duration::from_millis(state.cfg.drain_timeout_ms);
+        tokio::time::Instant::now() + state.cfg.drain_timeout();
     let mut last_reported = usize::MAX;
 
     loop {

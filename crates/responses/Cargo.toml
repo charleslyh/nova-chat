@@ -2,17 +2,15 @@
 name = "nova-responses"
 version.workspace = true
 edition.workspace = true
-description = "Responses 领域 + 能力层 + 后台维护，不含具体存储适配器（经端口注入）"
+description = "Responses 领域 + 能力层，不含具体存储适配器（经端口注入）"
 
 [dependencies]
-anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 # NFC normalisation for stable content fingerprints (INV-44).
@@ -23,4 +21,10 @@ url = { workspace = true }
 # drift apart on the signing scheme.
 hmac = { workspace = true }
 sha2 = { workspace = true }
+hex = { workspace = true }
+# Wire names for enums have exactly one definition (the derive), not two.
 strum = { workspace = true }
+# Parsing *and* validating config is the library's job, so the two cannot be done
+# separately; choosing a file to read is the assembler's, which is why there is no
+# path-taking loader here.
+toml = { workspace = true }

@@ -3,11 +3,13 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use nova_responses::{
-    AbortedClaim, AgentId, Attempt, ClaimedResponse, CreateOutcome, IdempotencyKey, LedgerError,
-    ResponseId, ResponseLedger, ResponseRecord, ResponseStatus, StoreError, TenantId, Usage,
+use nova_responses::{AgentId, Attempt, IdempotencyKey, ResponseId, ResponseRecord, ResponseStatus, TenantId, Usage};
+use nova_responses::ports::{
+    AbortedClaim, AdmissionControl, ClaimedResponse, CreateOutcome, LedgerError, ResponseLedger,
+    StoreError,
 };
 
 use mock_server::proto::{ProtoError, Request, Response};
@@ -81,7 +83,7 @@ impl ResponseLedger for MemLedgerClient {
         &self,
         agent_id: AgentId,
         now_ms: u64,
-        exec_ttl_ms: u64,
+        exec_ttl: Duration,
     ) -> Result<Option<ClaimedResponse>, LedgerError> {
         if self.read_only.load(Ordering::SeqCst) {
             return Err(LedgerError::Store(StoreError::ReadOnly));
@@ -91,7 +93,7 @@ impl ResponseLedger for MemLedgerClient {
             Request::LedgerClaim {
                 agent_id,
                 now_ms,
-                exec_ttl_ms,
+                exec_ttl,
             },
         )
         .await?
@@ -176,13 +178,13 @@ impl ResponseLedger for MemLedgerClient {
     async fn reap(
         &self,
         now_ms: u64,
-        heartbeat_ttl_ms: u64,
+        heartbeat_ttl: Duration,
     ) -> Result<Vec<AbortedClaim>, LedgerError> {
         match ledger_rpc(
             &self.rpc,
             Request::LedgerReap {
                 now_ms,
-                heartbeat_ttl_ms,
+                heartbeat_ttl,
             },
         )
         .await?
@@ -304,6 +306,9 @@ impl ResponseLedger for MemLedgerClient {
         }
     }
 
+}
+
+impl AdmissionControl for MemLedgerClient {
     fn set_read_only(&self, enabled: bool) {
         self.read_only.store(enabled, Ordering::SeqCst);
     }

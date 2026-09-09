@@ -167,15 +167,7 @@ async fn procs(action: &str) -> Result<()> {
             wait_port("127.0.0.1:19000", Duration::from_secs(20)).await?;
             wait_port("127.0.0.1:19001", Duration::from_secs(20)).await?;
 
-            // 2. Standalone sweep process: single owner of reap/retention/expiry.
-            //    Short heartbeat TTL so lost-claim recovery is observable in tests.
-            start_bin(
-                "mock-sweep",
-                &["--heartbeat-ttl-ms", "2000", "--retain-after-terminal-ms", "60000"],
-                run_dir.join("sweep.pid"),
-            )?;
-
-            // 3. Execution daemon over the shared carrier, with a scripted scheduler
+            // 2. Execution daemon over the shared carrier, with a scripted scheduler
             //    (normal answers plus a `hang` rule for overload scenarios).
             start_bin(
                 "mock-agentd",
@@ -184,18 +176,19 @@ async fn procs(action: &str) -> Result<()> {
                     "scripted",
                     "--scheduler-script",
                     "verify/config/l2-agent-script.yaml",
-                    // The sweep fixture reaps at 2000ms; the heartbeat must fire
-                    // well inside that or any generation the agent does not finish
-                    // instantly gets reaped mid-flight (see the default of 30s
-                    // against a 2s TTL, which is exactly the mismatch that made
-                    // background-then-subscribe flake).
+                    // Each gateway sweeps in-gateway at a 2000ms heartbeat TTL; the
+                    // heartbeat must fire well inside that or any generation the
+                    // agent does not finish instantly gets reaped mid-flight (see
+                    // the default of 30s against a 2s TTL, which is exactly the
+                    // mismatch that made background-then-subscribe flake).
                     "--heartbeat-interval-ms",
                     "500",
                 ],
                 run_dir.join("agentd.pid"),
             )?;
 
-            // 4. Three peer gateways over the shared carrier (no embedded execution).
+            // 3. Three peer gateways over the shared carrier (no embedded execution;
+            //    each reaps lost claims in-gateway).
             for (tag, port) in [("node-a", 18080), ("node-b", 18081), ("node-c", 18082)] {
                 start_bin(
                     "nova-responses-gateway",

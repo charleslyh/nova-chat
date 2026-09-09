@@ -1,18 +1,24 @@
-//! Conversation store over the shared in-memory state (D27).
+//! Conversation store over the shared in-memory state (D27/D30).
 //!
-//! Scope: **verification only** (L0–L2). The sql adapter is the production
-//! carrier; this exists so the same port contract can be asserted without a
-//! database (D17).
+//! Four impl blocks, one per port facet: records, snapshot, turn lock, event stream. The
+//! composition [`ConversationStore`] comes free from its blanket impl, so assembly still
+//! mounts one object while each consumer depends only on the facet it uses.
+//!
+//! Scope: **verification only** (L0–L2). The sql adapter is the production carrier; this
+//! exists so the same port contract can be asserted without a database (D17).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use nova_responses::ports::{
+    ConversationError, ConversationEvents, ConversationRepo, ConversationSnapshots, StoreError,
+    TurnLock,
+};
 use nova_responses::{
-    Conversation, ConversationError, ConversationEvent, ConversationEventKind, ConversationId,
-    ConversationStore, ResolvedContext, ResponseId, ResponseItem, ResponseStatus, StoreError,
-    TenantId, TurnCommit,
+    ContextEntry, Conversation, ConversationEvent, ConversationEventKind, ConversationId,
+    ResolvedContext, ResponseId, ResponseStatus, TenantId, TurnCommit,
 };
 
 use crate::store::{Inner, MemStore};
@@ -46,11 +52,26 @@ impl MemConversationStore {
         self.store.lock().conversations.len()
     }
 
-    /// INV-59: refuse the append once the per-conversation event stream has
-    /// reached its bound, rather than evicting the oldest event. Checked before
-    /// any marker transition so a refused turn never leaves "occupied but no
-    /// event" behind (INV-58).
-    fn ensure_event_capacity(&self, g: &Inner, id: &ConversationId) -> Result<(), ConversationError> {
+    /// The conversation, if it exists and belongs to `tenant`. Tenant mismatch reads as
+    /// absent, never as forbidden (SEC-2).
+    fn owned<'a>(
+        g: &'a Inner,
+        tenant: &TenantId,
+        id: &ConversationId,
+    ) -> Option<&'a Conversation> {
+        g.conversations
+            .get(id)
+            .filter(|c| &c.tenant_id == tenant)
+    }
+
+    /// INV-59: refuse the append once the per-conversation event stream has reached its
+    /// bound, rather than evicting the oldest event. Checked before any marker transition
+    /// so a refused turn never leaves "occupied but no event" behind (INV-58).
+    fn ensure_event_capacity(
+        &self,
+        g: &Inner,
+        id: &ConversationId,
+    ) -> Result<(), ConversationError> {
         let next = g
             .conversation_events
             .get(id)
@@ -64,11 +85,8 @@ impl MemConversationStore {
 }
 
 #[async_trait]
-impl ConversationStore for MemConversationStore {
-    async fn create(
-        &self,
-        conversation: Conversation,
-    ) -> Result<Conversation, ConversationError> {
+impl ConversationRepo for MemConversationStore {
+    async fn create(&self, conversation: Conversation) -> Result<Conversation, ConversationError> {
         self.guard_writable()?;
         let mut g = self.store.lock();
         if g.conversations.len() >= self.store.max_conversations() {
@@ -85,77 +103,7 @@ impl ConversationStore for MemConversationStore {
     ) -> Result<Option<Conversation>, ConversationError> {
         self.guard_available()?;
         let g = self.store.lock();
-        Ok(match g.conversations.get(id) {
-            None => None,
-            // Tenant mismatch reads as absent, not forbidden (SEC-2).
-            Some(c) if &c.tenant_id != tenant => None,
-            Some(c) => Some(c.clone()),
-        })
-    }
-
-    async fn read_snapshot(
-        &self,
-        tenant: &TenantId,
-        id: &ConversationId,
-    ) -> Result<ResolvedContext, ConversationError> {
-        self.guard_available()?;
-        let g = self.store.lock();
-        let Some(existing) = g.conversations.get(id) else {
-            return Err(ConversationError::NotFound);
-        };
-        if &existing.tenant_id != tenant {
-            return Err(ConversationError::NotFound);
-        }
-        let snap = g.snapshots.get(id);
-        Ok(ResolvedContext {
-            items: snap.map(|s| s.items.clone()).unwrap_or_default(),
-            reasoning: snap.map(|s| s.reasoning.clone()).unwrap_or_default(),
-            depth: snap.map(|s| s.turn_count).unwrap_or(0),
-            bytes: snap.map(|s| s.bytes).unwrap_or(0),
-        })
-    }
-
-    async fn append_turn(
-        &self,
-        tenant: &TenantId,
-        id: &ConversationId,
-        _response_id: &ResponseId,
-        commit: TurnCommit,
-        _now_ms: u64,
-    ) -> Result<u64, ConversationError> {
-        self.guard_writable()?;
-        let mut g = self.store.lock();
-        let Some(existing) = g.conversations.get(id) else {
-            return Err(ConversationError::NotFound);
-        };
-        if &existing.tenant_id != tenant {
-            return Err(ConversationError::NotFound);
-        }
-        let TurnCommit {
-            input_items,
-            output_items,
-            reasoning,
-            ..
-        } = commit;
-        let snap = g.snapshots.entry(id.clone()).or_default();
-        let turn_start = snap.items.len();
-        let input_len = input_items.len();
-        snap.bytes += input_items.iter().map(ResponseItem::byte_len).sum::<usize>();
-        snap.bytes += output_items.iter().map(ResponseItem::byte_len).sum::<usize>();
-        snap.items.extend(input_items);
-        snap.items.extend(output_items);
-        snap.reasoning.resize(snap.items.len(), None);
-        if let Some(text) = reasoning {
-            // Reasoning precedes this turn's output, i.e. the item right after the
-            // input block.
-            let output_start = turn_start + input_len;
-            if output_start < snap.reasoning.len() {
-                snap.reasoning[output_start] = Some(text);
-            }
-        }
-        let turn_index = snap.turn_count as u64;
-        snap.turn_count += 1;
-        Ok(turn_index)
+        Ok(Self::owned(&g, tenant, id).cloned())
     }
 
     async fn update_metadata(
@@ -166,12 +114,7 @@ impl ConversationStore for MemConversationStore {
     ) -> Result<Conversation, ConversationError> {
         self.guard_writable()?;
         let mut g = self.store.lock();
-        let Some(existing) = g.conversations.get(id) else {
-            return Err(ConversationError::NotFound);
-        };
-        if &existing.tenant_id != tenant {
-            return Err(ConversationError::NotFound);
-        }
+        let existing = Self::owned(&g, tenant, id).ok_or(ConversationError::NotFound)?;
         let updated = Conversation {
             metadata,
             ..existing.clone()
@@ -187,11 +130,10 @@ impl ConversationStore for MemConversationStore {
     ) -> Result<bool, ConversationError> {
         self.guard_writable()?;
         let mut g = self.store.lock();
-        match g.conversations.get(id) {
-            None => Ok(false),
-            Some(c) if &c.tenant_id != tenant => Ok(false),
-            Some(_) => Ok(g.remove_conversation(id).is_some()),
+        if Self::owned(&g, tenant, id).is_none() {
+            return Ok(false);
         }
+        Ok(g.remove_conversation(id).is_some())
     }
 
     async fn delete_by_tenant(&self, tenant: &TenantId) -> Result<u64, ConversationError> {
@@ -211,6 +153,78 @@ impl ConversationStore for MemConversationStore {
         Ok(removed)
     }
 
+    async fn list(&self, tenant: &TenantId) -> Result<Vec<Conversation>, ConversationError> {
+        self.guard_available()?;
+        let g = self.store.lock();
+        let ids: Vec<ConversationId> = g
+            .conversations_by_tenant
+            .get(tenant)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut out: Vec<Conversation> = ids
+            .iter()
+            .filter_map(|id| g.conversations.get(id).cloned())
+            .collect();
+        // Newest first.
+        out.sort_by_key(|c| std::cmp::Reverse(c.created_at_ms));
+        Ok(out)
+    }
+
+    async fn health(&self) -> Result<(), ConversationError> {
+        self.guard_available()
+    }
+}
+
+#[async_trait]
+impl ConversationSnapshots for MemConversationStore {
+    async fn read_snapshot(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+    ) -> Result<ResolvedContext, ConversationError> {
+        self.guard_available()?;
+        let g = self.store.lock();
+        Self::owned(&g, tenant, id).ok_or(ConversationError::NotFound)?;
+        let snap = g.snapshots.get(id);
+        Ok(ResolvedContext::new(
+            snap.map(|s| s.entries.clone()).unwrap_or_default(),
+            snap.map(|s| s.turn_count).unwrap_or(0),
+        ))
+    }
+
+    async fn append_turn(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        _response_id: &ResponseId,
+        commit: TurnCommit,
+        _now_ms: u64,
+    ) -> Result<u64, ConversationError> {
+        self.guard_writable()?;
+        let mut g = self.store.lock();
+        Self::owned(&g, tenant, id).ok_or(ConversationError::NotFound)?;
+        let TurnCommit {
+            input_items,
+            output_items,
+            reasoning,
+            ..
+        } = commit;
+        let snap = g.snapshots.entry(id.clone()).or_default();
+        snap.entries
+            .extend(input_items.into_iter().map(ContextEntry::new));
+        // Reasoning precedes this turn's output, i.e. it belongs to the first output item.
+        // Attaching it to that entry is the whole reason entries carry it: there is no
+        // index arithmetic to get wrong and no parallel vector to keep aligned.
+        let mut reasoning = reasoning;
+        for item in output_items {
+            snap.entries
+                .push(ContextEntry::with_reasoning(item, reasoning.take()));
+        }
+        let turn_index = snap.turn_count as u64;
+        snap.turn_count += 1;
+        Ok(turn_index)
+    }
+
     async fn advance(
         &self,
         tenant: &TenantId,
@@ -219,14 +233,9 @@ impl ConversationStore for MemConversationStore {
     ) -> Result<(), ConversationError> {
         self.guard_writable()?;
         let mut g = self.store.lock();
-        let Some(existing) = g.conversations.get(id) else {
-            return Err(ConversationError::NotFound);
-        };
-        if &existing.tenant_id != tenant {
-            return Err(ConversationError::NotFound);
-        }
-        // Last write wins, on purpose: no compare-and-set, no conflict status
-        // upstream never returns. See the port documentation.
+        let existing = Self::owned(&g, tenant, id).ok_or(ConversationError::NotFound)?;
+        // Last write wins, on purpose: no compare-and-set, no conflict status upstream
+        // never returns. See the port documentation.
         let updated = Conversation {
             last_response_id: Some(last.clone()),
             ..existing.clone()
@@ -234,7 +243,10 @@ impl ConversationStore for MemConversationStore {
         g.insert_conversation(updated);
         Ok(())
     }
+}
 
+#[async_trait]
+impl TurnLock for MemConversationStore {
     async fn acquire_active(
         &self,
         tenant: &TenantId,
@@ -244,16 +256,11 @@ impl ConversationStore for MemConversationStore {
     ) -> Result<u64, ConversationError> {
         self.guard_writable()?;
         let mut g = self.store.lock();
-        let Some(existing) = g.conversations.get(id) else {
-            return Err(ConversationError::NotFound);
-        };
-        if &existing.tenant_id != tenant {
-            return Err(ConversationError::NotFound);
-        }
+        let existing = Self::owned(&g, tenant, id).ok_or(ConversationError::NotFound)?;
         match existing.active_response_id.clone() {
             None => {
-                // INV-58: refuse before touching the marker, so a rejected turn
-                // never leaves "occupied but no event" behind.
+                // INV-58: refuse before touching the marker, so a rejected turn never
+                // leaves "occupied but no event" behind.
                 self.ensure_event_capacity(&g, id)?;
                 let updated = Conversation {
                     active_response_id: Some(response_id.clone()),
@@ -275,8 +282,7 @@ impl ConversationStore for MemConversationStore {
             }
             Some(holder) if holder == *response_id => {
                 // Re-entrant: return the sequence already assigned.
-                Ok(g
-                    .conversation_events
+                Ok(g.conversation_events
                     .get(id)
                     .and_then(|s| s.lock_seq)
                     .unwrap_or(0))
@@ -295,12 +301,9 @@ impl ConversationStore for MemConversationStore {
     ) -> Result<u64, ConversationError> {
         self.guard_writable()?;
         let mut g = self.store.lock();
-        let Some(existing) = g.conversations.get(id) else {
+        let Some(existing) = Self::owned(&g, tenant, id) else {
             return Ok(0);
         };
-        if &existing.tenant_id != tenant {
-            return Ok(0);
-        }
         // Conditional release: only clear it if we still hold it.
         if existing.active_response_id.as_ref() != Some(response_id) {
             return Ok(0);
@@ -344,12 +347,9 @@ impl ConversationStore for MemConversationStore {
     ) -> Result<bool, ConversationError> {
         self.guard_writable()?;
         let mut g = self.store.lock();
-        let Some(existing) = g.conversations.get(id) else {
+        let Some(existing) = Self::owned(&g, tenant, id) else {
             return Ok(false);
         };
-        if &existing.tenant_id != tenant {
-            return Ok(false);
-        }
         if existing.active_response_id.as_ref() != Some(holder) {
             return Ok(false);
         }
@@ -360,7 +360,10 @@ impl ConversationStore for MemConversationStore {
         g.insert_conversation(updated);
         Ok(true)
     }
+}
 
+#[async_trait]
+impl ConversationEvents for MemConversationStore {
     async fn append_event(
         &self,
         tenant: &TenantId,
@@ -370,12 +373,7 @@ impl ConversationStore for MemConversationStore {
     ) -> Result<u64, ConversationError> {
         self.guard_writable()?;
         let mut g = self.store.lock();
-        let Some(existing) = g.conversations.get(id) else {
-            return Err(ConversationError::NotFound);
-        };
-        if &existing.tenant_id != tenant {
-            return Err(ConversationError::NotFound);
-        }
+        Self::owned(&g, tenant, id).ok_or(ConversationError::NotFound)?;
         self.ensure_event_capacity(&g, id)?;
         let seq = g.push_conversation_event(id, kind, now_ms);
         self.store.notify_conversation_event();
@@ -388,23 +386,18 @@ impl ConversationStore for MemConversationStore {
         id: &ConversationId,
         starting_after: Option<u64>,
         limit: usize,
-        wait_ms: u64,
+        wait: Duration,
     ) -> Result<Vec<ConversationEvent>, ConversationError> {
         self.guard_available()?;
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+        let deadline = tokio::time::Instant::now() + wait;
         loop {
             {
                 let g = self.store.lock();
-                let Some(existing) = g.conversations.get(id) else {
-                    return Err(ConversationError::NotFound);
-                };
-                if &existing.tenant_id != tenant {
-                    return Err(ConversationError::NotFound);
-                }
+                Self::owned(&g, tenant, id).ok_or(ConversationError::NotFound)?;
                 let start = starting_after.map(|s| (s + 1) as usize).unwrap_or(0);
-                // No stream yet means "created but nothing appended": wait for the
-                // first event rather than immediately returning empty, or the SSE
-                // skeleton would busy-loop on a freshly created conversation.
+                // No stream yet means "created but nothing appended": wait for the first
+                // event rather than immediately returning empty, or the SSE skeleton
+                // would busy-loop on a freshly created conversation.
                 if let Some(stream) = g.conversation_events.get(id) {
                     let batch: Vec<_> = stream
                         .events
@@ -418,8 +411,8 @@ impl ConversationStore for MemConversationStore {
                     }
                 }
             }
-            // Long-poll deadline hit with nothing new: report empty and let the
-            // caller (the SSE skeleton) decide whether to wait again.
+            // Long-poll deadline hit with nothing new: report empty and let the caller
+            // (the SSE skeleton) decide whether to wait again.
             if tokio::time::Instant::now() >= deadline {
                 return Ok(vec![]);
             }
@@ -430,28 +423,7 @@ impl ConversationStore for MemConversationStore {
         }
     }
 
-    async fn list(&self, tenant: &TenantId) -> Result<Vec<Conversation>, ConversationError> {
-        self.guard_available()?;
-        let g = self.store.lock();
-        let ids: Vec<ConversationId> = g
-            .conversations_by_tenant
-            .get(tenant)
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default();
-        let mut out: Vec<Conversation> = ids
-            .iter()
-            .filter_map(|id| g.conversations.get(id).cloned())
-            .collect();
-        // Newest first.
-        out.sort_by_key(|c| std::cmp::Reverse(c.created_at_ms));
-        Ok(out)
-    }
-
-    fn set_max_events_per_conversation(&self, limit: usize) {
+    fn set_max_events(&self, limit: usize) {
         self.store.set_max_events_per_conversation(limit);
-    }
-
-    async fn health(&self) -> Result<(), ConversationError> {
-        self.guard_available()
     }
 }

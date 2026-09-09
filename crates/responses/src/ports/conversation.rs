@@ -1,80 +1,49 @@
+//! The conversation's storage, as four traits.
+//!
+//! One trait with eighteen methods obliged every backend to implement the whole
+//! surface, and every consumer to depend on it: the SSE skeleton needs to read an
+//! event stream and nothing else, yet it took a handle that could also delete the
+//! conversation. The split is by *reason to change* — records, snapshot, turn lock,
+//! event stream — and [`ConversationStore`] remains as the composition of all four,
+//! so assembly still mounts one object.
+
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::context::{ResolvedContext, ResponseId, ResponseStatus, Usage};
-use crate::conversation::{Conversation, ConversationEvent, ConversationEventKind, ConversationId};
-use crate::protocol::ResponseItem;
-use crate::shared::TenantId;
-use crate::StoreError;
+use crate::context::ResolvedContext;
+use crate::conversation::{
+    Conversation, ConversationEvent, ConversationEventKind, ConversationId, TurnCommit,
+};
+use crate::identity::TenantId;
+use crate::response::{ResponseId, ResponseStatus};
+
+use super::store_error::StoreError;
 
 #[derive(Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConversationError {
-    /// The conversation does not exist, or belongs to another tenant. One error
-    /// for both so ids cannot be probed (SEC-2).
+    /// The conversation does not exist, or belongs to another tenant. One error for
+    /// both so ids cannot be probed (SEC-2).
     #[error("not found")]
     NotFound,
     /// A turn is already in flight for this conversation (D28). The holder is
-    /// reported so a caller can decide whether to take the stale lock over — the
-    /// same recoverability contract the old session lock had (D26).
+    /// reported so a caller can decide whether to take the stale lock over.
     #[error("conversation is busy with {holder}")]
     Busy { holder: ResponseId },
     #[error("capacity exceeded")]
     CapacityExceeded,
-    /// The anchor this response inherits from does not exist or belongs to
-    /// another tenant. Reported identically for "absent" and "foreign" so ids
-    /// cannot be probed (SEC-2).
-    #[error("chain broken at {0}")]
-    ChainBroken(ResponseId),
-    /// The referenced response was created with `store: false`, so it holds no
-    /// durable snapshot to inherit (FR-18).
-    #[error("referenced response was not stored")]
-    NotStored,
-    #[error("chain exceeds depth limit {limit}")]
-    ChainTooLong { limit: usize },
-    #[error("chain exceeds byte limit {limit}")]
-    ChainTooLarge { limit: usize },
-    #[error("chain crosses tenant boundary")]
-    CrossTenant,
-    #[error("integrity mismatch")]
-    IntegrityMismatch,
     /// Infrastructure failure (read-only / unreachable / internal).
     #[error(transparent)]
     Store(#[from] StoreError),
 }
 
-/// The durable content one turn commits to a conversation snapshot at terminal
-/// time (D30). Grouped as a value object so `append_turn` does not take a
-/// nine-argument call whose items, usage and status are really one fact.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TurnCommit {
-    pub input_items: Vec<ResponseItem>,
-    pub output_items: Vec<ResponseItem>,
-    /// Render-only, placed immediately before the output block.
-    pub reasoning: Option<String>,
-    pub usage: Usage,
-    pub status: ResponseStatus,
-}
-
-/// Storage for the conversation: the **long-term record of a dialogue** (D30).
-///
-/// In the D30 design the conversation is the system of record for content — it
-/// holds the materialised snapshot (a growing, per-turn-delta list of items) and
-/// the turn lock and event stream it already held under D28. Responses are
-/// short-lived (event stream with a TTL); the conversation survives them, so
-/// history assembly reads here rather than from a per-response snapshot.
-///
-/// The snapshot methods below replace the removed [`ContextStore`] and its
-/// `resolve_chain`. `append_turn` must take its items **from the execution
-/// side's final output**, never from replaying the event stream (INV-48).
+/// The conversation record itself: create, read, retire.
 #[async_trait]
-pub trait ConversationStore: Send + Sync {
-    async fn create(
-        &self,
-        conversation: Conversation,
-    ) -> Result<Conversation, ConversationError>;
+pub trait ConversationRepo: Send + Sync {
+    async fn create(&self, conversation: Conversation) -> Result<Conversation, ConversationError>;
 
     async fn get(
         &self,
@@ -82,44 +51,11 @@ pub trait ConversationStore: Send + Sync {
         id: &ConversationId,
     ) -> Result<Option<Conversation>, ConversationError>;
 
-    /// Read the conversation's materialised snapshot — the full history as it
-    /// currently stands — in chronological order. This is what an execution
-    /// builds its LLM context from (one read per turn, D30), and what the
-    /// transcript endpoint renders.
-    ///
-    /// The turn lock serialises turns per conversation, so the snapshot is
-    /// stable for the in-flight turn: no other turn appends concurrently.
-    async fn read_snapshot(
-        &self,
-        tenant: &TenantId,
-        id: &ConversationId,
-    ) -> Result<ResolvedContext, ConversationError>;
-
-    /// Append one turn's items to the conversation snapshot at terminal time.
-    ///
-    /// Both the turn's input and output are appended, so the next turn's model
-    /// context is complete without the caller re-supplying history. The items
-    /// come from the execution side's final result — **never** derived by
-    /// replaying the event stream (INV-48). This is the single place durable
-    /// content is written; it is paired with `ResponseLedger::complete` in one
-    /// transaction boundary (INV-34).
-    ///
-    /// `reasoning` (render-only) is placed immediately before the output block.
-    /// Returns the turn's index (0-based, monotonically increasing).
-    async fn append_turn(
-        &self,
-        tenant: &TenantId,
-        id: &ConversationId,
-        response_id: &ResponseId,
-        commit: TurnCommit,
-        now_ms: u64,
-    ) -> Result<u64, ConversationError>;
-
     /// Replace `metadata` wholesale and return the updated record.
     ///
-    /// Wholesale rather than merge-patch because upstream models this as a POST
-    /// of the new value; a merge would need a way to express deletion, which the
-    /// wire format does not have.
+    /// Wholesale rather than merge-patch because upstream models this as a POST of
+    /// the new value; a merge would need a way to express deletion, which the wire
+    /// format does not have.
     async fn update_metadata(
         &self,
         tenant: &TenantId,
@@ -141,36 +77,81 @@ pub trait ConversationStore: Send + Sync {
 
     async fn delete_by_tenant(&self, tenant: &TenantId) -> Result<u64, ConversationError>;
 
+    /// Every conversation the tenant owns, newest first (for list rendering).
+    async fn list(&self, tenant: &TenantId) -> Result<Vec<Conversation>, ConversationError>;
+
+    /// Liveness probe backing the refuse-writes degrade (INV-46).
+    async fn health(&self) -> Result<(), ConversationError>;
+}
+
+/// The conversation's materialised history — the system of record for content under
+/// D30, replacing the removed per-response context store.
+#[async_trait]
+pub trait ConversationSnapshots: Send + Sync {
+    /// Read the full history as it currently stands, oldest first. This is what an
+    /// execution builds its LLM context from (one read per turn, D30), and what the
+    /// transcript endpoint renders.
+    ///
+    /// The turn lock serialises turns per conversation, so the snapshot is stable for
+    /// the in-flight turn: no other turn appends concurrently.
+    async fn read_snapshot(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+    ) -> Result<ResolvedContext, ConversationError>;
+
+    /// Append one turn's items to the snapshot at terminal time.
+    ///
+    /// Both the turn's input and output are appended, so the next turn's model
+    /// context is complete without the caller re-supplying history. The items come
+    /// from the execution side's final result — **never** derived by replaying the
+    /// event stream (INV-48). This is the single place durable content is written; it
+    /// is paired with `ResponseLedger::complete` in one transaction boundary
+    /// (INV-34).
+    ///
+    /// Returns the turn's index (0-based, monotonically increasing).
+    async fn append_turn(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        response_id: &ResponseId,
+        commit: TurnCommit,
+        now_ms: u64,
+    ) -> Result<u64, ConversationError>;
+
     /// Move the tail pointer to `last`, after a turn reaches a terminal status.
     ///
-    /// **Last write wins.** Two turns racing on the same conversation leave
-    /// whichever finished last as the tail; the other's chain survives intact
-    /// and addressable, it simply is not the tail any more. This is a deliberate
-    /// choice, not an oversight: a compare-and-set here would reject the loser
-    /// with a conflict status that upstream never returns, breaking callers that
-    /// drive the conversation with an official SDK and no session. Turns that
-    /// need serialisation get it from [`ConversationStore::acquire_active`],
-    /// which refuses the second turn up front instead of letting both run and
-    /// discarding one result.
+    /// **Last write wins.** Two turns racing on the same conversation leave whichever
+    /// finished last as the tail; the other's chain survives intact and addressable,
+    /// it simply is not the tail any more. This is a deliberate choice: a
+    /// compare-and-set here would reject the loser with a conflict status that
+    /// upstream never returns, breaking callers that drive the conversation with an
+    /// official SDK. Turns that need serialisation get it from [`TurnLock`], which
+    /// refuses the second turn up front instead of letting both run and discarding
+    /// one result.
     async fn advance(
         &self,
         tenant: &TenantId,
         id: &ConversationId,
         last: &ResponseId,
     ) -> Result<(), ConversationError>;
+}
 
-    /// Occupy the in-flight marker and emit `TurnStarted`, atomically (D28).
-    ///
-    /// The marker transition and the event that announces it must land together
-    /// or not at all — a crash between two separate calls leaves either a busy
-    /// conversation with nothing on the stream to explain it, or an announced
-    /// turn no marker is holding. Atomicity is a property of the store, so the
-    /// pairing lives here.
+/// The per-conversation mutual-exclusion marker (D28).
+///
+/// Every method pairs a marker transition with the event that announces it, because
+/// the two must land together or not at all — a crash between two separate calls
+/// leaves either a busy conversation with nothing on the stream to explain it, or an
+/// announced turn no marker is holding. Atomicity is a property of the store, so the
+/// pairing lives in the port.
+#[async_trait]
+pub trait TurnLock: Send + Sync {
+    /// Occupy the marker and emit `TurnStarted`, atomically.
     ///
     /// Contract:
     /// - `active` empty → set it to `response_id`, emit `TurnStarted`, return its seq
-    /// - `active` already holds another response → [`ConversationError::Busy`]
-    ///   naming the holder, and **write nothing** (no event, no partial state)
+    /// - `active` already holds another response → [`ConversationError::Busy`] naming
+    ///   the holder, and **write nothing** (no event, no partial state)
     /// - re-entering with the id that already holds the marker succeeds without a
     ///   second event, so an execution-side retry is harmless
     async fn acquire_active(
@@ -181,10 +162,10 @@ pub trait ConversationStore: Send + Sync {
         now_ms: u64,
     ) -> Result<u64, ConversationError>;
 
-    /// Clear the in-flight marker and emit `TurnCompleted`, atomically (D28).
+    /// Clear the marker and emit `TurnCompleted`, atomically.
     ///
-    /// Must be called on **every** terminal path. Conditional on `response_id`
-    /// still being the holder, and idempotent for the same id.
+    /// Must be called on **every** terminal path. Conditional on `response_id` still
+    /// being the holder, and idempotent for the same id.
     async fn release_active(
         &self,
         tenant: &TenantId,
@@ -194,23 +175,31 @@ pub trait ConversationStore: Send + Sync {
         now_ms: u64,
     ) -> Result<u64, ConversationError>;
 
-    /// Release a marker held by `holder` without a `TurnCompleted`, for one
-    /// situation only: the holder is already terminal but its marker was never
-    /// released. No event is emitted — the terminal event was already emitted by
-    /// whoever completed the response.
+    /// Release a marker held by `holder` without a `TurnCompleted`, for one situation
+    /// only: the holder is already terminal but its marker was never released. No
+    /// event is emitted — the terminal event was already emitted by whoever completed
+    /// the response.
     ///
-    /// Returns whether a marker was actually released. Conditional on `holder`
-    /// still being the holder.
+    /// Returns whether a marker was actually released. Conditional on `holder` still
+    /// being the holder.
     async fn release_stale_active(
         &self,
         tenant: &TenantId,
         id: &ConversationId,
         holder: &ResponseId,
     ) -> Result<bool, ConversationError>;
+}
 
+/// The conversation's event stream (D28): turn boundaries, deletions and business
+/// events in one sequence space.
+///
+/// This is the whole surface the SSE skeleton needs, which is the point of it being
+/// its own trait.
+#[async_trait]
+pub trait ConversationEvents: Send + Sync {
     /// Append a non-turn event (`Business` or `ResponseDeleted`) and return its
-    /// sequence number. Turn boundaries go through `acquire_active` /
-    /// `release_active` instead, since those must be paired with the marker.
+    /// sequence number. Turn boundaries go through [`TurnLock`] instead, since those
+    /// must be paired with the marker.
     async fn append_event(
         &self,
         tenant: &TenantId,
@@ -220,23 +209,34 @@ pub trait ConversationStore: Send + Sync {
     ) -> Result<u64, ConversationError>;
 
     /// Read events strictly after `starting_after`. `None` means "from the
-    /// beginning". `wait_ms` allows a long poll for live continuation.
+    /// beginning" — necessary because 0 is a legitimate sequence number, so a
+    /// sentinel would be ambiguous. `wait` allows a long poll for live continuation.
     async fn read_after(
         &self,
         tenant: &TenantId,
         id: &ConversationId,
         starting_after: Option<u64>,
         limit: usize,
-        wait_ms: u64,
+        wait: Duration,
     ) -> Result<Vec<ConversationEvent>, ConversationError>;
 
-    /// Every conversation the tenant owns, newest first (for list rendering).
-    async fn list(&self, tenant: &TenantId) -> Result<Vec<Conversation>, ConversationError>;
+    /// Set the per-conversation event-stream bound. Reaching it refuses the append
+    /// rather than evicting the oldest events: dropping a turn boundary loses the
+    /// only record that it happened.
+    fn set_max_events(&self, limit: usize);
+}
 
-    /// Set the per-conversation event-stream bound. Reaching it refuses the
-    /// append rather than evicting the oldest events.
-    fn set_max_events_per_conversation(&self, limit: usize);
+/// The whole conversation carrier.
+///
+/// A composition, not a fifth interface: assembly mounts one object, while each
+/// consumer depends only on the facet it uses. The blanket impl means a backend
+/// implements the four traits and gets this for free.
+pub trait ConversationStore:
+    ConversationRepo + ConversationSnapshots + TurnLock + ConversationEvents
+{
+}
 
-    /// Liveness probe backing the refuse-writes degrade (INV-46).
-    async fn health(&self) -> Result<(), ConversationError>;
+impl<T> ConversationStore for T where
+    T: ConversationRepo + ConversationSnapshots + TurnLock + ConversationEvents
+{
 }

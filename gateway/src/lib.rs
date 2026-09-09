@@ -6,6 +6,7 @@
 //! backend —— 生产 REST 进程复用本库、只替换 backend，与验证装配壳同构。
 
 pub mod auth;
+pub mod config;
 pub mod error;
 pub mod metrics;
 pub mod routes;
@@ -14,4 +15,5 @@ pub mod sse;
 pub mod state;
 
 pub use auth::KeyTable;
+pub use config::GatewayConfig;
 pub use state::AppState;

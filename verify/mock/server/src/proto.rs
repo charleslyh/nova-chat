@@ -13,25 +13,32 @@
 use serde::{Deserialize, Serialize};
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use nova_responses::{
-    AbortedClaim, AgentId, AppendEvent, Attempt, ClaimedResponse, Conversation, ConversationError,
-    ConversationEvent, ConversationEventKind, ConversationId, CreateOutcome, EventLogError,
-    IdempotencyKey, LedgerError, ResolvedContext, ResponseEvent, ResponseEventKind, ResponseId,
-    ResponseItem, ResponseRecord, ResponseStatus, TenantId, Usage,
+    AgentId, AppendEvent, Attempt, Conversation, ConversationEvent, ConversationEventKind,
+    ConversationId, IdempotencyKey, ResolvedContext, ResponseEvent, ResponseEventKind, ResponseId,
+    ResponseRecord, ResponseStatus, TenantId, TurnCommit, Usage,
 };
+use nova_responses::ports::{AbortedClaim, ClaimedResponse, ConversationError, CreateOutcome, EventLogError, LedgerError};
 
-/// Internal wire form of a stream event.
+/// Internal wire form of an event to append.
 ///
-/// `ResponseEvent`'s public `Serialize` deliberately omits `response_id` and
-/// `attempt` (they are internal fence/owner state, never on the SSE wire), so a
-/// cross-process carrier needs its own round-trippable representation that
-/// preserves both.
+/// The domain's own serialisation is the **SSE** shape: it omits `response_id` (which
+/// lives in the URL) and `attempt` (an internal fence). A cross-process carrier has to
+/// preserve both, so it needs its own round-trippable form — this one.
+///
+/// There is a single wire type for both directions, with the sequence number optional:
+/// absent on the way in (the carrier assigns it, INV-11), present on the way back. Two
+/// near-identical structs plus four hand-written conversions expressed exactly the same
+/// thing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireEvent {
     pub response_id: ResponseId,
     pub attempt: Option<Attempt>,
-    pub sequence_number: u64,
+    /// `None` on an append, `Some` once the log has numbered it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence_number: Option<u64>,
     pub kind: ResponseEventKind,
     #[serde(flatten)]
     pub body: nova_responses::EventBody,
@@ -39,74 +46,61 @@ pub struct WireEvent {
 
 impl From<ResponseEvent> for WireEvent {
     fn from(e: ResponseEvent) -> Self {
-        WireEvent {
-            response_id: e.response_id,
-            attempt: e.attempt,
-            sequence_number: e.sequence_number,
-            kind: e.kind,
-            body: e.body,
-        }
+        let sequence_number = Some(e.sequence_number());
+        let mut wire = WireEvent::from(e.into_append());
+        wire.sequence_number = sequence_number;
+        wire
     }
 }
 
-impl From<WireEvent> for ResponseEvent {
-    fn from(w: WireEvent) -> Self {
-        ResponseEvent {
-            response_id: w.response_id,
-            attempt: w.attempt,
-            sequence_number: w.sequence_number,
-            kind: w.kind,
-            body: w.body,
-        }
-    }
-}
-
-/// Internal wire form of an event to append — the append-input counterpart of
-/// [`WireEvent`], with no `sequence_number` (the carrier assigns it, INV-11).
-///
-/// `AppendEvent`'s public `Serialize` omits `response_id` and `attempt`, so the
-/// cross-process carrier needs its own round-trippable form that preserves both,
-/// exactly as `WireEvent` does for the read path. The two are split on purpose:
-/// an append carries no number, a read returns one.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AppendWireEvent {
-    pub response_id: ResponseId,
-    pub attempt: Option<Attempt>,
-    pub kind: ResponseEventKind,
-    #[serde(flatten)]
-    pub body: nova_responses::EventBody,
-}
-
-impl From<AppendEvent> for AppendWireEvent {
+impl From<AppendEvent> for WireEvent {
     fn from(e: AppendEvent) -> Self {
-        AppendWireEvent {
-            response_id: e.response_id,
-            attempt: e.attempt,
-            kind: e.kind,
-            body: e.body,
+        WireEvent {
+            response_id: e.response_id().clone(),
+            attempt: e.attempt(),
+            sequence_number: None,
+            kind: e.kind(),
+            body: e.body().clone(),
         }
     }
 }
 
-impl From<AppendWireEvent> for AppendEvent {
-    fn from(w: AppendWireEvent) -> Self {
-        AppendEvent {
-            response_id: w.response_id,
-            kind: w.kind,
-            attempt: w.attempt,
-            body: w.body,
-        }
+impl From<WireEvent> for AppendEvent {
+    fn from(w: WireEvent) -> Self {
+        AppendEvent::from_parts(w.response_id, w.kind, w.attempt, w.body)
+    }
+}
+
+impl WireEvent {
+    /// Rebuild the numbered form. The number is required here: a read that lost it would
+    /// break every cursor downstream, so its absence is a carrier defect, not a value to
+    /// invent.
+    pub fn into_response_event(self) -> Result<ResponseEvent, ProtoError> {
+        let Some(seq) = self.sequence_number else {
+            return Err(ProtoError::Internal(
+                "carrier returned an event with no sequence number".into(),
+            ));
+        };
+        Ok(AppendEvent::from(self).with_seq(seq))
     }
 }
 
 /// A carrier-side failure, tagged by which port rejected the call.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+///
+/// `Display` is derived rather than left to callers: a client that has to fold this into
+/// its own port error needs a message, and every call site formatting the `Debug` shape
+/// by hand would leak Rust syntax into an error a human reads.
+#[derive(Debug, PartialEq, Serialize, Deserialize, thiserror::Error)]
 pub enum ProtoError {
+    #[error(transparent)]
     Ledger(LedgerError),
+    #[error(transparent)]
     EventLog(EventLogError),
+    #[error(transparent)]
     Conversation(ConversationError),
-    /// A failure in the carrier itself (serialization, dispatch) rather than in
-    /// a domain operation. Carried as text for debuggability.
+    /// A failure in the carrier itself (serialization, dispatch) rather than in a domain
+    /// operation. Carried as text for debuggability.
+    #[error("carrier: {0}")]
     Internal(String),
 }
 
@@ -124,7 +118,7 @@ pub enum Request {
     LedgerClaim {
         agent_id: AgentId,
         now_ms: u64,
-        exec_ttl_ms: u64,
+        exec_ttl: Duration,
     },
     LedgerHeartbeat {
         agent_id: AgentId,
@@ -144,7 +138,7 @@ pub enum Request {
     },
     LedgerReap {
         now_ms: u64,
-        heartbeat_ttl_ms: u64,
+        heartbeat_ttl: Duration,
     },
     LedgerRecordPartialUsage {
         response_id: ResponseId,
@@ -168,18 +162,18 @@ pub enum Request {
 
     // --- event log ---
     EventLogAppend {
-        event: AppendWireEvent,
+        event: WireEvent,
     },
     EventLogReadAfter {
         response_id: ResponseId,
         starting_after: Option<u64>,
         limit: usize,
-        wait_ms: u64,
+        wait: Duration,
     },
     EventLogClose {
         response_id: ResponseId,
         now_ms: u64,
-        retain_ms: u64,
+        retain: Duration,
     },
     EventLogSweepExpired {
         now_ms: u64,
@@ -242,7 +236,7 @@ pub enum Request {
         id: ConversationId,
         starting_after: Option<u64>,
         limit: usize,
-        wait_ms: u64,
+        wait: Duration,
     },
     ConversationList {
         tenant: TenantId,
@@ -255,11 +249,9 @@ pub enum Request {
         tenant: TenantId,
         id: ConversationId,
         response_id: ResponseId,
-        input_items: Vec<ResponseItem>,
-        output_items: Vec<ResponseItem>,
-        reasoning: Option<String>,
-        usage: Usage,
-        status: ResponseStatus,
+        /// The commit as one value, not five fields the receiver has to reassemble into
+        /// the very struct the sender took apart.
+        commit: TurnCommit,
         now_ms: u64,
     },
     ConversationHealth,

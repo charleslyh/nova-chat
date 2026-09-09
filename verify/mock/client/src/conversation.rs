@@ -1,15 +1,23 @@
-//! Conversation store client: shared data forwarded to the carrier; per-node
-//! read_only gate on writes (INV-32), unreachable → `Unavailable` (INV-46).
+//! Conversation store client: shared data forwarded to the carrier; per-node read_only
+//! gate on writes (INV-32), unreachable → `Unavailable` (INV-46).
+//!
+//! Four impl blocks, one per port facet (records, snapshot, turn lock, event stream). The
+//! composition [`nova_responses::ports::ConversationStore`] comes free from its blanket
+//! impl, so assembly still mounts one object.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use nova_responses::ports::{
+    ConversationError, ConversationEvents, ConversationRepo, ConversationSnapshots, StoreError,
+    TurnLock,
+};
 use nova_responses::{
-    Conversation, ConversationError, ConversationEvent, ConversationEventKind, ConversationId,
-    ConversationStore, ResolvedContext, ResponseId, ResponseStatus, StoreError, TenantId,
-    TurnCommit,
+    Conversation, ConversationEvent, ConversationEventKind, ConversationId, ResolvedContext,
+    ResponseId, ResponseStatus, TenantId, TurnCommit,
 };
 
 use mock_server::proto::{ProtoError, Request, Response};
@@ -35,30 +43,31 @@ impl MemConversationClient {
 }
 
 async fn conversation_rpc(rpc: &Rpc, req: Request) -> Result<Response, ConversationError> {
-    // Transport failure = store unreachable. Callers must reject writes rather
-    // than proceed unstored (INV-46).
+    // Transport failure = store unreachable. Callers must reject writes rather than
+    // proceed unstored (INV-46).
     let resp = rpc
         .call(req)
         .await
         .map_err(|_| ConversationError::Store(StoreError::Unavailable))?;
     match resp {
         Response::Err(ProtoError::Conversation(e)) => Err(e),
-        Response::Err(ProtoError::Internal(s)) => Err(ConversationError::Store(StoreError::Internal(s))),
+        Response::Err(ProtoError::Internal(s)) => {
+            Err(ConversationError::Store(StoreError::Internal(s)))
+        }
         ok => Ok(ok),
     }
 }
 
 /// Reject a response shape the carrier should never have produced for this call.
 fn unexpected(other: Response) -> ConversationError {
-    ConversationError::Store(StoreError::Internal(format!("unexpected rpc response {other:?}")))
+    ConversationError::Store(StoreError::Internal(format!(
+        "unexpected rpc response {other:?}"
+    )))
 }
 
 #[async_trait]
-impl ConversationStore for MemConversationClient {
-    async fn create(
-        &self,
-        conversation: Conversation,
-    ) -> Result<Conversation, ConversationError> {
+impl ConversationRepo for MemConversationClient {
+    async fn create(&self, conversation: Conversation) -> Result<Conversation, ConversationError> {
         self.guard_writable()?;
         match conversation_rpc(&self.rpc, Request::ConversationCreate { conversation }).await? {
             Response::ConversationCreate(c) => Ok(c),
@@ -142,6 +151,77 @@ impl ConversationStore for MemConversationClient {
         }
     }
 
+    async fn list(&self, tenant: &TenantId) -> Result<Vec<Conversation>, ConversationError> {
+        match conversation_rpc(
+            &self.rpc,
+            Request::ConversationList {
+                tenant: tenant.clone(),
+            },
+        )
+        .await?
+        {
+            Response::ConversationList(list) => Ok(list),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn health(&self) -> Result<(), ConversationError> {
+        match conversation_rpc(&self.rpc, Request::ConversationHealth).await? {
+            Response::ConversationHealth => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+}
+
+#[async_trait]
+impl ConversationSnapshots for MemConversationClient {
+    async fn read_snapshot(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+    ) -> Result<ResolvedContext, ConversationError> {
+        match conversation_rpc(
+            &self.rpc,
+            Request::ConversationReadSnapshot {
+                tenant: tenant.clone(),
+                id: id.clone(),
+            },
+        )
+        .await?
+        {
+            Response::ConversationReadSnapshot(ctx) => Ok(ctx),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn append_turn(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        response_id: &ResponseId,
+        commit: TurnCommit,
+        now_ms: u64,
+    ) -> Result<u64, ConversationError> {
+        self.guard_writable()?;
+        // The commit travels whole: taking it apart here and reassembling it on the
+        // carrier was five fields' worth of opportunity to mismatch.
+        match conversation_rpc(
+            &self.rpc,
+            Request::ConversationAppendTurn {
+                tenant: tenant.clone(),
+                id: id.clone(),
+                response_id: response_id.clone(),
+                commit,
+                now_ms,
+            },
+        )
+        .await?
+        {
+            Response::ConversationAppendTurn(idx) => Ok(idx),
+            other => Err(unexpected(other)),
+        }
+    }
+
     async fn advance(
         &self,
         tenant: &TenantId,
@@ -163,7 +243,10 @@ impl ConversationStore for MemConversationClient {
             other => Err(unexpected(other)),
         }
     }
+}
 
+#[async_trait]
+impl TurnLock for MemConversationClient {
     async fn acquire_active(
         &self,
         tenant: &TenantId,
@@ -235,7 +318,10 @@ impl ConversationStore for MemConversationClient {
             other => Err(unexpected(other)),
         }
     }
+}
 
+#[async_trait]
+impl ConversationEvents for MemConversationClient {
     async fn append_event(
         &self,
         tenant: &TenantId,
@@ -266,7 +352,7 @@ impl ConversationStore for MemConversationClient {
         id: &ConversationId,
         starting_after: Option<u64>,
         limit: usize,
-        wait_ms: u64,
+        wait: Duration,
     ) -> Result<Vec<ConversationEvent>, ConversationError> {
         match conversation_rpc(
             &self.rpc,
@@ -275,7 +361,7 @@ impl ConversationStore for MemConversationClient {
                 id: id.clone(),
                 starting_after,
                 limit,
-                wait_ms,
+                wait,
             },
         )
         .await?
@@ -285,85 +371,8 @@ impl ConversationStore for MemConversationClient {
         }
     }
 
-    async fn list(&self, tenant: &TenantId) -> Result<Vec<Conversation>, ConversationError> {
-        match conversation_rpc(
-            &self.rpc,
-            Request::ConversationList {
-                tenant: tenant.clone(),
-            },
-        )
-        .await?
-        {
-            Response::ConversationList(list) => Ok(list),
-            other => Err(unexpected(other)),
-        }
-    }
-
-    async fn read_snapshot(
-        &self,
-        tenant: &TenantId,
-        id: &ConversationId,
-    ) -> Result<ResolvedContext, ConversationError> {
-        match conversation_rpc(
-            &self.rpc,
-            Request::ConversationReadSnapshot {
-                tenant: tenant.clone(),
-                id: id.clone(),
-            },
-        )
-        .await?
-        {
-            Response::ConversationReadSnapshot(ctx) => Ok(ctx),
-            other => Err(unexpected(other)),
-        }
-    }
-
-    async fn append_turn(
-        &self,
-        tenant: &TenantId,
-        id: &ConversationId,
-        response_id: &ResponseId,
-        commit: TurnCommit,
-        now_ms: u64,
-    ) -> Result<u64, ConversationError> {
-        self.guard_writable()?;
-        let TurnCommit {
-            input_items,
-            output_items,
-            reasoning,
-            usage,
-            status,
-        } = commit;
-        match conversation_rpc(
-            &self.rpc,
-            Request::ConversationAppendTurn {
-                tenant: tenant.clone(),
-                id: id.clone(),
-                response_id: response_id.clone(),
-                input_items,
-                output_items,
-                reasoning,
-                usage,
-                status,
-                now_ms,
-            },
-        )
-        .await?
-        {
-            Response::ConversationAppendTurn(idx) => Ok(idx),
-            other => Err(unexpected(other)),
-        }
-    }
-
-    fn set_max_events_per_conversation(&self, _limit: usize) {
-        // The bound lives on the carrier (mem-server); the client has no local
-        // knob to flip. No-op here, mirroring other client-side runtime controls.
-    }
-
-    async fn health(&self) -> Result<(), ConversationError> {
-        match conversation_rpc(&self.rpc, Request::ConversationHealth).await? {
-            Response::ConversationHealth => Ok(()),
-            other => Err(unexpected(other)),
-        }
+    fn set_max_events(&self, _limit: usize) {
+        // The bound lives on the carrier (mem-server); the client has no local knob to
+        // flip. No-op here, mirroring the other client-side runtime controls.
     }
 }

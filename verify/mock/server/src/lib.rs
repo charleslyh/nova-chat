@@ -29,7 +29,8 @@ pub use store::MemStore;
 
 use std::sync::Arc;
 
-use nova_responses::{ContentIntegrity, HmacSha256Integrity};
+use nova_responses::HmacSha256Integrity;
+use nova_responses::ports::ContentIntegrity;
 
 /// Capacity and retention knobs, mirroring the gateway configuration so tests
 /// can exercise eviction and expiry without waiting for production-scale
@@ -127,14 +128,6 @@ impl MemWorld {
             clock: Arc::new(MemClock::new()),
             metrics: Arc::new(MemMetrics::new()),
         }
-    }
-
-    /// The virtual clock as a timestamp function, for wiring into the
-    /// orchestrator / services that take an `Arc<dyn Fn() -> u64 + Send + Sync>`.
-    /// Advance it with [`MemClock::advance`] / [`MemClock::set`] via [`Self::clock`].
-    pub fn now_fn(&self) -> Arc<dyn Fn() -> u64 + Send + Sync> {
-        let clock = self.clock.clone();
-        Arc::new(move || clock.now_ms())
     }
 }
 

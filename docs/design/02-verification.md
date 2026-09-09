@@ -10,7 +10,7 @@
 |---|---|---|---|
 | **L0** | 端口契约（含全局领取、并发、过载完整性、输出溯源、会话快照） | **mock（参考实现）** | 无 |
 | **L1** | 场景（进程内，直驱端口） | mock | 无 |
-| **L2** | 场景（三节点 HTTP） | 共享载体 `mock-server` + 独立 `mock-agentd` + 独立 `mock-sweep` | 无 |
+| **L2** | 场景（三节点 HTTP） | 共享载体 `mock-server` + 独立 `mock-agentd` + gateway 内嵌 sweep | 无 |
 | **L4** | 官方 Python SDK 驱动 conversation 端点 | mock（经 gateway HTTP） | 无 |
 
 **L0–L2 完全不依赖基础设施**。L4 无 python3/openai 时**跳过而非失败**，否则没有 Python 环境的开发机会被门禁挡住。
@@ -244,7 +244,7 @@ fn saw_relevant_data(&self, trace: &Trace) -> bool;   // 无默认实现
 
 ## 7. L2 场景（13 个）与进程拓扑
 
-**fixture 进程**（`xtask procs up` 启动）：`mock-server`（数据面 19000 + 控制面 19001）· `mock-sweep`（短 heartbeat TTL）· `mock-agentd`（scripted scheduler，含 `hang` 规则）· 三个**对等** gateway（node-a/b/c，18080/18081/18082）。
+**fixture 进程**（`xtask procs up` 启动）：`mock-server`（数据面 19000 + 控制面 19001）· `mock-agentd`（scripted scheduler，含 `hang` 规则）· 三个**对等** gateway（node-a/b/c，18080/18081/18082，各自内嵌 sweep，短 heartbeat TTL）。
 
 三节点共享同一载体，执行由全局 agentd 完成，节点之间完全对等——不再有「node-c 挂起」「node-b 路由」这种固定分工。
 

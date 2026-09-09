@@ -6,11 +6,13 @@
 //! carrier: production execution integrates a real agent SDK against redis/mq.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use nova_agent_runtime::{AgentRuntime, AgentRuntimeConfig, AgentRuntimeDeps};
-use nova_responses::{ChainLimits, ConversationStore, ResponseEventLog, ResponseLedger};
+use nova_responses::SystemClock;
+use nova_responses::ports::{ConversationStore, ResponseEventLog, ResponseLedger};
 use tracing::info;
 
 use mock_agentd::{
@@ -48,14 +50,6 @@ struct Args {
     #[arg(long, default_value_t = 60_000)]
     drain_timeout_ms: u64,
 
-    /// Chain limits fed to the orchestrator (D24).
-    #[arg(long, default_value_t = 50)]
-    chain_max_depth: usize,
-    #[arg(long, default_value_t = 1000)]
-    chain_max_items: usize,
-    #[arg(long, default_value_t = 1_048_576)]
-    chain_max_bytes: usize,
-
     /// `echo` or `scripted` (verification schedulers) or `http` (real provider).
     #[arg(long, default_value = "echo")]
     scheduler: String,
@@ -81,12 +75,6 @@ struct Backend {
     conversation: Arc<dyn ConversationStore>,
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock before epoch")
-        .as_millis() as u64
-}
 
 fn build_scheduler(args: &Args) -> Result<Arc<dyn Scheduler>> {
     match args.scheduler.as_str() {
@@ -169,18 +157,13 @@ async fn main() -> Result<()> {
             ledger: backend.ledger,
             event_log: backend.event_log,
             runner,
-            now: Arc::new(now_ms),
+            clock: Arc::new(SystemClock),
             conversations: Some(backend.conversation),
         },
         AgentRuntimeConfig {
-            exec_ttl_ms: args.exec_ttl_ms,
-            heartbeat_interval_ms: args.heartbeat_interval_ms,
-            chain_limits: ChainLimits {
-                max_depth: args.chain_max_depth,
-                max_items: args.chain_max_items,
-                max_bytes: args.chain_max_bytes,
-            },
-            retain_after_terminal_ms: args.retain_after_terminal_ms,
+            exec_ttl: Duration::from_millis(args.exec_ttl_ms),
+            heartbeat_interval: Duration::from_millis(args.heartbeat_interval_ms),
+            retain_after_terminal: Duration::from_millis(args.retain_after_terminal_ms),
             ..AgentRuntimeConfig::default()
         },
     ));
@@ -191,11 +174,14 @@ async fn main() -> Result<()> {
         "mock execution daemon starting"
     );
 
-    let handle = runtime.start(args.max_concurrent, args.poll_interval_ms);
+    let handle = runtime.start(
+        args.max_concurrent,
+        Duration::from_millis(args.poll_interval_ms),
+    );
 
     wait_for_signal().await;
     info!("shutdown signal received; draining");
-    handle.stop(args.drain_timeout_ms).await;
+    handle.stop(Duration::from_millis(args.drain_timeout_ms)).await;
     info!("shutdown complete");
     Ok(())
 }

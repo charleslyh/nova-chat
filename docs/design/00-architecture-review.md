@@ -38,11 +38,11 @@
 | 在途事件缓冲 | `mock-client` → `mock-server` |
 | 会话（conversation，D28/D30） | `mock-client` → `mock-server` |
 | 执行位置 | **独立进程** `mock-agentd` |
-| 维护（sweep） | **独立进程** `mock-sweep` |
-| 时钟 | 注入式 `now: Arc<dyn Fn() -> u64>`（生产为真实墙钟，非端口 trait） |
+| 维护（sweep） | **内嵌于 gateway**，每节点各跑一份（reap 幂等） |
+| 时钟 | 注入式 `Arc<dyn Clock>`（生产挂 `SystemClock`，验证挂带 `advance`/`set` 的虚拟钟） |
 | 用途 | 协议验证 · 本地开发 · L0–L2 · L4 |
 
-**进程拓扑**：gateway（HTTP 接入）+ `mock-agentd`（执行）+ `mock-sweep`（reap/过期清理）+ `mock-server`（共享载体）。执行是独立进程，不内嵌于 gateway。
+**进程拓扑**：gateway（HTTP 接入 + 内嵌 sweep）+ `mock-agentd`（执行）+ `mock-server`（共享载体）。执行是独立进程，不内嵌于 gateway；维护（reap/过期清理）内嵌于 gateway，接受「peer 崩溃 → 该 peer 的 sweep 也停」的取舍（reap 幂等，幸存 peer 继续收口）。
 
 **mock 载体如何跨进程**：数据本体留在 `mock-server` 进程，对外暴露 `POST /rpc` 数据面（另有 `/unavailable`、`/tamper`、`/advance_clock`、`/set_clock` 控制面，仅供测试注入故障）；`mock-client` 是实现了三个端口（`ResponseLedger`/`ResponseEventLog`/`ConversationStore`）的 RPC 桩，gateway / agentd / sweep 各自持有一份，连同一个 `mock-server`。
 
@@ -51,9 +51,9 @@
 - 载体装配：`verify/mock/server/src/main.rs`（数据面 `/rpc` + 控制面 `/unavailable` `/tamper` `/advance_clock` `/set_clock`）
 - 客户端桩：`verify/mock/client/src/{ledger,event_log,conversation}.rs`（`MemClientWorld` 聚合三个适配器 + 每节点本地 read_only/pending_limit atomics）
 - 执行：`verify/mock/agentd/src/main.rs`（`--scheduler echo|scripted|http`，`--max-concurrent`）
-- 独立 sweep：`verify/mock/sweep/src/main.rs`，复用 `nova_responses_sweep::spawn(SweepDeps{...})`
+- sweep：`ResponsesService::start()` / `stop()`，由 gateway 在装配后启动、停机流程里停止
 - 端口与领域：都在 `nova-responses` library（`crates/responses`）；HTTP 层在 `gateway` crate
-- 夹具：`verify/config/node-{a,b,c}.toml` 供 gateway 用；`verify/xtask` 的 `procs up` 启动 mock-server + mock-agentd + mock-sweep + 三个 gateway
+- 夹具：`verify/config/node-{a,b,c}.toml` 供 gateway 用；`verify/xtask` 的 `procs up` 启动 mock-server + mock-agentd + 三个 gateway
 
 ---
 
@@ -76,8 +76,8 @@ graph BT
         agent["<b>nova-agent-runtime</b>（crates/agent-runtime）<br/>AgentRuntime（claim→run→commit 编排）<br/>AgentRunner（trait） · EventSink<br/>零 IO"]
     end
 
-    subgraph MAINT["后台维护库"]
-        sweeplib["<b>nova-responses-sweep</b>（crates/sweep）<br/>SweepDeps · 单循环三件事"]
+    subgraph MAINT["后台维护（能力层）"]
+        sweeplib["<b>ResponsesService</b>（crates/responses）<br/>start/stop · 单循环三件事"]
     end
 
     subgraph GWCRATE["接入层 + gateway 二进制"]
@@ -86,7 +86,6 @@ graph BT
 
     subgraph MOCK["验证进程（verify/mock/）"]
         agentd["<b>mock-agentd</b><br/>MockAgentRunner（ReAct loop）<br/>Scheduler · ToolExecutor · completions 形状"]
-        sweepbin["<b>mock-sweep</b><br/>独立维护进程"]
     end
 
     subgraph T["验证层（verify/）"]
@@ -607,7 +606,7 @@ graph LR
 
 ```mermaid
 graph TB
-    subgraph SW["sweeper：单循环三件事（2s 一跳，库 nova-responses-sweep，独立进程 mock-sweep）"]
+    subgraph SW["sweeper：单循环三件事（2s 一跳，ResponsesService start/stop）"]
         T1["1 reap 失联 claim<br/>抬高 attempt 栅栏 · 发 Failed 终态事件+close<br/>释放轮次标记 · 部分用量由 ledger 自身记账"]
         T2["2 释放过期事件缓冲（event_log.sweep_expired）"]
         T3["3 清理过期会话快照（conversation 冷存储保留策略，配置项）"]
@@ -624,13 +623,13 @@ graph TB
     style D3 fill:#1a5c2a,stroke:#4dd47a,color:#fff
 ```
 
-**核对点**（`crates/sweep/src/lib.rs`、`gateway/src/shutdown.rs`、`gateway/src/state.rs`、`verify/mock/sweep/src/main.rs`）：
+**核对点**（`crates/responses/src/service/sweep.rs`、`gateway/src/shutdown.rs`、`gateway/src/state.rs`、`gateway/src/main.rs`）：
 
 - 三件事合并为**一个**循环（`const TICK = 2s`，`SWEEP_BATCH = 500`）：三个独立循环意味着三个定时器和三次忘记其一的机会
 - 部分用量在回收时由 ledger 自身记账，故两步之间崩溃不会丢失（INV-51）
 - reap 是**失联执行的唯一收口**（INV-45）。执行进程独立后没有「启动时扫自己的孤儿」这一步可依赖——崩掉的 worker 不会再启动，只能由 sweep 进程抬 fence 并置失败（同时发 Failed 终态事件并 close 流）；回收也是终态迁移，故同时释放会话轮次标记（D28）
 - drain 期间**读与订阅继续服务**（`accepting` 原子位）——这是滚动发布不中断在途流的原因
-- **网关 drain 不影响执行**：`mock-agentd` 是独立进程，故障域已分离；sweep 也是独立进程（`mock-sweep`），残余在途由下一轮 reap 收口
+- **网关 drain 不影响执行**：`mock-agentd` 是独立进程，故障域已分离；sweep 内嵌于 gateway，reap 幂等——一个 peer 崩溃时幸存 peer 的下一轮 reap 仍会收口其残余在途
 
 ---
 
@@ -640,7 +639,7 @@ graph TB
 |---|---|---|---|---|
 | **L0** | 直调端口，契约用例 | mock | 端口语义：事件日志、账本、取消、会话快照、完整性、`global-claim`、输出溯源、持久化顺序、并发、协议子集、会话（conversation）… | `verify/conformance` |
 | **L1** | YAML 场景直驱端口 + Trace/Oracle | mock | 领域行为，**刻意绕过 HTTP**，故失败可定位到领域层 | `verify/scenarios/l1` |
-| **L2** | 真实多进程 + HTTP | mock（共享载体 `mock-server` + 独立 `mock-agentd` + 独立 `mock-sweep`） | 协议契约、幂等、只读、过载、跨节点订阅、会话快照、会话 | `verify/scenarios/l2` |
+| **L2** | 真实多进程 + HTTP | mock（共享载体 `mock-server` + 独立 `mock-agentd` + gateway 内嵌 sweep） | 协议契约、幂等、只读、过载、跨节点订阅、会话快照、会话 | `verify/scenarios/l2` |
 | **L4** | 官方 Python SDK 驱动 conversation 端点 | mock（经 gateway HTTP） | 上游 SDK 兼容（D27） | `verify/sdk-compat/run.py` |
 
 - 验证层级为 **L0 / L1 / L2 / L4 四档**（`verify/xtask` 的 `verify --level`，无 L3）
@@ -697,7 +696,7 @@ graph TB
 | 8 两条写路径 | [`invariants.md`](../architecture/invariants.md) INV-48 · [`03-context-chain.md`](./03-context-chain.md) |
 | 9 订阅续订 | `gateway/src/sse.rs` |
 | 10 职责边界 | `crates/agent-runtime/src/runner.rs` · `verify/mock/agentd/src/scheduler/mod.rs` · `verify/mock/agentd/src/tool.rs` · `decisions.md` D25 · D28 |
-| 11 维护与停机 | [`05-reliability.md`](./05-reliability.md) · `crates/sweep/src/lib.rs` · `verify/mock/sweep/src/main.rs` · `gateway/src/shutdown.rs` |
+| 11 维护与停机 | [`05-reliability.md`](./05-reliability.md) · `crates/responses/src/service/sweep.rs` · `gateway/src/main.rs` · `gateway/src/shutdown.rs` |
 | 12 验证分层 | [`02-verification.md`](./02-verification.md) · `verify/xtask/src/main.rs` |
 | 决策推导（本文档不重复） | [`decisions.md`](../architecture/decisions.md) |
 | 需求编号 | [`spec.md`](../requirements/spec.md) |

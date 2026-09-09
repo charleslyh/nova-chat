@@ -10,6 +10,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use nova_responses::ports::{ConversationRepo, ConversationSnapshots};
+
 use mock_server::MemWorld;
 use async_trait::async_trait;
 use nova_agent_runtime::{
@@ -23,10 +25,11 @@ use mock_agentd::{
     ScriptedScheduler, ToolError, ToolExecutor,
 };
 use nova_responses::protocol::{ContentPart, ResponseItem, Role};
+use nova_responses::ports::{ResponseEventLog, ResponseLedger};
 use nova_responses::{
-    Attempt, Conversation, ConversationId, ConversationStore, EventBody, IdempotencyKey, NodeTag,
-    ResolvedContext, ResponseEventKind, ResponseEventLog, ResponseId, ResponseLedger,
-    ResponseRecord, ResponseStatus, TenantId, Usage,
+    Clock, ContextAnchor, Conversation, ConversationId, EventBody, IdempotencyKey, ModelParams,
+    NodeTag, ResolvedContext, ResponseEventKind, ResponseId, ResponseRecord, ResponseStatus,
+    TenantId, TurnSpec, Usage,
 };
 use tokio::sync::Notify;
 
@@ -41,33 +44,24 @@ fn tenant() -> TenantId {
 }
 
 fn record(id: &ResponseId, text: &str, stored: bool) -> ResponseRecord {
-    ResponseRecord {
-        conversation_id: None,
-        response_id: id.clone(),
-        previous_response_id: None,
-        tenant_id: tenant(),
-        model: "m".into(),
-        instructions: None,
-        tools: Vec::new(),
-        tool_choice: None,
-        input_items: vec![ResponseItem::Message {
-            role: Role::User,
-            content: vec![ContentPart::InputText { text: text.into() }],
-            id: None,
-            status: None,
-        }],
-        reasoning: None,
-        status: ResponseStatus::Queued,
-        usage: Usage::default(),
-        created_at_ms: 1_000,
-        completed_at_ms: None,
-        stored,
-        expires_at_ms: None,
-        integrity: None,
-        idempotency_key: None,
-        owner: None,
-        attempt: Attempt::default(),
-    }
+    ResponseRecord::queued(
+        id.clone(),
+        tenant(),
+        TurnSpec {
+            params: ModelParams::new("m"),
+            input_items: vec![ResponseItem::Message {
+                role: Role::User,
+                content: vec![ContentPart::InputText { text: text.into() }],
+                id: None,
+                status: None,
+            }],
+            store: stored,
+            anchor: ContextAnchor::Root,
+        },
+        IdempotencyKey::parse(&id.to_string()).expect("a response id is a valid key"),
+        1_000,
+        0,
+    )
 }
 
 fn engine(world: &MemWorld, scheduler: Arc<dyn Scheduler>) -> AgentRuntime {
@@ -86,7 +80,7 @@ fn agent_with(
             ledger: world.ledger.clone(),
             event_log: world.event_log.clone(),
             runner,
-            now: world.now_fn(),
+            clock: world.clock.clone(),
             conversations: Some(world.conversation.clone()),
         },
         cfg,
@@ -108,10 +102,10 @@ async fn queue(world: &MemWorld, text: &str, stored: bool) -> (ResponseId, Conve
         .expect("create conversation");
     let id = ResponseId::new(node());
     let mut rec = record(&id, text, stored);
-    rec.conversation_id = Some(conv.id.clone());
+    rec.spec.anchor = ContextAnchor::Conversation(conv.id.clone());
     world
         .ledger
-        .create(rec, IdempotencyKey(uuid::Uuid::new_v4().to_string()), 1_000)
+        .create(rec, IdempotencyKey::parse(&uuid::Uuid::new_v4().to_string()).expect("a uuid is a valid key"), 1_000)
         .await
         .expect("create");
     (id, conv.id)
@@ -128,7 +122,7 @@ async fn snapshot(world: &MemWorld, conv: &ConversationId) -> ResolvedContext {
 /// The output half of a single-turn snapshot: everything after the input item.
 fn output_of(snap: &ResolvedContext) -> Vec<ResponseItem> {
     // One turn contributes input then output; the input is the first item.
-    snap.items.iter().skip(1).cloned().collect()
+    snap.items().skip(1).cloned().collect()
 }
 
 #[tokio::test]
@@ -152,11 +146,11 @@ async fn a_queued_response_runs_to_completion_with_no_socket_and_no_model() {
 
     let events = world
         .event_log
-        .read_after(&id, None, 64, 0)
+        .read_after(&id, None, 64, Duration::from_millis(0))
         .await
         .expect("read");
-    assert!(events.iter().any(|ev| ev.kind.is_terminal()));
-    assert!(events.iter().any(|ev| matches!(ev.kind, ResponseEventKind::OutputTextDelta)));
+    assert!(events.iter().any(|ev| ev.kind().is_terminal()));
+    assert!(events.iter().any(|ev| matches!(ev.kind(), ResponseEventKind::OutputTextDelta)));
 }
 
 #[tokio::test]
@@ -175,7 +169,7 @@ async fn any_nodes_work_can_be_executed_here() {
         .ledger
         .create(
             record(&foreign, "not yours", false),
-            IdempotencyKey(uuid::Uuid::new_v4().to_string()),
+            IdempotencyKey::parse(&uuid::Uuid::new_v4().to_string()).expect("a uuid is a valid key"),
             1_000,
         )
         .await
@@ -208,10 +202,10 @@ async fn a_scheduler_failure_terminates_the_response() {
 
     let events = world
         .event_log
-        .read_after(&id, None, 64, 0)
+        .read_after(&id, None, 64, Duration::from_millis(0))
         .await
         .expect("read");
-    assert!(events.iter().any(|ev| ev.kind.is_terminal()));
+    assert!(events.iter().any(|ev| ev.kind().is_terminal()));
 }
 
 #[tokio::test]
@@ -258,11 +252,11 @@ async fn store_false_completes_without_persisting_content() {
 
     let rec = world.ledger.get(&id).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Completed);
-    assert!(!rec.stored, "the flag must survive the round trip");
+    assert!(!rec.is_stored(), "the flag must survive the round trip");
 
     let snap = snapshot(&world, &conv).await;
-    assert_eq!(snap.depth, 0, "store=false must not write a snapshot turn");
-    assert!(snap.items.is_empty());
+    assert_eq!(snap.turns, 0, "store=false must not write a snapshot turn");
+    assert!(snap.is_empty());
 }
 
 #[tokio::test]
@@ -281,10 +275,10 @@ async fn a_stall_leaves_partial_output_but_does_not_complete() {
 
     let events = world
         .event_log
-        .read_after(&id, None, 64, 0)
+        .read_after(&id, None, 64, Duration::from_millis(0))
         .await
         .expect("read");
-    assert!(events.iter().any(|ev| matches!(ev.kind, ResponseEventKind::OutputTextDelta)));
+    assert!(events.iter().any(|ev| matches!(ev.kind(), ResponseEventKind::OutputTextDelta)));
     let rec = world.ledger.get(&id).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Failed);
 }
@@ -318,10 +312,10 @@ async fn history_is_assembled_from_the_conversation_snapshot() {
     // the server reads the conversation snapshot for history.
     let second = ResponseId::new(node());
     let mut rec = record(&second, "what is my name", true);
-    rec.conversation_id = Some(conv.clone());
+    rec.spec.anchor = ContextAnchor::Conversation(conv.clone());
     world
         .ledger
-        .create(rec, IdempotencyKey(uuid::Uuid::new_v4().to_string()), 3_000)
+        .create(rec, IdempotencyKey::parse(&uuid::Uuid::new_v4().to_string()).expect("a uuid is a valid key"), 3_000)
         .await
         .expect("create");
 
@@ -330,9 +324,9 @@ async fn history_is_assembled_from_the_conversation_snapshot() {
 
     // The snapshot now holds both turns.
     let snap = snapshot(&world, &conv).await;
-    assert_eq!(snap.depth, 2);
-    assert_eq!(snap.items.len(), 4, "2 turns x (input + output)");
-    let rendered = nova_responses::canonical_items(&snap.items);
+    assert_eq!(snap.turns, 2);
+    assert_eq!(snap.item_count(), 4, "2 turns x (input + output)");
+    let rendered = nova_responses::canonical_items(&snap.clone().into_items());
     assert!(rendered.contains("my name is Ada"));
     assert!(rendered.contains("what is my name"));
     let _ = first;
@@ -422,11 +416,11 @@ async fn a_tool_using_turn_runs_the_loop_and_stores_the_whole_trace() {
     assert!(matches!(&output[2], ResponseItem::Message { role: Role::Assistant, content, .. }
         if content.iter().any(|p| matches!(p, ContentPart::OutputText { text } if text.contains("sunny")))));
 
-    let events = world.event_log.read_after(&id, None, 64, 0).await.expect("read");
-    let kinds: Vec<_> = events.iter().map(|ev| ev.kind).collect();
+    let events = world.event_log.read_after(&id, None, 64, Duration::from_millis(0)).await.expect("read");
+    let kinds: Vec<_> = events.iter().map(|ev| ev.kind()).collect();
     assert!(kinds.contains(&ResponseEventKind::OutputItemAdded), "{kinds:?}");
     assert!(kinds.contains(&ResponseEventKind::OutputItemDone), "{kinds:?}");
-    assert!(events.iter().any(|ev| ev.kind.is_terminal()));
+    assert!(events.iter().any(|ev| ev.kind().is_terminal()));
 }
 
 #[tokio::test]
@@ -563,8 +557,8 @@ async fn tool_calls_stream_incrementally_to_the_subscriber() {
 
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
-    let events = world.event_log.read_after(&id, None, 128, 0).await.expect("read");
-    let kinds: Vec<_> = events.iter().map(|ev| ev.kind).collect();
+    let events = world.event_log.read_after(&id, None, 128, Duration::from_millis(0)).await.expect("read");
+    let kinds: Vec<_> = events.iter().map(|ev| ev.kind()).collect();
 
     assert!(kinds.contains(&ResponseEventKind::OutputItemAdded), "{kinds:?}");
     assert!(kinds.contains(&ResponseEventKind::FunctionCallArgumentsDelta), "{kinds:?}");
@@ -573,8 +567,8 @@ async fn tool_calls_stream_incrementally_to_the_subscriber() {
 
     let deltas: Vec<String> = events
         .iter()
-        .filter(|ev| ev.kind == ResponseEventKind::FunctionCallArgumentsDelta)
-        .map(|ev| match &ev.body {
+        .filter(|ev| ev.kind() == ResponseEventKind::FunctionCallArgumentsDelta)
+        .map(|ev| match &ev.body() {
             EventBody::Delta { delta, .. } => delta.clone(),
             _ => String::new(),
         })
@@ -619,9 +613,12 @@ async fn reasoning_is_persisted_but_never_fed_back_as_context() {
         !nova_responses::canonical_items(&output).contains("Let me think"),
         "reasoning must not leak into output items"
     );
-    // The reasoning block is recorded on the snapshot, aligned before the output.
+    // The reasoning block travels on the entry it belongs to, so "which item does this
+    // reasoning precede" is not a length agreement between two vectors any more.
+    let reasoning: Vec<Option<String>> =
+        snap.entries.iter().map(|e| e.reasoning.clone()).collect();
     assert_eq!(
-        snap.reasoning,
+        reasoning,
         vec![None, Some("Let me think about this.".into())]
     );
     let _ = id;
@@ -672,7 +669,7 @@ async fn a_long_generation_is_not_reaped_while_its_heartbeat_stays_fresh() {
     });
 
     let cfg = AgentRuntimeConfig {
-        heartbeat_interval_ms: 1_000,
+        heartbeat_interval: Duration::from_millis(1_000),
         ..AgentRuntimeConfig::default()
     };
     let e = agent_with(&world, scheduler, Arc::new(NoopToolExecutor), cfg);
@@ -686,7 +683,7 @@ async fn a_long_generation_is_not_reaped_while_its_heartbeat_stays_fresh() {
     tokio::time::advance(Duration::from_millis(2_000)).await;
     settle().await;
 
-    let aborted = world.ledger.reap(2_000, 1_500).await.expect("reap");
+    let aborted = world.ledger.reap(2_000, Duration::from_millis(1_500)).await.expect("reap");
     assert!(aborted.is_empty());
 
     release.notify_one();
@@ -710,7 +707,7 @@ async fn a_generation_is_reaped_once_its_heartbeat_stops() {
     });
 
     let cfg = AgentRuntimeConfig {
-        heartbeat_interval_ms: u64::MAX,
+        heartbeat_interval: Duration::MAX,
         ..AgentRuntimeConfig::default()
     };
     let e = agent_with(&world, scheduler, Arc::new(NoopToolExecutor), cfg);
@@ -724,7 +721,7 @@ async fn a_generation_is_reaped_once_its_heartbeat_stops() {
     tokio::time::advance(Duration::from_millis(5_000)).await;
     settle().await;
 
-    let aborted = world.ledger.reap(5_000, 2_000).await.expect("reap");
+    let aborted = world.ledger.reap(5_000, Duration::from_millis(2_000)).await.expect("reap");
     assert_eq!(aborted.len(), 1, "a stopped heartbeat must be reaped");
     assert_eq!(aborted[0].response_id, id);
 

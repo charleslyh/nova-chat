@@ -3,11 +3,11 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use nova_responses::{
-    AppendEvent, EventLogError, ResponseEvent, ResponseEventLog, ResponseId, StoreError,
-};
+use nova_responses::{AppendEvent, ResponseEvent, ResponseId};
+use nova_responses::ports::{EventLogError, ResponseEventLog, StoreError};
 
 use mock_server::proto::{ProtoError, Request, Response};
 
@@ -55,7 +55,7 @@ impl ResponseEventLog for MemEventLogClient {
         response_id: &ResponseId,
         starting_after: Option<u64>,
         limit: usize,
-        wait_ms: u64,
+        wait: Duration,
     ) -> Result<Vec<ResponseEvent>, EventLogError> {
         match event_rpc(
             &self.rpc,
@@ -63,12 +63,20 @@ impl ResponseEventLog for MemEventLogClient {
                 response_id: response_id.clone(),
                 starting_after,
                 limit,
-                wait_ms,
+                wait,
             },
         )
         .await?
         {
-            Response::EventLogReadAfter(events) => Ok(events.into_iter().map(Into::into).collect()),
+            // A read that came back without its sequence number is a carrier defect, not
+            // a number to invent: every cursor downstream depends on it.
+            Response::EventLogReadAfter(events) => events
+                .into_iter()
+                .map(|e| {
+                    e.into_response_event()
+                        .map_err(|e| EventLogError::Store(StoreError::Internal(e.to_string())))
+                })
+                .collect(),
             other => Err(EventLogError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
             )))),
@@ -79,14 +87,14 @@ impl ResponseEventLog for MemEventLogClient {
         &self,
         response_id: &ResponseId,
         now_ms: u64,
-        retain_ms: u64,
+        retain: Duration,
     ) -> Result<(), EventLogError> {
         match event_rpc(
             &self.rpc,
             Request::EventLogClose {
                 response_id: response_id.clone(),
                 now_ms,
-                retain_ms,
+                retain,
             },
         )
         .await?

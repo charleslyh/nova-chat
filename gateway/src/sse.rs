@@ -21,17 +21,14 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::future::BoxFuture;
 use futures::StreamExt;
-use nova_responses::{
-    ConversationEvent, ConversationId, ConversationStore, EventLogError, ResponseEvent,
-    StoreError,
-    ResponseEventLog, ResponseId, TenantId,
-};
+use nova_responses::{ConversationEvent, ConversationId, ResponseEvent, ResponseId, TenantId};
+use nova_responses::ports::{ConversationEvents, EventLogError, ResponseEventLog, StoreError};
 
 use crate::error::api_error;
 
 /// How long a single read may block waiting for new events. Long enough to keep
 /// first-token latency low, short enough that keep-alives still flow.
-const READ_WAIT_MS: u64 = 500;
+const READ_WAIT: Duration = Duration::from_millis(500);
 
 /// Events per read on the per-response stream. Batching cuts wake-ups on fast
 /// streams, and this one is the fast stream — thousands of deltas per turn.
@@ -101,7 +98,7 @@ pub trait SseSource: Send + Sync + 'static {
         &self,
         cursor: Option<u64>,
         limit: usize,
-        wait_ms: u64,
+        wait: Duration,
     ) -> BoxFuture<'_, Result<Vec<Self::Event>, StreamFailure>>;
 
     /// Sequence number, used as the SSE `id` so `Last-Event-ID` resumption works
@@ -133,7 +130,7 @@ pub async fn open_sse<S: SseSource>(
     batch: usize,
 ) -> Response {
     // Probe: surface unknown/expired as a status code before committing to 200.
-    if let Err((status, code, message)) = source.read(starting_after, 1, 0).await {
+    if let Err((status, code, message)) = source.read(starting_after, 1, Duration::ZERO).await {
         return api_error(status, code, message);
     }
 
@@ -145,7 +142,7 @@ pub async fn open_sse<S: SseSource>(
                 return None;
             }
             loop {
-                match source.read(cursor, batch, READ_WAIT_MS).await {
+                match source.read(cursor, batch, READ_WAIT).await {
                     Ok(batch) if !batch.is_empty() => {
                         let last = batch.last().map(S::seq);
                         let terminal = batch.iter().any(S::is_terminal);
@@ -207,22 +204,22 @@ impl SseSource for ResponseSource {
         &self,
         cursor: Option<u64>,
         limit: usize,
-        wait_ms: u64,
+        wait: Duration,
     ) -> BoxFuture<'_, Result<Vec<Self::Event>, StreamFailure>> {
         Box::pin(async move {
             self.event_log
-                .read_after(&self.response_id, cursor, limit, wait_ms)
+                .read_after(&self.response_id, cursor, limit, wait)
                 .await
                 .map_err(|e| map_event_log_error(&e))
         })
     }
 
     fn seq(event: &Self::Event) -> u64 {
-        event.sequence_number
+        event.sequence_number()
     }
 
     fn name(event: &Self::Event) -> &'static str {
-        event.kind.as_str()
+        event.kind().as_str()
     }
 
     fn data(event: &Self::Event) -> String {
@@ -230,7 +227,7 @@ impl SseSource for ResponseSource {
     }
 
     fn is_terminal(event: &Self::Event) -> bool {
-        event.kind.is_terminal()
+        event.kind().is_terminal()
     }
 }
 
@@ -255,7 +252,7 @@ pub async fn open_stream(
 
 /// The conversation event stream (D28).
 struct ConversationSource {
-    conversations: Arc<dyn ConversationStore>,
+    conversations: Arc<dyn ConversationEvents>,
     tenant: TenantId,
     conversation_id: ConversationId,
 }
@@ -267,11 +264,11 @@ impl SseSource for ConversationSource {
         &self,
         cursor: Option<u64>,
         limit: usize,
-        wait_ms: u64,
+        wait: Duration,
     ) -> BoxFuture<'_, Result<Vec<Self::Event>, StreamFailure>> {
         Box::pin(async move {
             self.conversations
-                .read_after(&self.tenant, &self.conversation_id, cursor, limit, wait_ms)
+                .read_after(&self.tenant, &self.conversation_id, cursor, limit, wait)
                 .await
                 .map_err(|e| crate::error::map_conversation_stream_error(&e))
         })
@@ -304,7 +301,7 @@ impl SseSource for ConversationSource {
 /// restores a reopened page, so there is no snapshot endpoint and therefore no
 /// snapshot that can go stale.
 pub async fn open_conversation_stream(
-    conversations: Arc<dyn ConversationStore>,
+    conversations: Arc<dyn ConversationEvents>,
     tenant: TenantId,
     conversation_id: ConversationId,
     starting_after: Option<u64>,
@@ -336,7 +333,7 @@ pub fn resolve_cursor(query: Option<u64>, last_event_id: Option<&str>) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nova_responses::{ConversationEventKind, ResponseStatus};
+    use nova_responses::{ConversationEventKind, NodeTag, ResponseStatus};
 
     #[test]
     fn last_event_id_takes_precedence() {
@@ -386,9 +383,7 @@ mod tests {
         // Not even at a turn boundary: the conversation outlives the turn, and
         // disconnecting a caught-up subscriber would force a reconnect for every
         // turn, which is exactly the round trip the long poll removes.
-        let response_id = nova_responses::ResponseId::new(
-            nova_responses::NodeTag::parse("n1").unwrap(),
-        );
+        let response_id = ResponseId::new(NodeTag::parse("n1").unwrap());
         for kind in [
             ConversationEventKind::TurnStarted {
                 response_id: response_id.clone(),
@@ -411,9 +406,7 @@ mod tests {
         // Resumption depends on this: `Last-Event-ID` is fed back as
         // `starting_after`, so the id must be the cursor and nothing else.
         let ev = conversation_event(ConversationEventKind::TurnStarted {
-            response_id: nova_responses::ResponseId::new(
-                nova_responses::NodeTag::parse("n1").unwrap(),
-            ),
+            response_id: ResponseId::new(NodeTag::parse("n1").unwrap()),
         });
         assert_eq!(ConversationSource::seq(&ev), ev.seq);
         assert_eq!(ConversationSource::name(&ev), "conversation.turn_started");

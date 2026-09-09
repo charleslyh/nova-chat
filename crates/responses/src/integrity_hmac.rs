@@ -54,7 +54,7 @@ impl HmacSha256Integrity {
         let mut mac = HmacSha256::new_from_slice(&self.key)
             .map_err(|e| IntegrityError::Internal(e.to_string()))?;
         mac.update(canonical.as_bytes());
-        Ok(hex(&mac.finalize().into_bytes()))
+        Ok(hex::encode(mac.finalize().into_bytes()))
     }
 }
 
@@ -78,18 +78,6 @@ impl ContentIntegrity for HmacSha256Integrity {
     fn alg(&self) -> &'static str {
         ALG
     }
-}
-
-/// Lowercase hex encoding. Hand-rolled rather than a `hex` crate dependency:
-/// it is five lines with no failure modes worth a crate.
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(DIGITS[(b >> 4) as usize] as char);
-        out.push(DIGITS[(b & 0x0f) as usize] as char);
-    }
-    out
 }
 
 #[cfg(test)]

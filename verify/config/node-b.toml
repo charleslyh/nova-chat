@@ -1,7 +1,11 @@
+# Peer node B. Same topology as node-a: the sweeper runs in-gateway, owned by the
+# responses service, with a short heartbeat TTL. Top-level keys are assembly-layer
+# knobs; the capability config — including heartbeat_ttl_ms — is under `[responses]`.
+
 listen = "127.0.0.1:18081"
+
+drain_timeout_ms = 3000
 
 [responses]
 node_tag = "node-b"
-
-run_sweeper = false
-drain_timeout_ms = 3000
+heartbeat_ttl_ms = 2000

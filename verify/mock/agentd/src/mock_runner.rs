@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use nova_agent_runtime::{
     AgentError, AgentEventSink, AgentOutcome, AgentRunner, AgentTask, SinkVerdict,
 };
+use nova_responses::protocol::ProtocolLimits;
 use nova_responses::{ResponseItem, ResponseStatus, Usage};
 
 use crate::completions::{
@@ -22,11 +23,27 @@ use crate::tool::ToolExecutor;
 pub struct MockAgentRunner {
     scheduler: Arc<dyn Scheduler>,
     tools: Arc<dyn ToolExecutor>,
+    /// The bounds our own output must clear, which are the bounds caller input clears:
+    /// anything we emit has to be acceptable as input next turn (INV-47), so there is one
+    /// set of numbers, not an output-side copy.
+    limits: ProtocolLimits,
 }
 
 impl MockAgentRunner {
     pub fn new(scheduler: Arc<dyn Scheduler>, tools: Arc<dyn ToolExecutor>) -> Self {
-        Self { scheduler, tools }
+        Self::with_limits(scheduler, tools, ProtocolLimits::default())
+    }
+
+    pub fn with_limits(
+        scheduler: Arc<dyn Scheduler>,
+        tools: Arc<dyn ToolExecutor>,
+        limits: ProtocolLimits,
+    ) -> Self {
+        Self {
+            scheduler,
+            tools,
+            limits,
+        }
     }
 }
 
@@ -48,14 +65,14 @@ impl AgentRunner for MockAgentRunner {
 
         // Provider shape, translated from the caller's inbound declaration.
         let tool_specs: Vec<ToolSpec> =
-            task.tools.clone().into_iter().map(ToolSpec::from).collect();
+            task.params.tools.clone().into_iter().map(ToolSpec::from).collect();
         let tool_choice: Option<CompletionsToolChoice> =
-            task.tool_choice.clone().map(CompletionsToolChoice::from);
+            task.params.tool_choice.clone().map(CompletionsToolChoice::from);
 
         loop {
             let request = match CompletionsRequest::from_context(
-                task.model.clone(),
-                task.instructions.as_deref(),
+                task.params.model.clone(),
+                task.params.instructions.as_deref(),
                 &conversation,
                 task.provenance.clone(),
             )
@@ -81,7 +98,7 @@ impl AgentRunner for MockAgentRunner {
                 }
             };
 
-            if let Err(e) = validate_outcome(&outcome) {
+            if let Err(e) = validate_outcome(&outcome, &self.limits) {
                 return Err(AgentError::Failed {
                     message: e.to_string(),
                     usage,

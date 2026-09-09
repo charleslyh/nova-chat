@@ -1,21 +1,26 @@
 # Peer node A. All three nodes are equivalent: each can create, none is an
-# authority. Execution and sweeping are separate processes over the shared
-# carrier, so the gateway neither embeds an agent nor runs the sweeper.
+# authority. Execution is a separate process (`mock-agentd`); the sweeper is owned
+# by the gateway's responses service — every peer reaps, and reaping is idempotent
+# so the redundant loops race harmlessly. This accepts the trade-off that a peer
+# crashing also stops *its* sweep loop (the surviving peers keep reaping).
 #
 # Secrets are absent by design — only the *names* of environment variables appear
 # here (SEC-4).
 #
-# Top-level keys are assembly-layer knobs (which backend, how to reach it, which
-# address to bind); the capability layer's config lives under `[responses]`.
+# Top-level keys are assembly-layer knobs: which backend, how to reach it, which
+# address to bind, which credentials table, how long shutdown may drain. The
+# capability layer's own config — including the sweeper's heartbeat TTL — lives
+# under `[responses]`.
 
 listen = "127.0.0.1:18080"
-
-[responses]
-node_tag = "node-a"
-
-# The sweep loop is a standalone process; the gateway must not run it.
-run_sweeper = false
 
 # Fixture value. Production defaults to 10 minutes so in-flight generations can
 # finish; here a short budget keeps the port from stranding the next run.
 drain_timeout_ms = 3000
+
+[responses]
+node_tag = "node-a"
+
+# Short so lost-claim recovery is observable in fixtures; production uses the 90s
+# default. Must stay well above the agent heartbeat interval (500ms in fixtures).
+heartbeat_ttl_ms = 2000

@@ -1,8 +1,8 @@
-{"type":"api_call","method":"POST","url":"http://127.0.0.1:18080/v1/responses","status_ok":true,"detail":"HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 410\r\nconnection: close\r\nda","at_ms":1}
+{"type":"api_call","method":"POST","url":"http://127.0.0.1:18080/v1/responses","status_ok":true,"detail":"HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 345\r\nconnection: close\r\nda","at_ms":1}
 {"type":"clock","now_ms":2}
-{"type":"api_call","method":"SSE_COLLECT","url":"http://127.0.0.1:18082/v1/responses/resp_node-a_f10c2b79-9624-4ce4-a639-a37b0ab62698?stream=true","status_ok":true,"detail":"events=3 last_seq=2 sample={\"sequence_number\":2,\"type\":\"response.output_item.added\",\"output_index\":0,\"item\"","at_ms":2}
+{"type":"api_call","method":"SSE_COLLECT","url":"http://127.0.0.1:18082/v1/responses/resp_node-a_418b7b8a-3526-4b68-93a7-741a7de8824b?stream=true","status_ok":true,"detail":"events=3 last_seq=2 sample={\"type\":\"response.output_item.added\",\"sequence_number\":2,\"output_index\":0,\"item\"","at_ms":2}
 {"type":"clock","now_ms":3}
 {"type":"fault_injected","kind":"kill_listener","target":"port:18082","at_ms":3}
 {"type":"clock","now_ms":4}
-{"type":"api_call","method":"SSE_COLLECT","url":"http://127.0.0.1:18080/v1/responses/resp_node-a_f10c2b79-9624-4ce4-a639-a37b0ab62698?stream=true&starting_after=2","status_ok":true,"detail":"events=5 last_seq=7 sample={\"sequence_number\":7,\"type\":\"response.content_part.done\",\"item_id\":\"msg_bf07ccac","at_ms":4}
+{"type":"api_call","method":"SSE_COLLECT","url":"http://127.0.0.1:18080/v1/responses/resp_node-a_418b7b8a-3526-4b68-93a7-741a7de8824b?stream=true&starting_after=2","status_ok":true,"detail":"events=5 last_seq=7 sample={\"type\":\"response.content_part.done\",\"sequence_number\":7,\"item_id\":\"msg_bf07ccac","at_ms":4}
 {"type":"clock","now_ms":5}

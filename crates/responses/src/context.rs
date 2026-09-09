@@ -1,454 +1,131 @@
-//! Stored response records and chain resolution types (D20).
-//!
-//! What is stored: the response's own **items** plus a pointer to the previous
-//! link. What is *not* stored: the incremental event stream.
+//! The context a generation inherits: history in chronological order.
 
-use std::fmt;
-use std::str::FromStr;
+use serde::{Deserialize, Serialize};
 
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
-use strum::AsRefStr;
-use uuid::Uuid;
+use crate::protocol::ResponseItem;
 
-use crate::conversation::ConversationId;
-use crate::protocol::{ResponseItem, Tool, ToolChoice};
-use crate::shared::{AgentId, Attempt, IdError, IdempotencyKey, NodeTag, TenantId};
-
-/// `resp_{node}_{uuid}`.
+/// One position in a conversation's history: an item, plus the reasoning block
+/// that precedes it if there is one.
 ///
-/// Carrying the host node inside the id is what makes directed routing possible
-/// without any shared registry lookup.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ResponseId {
-    node_tag: NodeTag,
-    uuid: Uuid,
-}
-
-impl ResponseId {
-    pub const PREFIX: &'static str = "resp_";
-
-    pub fn new(node_tag: NodeTag) -> Self {
-        Self {
-            node_tag,
-            uuid: Uuid::new_v4(),
-        }
-    }
-
-    pub fn from_parts(node_tag: NodeTag, uuid: Uuid) -> Self {
-        Self { node_tag, uuid }
-    }
-
-    pub fn parse(raw: &str) -> Result<Self, IdError> {
-        let rest = raw.strip_prefix(Self::PREFIX).ok_or(IdError::MissingPrefix)?;
-        // Node tags cannot contain '_', so the first separator is unambiguous.
-        let (node, uuid) = rest.split_once('_').ok_or(IdError::MalformedShape)?;
-        let node_tag = NodeTag::parse(node)?;
-        let uuid = Uuid::parse_str(uuid).map_err(|_| IdError::InvalidUuid)?;
-        Ok(Self { node_tag, uuid })
-    }
-
-    pub fn node_tag(&self) -> &NodeTag {
-        &self.node_tag
-    }
-
-    pub fn uuid(&self) -> Uuid {
-        self.uuid
-    }
-}
-
-impl fmt::Display for ResponseId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}{}_{}", Self::PREFIX, self.node_tag, self.uuid)
-    }
-}
-
-impl FromStr for ResponseId {
-    type Err = IdError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse(s)
-    }
-}
-
-impl Serialize for ResponseId {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_str(self)
-    }
-}
-
-impl<'de> Deserialize<'de> for ResponseId {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(d)?;
-        ResponseId::parse(&raw).map_err(de::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, AsRefStr)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum ResponseStatus {
-    Queued,
-    InProgress,
-    Completed,
-    Failed,
-    Incomplete,
-    Cancelled,
-}
-
-impl ResponseStatus {
-    pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            ResponseStatus::Completed
-                | ResponseStatus::Failed
-                | ResponseStatus::Incomplete
-                | ResponseStatus::Cancelled
-        )
-    }
-
-    pub fn as_str(&self) -> &str {
-        self.as_ref()
-    }
-}
-
-/// Token accounting. Integer typed throughout — never routed through `f64`,
-/// which would silently lose precision on large counts (D22).
-///
-/// `total_tokens` is **derived, never stored**: a stored total that disagreed
-/// with `input + output` would be two sources of truth for one fact. It is
-/// serialised for OpenAI wire compatibility only, and ignored on read.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Usage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-}
-
-impl Usage {
-    pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
-        Self {
-            input_tokens,
-            output_tokens,
-        }
-    }
-
-    pub fn total_tokens(self) -> u64 {
-        self.input_tokens.saturating_add(self.output_tokens)
-    }
-
-    pub fn is_zero(&self) -> bool {
-        self.input_tokens == 0 && self.output_tokens == 0
-    }
-
-    /// Accumulate across attempts so a mid-flight abort still contributes to
-    /// billing (CR-11 / INV-51). Named `accumulate` rather than `add`: the
-    /// semantics are saturating, which `std::ops::Add` would not advertise.
-    pub fn accumulate(self, other: Usage) -> Self {
-        Self::new(
-            self.input_tokens.saturating_add(other.input_tokens),
-            self.output_tokens.saturating_add(other.output_tokens),
-        )
-    }
-}
-
-impl Serialize for Usage {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("Usage", 3)?;
-        st.serialize_field("input_tokens", &self.input_tokens)?;
-        st.serialize_field("output_tokens", &self.output_tokens)?;
-        st.serialize_field("total_tokens", &self.total_tokens())?;
-        st.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for Usage {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct Raw {
-            input_tokens: u64,
-            output_tokens: u64,
-        }
-        let raw = Raw::deserialize(d)?;
-        Ok(Usage::new(raw.input_tokens, raw.output_tokens))
-    }
-}
-
-/// A persisted response record: ledger metadata for one generation.
-///
-/// Unlike the D24 design, the record carries **no materialised ancestor
-/// snapshot**. Long-term history lives in the conversation's snapshot (D30);
-/// this record holds only what identifies the response and the context it
-/// inherits from (its anchor), plus the turn's own input. Output is appended to
-/// the conversation snapshot at terminal and is reconstructable from the event
-/// stream within the retention window.
+/// The reasoning used to travel as a second `Vec<Option<String>>` that had to
+/// stay the same length as the items. Nothing enforced that, and one producer
+/// already got it wrong: it returned items with an empty reasoning vector, and the
+/// consumer `zip`ped the two — silently dropping the entire transcript. Fusing
+/// them removes the alignment as a thing that can be wrong.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ResponseRecord {
-    pub response_id: ResponseId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous_response_id: Option<ResponseId>,
-
-    /// Conversation this response belongs to, if any (D28). Recorded at create
-    /// time because the execution side has only the record when it reaches a
-    /// terminal status, and the alternative — scanning conversations for one
-    /// pointing at this response — cannot work.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_id: Option<ConversationId>,
-
-    pub tenant_id: TenantId,
-    pub model: String,
-
-    /// Echoed on retrieval, **never** fed into context assembly (INV-49).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-
-    /// Functions offered to the model this turn, in outbound provider shape.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<Tool>,
-
-    /// Per-response `tool_choice` selection, in outbound provider shape.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<ToolChoice>,
-
-    pub input_items: Vec<ResponseItem>,
-
-    /// Reasoning / thinking text streamed by a reasoning model this turn,
-    /// concatenated into one string. Render-only, never fed back as context.
+pub struct ContextEntry {
+    pub item: ResponseItem,
+    /// Render-only: a model does not read its own thinking, so this is never fed
+    /// back into model context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
-
-    pub status: ResponseStatus,
-    #[serde(default)]
-    pub usage: Usage,
-
-    pub created_at_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completed_at_ms: Option<u64>,
-
-    /// When false the record is not retained and cannot be referenced as a
-    /// previous link (FR-18).
-    pub stored: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at_ms: Option<u64>,
-
-    /// Integrity tag over the canonical encoding of the items. Algorithm and tag
-    /// are one fact — they are either both present or both absent — so they live
-    /// in a single `Option` rather than two parallel fields that could disagree.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub integrity: Option<IntegrityTag>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idempotency_key: Option<IdempotencyKey>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner: Option<AgentId>,
-    #[serde(default)]
-    pub attempt: Attempt,
 }
 
-impl ResponseRecord {
-    /// Where this response inherits its context from.
-    ///
-    /// The anchor is derived from the record's own fields — it is not a second
-    /// copy of state, just the view the execution/service layers consume to know
-    /// where to read history from (a conversation snapshot, a previous response,
-    /// or nothing).
-    pub fn anchor(&self) -> SnapshotRef {
-        if let Some(id) = &self.conversation_id {
-            SnapshotRef::Conversation(id.clone())
-        } else if let Some(id) = &self.previous_response_id {
-            SnapshotRef::Previous(id.clone())
-        } else {
-            SnapshotRef::Root
-        }
-    }
-
-    /// Whether this record may be used as `previous_response_id` by `tenant`.
-    pub fn is_referencable_by(&self, tenant: &TenantId) -> bool {
-        self.stored && &self.tenant_id == tenant
-    }
-}
-
-/// A content integrity tag together with the algorithm that produced it (INV-44).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IntegrityTag {
-    pub alg: String,
-    pub tag: String,
-}
-
-/// Where a response inherits its context from (D30).
-///
-/// The three variants replace D24's materialised snapshot: history is read from
-/// a single authoritative source — the conversation snapshot for anchored
-/// turns, or resolved through a previous response — rather than copied onto
-/// every record.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum SnapshotRef {
-    /// No prior context.
-    Root,
-    /// Continue from a previous response (bare chain, no conversation anchor).
-    Previous(ResponseId),
-    /// Continue from a conversation's materialised snapshot.
-    Conversation(ConversationId),
-}
-
-/// Bounds for chain resolution. Exceeding any of them is an **error**, never a
-/// silent truncation (INV-41).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ChainLimits {
-    pub max_depth: usize,
-    pub max_items: usize,
-    pub max_bytes: usize,
-}
-
-impl Default for ChainLimits {
-    fn default() -> Self {
+impl ContextEntry {
+    pub fn new(item: ResponseItem) -> Self {
         Self {
-            max_depth: 50,
-            max_items: 1000,
-            max_bytes: 1024 * 1024,
+            item,
+            reasoning: None,
         }
+    }
+
+    pub fn with_reasoning(item: ResponseItem, reasoning: Option<String>) -> Self {
+        Self { item, reasoning }
     }
 }
 
-/// Result of resolving a response's context: history in chronological order.
+/// Resolved history, oldest first.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ResolvedContext {
-    pub items: Vec<ResponseItem>,
-    /// Reasoning blocks aligned to `items`: one entry per item, `Some(text)`
-    /// meaning a reasoning block precedes that item. Render-only — never fed
-    /// back into model context.
-    #[serde(default)]
-    pub reasoning: Vec<Option<String>>,
-    pub depth: usize,
-    pub bytes: usize,
+    pub entries: Vec<ContextEntry>,
+    /// Completed turns behind this context. Not derivable from the entries — a
+    /// turn contributes a variable number of items — so it is carried.
+    pub turns: usize,
+}
+
+impl ResolvedContext {
+    pub fn new(entries: Vec<ContextEntry>, turns: usize) -> Self {
+        Self { entries, turns }
+    }
+
+    /// Build from bare items, for a source that has no reasoning to report.
+    pub fn from_items(items: impl IntoIterator<Item = ResponseItem>, turns: usize) -> Self {
+        Self::new(items.into_iter().map(ContextEntry::new).collect(), turns)
+    }
+
+    pub fn items(&self) -> impl Iterator<Item = &ResponseItem> {
+        self.entries.iter().map(|e| &e.item)
+    }
+
+    pub fn into_items(self) -> Vec<ResponseItem> {
+        self.entries.into_iter().map(|e| e.item).collect()
+    }
+
+    pub fn item_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Byte cost of the history, **computed** rather than carried: a stored size
+    /// beside the items it describes is a second source of truth that goes stale
+    /// the moment anything is appended.
+    pub fn bytes(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|e| e.item.byte_len())
+            .fold(0usize, |acc, len| acc.saturating_add(len))
+    }
+
+    pub fn extend(&mut self, other: ResolvedContext) {
+        self.entries.extend(other.entries);
+        self.turns = self.turns.saturating_add(other.turns);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tenant(s: &str) -> TenantId {
-        TenantId::parse(s).unwrap()
-    }
-
-    fn tag(s: &str) -> NodeTag {
-        NodeTag::parse(s).unwrap()
+    #[test]
+    fn bytes_track_the_items_without_a_second_field_to_maintain() {
+        let mut ctx = ResolvedContext::from_items([ResponseItem::user_text("abcd")], 1);
+        assert_eq!(ctx.bytes(), 4);
+        ctx.entries.push(ContextEntry::new(ResponseItem::user_text("ef")));
+        // No `bytes` field to forget to update.
+        assert_eq!(ctx.bytes(), 6);
+        assert_eq!(ctx.item_count(), 2);
     }
 
     #[test]
-    fn round_trips_response_id() {
-        let id = ResponseId::new(tag("node-a"));
-        let text = id.to_string();
-        assert!(text.starts_with("resp_node-a_"));
-        assert_eq!(ResponseId::parse(&text).unwrap(), id);
-        assert_eq!(id.node_tag().as_str(), "node-a");
-    }
-
-    #[test]
-    fn round_trips_through_serde() {
-        let id = ResponseId::new(tag("n1"));
-        let json = serde_json::to_string(&id).unwrap();
-        assert_eq!(json, format!("\"{id}\""));
-        assert_eq!(serde_json::from_str::<ResponseId>(&json).unwrap(), id);
-    }
-
-    #[test]
-    fn rejects_malformed_response_ids() {
-        assert_eq!(ResponseId::parse("abc"), Err(IdError::MissingPrefix));
-        assert_eq!(ResponseId::parse("resp_nouuid"), Err(IdError::MalformedShape));
-        assert_eq!(
-            ResponseId::parse("resp_node-a_not-a-uuid"),
-            Err(IdError::InvalidUuid)
+    fn reasoning_cannot_be_misaligned_with_items() {
+        let ctx = ResolvedContext::new(
+            vec![
+                ContextEntry::new(ResponseItem::user_text("q")),
+                ContextEntry::with_reasoning(
+                    ResponseItem::assistant_text("a"),
+                    Some("thinking".into()),
+                ),
+            ],
+            1,
         );
-        assert_eq!(
-            ResponseId::parse("resp_NODE_00000000-0000-0000-0000-000000000000"),
-            Err(IdError::InvalidNodeTag)
-        );
-        // Path traversal attempt inside the id.
-        assert!(ResponseId::parse("resp_../../etc_x").is_err());
-    }
-
-    fn record(stored: bool, tenant_id: &str) -> ResponseRecord {
-        ResponseRecord {
-            response_id: ResponseId::new(NodeTag::parse("n1").unwrap()),
-            previous_response_id: None,
-            conversation_id: None,
-            tenant_id: tenant(tenant_id),
-            model: "m".into(),
-            instructions: Some("secret system prompt".into()),
-            tools: Vec::new(),
-            tool_choice: None,
-            input_items: vec![ResponseItem::user_text("in")],
-            reasoning: None,
-            status: ResponseStatus::Completed,
-            usage: Usage::new(1, 2),
-            created_at_ms: 0,
-            completed_at_ms: Some(1),
-            stored,
-            expires_at_ms: None,
-            integrity: None,
-            idempotency_key: None,
-            owner: None,
-            attempt: Attempt::default(),
-        }
+        // Every item is reachable regardless of how many carry reasoning — the
+        // parallel-array version dropped all of them when the lengths differed.
+        assert_eq!(ctx.items().count(), 2);
+        let annotated: Vec<_> = ctx
+            .entries
+            .iter()
+            .filter(|e| e.reasoning.is_some())
+            .collect();
+        assert_eq!(annotated.len(), 1);
     }
 
     #[test]
-    fn anchor_is_derived_from_the_record() {
-        let root = record(true, "t1");
-        assert_eq!(root.anchor(), SnapshotRef::Root);
-
-        let prev = ResponseId::new(NodeTag::parse("n1").unwrap());
-        let mut chained = record(true, "t1");
-        chained.previous_response_id = Some(prev.clone());
-        assert_eq!(chained.anchor(), SnapshotRef::Previous(prev));
-
-        let conv = ConversationId::new();
-        let mut anchored = record(true, "t1");
-        anchored.conversation_id = Some(conv.clone());
-        assert_eq!(anchored.anchor(), SnapshotRef::Conversation(conv));
-    }
-
-    #[test]
-    fn referencability_requires_store_and_same_tenant() {
-        assert!(record(true, "t1").is_referencable_by(&tenant("t1")));
-        assert!(!record(false, "t1").is_referencable_by(&tenant("t1")));
-        assert!(!record(true, "t1").is_referencable_by(&tenant("t2")));
-    }
-
-    #[test]
-    fn usage_totals_and_accumulates() {
-        let a = Usage::new(3, 4);
-        assert_eq!(a.total_tokens(), 7);
-        let b = a.accumulate(Usage::new(1, 1));
-        assert_eq!(b, Usage::new(4, 5));
-        assert!(Usage::default().is_zero());
-        assert!(!a.is_zero());
-    }
-
-    #[test]
-    fn usage_saturates_instead_of_overflowing() {
-        let max = Usage::new(u64::MAX, u64::MAX);
-        assert_eq!(max.accumulate(Usage::new(1, 1)), max);
-    }
-
-    #[test]
-    fn terminal_status_set() {
-        for s in [
-            ResponseStatus::Completed,
-            ResponseStatus::Failed,
-            ResponseStatus::Incomplete,
-            ResponseStatus::Cancelled,
-        ] {
-            assert!(s.is_terminal(), "{s:?}");
-        }
-        assert!(!ResponseStatus::Queued.is_terminal());
-        assert!(!ResponseStatus::InProgress.is_terminal());
-    }
-
-    #[test]
-    fn default_chain_limits_match_parameters_doc() {
-        let limits = ChainLimits::default();
-        assert_eq!(limits.max_depth, 50);
-        assert_eq!(limits.max_bytes, 1024 * 1024);
+    fn from_items_is_the_no_reasoning_case() {
+        let ctx = ResolvedContext::from_items([ResponseItem::user_text("x")], 1);
+        assert!(ctx.entries.iter().all(|e| e.reasoning.is_none()));
+        assert_eq!(ctx.into_items().len(), 1);
     }
 }

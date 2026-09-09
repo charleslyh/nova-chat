@@ -13,8 +13,9 @@ use serde_json::{json, Value};
 // The gateway binary is thin assembly over `nova-responses`, so these tests drive
 // the same library the binary mounts — just with the mem backend injected in
 // process instead of a real carrier.
-use nova_responses::{Config, ConversationsService, RawConfig, ResponsesService};
-use nova_responses_gateway::{AppState, KeyTable};
+use nova_responses::config::Config;
+use nova_responses::service::{ConversationsService, ResponsesDeps, ResponsesService};
+use nova_responses_gateway::{AppState, GatewayConfig, KeyTable};
 
 use nova_agent_runtime::{
     AgentEventSink, AgentRuntime, AgentRuntimeConfig, AgentRuntimeDeps, Executed,
@@ -127,8 +128,10 @@ impl Scheduler for DivergentScheduler {
 }
 
 const DEFAULT_RAW: &str = r#"
+listen = "127.0.0.1:0"
+
+[responses]
 node_tag = "node-a"
-run_sweeper = false
 sync_wait_timeout_ms = 1500
 content_retention_ms = 600000
 retain_after_terminal_ms = 60000
@@ -139,8 +142,9 @@ async fn start() -> Harness {
 }
 
 async fn start_with_config(raw_text: &str) -> Harness {
-    let raw: RawConfig = toml::from_str(raw_text).expect("config");
-    let cfg = Arc::new(Config::from_raw(raw).expect("validate"));
+    let cfg: GatewayConfig = toml::from_str(raw_text).expect("config");
+    let cfg = Arc::new(cfg);
+    let responses_cfg: Arc<Config> = Arc::new(cfg.responses.clone());
 
     let world = mock_server::MemWorld::new();
     let world_handle = world.clone();
@@ -149,24 +153,27 @@ async fn start_with_config(raw_text: &str) -> Harness {
     // does it — this fixture is only worth anything if it is wired the same way.
     let conversations = Arc::new(ConversationsService::new(
         world.conversation.clone(),
-        world.now_fn(),
+        world.clock.clone(),
         world.metrics.clone(),
     ));
-    let service = Arc::new(ResponsesService::new(nova_responses::ResponsesDeps {
+    let service = Arc::new(ResponsesService::new(ResponsesDeps {
         ledger: world.ledger.clone(),
         event_log: world.event_log.clone(),
         conversations: conversations.clone(),
-        now: world.now_fn(),
+        turn_lock: world.conversation.clone(),
+        clock: world.clock.clone(),
         metrics: world.metrics.clone(),
-        cfg: cfg.clone(),
+        cfg: responses_cfg,
     }));
 
     let app_state = AppState {
         cfg,
         ledger: world.ledger.clone(),
         event_log: world.event_log.clone(),
-        conversation_store: world.conversation.clone(),
-        now: world.now_fn(),
+        // Each consumer takes the facet it needs; the same object backs both.
+        conversation_events: world.conversation.clone(),
+        conversation_repo: world.conversation.clone(),
+        clock: world.clock.clone(),
         metrics: world.metrics.clone(),
         keys,
         service,
@@ -282,7 +289,7 @@ impl Harness {
                 ledger: self.world.ledger.clone(),
                 event_log: self.world.event_log.clone(),
                 runner,
-                now: self.world.now_fn(),
+                clock: self.world.clock.clone(),
                 // Mounted, not `None`: with the port absent every terminal path
                 // would skip the marker release and the tail advance, and this
                 // harness could not tell working bookkeeping from missing
@@ -423,12 +430,15 @@ async fn multi_turn_chain_assembles_history_server_side() {
 async fn chain_limit_is_enforced() {
     let h = start_with_config(
         r#"
+        listen = "127.0.0.1:0"
+
+        [responses]
         node_tag = "node-a"
-        run_sweeper = false
         sync_wait_timeout_ms = 1500
         content_retention_ms = 600000
         retain_after_terminal_ms = 60000
-        [chain]
+
+        [responses.chain]
         max_depth = 2
         "#,
     )

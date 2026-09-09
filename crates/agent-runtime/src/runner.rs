@@ -11,19 +11,18 @@
 //! into every provider adapter.
 
 use async_trait::async_trait;
-use nova_responses::protocol::{Tool, ToolChoice};
-use nova_responses::{RequestProvenance, ResponseItem, ResponseStatus, Usage};
+use nova_responses::{ModelParams, RequestProvenance, ResponseItem, ResponseStatus, Usage};
 
 /// One agent execution task, assembled by the orchestrator after a claim.
 #[derive(Debug, Clone)]
 pub struct AgentTask {
-    pub model: String,
-    pub instructions: Option<String>,
-    /// Functions offered to the model this turn, in inbound protocol shape
-    /// (the caller's declaration); provider translation is the runner's job.
-    pub tools: Vec<Tool>,
-    pub tool_choice: Option<ToolChoice>,
-    /// Initial conversation (`snapshot.items + input_items`, D30).
+    /// What to ask the model, in inbound protocol shape (the caller's declaration);
+    /// provider translation is the runner's job.
+    ///
+    /// The same value the record stores, not a field-by-field copy of it: a new model
+    /// parameter then reaches the runner without a second place to remember.
+    pub params: ModelParams,
+    /// Initial conversation (`snapshot items + this turn's input`, D30).
     pub items: Vec<ResponseItem>,
     pub provenance: RequestProvenance,
     pub max_tool_rounds: usize,

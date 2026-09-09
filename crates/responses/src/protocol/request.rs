@@ -1,11 +1,11 @@
 //! Create-response request envelope — the full accepted parameter set (D22).
 //!
-//! `input` and `tool_choice` are genuine unions in the upstream protocol. They
-//! are deserialised with hand-written visitors rather than `#[serde(untagged)]`
-//! because `untagged` reports "data did not match any variant" and **discards
-//! the real error** — a malformed item deep inside an input array would surface
-//! as an unhelpful top-level failure. The visitors dispatch on the JSON kind
-//! first, then let the inner error propagate verbatim.
+//! `input` and `conversation` are genuine unions in the upstream protocol. They are
+//! deserialised with hand-written visitors rather than `#[serde(untagged)]` because
+//! `untagged` reports "data did not match any variant" and **discards the real
+//! error** — a malformed item deep inside an input array would surface as an
+//! unhelpful top-level failure. The visitors dispatch on the JSON kind first, then
+//! let the inner error propagate verbatim.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -16,12 +16,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::item::{ItemViolation, ResponseItem};
-use super::limits::{InputLimits, LimitViolation};
-
-/// Upstream metadata constraints.
-pub const MAX_METADATA_ENTRIES: usize = 16;
-pub const MAX_METADATA_KEY_BYTES: usize = 64;
-pub const MAX_METADATA_VALUE_BYTES: usize = 512;
+use super::limits::{LimitViolation, ProtocolLimits};
+use super::tool::{Tool, ToolChoice};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,12 +46,12 @@ pub struct CreateResponseRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
 
-    /// Conversation to continue, and whose tail pointer this response advances
-    /// once it completes (D27).
+    /// Conversation to continue, and whose tail pointer this response advances once
+    /// it completes (D27).
     ///
     /// Mutually exclusive with `previous_response_id`: both name the context to
-    /// inherit, and honouring one while ignoring the other would be a silent
-    /// choice made on the caller's behalf.
+    /// inherit, and honouring one while ignoring the other would be a silent choice
+    /// made on the caller's behalf.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<ConversationRef>,
 
@@ -85,8 +81,8 @@ fn default_true() -> bool {
 /// `conversation` accepts either a bare id string or `{"id": "conv_…"}`.
 ///
 /// Both forms are upstream's, not ours, so both are preserved on the wire rather
-/// than normalised on the way in — a request that round-trips differently from
-/// how it arrived is a request the caller cannot recognise. Consumers use
+/// than normalised on the way in — a request that round-trips differently from how
+/// it arrived is a request the caller cannot recognise. Consumers use
 /// [`ConversationRef::id`] and never branch on the shape.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
@@ -126,9 +122,8 @@ impl<'de> Deserialize<'de> for ConversationRef {
             }
 
             /// Dispatching on the JSON kind first, then letting the inner error
-            /// through, is why this is hand-written: `untagged` would report
-            /// "data did not match any variant" and discard which field was
-            /// wrong (see the module header).
+            /// through, is why this is hand-written: `untagged` would report "data
+            /// did not match any variant" and discard which field was wrong.
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                 let mut id: Option<String> = None;
                 while let Some(key) = map.next_key::<String>()? {
@@ -139,9 +134,7 @@ impl<'de> Deserialize<'de> for ConversationRef {
                             }
                             id = Some(map.next_value()?);
                         }
-                        other => {
-                            return Err(de::Error::unknown_field(other, &["id"]));
-                        }
+                        other => return Err(de::Error::unknown_field(other, &["id"])),
                     }
                 }
                 let id = id.ok_or_else(|| de::Error::missing_field("id"))?;
@@ -153,39 +146,8 @@ impl<'de> Deserialize<'de> for ConversationRef {
     }
 }
 
-/// Validate a metadata map against the upstream limits.
-///
-/// Shared by the create-response request and the conversation endpoints because
-/// upstream applies the same numbers to both. One implementation means the two
-/// cannot drift into disagreeing about what a valid key is.
-pub fn validate_metadata(
-    metadata: &BTreeMap<String, String>,
-) -> Result<(), RequestViolation> {
-    if metadata.len() > MAX_METADATA_ENTRIES {
-        return Err(RequestViolation::TooManyMetadataEntries {
-            actual: metadata.len(),
-            max: MAX_METADATA_ENTRIES,
-        });
-    }
-    for (key, value) in metadata {
-        if key.len() > MAX_METADATA_KEY_BYTES {
-            return Err(RequestViolation::MetadataKeyTooLong {
-                key: key.clone(),
-                max: MAX_METADATA_KEY_BYTES,
-            });
-        }
-        if value.len() > MAX_METADATA_VALUE_BYTES {
-            return Err(RequestViolation::MetadataValueTooLong {
-                key: key.clone(),
-                max: MAX_METADATA_VALUE_BYTES,
-            });
-        }
-    }
-    Ok(())
-}
-
-/// `input` accepts either a bare string (shorthand for a single user message)
-/// or an explicit item array.
+/// `input` accepts either a bare string (shorthand for a single user message) or an
+/// explicit item array.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum ResponseInput {
@@ -230,8 +192,8 @@ impl<'de> Deserialize<'de> for ResponseInput {
                 A: SeqAccess<'de>,
             {
                 let mut items = Vec::new();
-                // Errors from individual items propagate unchanged, preserving
-                // the offending item's index and field name.
+                // Errors from individual items propagate unchanged, preserving the
+                // offending item's index and field name.
                 while let Some(item) = seq.next_element::<ResponseItem>()? {
                     items.push(item);
                 }
@@ -240,86 +202,6 @@ impl<'de> Deserialize<'de> for ResponseInput {
         }
 
         deserializer.deserialize_any(InputVisitor)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Tool {
-    Function {
-        name: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        description: Option<String>,
-        /// JSON Schema; opaque to this service but depth-checked (SEC-7).
-        parameters: Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        strict: Option<bool>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolChoiceMode {
-    Auto,
-    None,
-    Required,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(untagged)]
-pub enum ToolChoice {
-    Mode(ToolChoiceMode),
-    Function { name: String },
-}
-
-impl<'de> Deserialize<'de> for ToolChoice {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct ChoiceVisitor;
-
-        impl<'de> Visitor<'de> for ChoiceVisitor {
-            type Value = ToolChoice;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(r#""auto" | "none" | "required" | {"type":"function","name":"…"}"#)
-            }
-
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                match v {
-                    "auto" => Ok(ToolChoice::Mode(ToolChoiceMode::Auto)),
-                    "none" => Ok(ToolChoice::Mode(ToolChoiceMode::None)),
-                    "required" => Ok(ToolChoice::Mode(ToolChoiceMode::Required)),
-                    other => Err(E::unknown_variant(other, &["auto", "none", "required"])),
-                }
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut kind: Option<String> = None;
-                let mut name: Option<String> = None;
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "type" => kind = Some(map.next_value()?),
-                        "name" => name = Some(map.next_value()?),
-                        other => return Err(de::Error::unknown_field(other, &["type", "name"])),
-                    }
-                }
-                match kind.as_deref() {
-                    Some("function") => {
-                        let name = name.ok_or_else(|| de::Error::missing_field("name"))?;
-                        Ok(ToolChoice::Function { name })
-                    }
-                    Some(other) => Err(de::Error::unknown_variant(other, &["function"])),
-                    None => Err(de::Error::missing_field("type")),
-                }
-            }
-        }
-
-        deserializer.deserialize_any(ChoiceVisitor)
     }
 }
 
@@ -342,9 +224,9 @@ pub enum RequestViolation {
     #[error("conversation id must not be empty")]
     EmptyConversationId,
     /// Both name the context to inherit. Upstream's own documentation does not
-    /// state whether it rejects the combination, so this is our call, taken the
-    /// way the rest of the service takes such calls: fail loudly rather than pick
-    /// one silently (see `docs/design/07-conversations.md`).
+    /// state whether it rejects the combination, so this is our call, taken the way
+    /// the rest of the service takes such calls: fail loudly rather than pick one
+    /// silently (see `docs/design/07-conversations.md`).
     #[error("previous_response_id and conversation must not both be set")]
     PreviousIdAndConversation,
     #[error("max_output_tokens must be greater than zero")]
@@ -371,14 +253,48 @@ pub enum RequestViolation {
     StreamAndBackground,
 }
 
-pub const MAX_INSTRUCTIONS_BYTES: usize = 32 * 1024;
+/// Validate a metadata map against the configured limits.
+///
+/// A method on the limits rather than a free function beside them, matching the
+/// other bound checks: the numbers and the rule that applies them belong together.
+/// Shared by the create-response request and the conversation endpoints, because
+/// upstream applies the same numbers to both.
+pub fn validate_metadata(
+    limits: &ProtocolLimits,
+    metadata: &BTreeMap<String, String>,
+) -> Result<(), RequestViolation> {
+    if metadata.len() > limits.max_metadata_entries {
+        return Err(RequestViolation::TooManyMetadataEntries {
+            actual: metadata.len(),
+            max: limits.max_metadata_entries,
+        });
+    }
+    for (key, value) in metadata {
+        if key.len() > limits.max_metadata_key_bytes {
+            return Err(RequestViolation::MetadataKeyTooLong {
+                key: key.clone(),
+                max: limits.max_metadata_key_bytes,
+            });
+        }
+        if value.len() > limits.max_metadata_value_bytes {
+            return Err(RequestViolation::MetadataValueTooLong {
+                key: key.clone(),
+                max: limits.max_metadata_value_bytes,
+            });
+        }
+    }
+    Ok(())
+}
 
 impl CreateResponseRequest {
     /// Full semantic validation. Structural rejection already happened during
     /// deserialisation; this covers value ranges and cross-field rules.
     ///
     /// Returns the normalised input items on success.
-    pub fn validate(&self, limits: &InputLimits) -> Result<Vec<ResponseItem>, RequestViolation> {
+    pub fn validate(
+        &self,
+        limits: &ProtocolLimits,
+    ) -> Result<Vec<ResponseItem>, RequestViolation> {
         if self.model.trim().is_empty() {
             return Err(RequestViolation::EmptyModel);
         }
@@ -386,9 +302,9 @@ impl CreateResponseRequest {
             return Err(RequestViolation::StreamAndBackground);
         }
         if let Some(instructions) = &self.instructions {
-            if instructions.len() > MAX_INSTRUCTIONS_BYTES {
+            if instructions.len() > limits.max_instructions_bytes {
                 return Err(RequestViolation::InstructionsTooLong {
-                    max: MAX_INSTRUCTIONS_BYTES,
+                    max: limits.max_instructions_bytes,
                 });
             }
         }
@@ -419,34 +335,29 @@ impl CreateResponseRequest {
             }
         }
         if let Some(metadata) = &self.metadata {
-            validate_metadata(metadata)?;
+            validate_metadata(limits, metadata)?;
         }
-        if let Some(tools) = &self.tools {
-            for tool in tools {
-                let Tool::Function {
-                    name, parameters, ..
-                } = tool;
-                limits.validate_depth(parameters).map_err(|source| {
-                    RequestViolation::ToolParameters {
-                        name: name.clone(),
-                        source,
-                    }
-                })?;
-            }
+        for tool in self.tools.iter().flatten() {
+            limits.validate_depth(tool.parameters()).map_err(|source| {
+                RequestViolation::ToolParameters {
+                    name: tool.name().to_string(),
+                    source,
+                }
+            })?;
         }
 
         let items = self.input.to_items();
         limits.validate_items(&items)?;
         for (index, item) in items.iter().enumerate() {
-            item.validate()
+            item.validate(limits)
                 .map_err(|source| RequestViolation::Item { index, source })?;
         }
         Ok(items)
     }
 }
 
-/// Detect deliberately unsupported upstream fields *before* deserialisation so
-/// the caller gets a specific remedy instead of a generic "unknown field".
+/// Detect deliberately unsupported upstream fields *before* deserialisation so the
+/// caller gets a specific remedy instead of a generic "unknown field".
 ///
 /// Returns `(field, explanation)` for the first match.
 pub fn preflight_unsupported(raw: &Value) -> Option<(&'static str, &'static str)> {
@@ -460,7 +371,11 @@ pub fn preflight_unsupported(raw: &Value) -> Option<(&'static str, &'static str)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ContentPart, Role};
+    use crate::protocol::{ContentPart, Role, ToolChoiceMode};
+
+    fn limits() -> ProtocolLimits {
+        ProtocolLimits::default()
+    }
 
     fn minimal(json: &str) -> Result<CreateResponseRequest, serde_json::Error> {
         serde_json::from_str(json)
@@ -507,8 +422,8 @@ mod tests {
 
     #[test]
     fn malformed_item_error_names_the_real_problem() {
-        // This is the payoff for not using #[serde(untagged)] on `input`:
-        // the error must point at the item type, not at "no variant matched".
+        // This is the payoff for not using #[serde(untagged)] on `input`: the error
+        // must point at the item type, not at "no variant matched".
         let err = minimal(r#"{"model":"m","input":[{"type":"item_reference","id":"x"}]}"#)
             .expect_err("must fail");
         let msg = err.to_string();
@@ -521,9 +436,9 @@ mod tests {
 
     #[test]
     fn preflight_no_longer_rejects_conversation() {
-        // The field is inside the subset now (D27). Leaving it on the rejection
-        // list would have made the new feature unreachable behind its own
-        // pre-flight check.
+        // The field is inside the subset now (D27). Leaving it on the rejection list
+        // would have made the new feature unreachable behind its own pre-flight
+        // check.
         let raw: Value =
             serde_json::from_str(r#"{"model":"m","input":"a","conversation":"conv_1"}"#).unwrap();
         assert_eq!(preflight_unsupported(&raw), None);
@@ -532,18 +447,19 @@ mod tests {
     #[test]
     fn conversation_accepts_both_upstream_shapes_and_null() {
         let req = minimal(r#"{"model":"m","input":"a","conversation":"conv_1"}"#).unwrap();
-        assert_eq!(
-            req.conversation,
-            Some(ConversationRef::Id("conv_1".into()))
-        );
-        assert_eq!(req.conversation.as_ref().map(ConversationRef::id), Some("conv_1"));
+        assert_eq!(req.conversation, Some(ConversationRef::Id("conv_1".into())));
 
         let req = minimal(r#"{"model":"m","input":"a","conversation":{"id":"conv_2"}}"#).unwrap();
         assert_eq!(
             req.conversation,
-            Some(ConversationRef::Object { id: "conv_2".into() })
+            Some(ConversationRef::Object {
+                id: "conv_2".into()
+            })
         );
-        assert_eq!(req.conversation.as_ref().map(ConversationRef::id), Some("conv_2"));
+        assert_eq!(
+            req.conversation.as_ref().map(ConversationRef::id),
+            Some("conv_2")
+        );
 
         // `null` is an accepted upstream spelling of "no conversation".
         let req = minimal(r#"{"model":"m","input":"a","conversation":null}"#).unwrap();
@@ -565,13 +481,11 @@ mod tests {
 
     #[test]
     fn malformed_conversation_objects_report_the_real_problem() {
-        // The hand-written visitor exists so these say what is wrong instead of
-        // "data did not match any variant".
         let err = minimal(r#"{"model":"m","input":"a","conversation":{}}"#).unwrap_err();
         assert!(err.to_string().contains("id"), "unhelpful error: {err}");
 
-        let err = minimal(r#"{"model":"m","input":"a","conversation":{"ref":"conv_1"}}"#)
-            .unwrap_err();
+        let err =
+            minimal(r#"{"model":"m","input":"a","conversation":{"ref":"conv_1"}}"#).unwrap_err();
         assert!(err.to_string().contains("ref"), "unhelpful error: {err}");
 
         let err = minimal(r#"{"model":"m","input":"a","conversation":7}"#).unwrap_err();
@@ -588,14 +502,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            req.validate(&InputLimits::default()),
+            req.validate(&limits()),
             Err(RequestViolation::PreviousIdAndConversation)
         );
 
         // Either one alone is fine.
         assert!(minimal(r#"{"model":"m","input":"a","conversation":"conv_1"}"#)
             .unwrap()
-            .validate(&InputLimits::default())
+            .validate(&limits())
             .is_ok());
     }
 
@@ -606,7 +520,7 @@ mod tests {
             r#"{"model":"m","input":"a","conversation":{"id":"   "}}"#,
         ] {
             assert_eq!(
-                minimal(json).unwrap().validate(&InputLimits::default()),
+                minimal(json).unwrap().validate(&limits()),
                 Err(RequestViolation::EmptyConversationId),
                 "{json}"
             );
@@ -624,37 +538,15 @@ mod tests {
     }
 
     #[test]
-    fn tool_choice_accepts_both_shapes() {
-        let mode: ToolChoice = serde_json::from_str(r#""required""#).unwrap();
-        assert_eq!(mode, ToolChoice::Mode(ToolChoiceMode::Required));
-        let func: ToolChoice = serde_json::from_str(r#"{"type":"function","name":"f"}"#).unwrap();
-        assert_eq!(func, ToolChoice::Function { name: "f".into() });
-        assert!(serde_json::from_str::<ToolChoice>(r#""whatever""#).is_err());
-        assert!(serde_json::from_str::<ToolChoice>(r#"{"type":"mcp","name":"f"}"#).is_err());
-    }
-
-    #[test]
-    fn rejects_hosted_tool_types() {
-        assert!(minimal(r#"{"model":"m","input":"a","tools":[{"type":"web_search"}]}"#).is_err());
-        assert!(minimal(
-            r#"{"model":"m","input":"a","tools":[{"type":"function","name":"f","parameters":{}}]}"#
-        )
-        .is_ok());
-    }
-
-    #[test]
     fn validates_ranges() {
-        let limits = InputLimits::default();
+        let limits = limits();
         let bad_temp = minimal(r#"{"model":"m","input":"a","temperature":3}"#).unwrap();
         assert_eq!(
             bad_temp.validate(&limits),
             Err(RequestViolation::TemperatureOutOfRange)
         );
         let bad_top = minimal(r#"{"model":"m","input":"a","top_p":1.5}"#).unwrap();
-        assert_eq!(
-            bad_top.validate(&limits),
-            Err(RequestViolation::TopPOutOfRange)
-        );
+        assert_eq!(bad_top.validate(&limits), Err(RequestViolation::TopPOutOfRange));
         let zero = minimal(r#"{"model":"m","input":"a","max_output_tokens":0}"#).unwrap();
         assert_eq!(
             zero.validate(&limits),
@@ -665,10 +557,26 @@ mod tests {
     }
 
     #[test]
+    fn bounds_come_from_the_supplied_limits() {
+        // Instructions used to be bounded by a constant; an operator could not
+        // change it while every neighbouring bound was configurable.
+        let req = minimal(r#"{"model":"m","input":"a","instructions":"abcdef"}"#).unwrap();
+        let tight = ProtocolLimits {
+            max_instructions_bytes: 3,
+            ..ProtocolLimits::default()
+        };
+        assert_eq!(
+            req.validate(&tight),
+            Err(RequestViolation::InstructionsTooLong { max: 3 })
+        );
+        assert!(req.validate(&limits()).is_ok());
+    }
+
+    #[test]
     fn rejects_stream_and_background_together() {
         let req = minimal(r#"{"model":"m","input":"a","stream":true,"background":true}"#).unwrap();
         assert_eq!(
-            req.validate(&InputLimits::default()),
+            req.validate(&limits()),
             Err(RequestViolation::StreamAndBackground)
         );
     }
@@ -679,8 +587,41 @@ mod tests {
             r#"{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"https://10.0.0.1/x.png"}]}]}"#,
         )
         .unwrap();
-        let err = req.validate(&InputLimits::default()).expect_err("must reject");
+        let err = req.validate(&limits()).expect_err("must reject");
         assert!(matches!(err, RequestViolation::Item { index: 0, .. }), "{err}");
+    }
+
+    #[test]
+    fn rejects_deeply_nested_tool_schemas() {
+        let mut schema = Value::Null;
+        for _ in 0..40 {
+            schema = Value::Array(vec![schema]);
+        }
+        let req = CreateResponseRequest {
+            model: "m".into(),
+            input: ResponseInput::Text("a".into()),
+            instructions: None,
+            store: true,
+            stream: false,
+            background: false,
+            previous_response_id: None,
+            conversation: None,
+            max_output_tokens: None,
+            metadata: None,
+            tools: Some(vec![Tool::Function {
+                name: "f".into(),
+                description: None,
+                parameters: schema,
+                strict: None,
+            }]),
+            tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
+            temperature: None,
+            top_p: None,
+        };
+        assert!(matches!(
+            req.validate(&limits()),
+            Err(RequestViolation::ToolParameters { .. })
+        ));
     }
 
     #[test]
@@ -689,7 +630,6 @@ mod tests {
             r#"{"model":"m","input":"hi","instructions":"be brief","temperature":0.7,"metadata":{"k":"v"}}"#,
         )
         .unwrap();
-        let items = req.validate(&InputLimits::default()).unwrap();
-        assert_eq!(items.len(), 1);
+        assert_eq!(req.validate(&limits()).unwrap().len(), 1);
     }
 }

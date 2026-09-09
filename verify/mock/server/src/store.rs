@@ -14,23 +14,24 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nova_responses::{
-    AgentId, Attempt, Conversation, ConversationEvent, ConversationEventKind, ConversationId,
-    ResponseId, ResponseItem, ResponseRecord, TenantId, Usage,
+    AgentId, Attempt, ContextEntry, Conversation, ConversationEvent, ConversationEventKind,
+    ConversationId, IdempotencyKey, ResponseId, ResponseRecord, TenantId, Usage,
 };
 use parking_lot::{Mutex, MutexGuard};
 use tokio::sync::Notify;
 
-/// A conversation's materialised snapshot (D30): the accumulated input+output of
-/// every completed turn, plus aligned reasoning blocks. This is the long-term
-/// record of the dialogue; responses are short-lived and reconstructable only
+/// A conversation's materialised snapshot (D30): the accumulated input+output of every
+/// completed turn, each entry carrying the reasoning block that precedes it. This is the
+/// long-term record of the dialogue; responses are short-lived and reconstructable only
 /// while their event stream is retained.
+///
+/// One vector of entries, not an item list beside a reasoning list: the two had to stay
+/// the same length and nothing enforced it.
 #[derive(Default)]
 pub(crate) struct Snapshot {
-    pub items: Vec<ResponseItem>,
-    pub reasoning: Vec<Option<String>>,
-    /// Number of completed turns (== `depth` in `ResolvedContext`).
+    pub entries: Vec<ContextEntry>,
+    /// Number of completed turns.
     pub turn_count: usize,
-    pub bytes: usize,
 }
 
 /// A conversation's event stream (D28). Held beside the conversation under the
@@ -53,8 +54,9 @@ pub(crate) struct Inner {
     /// of a full table scan every tick.
     pub expiry: BTreeMap<(u64, ResponseId), ()>,
     pub queued: VecDeque<ResponseId>,
-    /// Idempotency gate. No TTL window — presence alone rejects (INV-2).
-    pub idem: HashMap<String, ResponseId>,
+    /// Idempotency gate. No TTL window — presence alone rejects (INV-2). Keyed by the
+    /// validated newtype, so an unvalidated string cannot become a key.
+    pub idem: HashMap<IdempotencyKey, ResponseId>,
     pub heartbeats: HashMap<AgentId, u64>,
     /// Usage booked against abandoned attempts (INV-51).
     pub partial_usage: HashMap<(ResponseId, Attempt), Usage>,

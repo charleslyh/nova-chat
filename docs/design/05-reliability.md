@@ -72,7 +72,7 @@ SIGTERM → accepting = false      # 创建 503；查询与订阅继续
 
 ### 4.2 失联领取的心跳收口（reap）
 
-执行进程独立后没有「启动期扫自己的孤儿」这一步——崩掉的 agentd 不会再启动。失联 claim 由**独立 sweep 进程**按心跳超时回收：`in_progress` 且 owner 心跳超 `heartbeat_ttl` 的领取被抬栅栏并置失败。
+执行进程独立后没有「启动期扫自己的孤儿」这一步——崩掉的 agentd 不会再启动。失联 claim 由 gateway 内嵌的 sweep 按心跳超时回收：`in_progress` 且 owner 心跳超 `heartbeat_ttl` 的领取被抬栅栏并置失败。
 
 ```sql
 UPDATE responses SET attempt = attempt + 1, status = 'failed', …
@@ -115,7 +115,7 @@ END
 
 ## 5. 后台维护合并为单循环
 
-回收失联领取、释放过期事件缓冲、清理过期会话快照**同一 tick（2s）完成**，由独立进程 `mock-sweep`（复用 `nova-responses-sweep` 库）承担（共享载体下它是单一收口方，而非每节点各跑一份）。三个独立循环意味着三个定时器与三次遗漏机会。
+回收失联领取、释放过期事件缓冲、清理过期会话快照**同一 tick（2s）完成**，由能力层的 `ResponsesService`（`start` 启动、`stop` 停止）承担，每节点各跑一份——reap 幂等，冗余循环只竞争不重复收口。三个独立循环意味着三个定时器与三次遗漏机会。
 
 ```
 tick:

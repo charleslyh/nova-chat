@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use nova_responses::MetricsSink;
+use nova_responses::ports::MetricsSink;
 use parking_lot::Mutex;
 
 pub struct MemMetrics {

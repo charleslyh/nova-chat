@@ -21,7 +21,8 @@ use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
 use clap::Parser;
-use nova_responses::{ContentIntegrity, HmacSha256Integrity, ResponseId, ResponseItem};
+use nova_responses::{HmacSha256Integrity, ResponseId, ResponseItem};
+use nova_responses::ports::ContentIntegrity;
 use serde::Deserialize;
 
 use mock_server::proto::{Request, Response};

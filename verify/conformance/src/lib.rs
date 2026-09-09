@@ -9,14 +9,18 @@
 //! repeatedly against a persistent backend without cleanup between passes.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use nova_responses::protocol::{CreateResponseRequest, InputLimits, ResponseItem};
+use nova_responses::protocol::{CreateResponseRequest, ProtocolLimits, ResponseItem};
 use nova_responses::{
-    canonical_items, AgentId, AppendEvent, Attempt, ContentIntegrity, Conversation,
-    ConversationError, ConversationEventKind, ConversationId, ConversationStore, CreateOutcome,
-    EventBody, EventLogError, IdempotencyKey, LedgerError, NodeTag, ResponseEventKind,
-    ResponseEventLog, ResponseId, ResponseLedger, ResponseRecord, ResponseStatus, TenantId,
-    TurnCommit, Usage,
+    canonical_items, AgentId, AppendEvent, Attempt, ContextAnchor, Conversation,
+    ConversationEventKind, ConversationId, EventBody, IdempotencyKey, ModelParams, NodeTag,
+    ResponseEventKind, ResponseId, ResponseRecord, ResponseStatus, TenantId, TurnCommit, TurnSpec,
+    Usage,
+};
+use nova_responses::ports::{
+    ContentIntegrity, ConversationError, ConversationStore, CreateOutcome, EventLogError,
+    LedgerError, ResponseEventLog, ResponseLedger,
 };
 
 /// The set of ports under test. Backend-agnostic by construction.
@@ -57,7 +61,7 @@ fn fresh_tenant(prefix: &str) -> TenantId {
 }
 
 fn fresh_key() -> IdempotencyKey {
-    IdempotencyKey(uuid::Uuid::new_v4().to_string())
+    IdempotencyKey::parse(&uuid::Uuid::new_v4().to_string()).expect("a uuid is a valid key")
 }
 
 fn record(
@@ -67,45 +71,63 @@ fn record(
     stored: bool,
     status: ResponseStatus,
 ) -> ResponseRecord {
-    ResponseRecord {
-        response_id: id.clone(),
-        previous_response_id: previous.cloned(),
-        // Association is opt-in: cases that exercise it set these with
-        // struct-update syntax rather than threading two more parameters through
-        // every call site that does not care.
-        conversation_id: None,
-        tenant_id: tenant.clone(),
-        model: "test-model".into(),
-        instructions: Some("INSTRUCTIONS-MARKER".into()),
-        tools: Vec::new(),
-        tool_choice: None,
-        input_items: vec![ResponseItem::user_text(format!("in-{}", id.uuid()))],
-        reasoning: None,
-        status,
-        usage: Usage::default(),
-        created_at_ms: 1_000,
-        completed_at_ms: None,
-        stored,
-        expires_at_ms: None,
-        integrity: None,
-        idempotency_key: None,
-        owner: None,
-        attempt: Attempt::default(),
-    }
+    // The anchor is one field, so "continues a chain" and "belongs to a conversation" are
+    // mutually exclusive by construction; cases that need the conversation form overwrite
+    // `spec.anchor` rather than setting a second field.
+    let anchor = match previous {
+        Some(previous) => ContextAnchor::Previous(previous.clone()),
+        None => ContextAnchor::Root,
+    };
+    let mut record = ResponseRecord::queued(
+        id.clone(),
+        tenant.clone(),
+        TurnSpec {
+            params: ModelParams {
+                instructions: Some("INSTRUCTIONS-MARKER".into()),
+                ..ModelParams::new("test-model")
+            },
+            input_items: vec![ResponseItem::user_text(format!("in-{}", id.uuid()))],
+            store: stored,
+            anchor,
+        },
+        fresh_key(),
+        1_000,
+        // Retention only matters to the sweep cases, which set their own deadline.
+        0,
+    );
+    record.status = status;
+    record.idempotency_key = None;
+    record
 }
 
+/// A delta event, which is what most log cases append: the content is irrelevant, only
+/// the numbering and the fence are under test.
 fn event(id: &ResponseId, kind: ResponseEventKind, payload: &str) -> AppendEvent {
-    AppendEvent {
-        response_id: id.clone(),
+    fenced_event(id, kind, None, payload)
+}
+
+/// The same, carrying an explicit fence.
+///
+/// Events are built through the domain's constructors, so a kind can never be paired with
+/// a body that does not belong to it — which is why the fence is a parameter here instead
+/// of a field the case assigns afterwards.
+fn fenced_event(
+    id: &ResponseId,
+    kind: ResponseEventKind,
+    attempt: Option<Attempt>,
+    payload: &str,
+) -> AppendEvent {
+    AppendEvent::from_parts(
+        id.clone(),
         kind,
-        attempt: None,
-        body: EventBody::Delta {
+        attempt,
+        EventBody::Delta {
             item_id: String::new(),
             output_index: 0,
             content_index: None,
             delta: payload.to_string(),
         },
-    }
+    )
 }
 
 // ---------------------------------------------------------------- event log
@@ -136,42 +158,42 @@ pub async fn assert_event_log_conformance(log: Arc<dyn ResponseEventLog>, node_t
         assert_eq!(seq, expected, "sequence numbers must be contiguous");
     }
 
-    let all = log.read_after(&id, None, 100, 0).await.expect("read all");
-    let seqs: Vec<u64> = all.iter().map(|e| e.sequence_number).collect();
+    let all = log.read_after(&id, None, 100, Duration::from_millis(0)).await.expect("read all");
+    let seqs: Vec<u64> = all.iter().map(|e| e.sequence_number()).collect();
     assert_eq!(seqs, vec![0, 1, 2, 3, 4], "no gaps and no repeats");
 
     // `Some(0)` must skip event 0; `None` must include it. If these collapsed,
     // resuming from the very first event would be impossible.
-    let after_zero = log.read_after(&id, Some(0), 100, 0).await.expect("read");
+    let after_zero = log.read_after(&id, Some(0), 100, Duration::from_millis(0)).await.expect("read");
     assert_eq!(
-        after_zero.first().map(|e| e.sequence_number),
+        after_zero.first().map(|e| e.sequence_number()),
         Some(1),
         "starting_after is exclusive"
     );
-    let from_start = log.read_after(&id, None, 100, 0).await.expect("read");
-    assert_eq!(from_start.first().map(|e| e.sequence_number), Some(0));
+    let from_start = log.read_after(&id, None, 100, Duration::from_millis(0)).await.expect("read");
+    assert_eq!(from_start.first().map(|e| e.sequence_number()), Some(0));
 
     // Beyond the tip: empty, not an error — the response may still be running.
-    let future = log.read_after(&id, Some(999), 10, 0).await.expect("read");
+    let future = log.read_after(&id, Some(999), 10, Duration::from_millis(0)).await.expect("read");
     assert!(future.is_empty());
 
     // Unknown ids are reported, never treated as an empty stream.
     let unknown = ResponseId::new(node_tag.clone());
     assert_eq!(
-        log.read_after(&unknown, None, 10, 0).await,
+        log.read_after(&unknown, None, 10, Duration::from_millis(0)).await,
         Err(EventLogError::Unknown)
     );
 
     // After the retention window: explicit expiry, and crucially **no partial
     // data and no fallback layer** (INV-40).
-    log.close(&id, 10_000, 1_000).await.expect("close");
+    log.close(&id, 10_000, Duration::from_millis(1_000)).await.expect("close");
     log.sweep_expired(11_001).await.expect("sweep");
     assert_eq!(
-        log.read_after(&id, None, 10, 0).await,
+        log.read_after(&id, None, 10, Duration::from_millis(0)).await,
         Err(EventLogError::Expired)
     );
     assert_eq!(
-        log.read_after(&id, Some(2), 10, 0).await,
+        log.read_after(&id, Some(2), 10, Duration::from_millis(0)).await,
         Err(EventLogError::Expired),
         "expiry applies to every cursor, not just the earliest"
     );
@@ -203,7 +225,11 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
         )
         .await
         .expect("create");
-    assert_eq!(outcome, CreateOutcome::Accepted { response_id: id.clone() });
+    assert_eq!(
+        outcome.record().map(|r| r.response_id.clone()),
+        Some(id.clone()),
+        "an accepted create returns the stored record"
+    );
 
     // Replay far in the future still returns the original: the gate has no TTL
     // window, so a late retry cannot produce a second response (INV-2).
@@ -216,28 +242,32 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
         )
         .await
         .expect("replay");
-    assert_eq!(replay, CreateOutcome::Duplicate { response_id: id.clone() });
+    assert_eq!(
+        replay.record().map(|r| r.response_id.clone()),
+        Some(id.clone()),
+        "an idempotent replay returns the original record"
+    );
 
     let agent = AgentId::new();
     let claimed = ports
         .ledger
-        .claim(agent, 2_000, 60_000)
+        .claim(agent, 2_000, Duration::from_millis(60_000))
         .await
         .expect("claim")
         .expect("something claimable");
-    assert_eq!(claimed.attempt, Attempt(1), "attempt starts at 1 and increments");
+    assert_eq!(claimed.record.attempt, Attempt(1), "attempt starts at 1 and increments");
     let claimed_id = claimed.record.response_id.clone();
 
     // The fence accepts the current attempt and rejects anything else.
     ports
         .ledger
-        .check_attempt(&claimed_id, claimed.attempt)
+        .check_attempt(&claimed_id, claimed.record.attempt)
         .await
         .expect("current attempt is valid");
     assert_eq!(
         ports
             .ledger
-            .check_attempt(&claimed_id, Attempt(claimed.attempt.0 + 1))
+            .check_attempt(&claimed_id, Attempt(claimed.record.attempt.0 + 1))
             .await,
         Err(LedgerError::StaleAttempt)
     );
@@ -246,7 +276,7 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
         .ledger
         .complete(
             &claimed_id,
-            claimed.attempt,
+            claimed.record.attempt,
             ResponseStatus::Completed,
             Usage::new(3, 4),
             3_000,
@@ -260,7 +290,7 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
         .ledger
         .complete(
             &claimed_id,
-            claimed.attempt,
+            claimed.record.attempt,
             ResponseStatus::Completed,
             Usage::default(),
             3_100,
@@ -274,7 +304,7 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
             .ledger
             .complete(
                 &claimed_id,
-                claimed.attempt,
+                claimed.record.attempt,
                 ResponseStatus::InProgress,
                 Usage::default(),
                 3_200,
@@ -419,12 +449,12 @@ pub async fn assert_context_conformance(ports: &PortSet) {
         .read_snapshot(&tenant, &conversation.id)
         .await
         .expect("read snapshot");
-    assert_eq!(resolved.depth, 3);
-    assert!(resolved.bytes > 0);
-    assert_eq!(resolved.items.len(), 6, "each turn contributes input + output");
+    assert_eq!(resolved.turns, 3);
+    assert!(resolved.bytes() > 0);
+    assert_eq!(resolved.item_count(), 6, "each turn contributes input + output");
 
     // Chronological order: the oldest turn's input comes first.
-    let encoded_first = canonical_items(&resolved.items[..1]);
+    let encoded_first = canonical_items(&resolved.clone().into_items()[..1]);
     assert!(
         encoded_first.contains("in-0"),
         "snapshot must be oldest-first, got {encoded_first}"
@@ -432,7 +462,7 @@ pub async fn assert_context_conformance(ports: &PortSet) {
 
     // Instructions must never cross into the snapshot (INV-49): they live on the
     // record, and `append_turn` only takes items.
-    let encoded_all = canonical_items(&resolved.items);
+    let encoded_all = canonical_items(&resolved.clone().into_items());
     assert!(
         !encoded_all.contains("INSTRUCTIONS-MARKER"),
         "instructions leaked into the snapshot"
@@ -462,8 +492,8 @@ pub async fn assert_context_conformance(ports: &PortSet) {
         .read_snapshot(&tenant, &conversation.id)
         .await
         .expect("snapshot must survive response deletion");
-    assert_eq!(after_delete.depth, 3);
-    assert_eq!(after_delete.items.len(), 6);
+    assert_eq!(after_delete.turns, 3);
+    assert_eq!(after_delete.item_count(), 6);
 
     // Bulk purge is tenant-scoped.
     let foreign_tenant = fresh_tenant("foreign");
@@ -500,7 +530,7 @@ pub async fn assert_context_conformance(ports: &PortSet) {
             .read_snapshot(&foreign_tenant, &foreign_conv.id)
             .await
             .expect("foreign snapshot survives")
-            .depth,
+            .turns,
         1,
         "purge must not touch other tenants"
     );
@@ -631,7 +661,7 @@ pub fn assert_protocol_subset_rejects() {
     )
     .expect("structurally valid");
     assert!(
-        inline.validate(&InputLimits::default()).is_err(),
+        inline.validate(&ProtocolLimits::default()).is_err(),
         "inline binary must be rejected"
     );
 
@@ -640,7 +670,7 @@ pub fn assert_protocol_subset_rejects() {
     )
     .expect("structurally valid");
     assert!(
-        internal.validate(&InputLimits::default()).is_err(),
+        internal.validate(&ProtocolLimits::default()).is_err(),
         "internal addresses must be rejected"
     );
 
@@ -649,7 +679,7 @@ pub fn assert_protocol_subset_rejects() {
     let ok: CreateResponseRequest =
         serde_json::from_str(r#"{"model":"m","input":"hi","store":true,"temperature":0.5}"#)
             .expect("supported request");
-    assert!(ok.validate(&InputLimits::default()).is_ok());
+    assert!(ok.validate(&ProtocolLimits::default()).is_ok());
     assert!(ok.store, "store defaults to true");
 }
 
@@ -690,7 +720,7 @@ pub async fn assert_global_claim(ports: &PortSet) {
     loop {
         let Some(c) = ports
             .ledger
-            .claim(AgentId::new(), 1_000, 30_000)
+            .claim(AgentId::new(), 1_000, Duration::from_millis(30_000))
             .await
             .expect("drain claim")
         else {
@@ -700,7 +730,7 @@ pub async fn assert_global_claim(ports: &PortSet) {
             .ledger
             .complete(
                 &c.record.response_id,
-                c.attempt,
+                c.record.attempt,
                 ResponseStatus::Completed,
                 Usage::default(),
                 1_000,
@@ -733,13 +763,13 @@ pub async fn assert_global_claim(ports: &PortSet) {
     // One execution process claims both, in FIFO order, regardless of node tag.
     let first = ports
         .ledger
-        .claim(AgentId::new(), 2_000, 30_000)
+        .claim(AgentId::new(), 2_000, Duration::from_millis(30_000))
         .await
         .expect("claim first")
         .expect("something claimable");
     let second = ports
         .ledger
-        .claim(AgentId::new(), 2_100, 30_000)
+        .claim(AgentId::new(), 2_100, Duration::from_millis(30_000))
         .await
         .expect("claim second")
         .expect("something claimable");
@@ -756,8 +786,8 @@ pub async fn assert_global_claim(ports: &PortSet) {
         claimed_ids, expected,
         "global claim must hand out every queued response regardless of node tag"
     );
-    assert_eq!(first.attempt.0, 1);
-    assert_eq!(second.attempt.0, 1);
+    assert_eq!(first.record.attempt.0, 1);
+    assert_eq!(second.record.attempt.0, 1);
 
     // Drive both claims to a terminal state before returning, so in-flight work
     // left behind cannot consume another case's admission budget.
@@ -766,7 +796,7 @@ pub async fn assert_global_claim(ports: &PortSet) {
             .ledger
             .complete(
                 &c.record.response_id,
-                c.attempt,
+                c.record.attempt,
                 ResponseStatus::Completed,
                 Usage::default(),
                 2_200,
@@ -810,7 +840,7 @@ pub async fn assert_overload_integrity(ports: &PortSet) {
     loop {
         let Some(c) = ports
             .ledger
-            .claim(AgentId(uuid::Uuid::new_v4()), 1_000, 30_000)
+            .claim(AgentId::new(), 1_000, Duration::from_millis(30_000))
             .await
             .expect("drain claim")
         else {
@@ -820,7 +850,7 @@ pub async fn assert_overload_integrity(ports: &PortSet) {
             .ledger
             .complete(
                 &c.record.response_id,
-                c.attempt,
+                c.record.attempt,
                 ResponseStatus::Completed,
                 Usage::default(),
                 1_000,
@@ -845,7 +875,7 @@ pub async fn assert_overload_integrity(ports: &PortSet) {
     let mut refused = 0usize;
     for h in handles {
         match h.await.expect("create task panicked").expect("create call") {
-            CreateOutcome::Accepted { response_id } => accepted.push(response_id),
+            CreateOutcome::Accepted(record) => accepted.push(record.response_id.clone()),
             CreateOutcome::Overloaded => refused += 1,
             other => panic!("unexpected outcome at the admission boundary: {other:?}"),
         }
@@ -885,7 +915,7 @@ pub async fn assert_overload_integrity(ports: &PortSet) {
         let ledger = ports.ledger.clone();
         claim_handles.push(tokio::spawn(async move {
             ledger
-                .claim(AgentId(uuid::Uuid::new_v4()), 2_100, 30_000)
+                .claim(AgentId::new(), 2_100, Duration::from_millis(30_000))
                 .await
         }));
     }
@@ -990,14 +1020,14 @@ pub async fn assert_output_provenance(ports: &PortSet) {
     // Now discard the event stream entirely, as eviction or a node restart would.
     ports
         .event_log
-        .close(&id, 3_000, 1_000)
+        .close(&id, 3_000, Duration::from_millis(1_000))
         .await
         .expect("close");
     // Strictly past the retention window, matching the event-log case's convention.
     ports.event_log.sweep_expired(4_001).await.expect("sweep");
     assert!(
         matches!(
-            ports.event_log.read_after(&id, None, 64, 0).await,
+            ports.event_log.read_after(&id, None, 64, Duration::from_millis(0)).await,
             Err(EventLogError::Expired)
         ),
         "the event stream must be genuinely gone for this check to mean anything"
@@ -1010,7 +1040,7 @@ pub async fn assert_output_provenance(ports: &PortSet) {
         .await
         .expect("snapshot read");
     assert!(
-        canonical_items(&snapshot.items).contains("Stable answer"),
+        canonical_items(&snapshot.clone().into_items()).contains("Stable answer"),
         "output items must come from the executor's terminal submission (FR-20); \
          if they were derived by replaying the event stream, discarding that \
          stream would have emptied them, making durable history depend on a \
@@ -1033,28 +1063,33 @@ pub async fn assert_output_provenance(ports: &PortSet) {
         .expect("create");
     let claimed = ports
         .ledger
-        .claim(AgentId(uuid::Uuid::new_v4()), 1_100, 30_000)
+        .claim(AgentId::new(), 1_100, Duration::from_millis(30_000))
         .await
         .expect("claim")
         .expect("something was queued");
-    let live = claimed.attempt;
+    let live = claimed.record.attempt;
 
-    let mut ok_ev = event(&claimed.record.response_id, ResponseEventKind::OutputTextDelta, "live");
-    ok_ev.attempt = Some(live);
     ports
         .event_log
-        .append(ok_ev)
+        .append(fenced_event(
+            &claimed.record.response_id,
+            ResponseEventKind::OutputTextDelta,
+            Some(live),
+            "live",
+        ))
         .await
         .expect("the current holder must be able to write");
 
     let stale = Attempt(live.0.saturating_sub(1));
-    let mut stale_ev = event(
-        &claimed.record.response_id,
-        ResponseEventKind::OutputTextDelta,
-        "from a reaped holder",
-    );
-    stale_ev.attempt = Some(stale);
-    let rejected = ports.event_log.append(stale_ev).await;
+    let rejected = ports
+        .event_log
+        .append(fenced_event(
+            &claimed.record.response_id,
+            ResponseEventKind::OutputTextDelta,
+            Some(stale),
+            "from a reaped holder",
+        ))
+        .await;
     assert!(
         matches!(rejected, Err(EventLogError::StaleAttempt)),
         "an append carrying a superseded attempt must be rejected, got {rejected:?}. \
@@ -1082,14 +1117,14 @@ pub async fn assert_durability_order(ports: &PortSet) {
     let tenant = fresh_tenant("durability");
     let id = ports.new_id();
     let mut rec = record(&id, None, &tenant, true, ResponseStatus::Queued);
-    rec.input_items = vec![ResponseItem::user_text("durable-marker")];
+    rec.spec.input_items = vec![ResponseItem::user_text("durable-marker")];
 
     let outcome = ports
         .ledger
         .create(rec, fresh_key(), 1_000)
         .await
         .expect("create");
-    assert!(matches!(outcome, CreateOutcome::Accepted { .. }));
+    assert!(matches!(outcome, CreateOutcome::Accepted(_)));
 
     // No sleep, no retry loop: "eventually visible" is precisely what this
     // invariant forbids.
@@ -1101,7 +1136,7 @@ pub async fn assert_durability_order(ports: &PortSet) {
         .expect("a response reported as accepted must be readable immediately");
     assert_eq!(seen.response_id, id);
     assert!(
-        seen.stored,
+        seen.is_stored(),
         "the record must retain store=true, otherwise the chain it anchors cannot \
          be resolved later"
     );
@@ -1110,7 +1145,7 @@ pub async fn assert_durability_order(ports: &PortSet) {
     // (D30): acknowledging before the write means a later turn discovers a broken
     // anchor far from the request that actually failed (INV-34).
     assert!(
-        canonical_items(&seen.input_items).contains("durable-marker"),
+        canonical_items(&seen.spec.input_items).contains("durable-marker"),
         "the persisted input items must be the ones submitted"
     );
 
@@ -1131,7 +1166,7 @@ pub async fn assert_durability_order(ports: &PortSet) {
         .await
         .expect("replay");
     assert!(
-        matches!(replay, CreateOutcome::Duplicate { .. }),
+        matches!(replay, CreateOutcome::Duplicate(_)),
         "a replayed key must be reported as duplicate, not stored twice"
     );
 }
@@ -1167,14 +1202,14 @@ pub async fn assert_concurrency_conformance(ports: &PortSet) {
         )
         .await
         .expect("create");
-    assert!(matches!(created, CreateOutcome::Accepted { .. }));
+    assert!(matches!(created, CreateOutcome::Accepted(_)));
 
     let mut handles = Vec::new();
     for _ in 0..RACERS {
         let ledger = ports.ledger.clone();
         handles.push(tokio::spawn(async move {
             ledger
-                .claim(AgentId(uuid::Uuid::new_v4()), 1_100, 30_000)
+                .claim(AgentId::new(), 1_100, Duration::from_millis(30_000))
                 .await
         }));
     }
@@ -1211,7 +1246,7 @@ pub async fn assert_concurrency_conformance(ports: &PortSet) {
     );
     for w in &winners {
         assert_eq!(
-            w.attempt.0, 1,
+            w.record.attempt.0, 1,
             "a first claim must produce attempt 1, otherwise the fence cannot \
              distinguish a retry from the original"
         );
@@ -1237,8 +1272,8 @@ pub async fn assert_concurrency_conformance(ports: &PortSet) {
     let mut duplicates = Vec::new();
     for h in handles {
         match h.await.expect("create task panicked").expect("create call") {
-            CreateOutcome::Accepted { response_id } => accepted.push(response_id),
-            CreateOutcome::Duplicate { response_id } => duplicates.push(response_id),
+            CreateOutcome::Accepted(record) => accepted.push(record.response_id.clone()),
+            CreateOutcome::Duplicate(record) => duplicates.push(record.response_id.clone()),
             other => panic!("unexpected outcome under contention: {other:?}"),
         }
     }
@@ -1290,12 +1325,12 @@ pub async fn assert_concurrency_conformance(ports: &PortSet) {
     // depends on.
     let read = ports
         .event_log
-        .read_after(&id, None, 128, 0)
+        .read_after(&id, None, 128, Duration::from_millis(0))
         .await
         .expect("read back");
     assert_eq!(read.len(), RACERS);
     for (i, ev) in read.iter().enumerate() {
-        assert_eq!(ev.sequence_number, i as u64);
+        assert_eq!(ev.sequence_number(), i as u64);
     }
 }
 
@@ -1323,7 +1358,7 @@ pub async fn assert_conversation_conformance(ports: &PortSet) {
 
     let created = ports.fresh_conversation(&tenant).await;
     assert!(
-        created.has_no_turns(),
+        created.last_response_id.is_none(),
         "a new conversation has no tail: the first turn must start from empty context"
     );
 
@@ -1399,7 +1434,7 @@ pub async fn assert_conversation_conformance(ports: &PortSet) {
         .expect("get")
         .expect("present");
     assert_eq!(after.last_response_id.as_ref(), Some(&first));
-    assert!(!after.has_no_turns());
+    assert!(after.last_response_id.is_some());
 
     // INV-55: last write wins. Two turns racing on one conversation leave
     // whichever finished last as the tail; the other's chain survives and stays
@@ -1555,7 +1590,7 @@ pub async fn assert_conversation_events_conformance(ports: &PortSet) {
     assert_eq!(held.active_response_id.as_ref(), Some(&r1), "marker must be set");
     let events = ports
         .conversation
-        .read_after(&tenant, &cid, None, 10, 0)
+        .read_after(&tenant, &cid, None, 10, Duration::from_millis(0))
         .await
         .expect("read");
     assert_eq!(events.len(), 1, "TurnStarted must be emitted with the acquire");
@@ -1571,7 +1606,7 @@ pub async fn assert_conversation_events_conformance(ports: &PortSet) {
     }
     let events = ports
         .conversation
-        .read_after(&tenant, &cid, None, 10, 0)
+        .read_after(&tenant, &cid, None, 10, Duration::from_millis(0))
         .await
         .unwrap();
     assert_eq!(events.len(), 1, "a refused turn must leave no event behind");
@@ -1586,7 +1621,7 @@ pub async fn assert_conversation_events_conformance(ports: &PortSet) {
     assert_eq!(again, start_seq, "re-entrant acquire returns the original seq");
     let events = ports
         .conversation
-        .read_after(&tenant, &cid, None, 10, 0)
+        .read_after(&tenant, &cid, None, 10, Duration::from_millis(0))
         .await
         .unwrap();
     assert_eq!(events.len(), 1, "re-entrant acquire must not emit a second TurnStarted");
@@ -1607,7 +1642,7 @@ pub async fn assert_conversation_events_conformance(ports: &PortSet) {
     assert!(released.active_response_id.is_none(), "marker must be cleared");
     let events = ports
         .conversation
-        .read_after(&tenant, &cid, Some(start_seq), 10, 0)
+        .read_after(&tenant, &cid, Some(start_seq), 10, Duration::from_millis(0))
         .await
         .unwrap();
     assert_eq!(events.len(), 1);
@@ -1622,7 +1657,7 @@ pub async fn assert_conversation_events_conformance(ports: &PortSet) {
         .expect("idempotent release");
     let events = ports
         .conversation
-        .read_after(&tenant, &cid, Some(done_seq), 10, 0)
+        .read_after(&tenant, &cid, Some(done_seq), 10, Duration::from_millis(0))
         .await
         .unwrap();
     assert!(events.is_empty(), "idempotent release must not emit a second TurnCompleted");
@@ -1648,7 +1683,7 @@ pub async fn assert_conversation_events_conformance(ports: &PortSet) {
     );
     let events = ports
         .conversation
-        .read_after(&tenant, &cid, Some(done_seq), 10, 0)
+        .read_after(&tenant, &cid, Some(done_seq), 10, Duration::from_millis(0))
         .await
         .unwrap();
     assert_eq!(events.len(), 1);
@@ -1658,7 +1693,7 @@ pub async fn assert_conversation_events_conformance(ports: &PortSet) {
     // Full read-back is 0-based and contiguous (INV-57).
     let all = ports
         .conversation
-        .read_after(&tenant, &cid, None, 100, 0)
+        .read_after(&tenant, &cid, None, 100, Duration::from_millis(0))
         .await
         .unwrap();
     let seqs: Vec<u64> = all.iter().map(|e| e.seq).collect();
@@ -1696,7 +1731,7 @@ pub async fn assert_conversation_events_conformance(ports: &PortSet) {
     // INV-59: reaching the per-conversation event bound refuses the append
     // rather than evicting the oldest event.
     let capped = ports.fresh_conversation(&tenant).await;
-    ports.conversation.set_max_events_per_conversation(2);
+    ports.conversation.set_max_events(2);
     for i in 0..2u64 {
         ports
             .conversation
@@ -1731,7 +1766,7 @@ pub async fn assert_conversation_events_conformance(ports: &PortSet) {
         "reaching the event bound must refuse the append, not evict (INV-59)"
     );
     // Restore the default bound so later cases are unaffected.
-    ports.conversation.set_max_events_per_conversation(100_000);
+    ports.conversation.set_max_events(100_000);
 
     // INV-56: a conversation event carries references only. Its wire form must
     // never contain conversation content — the envelope names a response or a
@@ -2230,12 +2265,12 @@ mod tests {
             _response_id: &ResponseId,
             starting_after: Option<u64>,
             limit: usize,
-            _wait_ms: u64,
+            _wait: Duration,
         ) -> Result<Vec<ResponseEvent>, EventLogError> {
             let g = self.events.lock().expect("lock");
             Ok(g.iter()
                 .filter(|e| match starting_after {
-                    Some(after) => e.sequence_number > after,
+                    Some(after) => e.sequence_number() > after,
                     None => true,
                 })
                 .take(limit)
@@ -2243,7 +2278,7 @@ mod tests {
                 .collect())
         }
 
-        async fn close(&self, _response_id: &ResponseId, _now_ms: u64, _retain_ms: u64)
+        async fn close(&self, _response_id: &ResponseId, _now_ms: u64, _retain: Duration)
             -> Result<(), EventLogError> {
             Ok(())
         }

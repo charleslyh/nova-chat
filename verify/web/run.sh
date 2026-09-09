@@ -68,7 +68,6 @@ free_ports() {
 echo "==> 编译能力服务（mem 后端）..."
 cargo build -q \
   --bin mock-server \
-  --bin mock-sweep \
   --bin mock-agentd \
   --bin nova-responses-gateway
 
@@ -85,15 +84,9 @@ echo "==> 起 mem-server（共享载体，数据面 19000 / 控制面 19001）"
 PIDS+=($!)
 wait_port 19000
 
-echo "==> 起 sweep（回收/保留）"
-# heartbeat TTL（90s）> agentd 心跳间隔（30s）：agent 生成期间会持续心跳，超过
-# TTL 未心跳才判定 holder 失联并 reap。若 TTL 短于生成耗时且 agent 不心跳，会把
-# 正常长生成误 reap（表现为长请求 response.failed）。
-"$BIN/mock-sweep" --heartbeat-ttl-ms 90000 --retain-after-terminal-ms 60000 &
-PIDS+=($!)
-
 echo "==> 起 agentd（--scheduler http，读 NOVA_CHAT_* 与 NOVA_MEM_SERVER_URL）"
-# sweep 的回收 TTL 是 2000ms，心跳必须远短于它，否则生成稍慢就被中途回收。
+# gateway 内嵌的 sweep 用 2000ms 心跳 TTL，心跳必须远短于它，否则生成稍慢就被
+# 中途回收。
 "$BIN/mock-agentd" --scheduler http --heartbeat-interval-ms 500 &
 PIDS+=($!)
 

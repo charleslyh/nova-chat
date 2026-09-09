@@ -6,19 +6,17 @@
 
 ## 拓扑
 
-两种**载体**（mem / 生产存储）共享**同一进程拓扑**：gateway（接入）+ `mock-agentd`（执行）+ `mock-sweep`（维护）+ 独立载体。唯一差异是载体。
+两种**载体**（mem / 生产存储）共享**同一进程拓扑**：gateway（接入 + 内嵌 sweep）+ `mock-agentd`（执行）+ 独立载体。唯一差异是载体。
 
 ```mermaid
 %%{init: {"flowchart": {"curve": "basis", "rankSpacing": 72, "nodeSpacing": 28}}}%%
 flowchart TB
-    client(["调用方"]) -->|"POST /v1/responses<br/>GET /{id}?stream&starting_after"| gw["<b>nova-responses-gateway ×N</b><br/>HTTP 接入 · 优雅停机"]
+    client(["调用方"]) -->|"POST /v1/responses<br/>GET /{id}?stream&starting_after"| gw["<b>nova-responses-gateway ×N</b><br/>HTTP 接入 · 优雅停机 · 内嵌 sweep"]
     agentd["<b>mock-agentd ×M</b><br/>执行 · claim → ReAct → commit"]
-    sweep["<b>mock-sweep</b><br/>维护 · reap · 过期清理"]
     carrier[("共享载体<br/>验证：mock-server<br/>生产：接入方注入的 ResponseLedger /<br/>ConversationStore / ResponseEventLog")]
 
-    gw -->|"create · get · subscribe"| carrier
+    gw -->|"create · get · subscribe · reap · sweep_expired"| carrier
     agentd -->|"全局 claim · complete · append 增量 · append_turn"| carrier
-    sweep -->|"reap · sweep_expired"| carrier
 ```
 
 节点**对等**：每个 gateway 都能创建 / 查询 / 订阅，无权威节点、无节点间转发——任意节点直读共享载体。
@@ -30,9 +28,8 @@ flowchart TB
 | 组件 | 职责 | 关键约束 |
 |---|---|---|
 | `nova-responses-gateway`（`gateway/`） | HTTP 接入、三种响应模式、优雅停机 | **薄装配**；只依赖端口与能力层，`check-deps` 强制边界 |
-| `nova-responses`（`crates/responses`） | 领域类型、协议封闭子集、端口 trait、规范化、service 能力层 | 只依赖端口，不依赖任何 adapter（`FORBIDDEN_IN_CORE` 强制） |
+| `nova-responses`（`crates/responses`） | 领域类型、协议封闭子集、端口 trait、规范化、service 能力层（含 sweeper） | 只依赖端口，不依赖任何 adapter（`FORBIDDEN_IN_CORE` 强制） |
 | `nova-agent-runtime`（`crates/agent-runtime`） | 编排：全局 claim → 组装 → commit | 经端口连共享载体，零 HTTP/DB；`check-deps` 拒绝 `reqwest`/`hyper`/`axum` |
-| `nova-responses-sweep`（`crates/sweep`） | 维护库：reap / 过期清理 | 单一收口方；二进制为 `mock-sweep` |
 | `mock-agentd`（`verify/mock/agentd`） | 执行进程：ReAct loop + Scheduler + ToolExecutor | 无模型、无持久化；completions 出站形状在此 |
 | `mock-server` + `mock-client`（`verify/mock/`） | 验证载体：数据本体 + `/rpc` 数据面 + 控制面 + 客户端 RPC 桩 | 不持久化；L0/L1 进程内直用，L2 经 mock-server 共享 |
 
@@ -48,7 +45,7 @@ flowchart TB
 | `ContentIntegrity` | 签名 / 常数时间校验 | 仅防篡改，非不可否认性 |
 | `MetricsSink` | 指标上报 | — |
 
-> `ContextStore` 已在 **D30 移除**：快照读写并入 `ConversationStore`，response 检索重建并入 `ResponseEventLog`。时钟不是端口，是注入的 `now: Arc<dyn Fn() -> u64>`。
+> `ContextStore` 已在 **D30 移除**：快照读写并入 `ConversationStore`，response 检索重建并入 `ResponseEventLog`。时钟不是端口，是注入的 `Arc<dyn Clock>`（生产挂 `SystemClock`，验证挂带 `advance`/`set` 的虚拟钟）。
 
 ---
 

@@ -4,12 +4,17 @@
 //! Port semantics themselves are asserted once, in `verify/conformance`, and
 //! run against every backend.
 
+use std::time::Duration;
+
 use mock_server::{MemWorld, MemWorldConfig};
+use nova_responses::ports::{
+    ConversationRepo, ConversationSnapshots, EventLogError, ResponseEventLog, ResponseLedger,
+    StoreError,
+};
 use nova_responses::{
-    AppendEvent, Attempt, Conversation, ConversationId, ConversationStore, EventBody,
-    EventLogError, IdempotencyKey, NodeTag, ResponseEventKind, ResponseEventLog, ResponseId,
-    ResponseItem, ResponseLedger, ResponseRecord, ResponseStatus, StoreError, TenantId, TurnCommit,
-    Usage,
+    AppendEvent, Attempt, ContextAnchor, Conversation, ConversationId, EventBody, IdempotencyKey,
+    ModelParams, NodeTag, ResponseEventKind, ResponseId, ResponseItem, ResponseRecord,
+    ResponseStatus, TenantId, TurnCommit, TurnSpec, Usage,
 };
 
 fn tag() -> NodeTag {
@@ -21,42 +26,47 @@ fn tenant(s: &str) -> TenantId {
 }
 
 fn record(id: &ResponseId, tenant_id: &str, stored: bool) -> ResponseRecord {
-    ResponseRecord {
-        conversation_id: None,
-        response_id: id.clone(),
-        previous_response_id: None,
-        tenant_id: tenant(tenant_id),
-        model: "m".into(),
-        instructions: Some("SYSTEM-PROMPT-MARKER".into()),
-        tools: Vec::new(),
-        tool_choice: None,
-        input_items: vec![ResponseItem::user_text(format!("in-{}", id.uuid()))],
-        reasoning: None,
-        status: ResponseStatus::Queued,
-        usage: Usage::default(),
-        created_at_ms: 0,
-        completed_at_ms: None,
-        stored,
-        expires_at_ms: None,
-        integrity: None,
-        idempotency_key: None,
-        owner: None,
-        attempt: Attempt::default(),
-    }
+    ResponseRecord::queued(
+        id.clone(),
+        tenant(tenant_id),
+        TurnSpec {
+            params: ModelParams {
+                instructions: Some("SYSTEM-PROMPT-MARKER".into()),
+                ..ModelParams::new("m")
+            },
+            input_items: vec![ResponseItem::user_text(format!("in-{}", id.uuid()))],
+            store: stored,
+            anchor: ContextAnchor::Root,
+        },
+        IdempotencyKey::parse(&id.to_string()).expect("a response id is a valid key"),
+        0,
+        0,
+    )
 }
 
 fn event(id: &ResponseId, kind: ResponseEventKind, payload: &str) -> AppendEvent {
-    AppendEvent {
-        response_id: id.clone(),
+    fenced_event(id, kind, None, payload)
+}
+
+/// The same, carrying an explicit fence. Built through the domain constructor, so a kind
+/// can never be paired with a body that does not belong to it.
+fn fenced_event(
+    id: &ResponseId,
+    kind: ResponseEventKind,
+    attempt: Option<Attempt>,
+    payload: &str,
+) -> AppendEvent {
+    AppendEvent::from_parts(
+        id.clone(),
         kind,
-        attempt: None,
-        body: EventBody::Delta {
+        attempt,
+        EventBody::Delta {
             item_id: String::new(),
             output_index: 0,
             content_index: None,
             delta: payload.to_string(),
         },
-    }
+    )
 }
 
 /// Seed a conversation with `turns` completed turns (each contributing an input
@@ -119,10 +129,10 @@ async fn sequence_numbers_are_zero_based_and_contiguous() {
     }
     let all = world
         .event_log
-        .read_after(&id, None, 100, 0)
+        .read_after(&id, None, 100, Duration::from_millis(0))
         .await
         .unwrap();
-    let seqs: Vec<u64> = all.iter().map(|e| e.sequence_number).collect();
+    let seqs: Vec<u64> = all.iter().map(|e| e.sequence_number()).collect();
     assert_eq!(seqs, vec![0, 1, 2, 3, 4]);
 }
 
@@ -137,12 +147,12 @@ async fn starting_after_is_exclusive_and_zero_is_a_real_cursor() {
             .await
             .unwrap();
     }
-    let after_zero = world.event_log.read_after(&id, Some(0), 100, 0).await.unwrap();
+    let after_zero = world.event_log.read_after(&id, Some(0), 100, Duration::from_millis(0)).await.unwrap();
     assert_eq!(
-        after_zero.iter().map(|e| e.sequence_number).collect::<Vec<_>>(),
+        after_zero.iter().map(|e| e.sequence_number()).collect::<Vec<_>>(),
         vec![1, 2]
     );
-    let from_start = world.event_log.read_after(&id, None, 100, 0).await.unwrap();
+    let from_start = world.event_log.read_after(&id, None, 100, Duration::from_millis(0)).await.unwrap();
     assert_eq!(from_start.len(), 3);
 }
 
@@ -164,16 +174,16 @@ async fn ring_eviction_raises_the_watermark_and_reports_expired() {
     assert_eq!(world.event_log.evicted_before(&id), Some(2));
 
     assert_eq!(
-        world.event_log.read_after(&id, None, 10, 0).await,
+        world.event_log.read_after(&id, None, 10, Duration::from_millis(0)).await,
         Err(EventLogError::Expired)
     );
     assert_eq!(
-        world.event_log.read_after(&id, Some(0), 10, 0).await,
+        world.event_log.read_after(&id, Some(0), 10, Duration::from_millis(0)).await,
         Err(EventLogError::Expired)
     );
-    let tail = world.event_log.read_after(&id, Some(2), 10, 0).await.unwrap();
+    let tail = world.event_log.read_after(&id, Some(2), 10, Duration::from_millis(0)).await.unwrap();
     assert_eq!(
-        tail.iter().map(|e| e.sequence_number).collect::<Vec<_>>(),
+        tail.iter().map(|e| e.sequence_number()).collect::<Vec<_>>(),
         vec![3, 4]
     );
 }
@@ -203,7 +213,7 @@ async fn unknown_id_is_distinct_from_expired() {
     let world = MemWorld::new();
     let unknown = ResponseId::new(tag());
     assert_eq!(
-        world.event_log.read_after(&unknown, None, 10, 0).await,
+        world.event_log.read_after(&unknown, None, 10, Duration::from_millis(0)).await,
         Err(EventLogError::Unknown)
     );
 }
@@ -217,19 +227,19 @@ async fn retention_window_expires_then_becomes_unknown() {
         .append(event(&id, ResponseEventKind::Completed, "done"))
         .await
         .unwrap();
-    world.event_log.close(&id, 1_000, 60_000).await.unwrap();
+    world.event_log.close(&id, 1_000, Duration::from_millis(60_000)).await.unwrap();
 
-    assert!(world.event_log.read_after(&id, None, 10, 0).await.is_ok());
+    assert!(world.event_log.read_after(&id, None, 10, Duration::from_millis(0)).await.is_ok());
 
     world.event_log.sweep_expired(61_001).await.unwrap();
     assert_eq!(
-        world.event_log.read_after(&id, None, 10, 0).await,
+        world.event_log.read_after(&id, None, 10, Duration::from_millis(0)).await,
         Err(EventLogError::Expired)
     );
 
     world.event_log.sweep_expired(10_000_000).await.unwrap();
     assert_eq!(
-        world.event_log.read_after(&id, None, 10, 0).await,
+        world.event_log.read_after(&id, None, 10, Duration::from_millis(0)).await,
         Err(EventLogError::Unknown)
     );
 }
@@ -274,11 +284,11 @@ async fn snapshot_accumulates_turns_in_chronological_order() {
         .read_snapshot(&tenant("t1"), &conv)
         .await
         .unwrap();
-    assert_eq!(snap.depth, 3);
-    assert_eq!(snap.items.len(), 6, "3 turns x (input + output)");
+    assert_eq!(snap.turns, 3);
+    assert_eq!(snap.item_count(), 6, "3 turns x (input + output)");
     assert!(ids.len() == 3);
     // Oldest first.
-    assert!(nova_responses::canonical_items(&snap.items[..1]).contains("in-0"));
+    assert!(nova_responses::canonical_items(&snap.clone().into_items()[..1]).contains("in-0"));
 }
 
 #[tokio::test]
@@ -291,7 +301,7 @@ async fn snapshot_never_contains_instructions() {
         .read_snapshot(&tenant("t1"), &conv)
         .await
         .unwrap();
-    let encoded = nova_responses::canonical_items(&snap.items);
+    let encoded = nova_responses::canonical_items(&snap.clone().into_items());
     assert!(
         !encoded.contains("SYSTEM-PROMPT-MARKER"),
         "instructions must not enter the snapshot: {encoded}"
@@ -311,8 +321,8 @@ async fn snapshot_survives_response_deletion() {
         .read_snapshot(&tenant("t1"), &conv)
         .await
         .unwrap();
-    assert_eq!(snap.depth, 2, "the snapshot keeps every turn it accumulated");
-    assert_eq!(snap.items.len(), 4);
+    assert_eq!(snap.turns, 2, "the snapshot keeps every turn it accumulated");
+    assert_eq!(snap.item_count(), 4);
 }
 
 #[tokio::test]
@@ -324,7 +334,7 @@ async fn a_missing_conversation_is_not_found() {
             .conversation
             .read_snapshot(&tenant("t1"), &ghost)
             .await,
-        Err(nova_responses::ConversationError::NotFound)
+        Err(nova_responses::ports::ConversationError::NotFound)
     );
 }
 
@@ -338,20 +348,20 @@ async fn partial_usage_survives_cancellation() {
     let id = ResponseId::new(tag());
     world
         .ledger
-        .create(record(&id, "t1", true), IdempotencyKey("k".into()), 0)
+        .create(record(&id, "t1", true), IdempotencyKey::parse("k").unwrap(), 0)
         .await
         .unwrap();
 
     let claimed = world
         .ledger
-        .claim(nova_responses::AgentId::new(), 0, 60_000)
+        .claim(nova_responses::AgentId::new(), 0, Duration::from_millis(60_000))
         .await
         .unwrap()
         .expect("claimable");
 
     world
         .ledger
-        .record_partial_usage(&id, claimed.attempt, Usage::new(7, 3))
+        .record_partial_usage(&id, claimed.record.attempt, Usage::new(7, 3))
         .await
         .unwrap();
     world.ledger.cancel(&tenant("t1"), &id, 1_000).await.unwrap();
@@ -368,12 +378,12 @@ async fn cancel_is_scoped_to_the_owning_tenant() {
     let id = ResponseId::new(tag());
     world
         .ledger
-        .create(record(&id, "t1", true), IdempotencyKey("k".into()), 0)
+        .create(record(&id, "t1", true), IdempotencyKey::parse("k").unwrap(), 0)
         .await
         .unwrap();
     assert_eq!(
         world.ledger.cancel(&tenant("intruder"), &id, 1).await,
-        Err(nova_responses::LedgerError::NotFound)
+        Err(nova_responses::ports::LedgerError::NotFound)
     );
 }
 
@@ -383,17 +393,21 @@ async fn stale_attempt_cannot_append_after_reaping() {
     let id = ResponseId::new(tag());
     world
         .ledger
-        .create(record(&id, "t1", true), IdempotencyKey("k".into()), 0)
+        .create(record(&id, "t1", true), IdempotencyKey::parse("k").unwrap(), 0)
         .await
         .unwrap();
     let agent = nova_responses::AgentId::new();
-    let claimed = world.ledger.claim(agent, 0, 60_000).await.unwrap().unwrap();
+    let claimed = world.ledger.claim(agent, 0, Duration::from_millis(60_000)).await.unwrap().unwrap();
 
-    let mut ev = event(&id, ResponseEventKind::OutputTextDelta, "a");
-    ev.attempt = Some(claimed.attempt);
+    let ev = fenced_event(
+        &id,
+        ResponseEventKind::OutputTextDelta,
+        Some(claimed.record.attempt),
+        "a",
+    );
     assert!(world.event_log.append(ev.clone()).await.is_ok());
 
-    world.ledger.reap(1_000_000, 90_000).await.unwrap();
+    world.ledger.reap(1_000_000, Duration::from_millis(90_000)).await.unwrap();
     assert_eq!(
         world.event_log.append(ev).await,
         Err(EventLogError::StaleAttempt)
@@ -404,14 +418,14 @@ async fn stale_attempt_cannot_append_after_reaping() {
 async fn idempotency_gate_has_no_ttl_window() {
     let world = MemWorld::new();
     let id = ResponseId::new(tag());
-    let key = IdempotencyKey("same".into());
+    let key = IdempotencyKey::parse("same").unwrap();
     let first = world
         .ledger
         .create(record(&id, "t1", true), key.clone(), 0)
         .await
         .unwrap();
     let response_id = match first {
-        nova_responses::CreateOutcome::Accepted { response_id } => response_id,
+        nova_responses::ports::CreateOutcome::Accepted(record) => record.response_id.clone(),
         other => panic!("expected acceptance, got {other:?}"),
     };
     let replay = world
@@ -419,7 +433,11 @@ async fn idempotency_gate_has_no_ttl_window() {
         .create(record(&ResponseId::new(tag()), "t1", true), key, u64::MAX)
         .await
         .unwrap();
-    assert_eq!(replay, nova_responses::CreateOutcome::Duplicate { response_id });
+    assert_eq!(
+        replay.record().map(|r| r.response_id.clone()),
+        Some(response_id),
+        "an idempotent replay returns the original record"
+    );
 }
 
 #[tokio::test]
@@ -428,7 +446,7 @@ async fn read_only_degrade_blocks_writes_but_not_reads() {
     let id = ResponseId::new(tag());
     world
         .ledger
-        .create(record(&id, "t1", true), IdempotencyKey("k".into()), 0)
+        .create(record(&id, "t1", true), IdempotencyKey::parse("k").unwrap(), 0)
         .await
         .unwrap();
     world.store.set_read_only(true);
@@ -436,9 +454,9 @@ async fn read_only_degrade_blocks_writes_but_not_reads() {
     assert_eq!(
         world
             .ledger
-            .create(record(&ResponseId::new(tag()), "t1", true), IdempotencyKey("k2".into()), 0)
+            .create(record(&ResponseId::new(tag()), "t1", true), IdempotencyKey::parse("k2").unwrap(), 0)
             .await,
-        Ok(nova_responses::CreateOutcome::ReadOnly)
+        Ok(nova_responses::ports::CreateOutcome::ReadOnly)
     );
     assert_eq!(
         world
@@ -459,7 +477,7 @@ async fn overload_rejects_new_work_without_corrupting_state() {
     let first = ResponseId::new(tag());
     world
         .ledger
-        .create(record(&first, "t1", true), IdempotencyKey("k1".into()), 0)
+        .create(record(&first, "t1", true), IdempotencyKey::parse("k1").unwrap(), 0)
         .await
         .unwrap();
 
@@ -467,10 +485,10 @@ async fn overload_rejects_new_work_without_corrupting_state() {
     assert_eq!(
         world
             .ledger
-            .create(record(&second, "t1", true), IdempotencyKey("k2".into()), 0)
+            .create(record(&second, "t1", true), IdempotencyKey::parse("k2").unwrap(), 0)
             .await
             .unwrap(),
-        nova_responses::CreateOutcome::Overloaded
+        nova_responses::ports::CreateOutcome::Overloaded
     );
     assert!(world.ledger.get(&second).await.unwrap().is_none());
     assert_eq!(world.ledger.in_flight().await.unwrap(), 1);
@@ -486,14 +504,14 @@ async fn tenant_purge_removes_records_and_snapshots() {
         rec.status = ResponseStatus::Completed;
         world
             .ledger
-            .create(rec, IdempotencyKey(format!("k-{id}")), 0)
+            .create(rec, IdempotencyKey::parse(&format!("k-{id}")).expect("generated key is valid"), 0)
             .await
             .unwrap();
     }
     let keep = ResponseId::new(tag());
     world
         .ledger
-        .create(record(&keep, "t2", true), IdempotencyKey("keep".into()), 0)
+        .create(record(&keep, "t2", true), IdempotencyKey::parse("keep").unwrap(), 0)
         .await
         .unwrap();
 

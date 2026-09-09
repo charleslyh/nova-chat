@@ -3,17 +3,21 @@
 //! L1 deliberately bypasses HTTP so a failure localises to the domain layer.
 //! The HTTP contract is covered at L2.
 
+use std::time::Duration;
 use std::collections::HashMap;
 use std::path::Path;
 
 use mock_server::MemWorld;
 use anyhow::{bail, Context, Result};
-use nova_responses::protocol::{CreateResponseRequest, InputLimits};
+use nova_responses::protocol::{CreateResponseRequest, ProtocolLimits, ResponseObject};
 use nova_responses::{
-    canonical_items, AgentId, AppendEvent, Attempt, Conversation, ConversationError,
-    ConversationId, ConversationStore, CreateOutcome, EventLogError, IdempotencyKey, NodeTag,
-    ResponseEventKind, ResponseEventLog, ResponseId, ResponseItem, ResponseLedger, ResponseRecord,
-    ResponseStatus, StoreError, TenantId, TurnCommit, Usage,
+    canonical_items, AgentId, AppendEvent, Attempt, ContextAnchor, Conversation, ConversationId,
+    IdempotencyKey, ModelParams, NodeTag, ResponseEventKind, ResponseId, ResponseItem,
+    ResponseRecord, ResponseStatus, TenantId, TurnCommit, TurnSpec, Usage,
+};
+use nova_responses::ports::{
+    AdmissionControl, ConversationError, ConversationRepo, ConversationSnapshots, CreateOutcome, EventLogError, ResponseEventLog, ResponseLedger, StoreError,
+    TurnLock,
 };
 use serde::Deserialize;
 
@@ -375,37 +379,43 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             // D30: the record holds metadata only — no materialised snapshot. History
             // is read from the conversation snapshot at execution time.
             let id = ResponseId::new(ctx.node_tag.clone());
-            let record = ResponseRecord {
-                conversation_id,
-                response_id: id.clone(),
-                previous_response_id: previous_id.clone(),
-                tenant_id: tenant_id.clone(),
-                model: "test-model".into(),
-                instructions: instructions.clone(),
-                tools: Vec::new(),
-                tool_choice: None,
-                input_items: vec![ResponseItem::user_text(input)],
-                reasoning: None,
-                status: ResponseStatus::Queued,
-                usage: Usage::default(),
-                created_at_ms: ctx.now_ms,
-                completed_at_ms: None,
-                stored: store,
-                expires_at_ms: None,
-                integrity: None,
-                idempotency_key: Some(IdempotencyKey(key.clone())),
-                owner: None,
-                attempt: Attempt::default(),
+            // One anchor, so a scenario cannot ask for a conversation *and* a previous
+            // response and leave the store to pick.
+            let anchor = match (conversation_id, previous_id.clone()) {
+                (Some(conversation_id), None) => ContextAnchor::Conversation(conversation_id),
+                (None, Some(previous)) => ContextAnchor::Previous(previous),
+                (None, None) => ContextAnchor::Root,
+                (Some(_), Some(_)) => bail!(
+                    "{sc}: a step may name a conversation or a previous response, not both"
+                ),
             };
+            let idempotency_key = IdempotencyKey::parse(&key)
+                .map_err(|e| anyhow::anyhow!("{sc}: idempotency key `{key}`: {e}"))?;
+            let record = ResponseRecord::queued(
+                id.clone(),
+                tenant_id.clone(),
+                TurnSpec {
+                    params: ModelParams {
+                        instructions: instructions.clone(),
+                        ..ModelParams::new("test-model")
+                    },
+                    input_items: vec![ResponseItem::user_text(input)],
+                    store,
+                    anchor,
+                },
+                idempotency_key.clone(),
+                ctx.now_ms,
+                0,
+            );
 
             let outcome = ctx
                 .world
                 .ledger
-                .create(record.clone(), IdempotencyKey(key.clone()), ctx.now_ms)
+                .create(record.clone(), idempotency_key, ctx.now_ms)
                 .await?;
             let (resulting_id, label_str) = match &outcome {
-                CreateOutcome::Accepted { response_id } => (response_id.clone(), "accepted"),
-                CreateOutcome::Duplicate { response_id } => (response_id.clone(), "duplicate"),
+                CreateOutcome::Accepted(record) => (record.response_id.clone(), "accepted"),
+                CreateOutcome::Duplicate(record) => (record.response_id.clone(), "duplicate"),
                 CreateOutcome::ReadOnly => (id.clone(), "read_only"),
                 CreateOutcome::Overloaded => (id.clone(), "overloaded"),
             };
@@ -445,11 +455,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                     .append(AppendEvent::lifecycle(
                         resulting_id.clone(),
                         ResponseEventKind::Created,
-                        serde_json::json!({
-                            "id": resulting_id.to_string(),
-                            "object": "response",
-                            "status": "queued",
-                        }),
+                        ResponseObject::terminal_stub(&resulting_id, ResponseStatus::Queued),
                     ))
                     .await?;
                 trace.push(TraceEvent::EventAppended {
@@ -472,7 +478,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let claimed = ctx
                 .world
                 .ledger
-                .claim(agent, ctx.now_ms, 60_000)
+                .claim(agent, ctx.now_ms, Duration::from_millis(60_000))
                 .await?;
             let want = expect.as_deref().unwrap_or("some");
             match (want, claimed) {
@@ -482,8 +488,8 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 ("some", Some(c)) => {
                     trace.push(TraceEvent::ResponseClaimed {
                         response_id: c.record.response_id.to_string(),
-                        agent_id: agent.0,
-                        attempt: c.attempt.0,
+                        agent_id: agent.uuid(),
+                        attempt: c.record.attempt.0,
                         at_ms: ctx.now_ms,
                     });
                     let seq = ctx
@@ -492,23 +498,19 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                         .append(AppendEvent::lifecycle_with_attempt(
                             c.record.response_id.clone(),
                             ResponseEventKind::InProgress,
-                            c.attempt,
-                            serde_json::json!({
-                                "id": c.record.response_id.to_string(),
-                                "object": "response",
-                                "status": "in_progress",
-                            }),
+                            c.record.attempt,
+                            ResponseObject::terminal_stub(&c.record.response_id, ResponseStatus::InProgress),
                         ))
                         .await?;
                     trace.push(TraceEvent::EventAppended {
                         response_id: c.record.response_id.to_string(),
-                        attempt: Some(c.attempt.0),
+                        attempt: Some(c.record.attempt.0),
                         sequence_number: seq,
                         kind: ResponseEventKind::InProgress.as_str().into(),
                         at_ms: ctx.now_ms,
                     });
                     ctx.last = Some(c.record.response_id.clone());
-                    ctx.last_attempt = Some(c.attempt);
+                    ctx.last_attempt = Some(c.record.attempt);
                 }
                 (other, _) => bail!("{sc}: unknown claim expectation `{other}`"),
             }
@@ -590,8 +592,8 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             // Output items are supplied here, not derived from the deltas above
             // (INV-48). Under D30 they go to the conversation snapshot when the
             // response is conversation-anchored.
-            if record.stored {
-                if let Some(conversation_id) = &record.conversation_id {
+            if record.is_stored() {
+                if let Some(conversation_id) = &record.conversation_id() {
                     let items = vec![ResponseItem::assistant_text(
                         output_text.clone().unwrap_or_else(|| "answer".into()),
                     )];
@@ -602,7 +604,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                             conversation_id,
                             &id,
                             TurnCommit {
-                                input_items: record.input_items.clone(),
+                                input_items: record.spec.input_items.clone(),
                                 output_items: items,
                                 reasoning: None,
                                 usage,
@@ -626,11 +628,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                     } else {
                         ResponseEventKind::Failed
                     },
-                    serde_json::json!({
-                        "id": id.to_string(),
-                        "object": "response",
-                        "status": status.as_str(),
-                    }),
+                    ResponseObject::terminal_stub(&id, status),
                 ))
                 .await?;
             trace.push(TraceEvent::EventAppended {
@@ -672,17 +670,17 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                         at_ms: ctx.now_ms,
                     });
                 }
-                ("not_found", Err(nova_responses::LedgerError::NotFound)) => {}
+                ("not_found", Err(nova_responses::ports::LedgerError::NotFound)) => {}
                 (
                     "invalid_transition",
-                    Err(nova_responses::LedgerError::InvalidTransition(_)),
+                    Err(nova_responses::ports::LedgerError::InvalidTransition(_)),
                 ) => {}
                 (want, got) => bail!("{sc}: cancel expected {want}, got {got:?}"),
             }
         }
 
         Step::Reap => {
-            let aborted = ctx.world.ledger.reap(ctx.now_ms, 0).await?;
+            let aborted = ctx.world.ledger.reap(ctx.now_ms, Duration::from_millis(0)).await?;
             for claim in &aborted {
                 // Reap is the only release a reaped response gets: its holder is
                 // gone and the fence has moved, so that holder's own terminal path
@@ -721,7 +719,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let batch = ctx
                 .world
                 .event_log
-                .read_after(&id, starting_after, 1000, 0)
+                .read_after(&id, starting_after, 1000, Duration::from_millis(0))
                 .await?;
             trace.push(TraceEvent::EventRead {
                 response_id: id.to_string(),
@@ -737,7 +735,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 );
             }
             if let Some(want) = expect_first_sequence {
-                let got = batch.first().map(|e| e.sequence_number);
+                let got = batch.first().map(|e| e.sequence_number());
                 if got != Some(want) {
                     bail!("{sc}: expected first sequence {want}, got {got:?}");
                 }
@@ -749,7 +747,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             match ctx
                 .world
                 .event_log
-                .read_after(&id, starting_after, 10, 0)
+                .read_after(&id, starting_after, 10, Duration::from_millis(0))
                 .await
             {
                 Err(EventLogError::Expired) => {
@@ -769,7 +767,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let id = ctx.resolve(&None)?;
             ctx.world
                 .event_log
-                .close(&id, ctx.now_ms, retain_ms)
+                .close(&id, ctx.now_ms, Duration::from_millis(retain_ms))
                 .await?;
         }
 
@@ -799,26 +797,26 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 .map_err(|e| anyhow::anyhow!("{sc}: snapshot read failed: {e}"))?;
             trace.push(TraceEvent::ChainResolved {
                 response_id: conv.to_string(),
-                depth: resolved.depth,
-                items: resolved.items.len(),
-                bytes: resolved.bytes,
+                depth: resolved.turns,
+                items: resolved.item_count(),
+                bytes: resolved.bytes(),
                 at_ms: ctx.now_ms,
             });
             if let Some(want) = expect_depth {
-                if resolved.depth != want {
-                    bail!("{sc}: expected chain depth {want}, got {}", resolved.depth);
+                if resolved.turns != want {
+                    bail!("{sc}: expected chain depth {want}, got {}", resolved.turns);
                 }
             }
             if let Some(want) = expect_items {
-                if resolved.items.len() != want {
+                if resolved.item_count() != want {
                     bail!(
                         "{sc}: expected {want} chain items, got {}",
-                        resolved.items.len()
+                        resolved.item_count()
                     );
                 }
             }
             if let Some(absent) = expect_absent_text {
-                let encoded = canonical_items(&resolved.items);
+                let encoded = canonical_items(&resolved.clone().into_items());
                 if encoded.contains(&absent) {
                     bail!("{sc}: `{absent}` must not appear in chain output: {encoded}");
                 }
@@ -870,7 +868,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 _ => {}
             }
             if let (Some(want), Some(record)) = (expect_items, &found) {
-                let got = record.input_items.len();
+                let got = record.spec.input_items.len();
                 if got != want {
                     bail!("{sc}: expected {want} stored items on {id}, got {got}");
                 }
@@ -994,7 +992,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let parsed: Result<CreateResponseRequest, _> = serde_json::from_str(&body);
             let rejected = match parsed {
                 Err(_) => true,
-                Ok(req) => req.validate(&InputLimits::default()).is_err(),
+                Ok(req) => req.validate(&ProtocolLimits::default()).is_err(),
             };
             if !rejected {
                 bail!("{sc}: payload should have been rejected: {body}");
@@ -1008,7 +1006,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
         Step::ExpectProtocolAccept { body } => {
             let req: CreateResponseRequest = serde_json::from_str(&body)
                 .map_err(|e| anyhow::anyhow!("{sc}: supported payload rejected: {e}"))?;
-            req.validate(&InputLimits::default())
+            req.validate(&ProtocolLimits::default())
                 .map_err(|e| anyhow::anyhow!("{sc}: supported payload failed validation: {e}"))?;
         }
 
@@ -1069,14 +1067,14 @@ async fn settle_session(
         status,
         ResponseStatus::Completed | ResponseStatus::Incomplete
     ) {
-        if let Some(conversation_id) = &record.conversation_id {
+        if let Some(conversation_id) = &record.conversation_id() {
             ctx.world
                 .conversation
                 .advance(&record.tenant_id, conversation_id, &record.response_id)
                 .await?;
         }
     }
-    if let Some(conversation_id) = &record.conversation_id {
+    if let Some(conversation_id) = &record.conversation_id() {
         ctx.world
             .conversation
             .release_active(

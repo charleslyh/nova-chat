@@ -13,6 +13,7 @@ name = "mock-server"
 path = "src/main.rs"
 
 [dependencies]
+thiserror = { workspace = true }
 nova-responses = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
