@@ -8,6 +8,15 @@
 //! - object keys sorted lexicographically by byte value
 //! - compact separators (no insignificant whitespace)
 //! - all strings normalised to NFC
+//! - numbers use `serde_json`'s shortest-round-trip rendering
+//!
+//! This is a **Nova-private canonical form, not RFC 8785 (JCS)**: JCS renders
+//! numbers with ECMAScript `Number::toString` semantics, which differs from
+//! Rust's rendering for some floating-point values. Tags produced here verify
+//! only against this implementation. That is sufficient because signing and
+//! verification always run the same code (every adapter shares this module);
+//! if a cross-implementation check is ever needed, switch to a real JCS crate
+//! rather than patching this one.
 //!
 //! Recursion depth is bounded by the parser limit and by
 //! [`crate::protocol::InputLimits::validate_depth`], both of which run before

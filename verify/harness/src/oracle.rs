@@ -461,12 +461,10 @@ impl Oracle for NoSilentContentLoss {
                 }
                 TraceEvent::ContentStored {
                     response_id,
-                    stored,
+                    stored: true,
                     ..
                 } => {
-                    if *stored {
-                        confirmed.insert(response_id.clone());
-                    }
+                    confirmed.insert(response_id.clone());
                 }
                 TraceEvent::ChainRejected { .. } | TraceEvent::CapacityRejected { .. } => {
                     rejected = true;

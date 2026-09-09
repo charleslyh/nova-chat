@@ -27,7 +27,8 @@ pub mod service;
 
 pub use canonical::{canonical_items, canonical_json, canonical_output_text, nfc};
 pub use context::{
-    ChainLimits, ResolvedContext, ResponseId, ResponseRecord, ResponseStatus, SnapshotRef, Usage,
+    ChainLimits, IntegrityTag, ResolvedContext, ResponseId, ResponseRecord, ResponseStatus,
+    SnapshotRef, Usage,
 };
 pub use conversation::{Conversation, ConversationEvent, ConversationEventKind, ConversationId};
 pub use events::{AppendEvent, EventBody, ResponseEvent, ResponseEventKind};
@@ -44,5 +45,8 @@ pub use ports::{
     ResponseLedger, StoreError, TurnCommit,
 };
 
-pub use config::{Config, RawConfig};
-pub use service::{ContextSource, ConversationsService, CreateResult, ResponsesService, ServiceError};
+pub use config::{Config, ConfigError, RawConfig};
+pub use service::{
+    ConversationsService, CreateIntent, CreateResult, ResponsesDeps, ResponsesService,
+    ServiceError,
+};

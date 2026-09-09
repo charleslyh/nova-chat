@@ -106,7 +106,7 @@ impl AgentRunner for MockAgentRunner {
 
             match finish {
                 FinishReason::Stop | FinishReason::Refusal => {
-                    usage = usage.add(outcome.usage);
+                    usage = usage.accumulate(outcome.usage);
                     conversation.extend(outcome.items);
                     return Ok(AgentOutcome {
                         items: conversation[base_len..].to_vec(),
@@ -116,7 +116,7 @@ impl AgentRunner for MockAgentRunner {
                 }
 
                 FinishReason::Length => {
-                    usage = usage.add(outcome.usage);
+                    usage = usage.accumulate(outcome.usage);
                     conversation.extend(outcome.items);
                     return Ok(AgentOutcome {
                         items: conversation[base_len..].to_vec(),
@@ -127,7 +127,7 @@ impl AgentRunner for MockAgentRunner {
 
                 FinishReason::ToolCalls => {
                     if tool_rounds >= task.max_tool_rounds {
-                        usage = usage.add(outcome.usage);
+                        usage = usage.accumulate(outcome.usage);
                         return Ok(AgentOutcome {
                             items: conversation[base_len..].to_vec(),
                             usage,
@@ -142,7 +142,7 @@ impl AgentRunner for MockAgentRunner {
                             usage,
                         });
                     }
-                    usage = usage.add(outcome.usage);
+                    usage = usage.accumulate(outcome.usage);
                     conversation.extend(outcome.items);
                     for (call_id, name, arguments) in calls {
                         match self.tools.call(&name, &arguments).await {

@@ -63,7 +63,7 @@ impl ResponseLedger for MemLedgerClient {
         match ledger_rpc(
             &self.rpc,
             Request::LedgerCreate {
-                record,
+                record: Box::new(record),
                 idempotency_key,
                 now_ms,
             },

@@ -3,12 +3,14 @@
 //! Bounds are enforced *after* structural parsing but *before* anything is
 //! stored or forwarded. Defaults come from `parameters.md` §4.5.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
 use super::item::ResponseItem;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct InputLimits {
     pub max_items: usize,
     pub max_item_bytes: usize,

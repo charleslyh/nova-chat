@@ -54,6 +54,5 @@ unicode-normalization = "0.1"
 # SSRF defence in depth for image/file reference URLs (SEC-6).
 url = "2"
 # Hex encoding for integrity tags.
-hex = "0.4"
 # Enum-to-string derivation so wire names have one source of truth.
 strum = { version = "0.26", features = ["derive"] }

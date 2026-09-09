@@ -115,7 +115,9 @@ pub enum ProtoError {
 pub enum Request {
     // --- ledger ---
     LedgerCreate {
-        record: ResponseRecord,
+        // Boxed: `ResponseRecord` dwarfs every other variant's payload, and
+        // boxing keeps the enum small on the wire-adjacent match paths.
+        record: Box<ResponseRecord>,
         idempotency_key: IdempotencyKey,
         now_ms: u64,
     },

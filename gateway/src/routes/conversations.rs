@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::{bad_request, map_conversation_error, not_found_kind};
-use crate::routes::shared::{parse_or_not_found, tenant_or_reject};
+use crate::routes::shared::{parse_or_not_found, tenant_or_reject, Reject};
 use nova_responses::service::conversations::TranscriptError;
 use crate::sse::{open_conversation_stream, resolve_cursor};
 use crate::state::AppState;
@@ -35,7 +35,7 @@ fn conversation_object(conversation: &Conversation) -> Value {
     })
 }
 
-fn parse_id(raw: &str) -> Result<ConversationId, Response> {
+fn parse_id(raw: &str) -> Result<ConversationId, Reject> {
     parse_or_not_found(ConversationId::parse(raw), "conversation")
 }
 
@@ -47,7 +47,7 @@ pub async fn create(
 ) -> Response {
     let tenant = match tenant_or_reject(&state, &headers) {
         Ok(t) => t,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     if !state.is_accepting() {
         return draining();
@@ -82,11 +82,11 @@ pub async fn retrieve(
 ) -> Response {
     let tenant = match tenant_or_reject(&state, &headers) {
         Ok(t) => t,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let id = match parse_id(&id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     match state.conversations.retrieve(&tenant, &id).await {
@@ -107,14 +107,14 @@ pub async fn update(
 ) -> Response {
     let tenant = match tenant_or_reject(&state, &headers) {
         Ok(t) => t,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     if !state.is_accepting() {
         return draining();
     }
     let id = match parse_id(&id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let request: ConversationMetadataRequest = match serde_json::from_value(raw) {
@@ -143,11 +143,11 @@ pub async fn delete(
 ) -> Response {
     let tenant = match tenant_or_reject(&state, &headers) {
         Ok(t) => t,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let id = match parse_id(&id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     match state.conversations.delete(&tenant, &id).await {
@@ -187,7 +187,7 @@ pub struct EventsQuery {
 pub async fn list(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let tenant = match tenant_or_reject(&state, &headers) {
         Ok(t) => t,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     match state.conversations.list(&tenant).await {
@@ -211,11 +211,11 @@ pub async fn events(
 ) -> Response {
     let tenant = match tenant_or_reject(&state, &headers) {
         Ok(t) => t,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let id = match parse_id(&id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     // `Last-Event-ID` wins over the query: it reflects what the client actually
@@ -243,14 +243,14 @@ pub async fn append_event(
 ) -> Response {
     let tenant = match tenant_or_reject(&state, &headers) {
         Ok(t) => t,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     if !state.is_accepting() {
         return draining();
     }
     let id = match parse_id(&id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let request: AppendBusinessEventRequest = match serde_json::from_value(raw) {
@@ -294,11 +294,11 @@ pub async fn transcript(
 ) -> Response {
     let tenant = match tenant_or_reject(&state, &headers) {
         Ok(t) => t,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let id = match parse_id(&id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     match state.conversations.transcript(&tenant, &id).await {

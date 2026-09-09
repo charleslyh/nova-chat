@@ -88,7 +88,6 @@ fn record(
         stored,
         expires_at_ms: None,
         integrity: None,
-        integrity_alg: None,
         idempotency_key: None,
         owner: None,
         attempt: Attempt::default(),
@@ -1806,7 +1805,6 @@ pub struct ContractCase {
 /// third hard-coded list of requirement ids inside the coverage gate — so an
 /// assertion added in one place, or deleted from all of them, changed nothing
 /// visible. A gate that cannot notice its own contents shrinking is not a gate.
-
 pub fn cases() -> &'static [ContractCase] {
     &[
         ContractCase {

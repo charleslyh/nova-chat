@@ -27,6 +27,16 @@ use tracing::{debug, info, warn};
 use crate::runner::{AgentError, AgentRunner, AgentTask};
 use crate::sink::EventSink;
 
+/// What a finished run produced, bundled so the terminal funnels take one
+/// value instead of four parallel parameters (the fields are one fact: the
+/// outcome of this attempt).
+struct TerminalOutput {
+    produced: Vec<ResponseItem>,
+    reasoning: String,
+    usage: Usage,
+    status: ResponseStatus,
+}
+
 /// Ports the orchestrator needs.
 pub struct AgentRuntimeDeps {
     pub ledger: Arc<dyn ResponseLedger>,
@@ -268,10 +278,12 @@ impl AgentRuntime {
         self.complete(
             &record,
             attempt,
-            outcome.items,
-            sink.reasoning().to_string(),
-            outcome.usage,
-            outcome.status,
+            TerminalOutput {
+                produced: outcome.items,
+                reasoning: sink.reasoning().to_string(),
+                usage: outcome.usage,
+                status: outcome.status,
+            },
             now_ms,
         )
         .await
@@ -282,12 +294,15 @@ impl AgentRuntime {
         &self,
         record: &ResponseRecord,
         attempt: Attempt,
-        produced: Vec<ResponseItem>,
-        reasoning: String,
-        usage: Usage,
-        status: ResponseStatus,
+        output: TerminalOutput,
         now_ms: u64,
     ) -> Executed {
+        let TerminalOutput {
+            produced,
+            reasoning,
+            usage,
+            status,
+        } = output;
         let id = &record.response_id;
 
         if let Err(e) = self
@@ -408,14 +423,14 @@ impl AgentRuntime {
                     .ledger
                     .get(id)
                     .await
-                    .map_err(|_| ConversationError::ChainBroken(id.to_string()))?
-                    .ok_or_else(|| ConversationError::ChainBroken(id.to_string()))?;
+                    .map_err(|_| ConversationError::ChainBroken(id.clone()))?
+                    .ok_or_else(|| ConversationError::ChainBroken(id.clone()))?;
                 match prev.anchor() {
                     SnapshotRef::Conversation(cid) => self.read_snapshot(tenant, &cid).await?,
                     // Bare response: reconstruct its own input+output from the stream.
                     SnapshotRef::Root => self.reconstruct_bare(&prev).await?,
                     SnapshotRef::Previous(_) => {
-                        return Err(ConversationError::ChainBroken(id.to_string()));
+                        return Err(ConversationError::ChainBroken(id.clone()));
                     }
                 }
             }

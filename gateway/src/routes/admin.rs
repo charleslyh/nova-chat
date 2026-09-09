@@ -11,15 +11,16 @@ use nova_responses::TenantId;
 use serde::Deserialize;
 
 use crate::error::{api_error, bad_request, map_conversation_error, map_ledger_error};
+use crate::routes::shared::Reject;
 use crate::state::AppState;
 
-fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Reject> {
     state.keys.authorize_admin(headers).map_err(|_| {
-        api_error(
+        Box::new(api_error(
             StatusCode::UNAUTHORIZED,
             "invalid_credentials",
             "admin credentials required",
-        )
+        ))
     })
 }
 
@@ -34,7 +35,7 @@ pub async fn set_read_only(
     Json(body): Json<ReadOnlyBody>,
 ) -> Response {
     if let Err(resp) = require_admin(&state, &headers) {
-        return resp;
+        return *resp;
     }
     // Applies to this node only: nodes are peers, so there is no authority to
     // broadcast from.
@@ -58,7 +59,7 @@ pub async fn set_pending_limit(
     Json(body): Json<PendingLimitBody>,
 ) -> Response {
     if let Err(resp) = require_admin(&state, &headers) {
-        return resp;
+        return *resp;
     }
     state.ledger.set_pending_limit(body.pending_limit);
     Json(serde_json::json!({
@@ -75,7 +76,7 @@ pub async fn purge_tenant(
     headers: HeaderMap,
 ) -> Response {
     if let Err(resp) = require_admin(&state, &headers) {
-        return resp;
+        return *resp;
     }
     let Ok(tenant) = TenantId::parse(&tenant_raw) else {
         return bad_request("invalid_tenant", "tenant id is malformed");

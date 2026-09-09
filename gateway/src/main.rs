@@ -86,14 +86,14 @@ async fn main() -> Result<()> {
         ports.now.clone(),
         ports.metrics.clone(),
     ));
-    let service = Arc::new(ResponsesService::new(
-        ports.ledger.clone(),
-        ports.event_log.clone(),
-        conversations.clone(),
-        ports.now.clone(),
-        ports.metrics.clone(),
-        cfg.clone(),
-    ));
+    let service = Arc::new(ResponsesService::new(nova_responses::ResponsesDeps {
+        ledger: ports.ledger.clone(),
+        event_log: ports.event_log.clone(),
+        conversations: conversations.clone(),
+        now: ports.now.clone(),
+        metrics: ports.metrics.clone(),
+        cfg: cfg.clone(),
+    }));
 
     let state = AppState {
         cfg: cfg.clone(),

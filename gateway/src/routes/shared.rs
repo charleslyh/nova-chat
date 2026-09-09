@@ -13,18 +13,24 @@ use crate::auth::AuthError;
 use crate::error::{api_error, not_found_kind};
 use crate::state::AppState;
 
-pub fn tenant_or_reject(state: &AppState, headers: &HeaderMap) -> Result<TenantId, Response> {
-    state.keys.resolve(headers).map_err(|e| match e {
-        AuthError::Missing => api_error(
-            StatusCode::UNAUTHORIZED,
-            "missing_credentials",
-            "provide `Authorization: Bearer <key>`",
-        ),
-        AuthError::Invalid => api_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_credentials",
-            "credentials were rejected",
-        ),
+/// The rejection half of an ingress check, boxed so `Result<T, Reject>` stays
+/// small on the happy path (`clippy::result_large_err`).
+pub type Reject = Box<Response>;
+
+pub fn tenant_or_reject(state: &AppState, headers: &HeaderMap) -> Result<TenantId, Reject> {
+    state.keys.resolve(headers).map_err(|e| {
+        Box::new(match e {
+            AuthError::Missing => api_error(
+                StatusCode::UNAUTHORIZED,
+                "missing_credentials",
+                "provide `Authorization: Bearer <key>`",
+            ),
+            AuthError::Invalid => api_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_credentials",
+                "credentials were rejected",
+            ),
+        })
     })
 }
 
@@ -33,6 +39,6 @@ pub fn tenant_or_reject(state: &AppState, headers: &HeaderMap) -> Result<TenantI
 /// Reporting the parse failure instead would let a caller probe the id format,
 /// and — worse — distinguish "this shape is wrong" from "this id is not yours",
 /// which is exactly the distinction SEC-2 removes.
-pub fn parse_or_not_found<T, E>(parsed: Result<T, E>, kind: &str) -> Result<T, Response> {
-    parsed.map_err(|_| not_found_kind(kind))
+pub fn parse_or_not_found<T, E>(parsed: Result<T, E>, kind: &str) -> Result<T, Reject> {
+    parsed.map_err(|_| Box::new(not_found_kind(kind)))
 }

@@ -7,4 +7,4 @@ pub mod conversations;
 pub mod responses;
 
 pub use conversations::{ConversationTail, ConversationsService, TranscriptError};
-pub use responses::{ContextSource, CreateIntent, CreateResult, ResponsesService, ServiceError};
+pub use responses::{CreateIntent, CreateResult, ResponsesDeps, ResponsesService, ServiceError};

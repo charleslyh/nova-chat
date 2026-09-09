@@ -16,6 +16,20 @@ pub struct CountingMetrics {
     inner: Mutex<HashMap<String, u64>>,
 }
 
+impl CountingMetrics {
+    /// Readback for test assertions. Kept off the `MetricsSink` trait: the port
+    /// is write-only, since a real backend cannot answer counter reads.
+    #[allow(dead_code)]
+    pub fn get(&self, name: &str) -> u64 {
+        self.inner
+            .lock()
+            .expect("metrics lock poisoned")
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 impl MetricsSink for CountingMetrics {
     fn incr(&self, name: &str, value: u64) {
         *self
@@ -24,14 +38,5 @@ impl MetricsSink for CountingMetrics {
             .expect("metrics lock poisoned")
             .entry(name.to_string())
             .or_insert(0) += value;
-    }
-
-    fn get(&self, name: &str) -> u64 {
-        self.inner
-            .lock()
-            .expect("metrics lock poisoned")
-            .get(name)
-            .copied()
-            .unwrap_or(0)
     }
 }

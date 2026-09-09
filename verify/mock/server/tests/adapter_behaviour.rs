@@ -39,7 +39,6 @@ fn record(id: &ResponseId, tenant_id: &str, stored: bool) -> ResponseRecord {
         stored,
         expires_at_ms: None,
         integrity: None,
-        integrity_alg: None,
         idempotency_key: None,
         owner: None,
         attempt: Attempt::default(),

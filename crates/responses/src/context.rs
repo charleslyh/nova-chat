@@ -139,8 +139,9 @@ impl Usage {
     }
 
     /// Accumulate across attempts so a mid-flight abort still contributes to
-    /// billing (CR-11 / INV-51).
-    pub fn add(self, other: Usage) -> Self {
+    /// billing (CR-11 / INV-51). Named `accumulate` rather than `add`: the
+    /// semantics are saturating, which `std::ops::Add` would not advertise.
+    pub fn accumulate(self, other: Usage) -> Self {
         Self::new(
             self.input_tokens.saturating_add(other.input_tokens),
             self.output_tokens.saturating_add(other.output_tokens),
@@ -228,11 +229,11 @@ pub struct ResponseRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<u64>,
 
-    /// Integrity tag over the canonical encoding of the items.
+    /// Integrity tag over the canonical encoding of the items. Algorithm and tag
+    /// are one fact — they are either both present or both absent — so they live
+    /// in a single `Option` rather than two parallel fields that could disagree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub integrity: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub integrity_alg: Option<String>,
+    pub integrity: Option<IntegrityTag>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<IdempotencyKey>,
@@ -265,6 +266,13 @@ impl ResponseRecord {
     }
 }
 
+/// A content integrity tag together with the algorithm that produced it (INV-44).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrityTag {
+    pub alg: String,
+    pub tag: String,
+}
+
 /// Where a response inherits its context from (D30).
 ///
 /// The three variants replace D24's materialised snapshot: history is read from
@@ -284,6 +292,7 @@ pub enum SnapshotRef {
 /// Bounds for chain resolution. Exceeding any of them is an **error**, never a
 /// silent truncation (INV-41).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ChainLimits {
     pub max_depth: usize,
     pub max_items: usize,
@@ -377,7 +386,6 @@ mod tests {
             stored,
             expires_at_ms: None,
             integrity: None,
-            integrity_alg: None,
             idempotency_key: None,
             owner: None,
             attempt: Attempt::default(),
@@ -411,7 +419,7 @@ mod tests {
     fn usage_totals_and_accumulates() {
         let a = Usage::new(3, 4);
         assert_eq!(a.total_tokens(), 7);
-        let b = a.add(Usage::new(1, 1));
+        let b = a.accumulate(Usage::new(1, 1));
         assert_eq!(b, Usage::new(4, 5));
         assert!(Usage::default().is_zero());
         assert!(!a.is_zero());
@@ -420,7 +428,7 @@ mod tests {
     #[test]
     fn usage_saturates_instead_of_overflowing() {
         let max = Usage::new(u64::MAX, u64::MAX);
-        assert_eq!(max.add(Usage::new(1, 1)), max);
+        assert_eq!(max.accumulate(Usage::new(1, 1)), max);
     }
 
     #[test]

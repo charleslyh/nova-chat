@@ -152,14 +152,14 @@ async fn start_with_config(raw_text: &str) -> Harness {
         world.now_fn(),
         world.metrics.clone(),
     ));
-    let service = Arc::new(ResponsesService::new(
-        world.ledger.clone(),
-        world.event_log.clone(),
-        conversations.clone(),
-        world.now_fn(),
-        world.metrics.clone(),
-        cfg.clone(),
-    ));
+    let service = Arc::new(ResponsesService::new(nova_responses::ResponsesDeps {
+        ledger: world.ledger.clone(),
+        event_log: world.event_log.clone(),
+        conversations: conversations.clone(),
+        now: world.now_fn(),
+        metrics: world.metrics.clone(),
+        cfg: cfg.clone(),
+    }));
 
     let app_state = AppState {
         cfg,
@@ -425,10 +425,11 @@ async fn chain_limit_is_enforced() {
         r#"
         node_tag = "node-a"
         run_sweeper = false
-        chain_max_depth = 2
         sync_wait_timeout_ms = 1500
         content_retention_ms = 600000
         retain_after_terminal_ms = 60000
+        [chain]
+        max_depth = 2
         "#,
     )
     .await;

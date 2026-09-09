@@ -42,21 +42,6 @@ pub enum ServiceError {
     Conversation(#[from] ConversationError),
 }
 
-/// 本次生成继承哪份上下文。
-///
-/// 三个变体最终**都收敛到同一条装配路径**：解析出一个锚点（`SnapshotRef`），交给
-/// `resolve_context` 从会话快照读物化历史（D30）。`Conversation` 不是第二种上下文
-/// 来源，只是第二种指定锚点的方式——容器存的就是链尾指针与会话快照。
-#[derive(Debug, Clone, PartialEq)]
-pub enum ContextSource {
-    /// 无前驱，空上下文。
-    Fresh,
-    /// 由 `previous_response_id` 直接指定锚点。
-    Previous(ResponseId),
-    /// 由 `conversation` 指定：先取容器链尾，再当作锚点用。
-    Conversation(ConversationId),
-}
-
 /// 创建结果。`ReadOnly` / `Overloaded` 不是错误，而是账本返回的正常拒绝。
 pub enum CreateResult {
     /// 新建成功，`Created` 事件已发出。
@@ -72,8 +57,8 @@ pub enum CreateResult {
 /// 创建生成的领域意图。
 ///
 /// 接入层已经把 wire 形状消解掉：`input` 简写已规范化为 [`ResponseItem`]，
-/// `conversation` 引用已解析为 [`ContextSource`]。传这个结构而不是「原始请求 +
-/// 并列的 `input_items`」，消除了二者必须一致的隐含契约。
+/// `conversation` / `previous_response_id` 引用已解析为 [`SnapshotRef`] 锚点。传
+/// 这个结构而不是「原始请求 + 并列的 `input_items`」，消除了二者必须一致的隐含契约。
 #[derive(Debug, Clone)]
 pub struct CreateIntent {
     pub model: String,
@@ -82,7 +67,18 @@ pub struct CreateIntent {
     pub tools: Vec<Tool>,
     pub tool_choice: Option<ToolChoice>,
     pub input_items: Vec<ResponseItem>,
-    pub source: ContextSource,
+    pub source: SnapshotRef,
+}
+
+/// `ResponsesService` 的依赖集合。聚合为一个 struct 而不是六个并列参数，装配方
+/// 按名组装，新增依赖不改签名。
+pub struct ResponsesDeps {
+    pub ledger: Arc<dyn ResponseLedger>,
+    pub event_log: Arc<dyn ResponseEventLog>,
+    pub conversations: Arc<ConversationsService>,
+    pub now: Arc<dyn Fn() -> u64 + Send + Sync>,
+    pub metrics: Arc<dyn MetricsSink>,
+    pub cfg: Arc<Config>,
 }
 
 /// Responses 用例编排。
@@ -96,22 +92,14 @@ pub struct ResponsesService {
 }
 
 impl ResponsesService {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        ledger: Arc<dyn ResponseLedger>,
-        event_log: Arc<dyn ResponseEventLog>,
-        conversations: Arc<ConversationsService>,
-        now: Arc<dyn Fn() -> u64 + Send + Sync>,
-        metrics: Arc<dyn MetricsSink>,
-        cfg: Arc<Config>,
-    ) -> Self {
+    pub fn new(deps: ResponsesDeps) -> Self {
         Self {
-            ledger,
-            event_log,
-            conversations,
-            now,
-            metrics,
-            cfg,
+            ledger: deps.ledger,
+            event_log: deps.event_log,
+            conversations: deps.conversations,
+            now: deps.now,
+            metrics: deps.metrics,
+            cfg: deps.cfg,
         }
     }
 
@@ -132,10 +120,12 @@ impl ResponsesService {
         let now_ms = self.now_ms();
 
         // 会话标识收敛为锚点：容器存的就是链尾指针，所以下面只有一条装配路径。
+        // `intent.source` 本身就是锚点（SnapshotRef），这里只需为 record 拆出
+        // previous/conversation_id 两个归属字段。
         let (previous, conversation_id) = match &intent.source {
-            ContextSource::Fresh => (None, None),
-            ContextSource::Previous(id) => (Some(id.clone()), None),
-            ContextSource::Conversation(id) => {
+            SnapshotRef::Root => (None, None),
+            SnapshotRef::Previous(id) => (Some(id.clone()), None),
+            SnapshotRef::Conversation(id) => {
                 let anchor = match self.conversations.resolve_tail(tenant, id).await? {
                     // 首轮：容器还没有链尾，空上下文。这与「容器不存在」不同，后者
                     // 已在 resolve_tail 内报 NotFound——绝不静默降级为空上下文，否则
@@ -149,15 +139,8 @@ impl ResponsesService {
 
         // 解析并校验前驱上下文（D30）：读会话快照校验深度/字节上界，断裂即失败，
         // 不留半创建记录。快照本身不复制进 record。
-        let anchor = if let Some(conversation_id) = &conversation_id {
-            SnapshotRef::Conversation(conversation_id.clone())
-        } else if let Some(previous) = &previous {
-            SnapshotRef::Previous(previous.clone())
-        } else {
-            SnapshotRef::Root
-        };
-        let resolved = self.resolve_context(tenant, &anchor).await?;
-        if !matches!(anchor, SnapshotRef::Root) {
+        let resolved = self.resolve_context(tenant, &intent.source).await?;
+        if !matches!(intent.source, SnapshotRef::Root) {
             self.metrics.incr("chain_resolved_depth", resolved.depth as u64);
         }
 
@@ -202,7 +185,6 @@ impl ResponsesService {
             stored: intent.store,
             expires_at_ms,
             integrity: None,
-            integrity_alg: None,
             idempotency_key: Some(idempotency_key.clone()),
             owner: None,
             attempt: Attempt::default(),
@@ -211,9 +193,7 @@ impl ResponsesService {
         // 锁已在手，之后任何一条非「已受理」的出路都必须把它还回去，否则会话永久
         // 锁死。用一个内部函数把这些出路收在一处，就不必在每个 `?` 和每个分支上
         // 各写一遍补偿——漏掉一处的后果是不可自愈的。
-        let outcome = self
-            .admit(&record, &response_id, idempotency_key, now_ms)
-            .await;
+        let outcome = self.admit(&record, idempotency_key, now_ms).await;
 
         match &outcome {
             Ok(CreateResult::Accepted { .. }) => {}
@@ -245,7 +225,7 @@ impl ResponsesService {
                     .ledger
                     .get(id)
                     .await?
-                    .ok_or_else(|| ConversationError::ChainBroken(id.to_string()))?;
+                    .ok_or_else(|| ConversationError::ChainBroken(id.clone()))?;
                 if !record.is_referencable_by(tenant) {
                     if &record.tenant_id != tenant {
                         return Err(ConversationError::CrossTenant.into());
@@ -263,7 +243,7 @@ impl ResponsesService {
                     // home for the deeper history — reported as broken, not silently
                     // truncated.
                     SnapshotRef::Previous(_) => {
-                        return Err(ConversationError::ChainBroken(id.to_string()).into());
+                        return Err(ConversationError::ChainBroken(id.clone()).into());
                     }
                 }
             }
@@ -333,11 +313,9 @@ impl ResponsesService {
     }
 
     /// 写账本（仅元数据）→ 发 `Created`。
-    #[allow(clippy::too_many_arguments)]
     async fn admit(
         &self,
         record: &ResponseRecord,
-        response_id: &ResponseId,
         idempotency_key: IdempotencyKey,
         now_ms: u64,
     ) -> Result<CreateResult, ServiceError> {
@@ -351,7 +329,7 @@ impl ResponsesService {
                 // （含 input），这正是「B 端在轮次进行中加入也能补齐全部内容」所依赖
                 // 的既有行为，不可回退为只带 id。创建时无输出。
                 let created = AppendEvent::lifecycle(
-                    response_id.clone(),
+                    record.response_id.clone(),
                     ResponseEventKind::Created,
                     response_object(record, &[]),
                 );
@@ -421,10 +399,10 @@ impl ResponsesService {
 
     /// 同步模式：等终态事件，超时返回当前状态对象供轮询。
     ///
-    /// 超时不是生成失败——调用方可转轮询。
+    /// 超时不是生成失败——调用方可转轮询。租户归属在调用前已由 `create`/`retrieve`
+    /// 路径确认（事件流按 response id 寻址，本身无租户维度），故这里不再接收 tenant。
     pub async fn wait_terminal(
         &self,
-        _tenant: &TenantId,
         response_id: &ResponseId,
         fallback: &ResponseRecord,
     ) -> Result<Value, ServiceError> {

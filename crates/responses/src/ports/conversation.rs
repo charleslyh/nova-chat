@@ -27,7 +27,7 @@ pub enum ConversationError {
     /// another tenant. Reported identically for "absent" and "foreign" so ids
     /// cannot be probed (SEC-2).
     #[error("chain broken at {0}")]
-    ChainBroken(String),
+    ChainBroken(ResponseId),
     /// The referenced response was created with `store: false`, so it holds no
     /// durable snapshot to inherit (FR-18).
     #[error("referenced response was not stored")]

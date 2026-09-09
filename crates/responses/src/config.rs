@@ -9,12 +9,30 @@
 //! A connection string or API key in a TOML file ends up in version control,
 //! logs and container images.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
 use crate::{ChainLimits, NodeTag};
 use crate::protocol::InputLimits;
 use serde::Deserialize;
+
+/// Configuration load/validation failure. A typed error (not `anyhow`) because
+/// this crate is an embeddable library: callers match on the failure class
+/// instead of parsing a message string.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("reading config {}: {source}", path.display())]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("parsing config {}: {source}", path.display())]
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+    #[error("invalid config: {0}")]
+    Invalid(String),
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,21 +63,16 @@ pub struct RawConfig {
     #[serde(default = "default_content_retention_ms")]
     pub content_retention_ms: u64,
 
-    #[serde(default = "default_chain_max_depth")]
-    pub chain_max_depth: usize,
-    #[serde(default = "default_chain_max_items")]
-    pub chain_max_items: usize,
-    #[serde(default = "default_chain_max_bytes")]
-    pub chain_max_bytes: usize,
+    /// Chain-resolution bounds. Nested as the domain struct itself so the
+    /// on-disk default **is** `ChainLimits::default()` — there is exactly one
+    /// source of truth for each number, and no per-field forwarding that could
+    /// drift from it.
+    #[serde(default)]
+    pub chain: ChainLimits,
 
-    #[serde(default = "default_input_max_items")]
-    pub input_max_items: usize,
-    #[serde(default = "default_input_max_item_bytes")]
-    pub input_max_item_bytes: usize,
-    #[serde(default = "default_input_max_bytes")]
-    pub input_max_bytes: usize,
-    #[serde(default = "default_input_max_depth")]
-    pub input_max_json_depth: usize,
+    /// Input hardening bounds (SEC-7). Same single-source rule as `chain`.
+    #[serde(default)]
+    pub input: InputLimits,
 
     /// Synchronous mode budget: how long to wait for a terminal event before
     /// returning the current state for the caller to poll.
@@ -92,30 +105,6 @@ fn default_retain_after_terminal_ms() -> u64 {
 fn default_content_retention_ms() -> u64 {
     30 * 24 * 60 * 60 * 1000
 }
-// Chain / input bounds default to the domain structs' own `Default`, so there is
-// exactly one source of truth for each number — the on-disk default cannot drift
-// from `ChainLimits::default()` / `InputLimits::default()`.
-fn default_chain_max_depth() -> usize {
-    ChainLimits::default().max_depth
-}
-fn default_chain_max_items() -> usize {
-    ChainLimits::default().max_items
-}
-fn default_chain_max_bytes() -> usize {
-    ChainLimits::default().max_bytes
-}
-fn default_input_max_items() -> usize {
-    InputLimits::default().max_items
-}
-fn default_input_max_item_bytes() -> usize {
-    InputLimits::default().max_item_bytes
-}
-fn default_input_max_bytes() -> usize {
-    InputLimits::default().max_total_bytes
-}
-fn default_input_max_depth() -> usize {
-    InputLimits::default().max_json_depth
-}
 fn default_sync_wait_timeout_ms() -> u64 {
     30_000
 }
@@ -147,30 +136,41 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config {}", path.display()))?;
-        let raw: RawConfig = toml::from_str(&text)
-            .with_context(|| format!("parsing config {}", path.display()))?;
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let raw: RawConfig =
+            toml::from_str(&text).map_err(|source| ConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?;
         Self::from_raw(raw)
     }
 
-    pub fn from_raw(raw: RawConfig) -> Result<Self> {
+    pub fn from_raw(raw: RawConfig) -> Result<Self, ConfigError> {
         let node_tag = NodeTag::parse(&raw.node_tag)
-            .map_err(|e| anyhow!("node_tag `{}`: {e}", raw.node_tag))?;
+            .map_err(|e| ConfigError::Invalid(format!("node_tag `{}`: {e}", raw.node_tag)))?;
 
-        if raw.chain_max_depth == 0 {
-            bail!("chain_max_depth must be at least 1");
+        if raw.chain.max_depth == 0 {
+            return Err(ConfigError::Invalid(
+                "chain.max_depth must be at least 1".into(),
+            ));
         }
         // A zero page would make every subscription return nothing forever, which
         // reads as "the conversation is quiet" rather than as a misconfiguration.
         if raw.conversation_events_page == 0 {
-            bail!("conversation_events_page must be at least 1");
+            return Err(ConfigError::Invalid(
+                "conversation_events_page must be at least 1".into(),
+            ));
         }
         // A zero drain budget silently reintroduces the rolling-deploy loss that
         // graceful shutdown exists to remove (D21).
         if raw.drain_timeout_ms == 0 {
-            bail!("drain_timeout_ms must be greater than zero");
+            return Err(ConfigError::Invalid(
+                "drain_timeout_ms must be greater than zero".into(),
+            ));
         }
 
         Ok(Self {
@@ -180,24 +180,14 @@ impl Config {
             conversation_events_page: raw.conversation_events_page,
             retain_after_terminal_ms: raw.retain_after_terminal_ms,
             content_retention_ms: raw.content_retention_ms,
-            chain_limits: ChainLimits {
-                max_depth: raw.chain_max_depth,
-                max_items: raw.chain_max_items,
-                max_bytes: raw.chain_max_bytes,
-            },
-            input_limits: InputLimits {
-                max_items: raw.input_max_items,
-                max_item_bytes: raw.input_max_item_bytes,
-                max_total_bytes: raw.input_max_bytes,
-                max_json_depth: raw.input_max_json_depth,
-            },
+            chain_limits: raw.chain,
+            input_limits: raw.input,
             sync_wait_timeout_ms: raw.sync_wait_timeout_ms,
             drain_timeout_ms: raw.drain_timeout_ms,
             run_sweeper: raw.run_sweeper,
             heartbeat_ttl_ms: raw.heartbeat_ttl_ms,
         })
     }
-
 }
 
 #[cfg(test)]
@@ -214,7 +204,16 @@ mod tests {
         let cfg = Config::from_raw(raw("")).unwrap();
         assert_eq!(cfg.chain_limits.max_depth, 50);
         assert_eq!(cfg.chain_limits.max_bytes, 1024 * 1024);
+        assert_eq!(cfg.input_limits.max_items, 200);
         assert!(cfg.run_sweeper);
+    }
+
+    #[test]
+    fn nested_limits_tables_override_partially() {
+        let cfg = Config::from_raw(raw("[chain]\nmax_depth = 5\n")).unwrap();
+        assert_eq!(cfg.chain_limits.max_depth, 5);
+        // Untouched fields fall back to the domain default, not to zero.
+        assert_eq!(cfg.chain_limits.max_bytes, ChainLimits::default().max_bytes);
     }
 
     #[test]
@@ -233,7 +232,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_bounds() {
-        assert!(Config::from_raw(raw("chain_max_depth = 0\n")).is_err());
+        assert!(Config::from_raw(raw("[chain]\nmax_depth = 0\n")).is_err());
         assert!(Config::from_raw(raw("conversation_events_page = 0\n")).is_err());
     }
 }

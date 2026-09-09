@@ -44,9 +44,6 @@ struct NoopMetrics;
 
 impl MetricsSink for NoopMetrics {
     fn incr(&self, _name: &str, _value: u64) {}
-    fn get(&self, _name: &str) -> u64 {
-        0
-    }
 }
 
 /// In-memory shared carrier.

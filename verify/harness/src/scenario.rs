@@ -393,7 +393,6 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 stored: store,
                 expires_at_ms: None,
                 integrity: None,
-                integrity_alg: None,
                 idempotency_key: Some(IdempotencyKey(key.clone())),
                 owner: None,
                 attempt: Attempt::default(),
@@ -838,14 +837,14 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 .conversation
                 .read_snapshot(&tenant_id, &conv)
                 .await;
-            let matched = match (&reason[..], &result) {
-                ("not_found", Err(ConversationError::NotFound)) => true,
-                (
-                    "unavailable",
-                    Err(ConversationError::Store(StoreError::Unavailable)),
-                ) => true,
-                _ => false,
-            };
+            let matched = matches!(
+                (&reason[..], &result),
+                ("not_found", Err(ConversationError::NotFound))
+                    | (
+                        "unavailable",
+                        Err(ConversationError::Store(StoreError::Unavailable))
+                    )
+            );
             if !matched {
                 bail!("{sc}: expected chain error `{reason}`, got {result:?}");
             }

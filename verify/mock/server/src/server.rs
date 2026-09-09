@@ -19,7 +19,7 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
             record,
             idempotency_key,
             now_ms,
-        } => match world.ledger.create(record, idempotency_key, now_ms).await {
+        } => match world.ledger.create(*record, idempotency_key, now_ms).await {
             Ok(o) => Response::Create(o),
             Err(e) => Response::Err(ProtoError::Ledger(e)),
         },

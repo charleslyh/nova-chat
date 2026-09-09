@@ -26,6 +26,11 @@ pub enum IdError {
     InvalidTenantId,
     #[error("conversation id must have the form conv_<uuid>")]
     MalformedConversationId,
+    #[error(
+        "idempotency key must be 1..={max} visible ASCII chars (no whitespace)",
+        max = IdempotencyKey::MAX_LEN
+    )]
+    InvalidIdempotencyKey,
 }
 
 /// Node tag embedded in every response id so in-flight subscriptions can be
@@ -159,8 +164,37 @@ impl fmt::Display for AgentId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Caller-supplied idempotency key. Bounded like the other identity types: it
+/// becomes a storage lookup key, so an unbounded value would let a caller force
+/// arbitrarily large keys into every backend index.
+///
+/// The tuple field stays public (tests and internal defaults construct it
+/// directly); the boundary — HTTP header parsing — must go through [`Self::parse`],
+/// and deserialisation validates, so a malformed stored key fails loudly on read.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct IdempotencyKey(pub String);
+
+impl IdempotencyKey {
+    pub const MAX_LEN: usize = 128;
+
+    pub fn parse(raw: &str) -> Result<Self, IdError> {
+        let ok = !raw.is_empty()
+            && raw.len() <= Self::MAX_LEN
+            && raw.bytes().all(|b| (0x21..=0x7e).contains(&b));
+        if ok {
+            Ok(Self(raw.to_string()))
+        } else {
+            Err(IdError::InvalidIdempotencyKey)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for IdempotencyKey {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        IdempotencyKey::parse(&raw).map_err(de::Error::custom)
+    }
+}
 
 /// Attempt is strictly monotonic and never resets (INV-5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]

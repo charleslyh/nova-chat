@@ -20,8 +20,9 @@ use serde_json::Value;
 use crate::error::{
     api_error, bad_request, map_conversation_error, map_ledger_error, not_found,
 };
-use crate::routes::shared::tenant_or_reject;
-use nova_responses::service::{ContextSource, CreateIntent, CreateResult, ServiceError};
+use crate::routes::shared::{tenant_or_reject, Reject};
+use nova_responses::service::{CreateIntent, CreateResult, ServiceError};
+use nova_responses::SnapshotRef;
 use crate::sse::{map_event_log_error, open_stream, resolve_cursor};
 use crate::state::AppState;
 
@@ -33,10 +34,10 @@ pub struct StreamQuery {
     pub starting_after: Option<u64>,
 }
 
-fn parse_id(raw: &str) -> Result<ResponseId, Response> {
+fn parse_id(raw: &str) -> Result<ResponseId, Reject> {
     // A malformed id is reported as absent rather than as a parse error, so
     // probing the id format reveals nothing (SEC-2).
-    ResponseId::parse(raw).map_err(|_| not_found())
+    ResponseId::parse(raw).map_err(|_| Box::new(not_found()))
 }
 
 /// Map a capability-layer error onto an HTTP response, preserving the distinct
@@ -59,26 +60,26 @@ fn map_service_error(err: &ServiceError) -> Response {
 /// Validation has already rejected the case where both are present, so this only
 /// has to parse — but it still parses *both* rather than short-circuiting on the
 /// first, so a malformed value is reported as malformed either way.
-fn context_source(request: &CreateResponseRequest) -> Result<ContextSource, Response> {
+fn context_source(request: &CreateResponseRequest) -> Result<SnapshotRef, Reject> {
     if let Some(reference) = &request.conversation {
         let id = ConversationId::parse(reference.id()).map_err(|_| {
-            bad_request(
+            Box::new(bad_request(
                 "invalid_request",
                 "conversation is not a valid conversation id",
-            )
+            ))
         })?;
-        return Ok(ContextSource::Conversation(id));
+        return Ok(SnapshotRef::Conversation(id));
     }
     match &request.previous_response_id {
-        None => Ok(ContextSource::Fresh),
+        None => Ok(SnapshotRef::Root),
         Some(raw) => {
             let id = ResponseId::parse(raw).map_err(|_| {
-                bad_request(
+                Box::new(bad_request(
                     "chain_broken",
                     "previous_response_id is not a valid response id",
-                )
+                ))
             })?;
-            Ok(ContextSource::Previous(id))
+            Ok(SnapshotRef::Previous(id))
         }
     }
 }
@@ -91,7 +92,7 @@ pub async fn create(
 ) -> Response {
     let tenant = match tenant_or_reject(&state, &headers) {
         Ok(t) => t,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     // Draining: refuse new work but keep serving reads and subscriptions, so a
@@ -127,13 +128,23 @@ pub async fn create(
     // capability layer's job, so no facade can bypass it.
     let source = match context_source(&request) {
         Ok(source) => source,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
-    let idempotency_key = headers
-        .get("idempotency-key")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| IdempotencyKey(v.to_string()));
+    // The key becomes a storage lookup key, so it is validated at the boundary
+    // like every other identity string (bounded length, visible ASCII).
+    let idempotency_key = match headers.get("idempotency-key") {
+        None => None,
+        Some(value) => match value.to_str().ok().map(IdempotencyKey::parse) {
+            Some(Ok(key)) => Some(key),
+            _ => {
+                return bad_request(
+                    "invalid_request",
+                    "idempotency-key header is empty, too long, or contains whitespace",
+                )
+            }
+        },
+    };
 
     // Resolve the wire request into a domain intent: the `input` shorthand and
     // the `conversation` reference shape are gateway concerns, so they are
@@ -172,11 +183,7 @@ pub async fn create(
                 )
                     .into_response();
             }
-            match state
-                .service
-                .wait_terminal(&tenant, &response_id, &record)
-                .await
-            {
+            match state.service.wait_terminal(&response_id, &record).await {
                 Ok(value) => Json(value).into_response(),
                 Err(e) => map_service_error(&e),
             }
@@ -206,11 +213,11 @@ pub async fn retrieve(
 ) -> Response {
     let tenant = match tenant_or_reject(&state, &headers) {
         Ok(t) => t,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let response_id = match parse_id(&id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     if q.stream.unwrap_or(false) {
@@ -238,7 +245,7 @@ async fn stream_impl(
     // (D30). The response itself is reconstructable from the event stream; a
     // missing ledger record means the response never existed or was deleted.
     if let Ok(Some(record)) = state.ledger.get(&response_id).await {
-        if &record.tenant_id != &tenant {
+        if record.tenant_id != tenant {
             return not_found();
         }
     }
@@ -254,11 +261,11 @@ pub async fn cancel(
 ) -> Response {
     let tenant = match tenant_or_reject(&state, &headers) {
         Ok(t) => t,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let response_id = match parse_id(&id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     match state.service.cancel(&tenant, &response_id).await {
@@ -284,11 +291,11 @@ pub async fn delete(
 ) -> Response {
     let tenant = match tenant_or_reject(&state, &headers) {
         Ok(t) => t,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     let response_id = match parse_id(&id) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     match state.service.delete(&tenant, &response_id).await {

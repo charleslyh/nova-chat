@@ -12,7 +12,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nova_responses::{
     canonical_items, AbortedClaim, AgentId, Attempt, ClaimedResponse, ContentIntegrity,
-    CreateOutcome, IdempotencyKey, LedgerError, ResponseId, ResponseItem, ResponseLedger,
+    CreateOutcome, IdempotencyKey, IntegrityTag, LedgerError, ResponseId, ResponseItem,
+    ResponseLedger,
     ResponseRecord, ResponseStatus, StoreError, TenantId, Usage,
 };
 
@@ -109,8 +110,10 @@ impl ResponseLedger for MemResponseLedger {
             let tag = integrity
                 .sign(&canonical)
                 .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
-            record.integrity = Some(tag);
-            record.integrity_alg = Some(integrity.alg().to_string());
+            record.integrity = Some(IntegrityTag {
+                alg: integrity.alg().to_string(),
+                tag,
+            });
         }
         let response_id = record.response_id.clone();
         g.queued.push_back(response_id.clone());
@@ -296,7 +299,7 @@ impl ResponseLedger for MemResponseLedger {
             .partial_usage
             .entry((response_id.clone(), attempt))
             .or_default();
-        *entry = entry.add(usage);
+        *entry = entry.accumulate(usage);
         Ok(())
     }
 

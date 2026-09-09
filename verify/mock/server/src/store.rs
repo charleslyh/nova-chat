@@ -293,6 +293,6 @@ impl Inner {
         self.partial_usage
             .iter()
             .filter(|((rid, _), _)| rid == id)
-            .fold(base, |acc, (_, usage)| acc.add(*usage))
+            .fold(base, |acc, (_, usage)| acc.accumulate(*usage))
     }
 }

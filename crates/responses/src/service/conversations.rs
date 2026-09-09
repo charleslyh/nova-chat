@@ -92,9 +92,9 @@ impl ConversationsService {
             .await
     }
 
-    /// 删除容器。**不级联删除会话快照里的内容？**——D30 下快照就是会话自己的内容，
-    /// 删会话即删快照；但响应记录不级联（与 D24 的记录级删除、官方「Items in the
-    /// conversation will not be deleted」的措辞需按 D30 语义重估，见 D30 正文）。
+    /// 删除容器。D30 下快照就是会话自己的内容，删会话即删快照；但响应**记录**
+    /// 不级联——这是既定决策而非悬案：记录级删除（D24）与官方「Items in the
+    /// conversation will not be deleted」的语义一致，移除的是指针，不抹除说过的话。
     pub async fn delete(
         &self,
         tenant: &TenantId,
