@@ -126,17 +126,20 @@ impl Scheduler for DivergentScheduler {
     }
 }
 
+const DEFAULT_RAW: &str = r#"
+node_tag = "node-a"
+run_sweeper = false
+sync_wait_timeout_ms = 1500
+content_retention_ms = 600000
+retain_after_terminal_ms = 60000
+"#;
+
 async fn start() -> Harness {
-    let raw: RawConfig = toml::from_str(
-        r#"
-        node_tag = "node-a"
-        run_sweeper = false
-        sync_wait_timeout_ms = 1500
-        content_retention_ms = 600000
-        retain_after_terminal_ms = 60000
-        "#,
-    )
-    .expect("config");
+    start_with_config(DEFAULT_RAW).await
+}
+
+async fn start_with_config(raw_text: &str) -> Harness {
+    let raw: RawConfig = toml::from_str(raw_text).expect("config");
     let cfg = Arc::new(Config::from_raw(raw).expect("validate"));
 
     let world = mock_server::MemWorld::new();
@@ -410,6 +413,62 @@ async fn multi_turn_chain_assembles_history_server_side() {
     assert!(rendered.contains("first question"), "got: {rendered}");
     assert!(rendered.contains("first answer"), "got: {rendered}");
     assert!(rendered.contains("second question"), "got: {rendered}");
+}
+
+/// Chain limits are enforced in the service layer: exceeding the depth ceiling
+/// is refused, never silently truncated.
+///
+/// covers: FR-17, INV-41
+#[tokio::test]
+async fn chain_limit_is_enforced() {
+    let h = start_with_config(
+        r#"
+        node_tag = "node-a"
+        run_sweeper = false
+        chain_max_depth = 2
+        sync_wait_timeout_ms = 1500
+        content_retention_ms = 600000
+        retain_after_terminal_ms = 60000
+        "#,
+    )
+    .await;
+
+    let (status, conv) = h.post("/v1/conversations", json!({})).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let conv_id = conv["id"].as_str().unwrap().to_string();
+
+    // Two completed turns bring the snapshot to depth 2 == chain_max_depth.
+    for i in 0..2 {
+        let (status, _resp) = h
+            .post(
+                "/v1/responses",
+                json!({
+                    "model": "m",
+                    "input": format!("turn {i}"),
+                    "conversation": conv_id,
+                    "background": true,
+                }),
+            )
+            .await;
+        assert_eq!(status, reqwest::StatusCode::ACCEPTED, "turn {i}");
+        h.run_agent_turn(&["A"], "answer").await;
+    }
+
+    // The third turn exceeds the ceiling and must be refused loudly, never
+    // silently truncated (FR-17 / INV-41).
+    let (status, body) = h
+        .post(
+            "/v1/responses",
+            json!({
+                "model": "m",
+                "input": "third",
+                "conversation": conv_id,
+                "background": true,
+            }),
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(body.to_string().contains("chain_too_long"), "{body}");
 }
 
 #[tokio::test]
@@ -818,4 +877,61 @@ async fn tenant_purge_clears_stored_content() {
 
     let (status, _) = h.get(&format!("/v1/responses/{id}")).await;
     assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+}
+
+/// Every `covers:` declaration on a test must be substantiated by that test's
+/// body — each id must appear inside the function (doc comment, inline comment,
+/// or assertion message). Without this, the coverage gate would count an id the
+/// test never actually asserts. (The marker is spelled `covers:` here on purpose,
+/// so this doc comment does not itself match the scanner below.)
+#[test]
+fn covers_claims_are_substantiated() {
+    let src = include_str!("http_contract.rs");
+    let lines: Vec<&str> = src.lines().collect();
+    let mut problems: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < lines.len() {
+        // Only a line that *starts* with the marker is a declaration, so the
+        // string literals inside this scanner itself are not mistaken for one.
+        let Some(rest) = lines[i].trim().strip_prefix("/// covers:") else {
+            i += 1;
+            continue;
+        };
+        let ids: Vec<&str> = rest
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // The test function is the next `async fn` after the declaration.
+        let fn_offset = lines[i..]
+            .iter()
+            .position(|l| l.contains("async fn"))
+            .expect("`covers:` must precede an async fn");
+        let fn_idx = i + fn_offset;
+
+        // The body runs until the next test attribute or end of file.
+        let end_offset = lines[fn_idx..]
+            .iter()
+            .position(|l| l.contains("#[tokio::test]") || l.contains("#[test]"))
+            .unwrap_or(lines.len() - fn_idx);
+        let body = lines[fn_idx..fn_idx + end_offset].join("\n");
+
+        for id in &ids {
+            if !body.contains(id) {
+                problems.push(format!("  covers {id}, but the test body never mentions it"));
+            }
+        }
+
+        i = fn_idx + end_offset.max(1);
+    }
+
+    assert!(
+        problems.is_empty(),
+        "unsubstantiated coverage claims:\n{}\nEither assert the requirement \
+         in the test and say so, or drop the claim — the coverage gate counts \
+         these ids as verified.",
+        problems.join("\n")
+    );
 }

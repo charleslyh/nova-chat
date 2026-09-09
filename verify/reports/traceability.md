@@ -1,20 +1,18 @@
 # Coverage detail
 
-**Verdict:** OK — 97/97 (100%)
+**Verdict:** OK — 96/96 (100%)
 
 ## Scenarios
 
 - `l1/attempt-fence`: CR-1, CR-3, CR-4, CR-5, CR-7, FR-5, FR-6, INV-1, INV-11, INV-5, INV-6
 - `l1/cancel-cross-tenant-denied`: FR-7, SEC-2
-- `l1/chain-bytes-limit`: CR-9, FR-17, INV-41, INV-42
 - `l1/chain-closure`: CR-12, FR-28, INV-47
-- `l1/chain-cross-tenant-denied`: CR-9, INV-41, INV-42, SEC-2, SEC-3
-- `l1/chain-delete-head-is-surgical`: CR-10, FR-21, INV-43, INV-46
-- `l1/chain-delete-middle-link-blast-radius`: CR-10, FR-18, FR-21, INV-43, INV-46
-- `l1/chain-depth-limit`: CR-9, FR-17, INV-41, INV-42
-- `l1/chain-multi-turn`: CR-10, CR-4, CR-5, CR-9, FR-15, FR-16, INV-11, INV-41, INV-42, INV-43, INV-46
+- `l1/chain-cross-tenant-denied`: CR-9, INV-42, SEC-2, SEC-3
+- `l1/chain-delete-head-is-surgical`: CR-10, FR-21, INV-43
+- `l1/chain-delete-middle-link-blast-radius`: CR-10, FR-21, INV-43
+- `l1/chain-multi-turn`: CR-4, CR-5, CR-9, FR-16, INV-11, INV-41, INV-42
 - `l1/claim-when-empty`: FR-4
-- `l1/content-delete-and-sweep`: FR-21, FR-22, OR-5
+- `l1/content-delete-is-idempotent`: FR-21
 - `l1/context-store-down-rejects-write`: CR-10, FR-37, INV-46, OR-2
 - `l1/double-claim`: CR-1, FR-4, INV-1
 - `l1/event-expired-explicit`: CR-10, CR-4, CR-5, FR-12, INV-11, INV-40
@@ -31,10 +29,10 @@
 - `l1/reap-closes-lost-claim`: CR-6, FR-35, FR-38, INV-35, INV-45
 - `l1/resume-starting-after`: CR-4, CR-5, FR-10, FR-12, FR-9, INV-11, INV-12, INV-40
 - `l1/sequential-responses`: CR-10, CR-4, CR-5, CR-6, FR-1, FR-4, FR-8, INV-11, INV-35, INV-43, INV-46
-- `l1/store-false-not-referencable`: CR-10, FR-15, FR-18, INV-43
 - `l1/tenant-purge`: FR-21, SEC-2
 - `l1/unknown-field-rejected`: FR-24, INV-50
 - `l2/background-then-subscribe-http`: CR-4, CR-5, FR-10, FR-2, FR-9
+- `l2/chain-break-http`: CR-10, FR-15, FR-18, INV-43
 - `l2/conversation-transcript-http`: FR-41, FR-45
 - `l2/cross-node-stream-http`: FR-11, FR-14, FR-30, FR-31
 - `l2/cross-tenant-404-http`: FR-13, SEC-2, SEC-5

@@ -61,6 +61,10 @@ enum Step {
         /// Label for later reference.
         #[serde(default)]
         label: Option<String>,
+        /// Conversation this turn belongs to (a `create_conversation` label),
+        /// which anchors the turn so `complete` appends to its snapshot (D30).
+        #[serde(default)]
+        conversation: Option<String>,
         /// accepted | duplicate | overloaded | read_only
         #[serde(default)]
         expect: Option<String>,
@@ -357,17 +361,22 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             instructions,
             label,
             expect,
+            conversation,
         } => {
             let tenant_id = ctx.tenant(&tenant)?;
             let previous_id = match &previous {
                 None => None,
                 Some(spec) => Some(ctx.resolve(&Some(spec.clone()))?),
             };
+            let conversation_id = match &conversation {
+                None => None,
+                Some(spec) => Some(ctx.resolve_conv(&Some(spec.clone()))?),
+            };
             // D30: the record holds metadata only — no materialised snapshot. History
             // is read from the conversation snapshot at execution time.
             let id = ResponseId::new(ctx.node_tag.clone());
             let record = ResponseRecord {
-                conversation_id: None,
+                conversation_id,
                 response_id: id.clone(),
                 previous_response_id: previous_id.clone(),
                 tenant_id: tenant_id.clone(),
@@ -417,6 +426,18 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 previous: previous_id.as_ref().map(|v| v.to_string()),
                 at_ms: ctx.now_ms,
             });
+
+            // D30: a store=true response commits its input at create time, so
+            // admission is the point where its content becomes durably stored.
+            // Recording it keeps NoSilentContentLoss able to see that an accepted
+            // store=true response was not silently dropped.
+            if store && label_str == "accepted" {
+                trace.push(TraceEvent::ContentStored {
+                    response_id: resulting_id.to_string(),
+                    stored: true,
+                    at_ms: ctx.now_ms,
+                });
+            }
 
             if label_str == "accepted" {
                 let seq = ctx

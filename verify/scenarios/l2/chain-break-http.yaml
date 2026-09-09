@@ -1,0 +1,29 @@
+name: chain-break-http
+covers: [FR-15, FR-18, CR-10, INV-43]
+oracles: []
+steps:
+  # A missing predecessor is reported explicitly, never degraded to a single
+  # turn (FR-18: "predecessor missing or expired").
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"x","previous_response_id":"resp_node-a_00000000-0000-0000-0000-000000000000","background":true}'
+    expect_status: 400
+    expect_contains: 'chain_broken'
+  # store=false does not persist content (FR-15), so it cannot be chained onto —
+  # and that refusal names the cause rather than reporting a generic break
+  # (FR-18: "referenced response was not stored").
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"unstored","store":false,"background":true}'
+    expect_status: 202
+    capture:
+      rid: id
+  - action: http_get_until
+    url: http://127.0.0.1:18080/v1/responses/{{rid}}
+    expect_contains: '"status":"completed"'
+    timeout_ms: 15000
+  - action: http_post
+    url: http://127.0.0.1:18080/v1/responses
+    body: '{"model":"m","input":"next","previous_response_id":"{{rid}}","background":true}'
+    expect_status: 400
+    expect_contains: 'previous_not_stored'

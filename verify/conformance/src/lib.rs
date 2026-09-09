@@ -369,21 +369,16 @@ pub async fn assert_cancel_conformance(ports: &PortSet) {
 
 // ------------------------------------------------------------------ context
 
-/// Context store and chain resolution contract.
+/// Context store and conversation snapshot contract (D30).
 ///
-/// - **FR-15**: the storage switch is honoured in both positions.
-/// - **FR-16 / CR-9**: history is reassembled from `previous_response_id`,
+/// - **FR-16 / CR-9**: history accumulates in the conversation snapshot,
 ///   deterministically and in chronological order.
-/// - **FR-17 / INV-41 / INV-42**: depth and byte ceilings yield diagnosable
-///   errors — never a silent truncation.
-/// - **FR-18 / CR-10 / INV-43**: all four break kinds are distinguishable, so a
-///   broken chain cannot degrade quietly into a single turn.
-/// - **FR-19 / INV-49**: instructions do not cross turns.
-/// - **FR-21**: single-response deletion and tenant-wide purge.
-/// - **FR-22**: expired content is swept.
-/// - **SEC-2 / SEC-3**: tenancy is checked per link; a foreign anchor reads as
-///   absent rather than forbidden.
-/// that never includes instructions and never truncates silently.
+/// - **FR-19 / INV-49**: instructions do not cross turns — they live on the
+///   record, never in the snapshot.
+/// - **FR-21**: single-response deletion leaves the snapshot intact, and
+///   tenant-wide purge is tenant-scoped.
+/// - **INV-42 / SEC-2 / SEC-3**: tenancy is checked on snapshot reads; a foreign
+///   conversation reads as absent rather than forbidden.
 pub async fn assert_context_conformance(ports: &PortSet) {
     let tenant = fresh_tenant("ctx");
     let store = &ports.conversation;
@@ -1847,10 +1842,13 @@ pub fn cases() -> &'static [ContractCase] {
         },
         ContractCase {
             name: "context-chain",
-            covers: &[
-                "FR-15", "FR-16", "FR-17", "FR-18", "FR-19", "FR-21", "FR-22", "CR-9", "CR-10",
-                "INV-41", "INV-42", "INV-43", "INV-49", "SEC-2", "SEC-3",
-            ],
+            // FR-15 (store switch), FR-17 (depth/byte ceilings) and FR-18
+            // (four break kinds) live in the service layer's `resolve_context`
+            // under D30 — a storage port cannot observe them, so they are
+            // substantiated by L2 instead. FR-22 (content expiry) is removed
+            // with D30 (content is the conversation snapshot's, not a
+            // per-response record to sweep).
+            covers: &["FR-16", "FR-19", "FR-21", "CR-9", "INV-42", "INV-49", "SEC-2", "SEC-3"],
             scope: CaseScope::Backend,
             asserts: "assert_context_conformance",
         },

@@ -1,15 +1,14 @@
 name: chain-cross-tenant-denied
 covers: [SEC-2, SEC-3, CR-9, INV-42]
-oracles: [ChainBounded]
+oracles: []
 steps:
-  - action: create_response
-    input: "theirs"
-    key: cct-1
-    tenant: tenant-b
+  - action: create_conversation
     label: theirs
-  # A foreign anchor is reported exactly like a missing one, so the field cannot
-  # be used to probe whether an id exists.
+    tenant: tenant-b
+  # A foreign conversation is reported exactly like a missing one, so the field
+  # cannot be used to probe whether an id exists (SEC-2). The read is through
+  # the conversation snapshot, which enforces tenant ownership (D30).
   - action: expect_chain_error
     from: theirs
     tenant: tenant-a
-    reason: chain_broken
+    reason: not_found

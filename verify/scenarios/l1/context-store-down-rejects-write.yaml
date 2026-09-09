@@ -2,19 +2,25 @@ name: context-store-down-rejects-write
 covers: [FR-37, CR-10, OR-2, INV-46]
 oracles: []
 steps:
+  - action: create_conversation
+    label: conv
   - action: create_response
     input: "before outage"
     key: csd-1
-    label: healthy
+    conversation: conv
+  - action: claim
+  - action: complete
+    output_text: "answer"
   - action: set_store_unavailable
     enabled: true
   # Must fail loudly. Answering as if the history were simply absent would push
   # the failure into an unrelated later request.
   - action: expect_chain_error
-    from: healthy
+    from: conv
     reason: unavailable
   - action: set_store_unavailable
     enabled: false
   - action: resolve_chain
-    from: healthy
+    from: conv
     expect_depth: 1
+    expect_items: 2

@@ -416,6 +416,29 @@ fn is_test_case_line(line: &str) -> bool {
     rest.contains(" ... ")
 }
 
+/// Requirement ids declared by the gateway HTTP contract tests.
+///
+/// Each test that substantiates a requirement says so with a `/// covers:` doc
+/// comment (e.g. `/// covers: FR-17, INV-41`). The declaration lives on the test
+/// itself, mirroring conformance's `cases()`, so a test that stops asserting a
+/// requirement stops claiming it — there is no second list here to drift. The
+/// `covers_claims_are_substantiated` test inside that file enforces the ids are
+/// actually asserted.
+fn http_contract_covers() -> Result<Vec<String>> {
+    let src = std::fs::read_to_string("gateway/tests/http_contract.rs")
+        .context("gateway/tests/http_contract.rs")?;
+    let mut ids = Vec::new();
+    for line in src.lines() {
+        let Some(rest) = line.trim().strip_prefix("/// covers:") else {
+            continue;
+        };
+        for id in rest.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            ids.push(id.to_string());
+        }
+    }
+    Ok(ids)
+}
+
 /// The requirement ids every automated gate must substantiate.
 ///
 /// Follows `docs/requirements/spec.md` v3 and `docs/architecture/invariants.md`.
@@ -429,8 +452,10 @@ fn coverage_baseline() -> std::collections::BTreeSet<&'static str> {
         "FR-1", "FR-2", "FR-3", "FR-4", "FR-5", "FR-6", "FR-7", "FR-8",
         // Streaming and resumption.
         "FR-9", "FR-10", "FR-11", "FR-12", "FR-13", "FR-14",
-        // Storage and context.
-        "FR-15", "FR-16", "FR-17", "FR-18", "FR-19", "FR-20", "FR-21", "FR-22",
+        // Storage and context. FR-22 (content expiry) is removed with D30:
+        // durable content lives in the conversation snapshot, whose retention is
+        // an operator-side concern (OR-5), not a per-response record to sweep.
+        "FR-15", "FR-16", "FR-17", "FR-18", "FR-19", "FR-20", "FR-21",
         // Protocol subset.
         "FR-23", "FR-24", "FR-25", "FR-26", "FR-27", "FR-28",
         // Ingress and routing.
@@ -538,15 +563,19 @@ async fn coverage() -> Result<()> {
         }
     }
 
+    // Gateway HTTP contract tests declare their own covers via `/// covers:`
+    // doc comments. Fold them in so service-layer properties — which the port
+    // contract cannot observe — are still counted, sourced from the test that
+    // substantiates them rather than from a second literal list here.
+    for id in http_contract_covers()? {
+        covered.insert(id);
+    }
+
     // Requirements whose verification is intentionally deferred. Listing them
     // here keeps them visible in the report instead of quietly missing.
     //
-    // All baseline requirements are now covered at L0–L2: the shared-carrier
-    // read/stream semantics (FR-11/FR-14/FR-30/FR-31) by `cross-node-stream-http`,
-    // and the instance-lifecycle properties (FR-32 no-stickiness resume, FR-34
-    // graceful drain) by their `z-` destructive scenarios. The list is empty;
-    // the mechanism stays so a future withdrawn requirement stays visible rather
-    // than silently dropping coverage.
+    // The list is empty; the mechanism stays so a future withdrawn requirement
+    // stays visible rather than silently dropping coverage.
     let deferred: BTreeSet<&str> = BTreeSet::new();
 
     let covered_baseline: BTreeSet<_> = covered

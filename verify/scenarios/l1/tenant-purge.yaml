@@ -2,21 +2,33 @@ name: tenant-purge
 covers: [FR-21, SEC-2]
 oracles: []
 steps:
+  # Two tenants each hold a conversation. Purge erases one tenant's response
+  # records, but the other tenant's conversation snapshot is untouched (SEC-2).
+  - action: create_conversation
+    label: mine
   - action: create_response
     input: "mine one"
     key: tp-1
-  - action: create_response
-    input: "mine two"
-    key: tp-2
+    conversation: mine
+  - action: claim
+  - action: complete
+    output_text: "answer one"
+  - action: create_conversation
+    label: theirs
+    tenant: tenant-b
   - action: create_response
     input: "theirs"
-    key: tp-3
+    key: tp-2
+    conversation: theirs
     tenant: tenant-b
-    label: theirs
+  - action: claim
+  - action: complete
+    output_text: "answer"
   - action: purge_tenant
-    expect_min: 2
-  # The other tenant's content is untouched by the purge.
+    expect_min: 1
+  # The other tenant's snapshot survives the purge.
   - action: resolve_chain
     from: theirs
     tenant: tenant-b
     expect_depth: 1
+    expect_items: 2

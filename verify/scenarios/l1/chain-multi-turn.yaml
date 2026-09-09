@@ -1,31 +1,34 @@
 name: chain-multi-turn
-covers: [FR-15, FR-16, CR-9, INV-41]
-oracles: [ChainBounded, NoSilentContentLoss, SequenceContiguous]
+covers: [FR-16, CR-9]
+oracles: [ChainBounded, SequenceContiguous]
 steps:
+  - action: create_conversation
+    label: conv
+  # Three turns against one conversation. Each completed turn appends its
+  # input + output to the materialised snapshot (D30), so the snapshot grows to
+  # six items across three turns.
   - action: create_response
     input: "turn one"
     key: chain-1
-    label: first
+    conversation: conv
   - action: claim
   - action: complete
     output_text: "answer one"
   - action: create_response
     input: "turn two"
     key: chain-2
-    previous: first
-    label: second
+    conversation: conv
   - action: claim
   - action: complete
     output_text: "answer two"
   - action: create_response
     input: "turn three"
     key: chain-3
-    previous: second
-    label: third
-  # Three links. The first two contributed input + output; the third has only
-  # produced its input so far, hence 5 items rather than 6 — resolution reflects
-  # actual state, it does not wait for or invent a pending output.
+    conversation: conv
+  - action: claim
+  - action: complete
+    output_text: "answer three"
   - action: resolve_chain
-    from: third
+    from: conv
     expect_depth: 3
-    expect_items: 5
+    expect_items: 6

@@ -1,25 +1,14 @@
-name: content-delete-and-sweep
-covers: [FR-21, FR-22, OR-5]
+name: content-delete-is-idempotent
+covers: [FR-21]
 oracles: []
 steps:
   - action: create_response
     input: "delete me"
     key: cds-1
     label: doomed
-  - action: create_response
-    input: "expire me"
-    key: cds-2
-    label: expiring
-  - action: set_expiry
-    target: expiring
-    expires_at_ms: 5000
   - action: delete_response
     target: doomed
   # Deleting twice reports "nothing removed" rather than succeeding vacuously.
   - action: delete_response
     target: doomed
     expect_deleted: false
-  - action: sweep_expired_content
-    expect_removed: 0
-  - action: sweep_expired_content
-    expect_removed: 1
