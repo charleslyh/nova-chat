@@ -7,7 +7,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value;
+use strum::AsRefStr;
 use uuid::Uuid;
 
 use crate::conversation::ConversationId;
@@ -82,8 +82,9 @@ impl<'de> Deserialize<'de> for ResponseId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, AsRefStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ResponseStatus {
     Queued,
     InProgress,
@@ -104,25 +105,21 @@ impl ResponseStatus {
         )
     }
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ResponseStatus::Queued => "queued",
-            ResponseStatus::InProgress => "in_progress",
-            ResponseStatus::Completed => "completed",
-            ResponseStatus::Failed => "failed",
-            ResponseStatus::Incomplete => "incomplete",
-            ResponseStatus::Cancelled => "cancelled",
-        }
+    pub fn as_str(&self) -> &str {
+        self.as_ref()
     }
 }
 
 /// Token accounting. Integer typed throughout — never routed through `f64`,
 /// which would silently lose precision on large counts (D22).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `total_tokens` is **derived, never stored**: a stored total that disagreed
+/// with `input + output` would be two sources of truth for one fact. It is
+/// serialised for OpenAI wire compatibility only, and ignored on read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub total_tokens: u64,
 }
 
 impl Usage {
@@ -130,22 +127,47 @@ impl Usage {
         Self {
             input_tokens,
             output_tokens,
-            total_tokens: input_tokens.saturating_add(output_tokens),
         }
     }
 
+    pub fn total_tokens(self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
     pub fn is_zero(&self) -> bool {
-        self.input_tokens == 0 && self.output_tokens == 0 && self.total_tokens == 0
+        self.input_tokens == 0 && self.output_tokens == 0
     }
 
     /// Accumulate across attempts so a mid-flight abort still contributes to
     /// billing (CR-11 / INV-51).
     pub fn add(self, other: Usage) -> Self {
-        Self {
-            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
-            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
-            total_tokens: self.total_tokens.saturating_add(other.total_tokens),
+        Self::new(
+            self.input_tokens.saturating_add(other.input_tokens),
+            self.output_tokens.saturating_add(other.output_tokens),
+        )
+    }
+}
+
+impl Serialize for Usage {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("Usage", 3)?;
+        st.serialize_field("input_tokens", &self.input_tokens)?;
+        st.serialize_field("output_tokens", &self.output_tokens)?;
+        st.serialize_field("total_tokens", &self.total_tokens())?;
+        st.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Usage {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            input_tokens: u64,
+            output_tokens: u64,
         }
+        let raw = Raw::deserialize(d)?;
+        Ok(Usage::new(raw.input_tokens, raw.output_tokens))
     }
 }
 
@@ -212,8 +234,6 @@ pub struct ResponseRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integrity_alg: Option<String>,
 
-    /// Host node that owns the in-flight buffer for this response.
-    pub node_tag: NodeTag,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<IdempotencyKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -242,39 +262,6 @@ impl ResponseRecord {
     /// Whether this record may be used as `previous_response_id` by `tenant`.
     pub fn is_referencable_by(&self, tenant: &TenantId) -> bool {
         self.stored && &self.tenant_id == tenant
-    }
-
-    /// The OpenAI-shaped response object for a response whose output is known,
-    /// embedded in lifecycle events and returned by `GET`. Only protocol fields
-    /// are exposed — the internal bookkeeping (`tenant_id`, `node_tag`,
-    /// `attempt`, …) never leaves the node.
-    ///
-    /// `output_items` is supplied by the caller rather than read from the record:
-    /// the record holds no output (output lives in the conversation snapshot and
-    /// the event stream), so the renderer passes in what it reconstructed.
-    pub fn to_response_value(&self, output_items: &[ResponseItem]) -> Value {
-        serde_json::json!({
-            "id": self.response_id.to_string(),
-            "object": "response",
-            "created_at": self.created_at_ms / 1000,
-            "status": self.status.as_str(),
-            "model": self.model,
-            "previous_response_id": self.previous_response_id.as_ref().map(|v| v.to_string()),
-            "conversation": self
-                .conversation_id
-                .as_ref()
-                .map(|id| serde_json::json!({ "id": id.to_string() })),
-            "instructions": self.instructions,
-            "store": self.stored,
-            "input": self.input_items,
-            "output": output_items,
-            "reasoning": self.reasoning,
-            "usage": {
-                "input_tokens": self.usage.input_tokens,
-                "output_tokens": self.usage.output_tokens,
-                "total_tokens": self.usage.total_tokens,
-            },
-        })
     }
 }
 
@@ -391,7 +378,6 @@ mod tests {
             expires_at_ms: None,
             integrity: None,
             integrity_alg: None,
-            node_tag: NodeTag::parse("n1").unwrap(),
             idempotency_key: None,
             owner: None,
             attempt: Attempt::default(),
@@ -424,20 +410,16 @@ mod tests {
     #[test]
     fn usage_totals_and_accumulates() {
         let a = Usage::new(3, 4);
-        assert_eq!(a.total_tokens, 7);
+        assert_eq!(a.total_tokens(), 7);
         let b = a.add(Usage::new(1, 1));
-        assert_eq!(b, Usage { input_tokens: 4, output_tokens: 5, total_tokens: 9 });
+        assert_eq!(b, Usage::new(4, 5));
         assert!(Usage::default().is_zero());
         assert!(!a.is_zero());
     }
 
     #[test]
     fn usage_saturates_instead_of_overflowing() {
-        let max = Usage {
-            input_tokens: u64::MAX,
-            output_tokens: u64::MAX,
-            total_tokens: u64::MAX,
-        };
+        let max = Usage::new(u64::MAX, u64::MAX);
         assert_eq!(max.add(Usage::new(1, 1)), max);
     }
 

@@ -14,10 +14,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nova_responses::{
-    AgentId, AppendEvent, Attempt, ChainLimits, ClaimedResponse, ConversationError,
-    ConversationStore, LedgerError, RequestProvenance, ResolvedContext, ResponseEventKind,
-    ResponseEventLog, ResponseId, ResponseItem, ResponseLedger, ResponseRecord, ResponseStatus,
-    SnapshotRef, TenantId, Usage,
+    response_object, AgentId, AppendEvent, Attempt, ChainLimits, ClaimedResponse,
+    ConversationError, ConversationStore, LedgerError, RequestProvenance, ResolvedContext,
+    ResponseEventKind, ResponseEventLog, ResponseId, ResponseItem, ResponseLedger, ResponseRecord,
+    ResponseStatus, SnapshotRef, StoreError, TenantId, TurnCommit, Usage,
 };
 use serde_json::Value;
 use tokio::sync::{watch, Semaphore};
@@ -108,7 +108,7 @@ impl AgentRuntime {
         {
             Ok(Some(c)) => c,
             Ok(None) => return Executed::Idle,
-            Err(LedgerError::ReadOnly) => {
+            Err(LedgerError::Store(StoreError::ReadOnly)) => {
                 debug!("ledger is read-only; not claiming");
                 return Executed::Idle;
             }
@@ -211,7 +211,7 @@ impl AgentRuntime {
                 id.clone(),
                 ResponseEventKind::InProgress,
                 attempt,
-                record.to_response_value(&[]),
+                response_object(&record, &[]),
             ))
             .await;
 
@@ -234,8 +234,8 @@ impl AgentRuntime {
             tool_choice: record.tool_choice.clone(),
             items,
             provenance: RequestProvenance {
-                response_id: id.to_string(),
-                attempt: attempt.0,
+                response_id: id.clone(),
+                attempt,
                 exec_deadline_ms: claimed.exec_deadline_ms,
             },
             max_tool_rounds: self.cfg.max_tool_rounds,
@@ -344,7 +344,7 @@ impl AgentRuntime {
             .ok()
             .flatten()
             .unwrap_or_else(|| record.clone());
-        let value = updated.to_response_value(&produced);
+        let value = response_object(&updated, &produced);
         self.close_stream(id, kind, value, now_ms).await;
         info!(response = %id, "completed");
         Executed::Completed
@@ -385,7 +385,7 @@ impl AgentRuntime {
             .ok()
             .flatten()
             .unwrap_or_else(|| record.clone());
-        let value = updated.to_response_value(&[]);
+        let value = response_object(&updated, &[]);
         self.close_stream(id, ResponseEventKind::Failed, value, now_ms)
             .await;
         Executed::Failed
@@ -438,7 +438,7 @@ impl AgentRuntime {
                 .event_log
                 .read_after(&record.response_id, cursor, 256, 0)
                 .await
-                .map_err(|e| ConversationError::Internal(e.to_string()))?;
+                .map_err(|e| ConversationError::Store(StoreError::Internal(e.to_string())))?;
             if batch.is_empty() {
                 break;
             }
@@ -475,7 +475,7 @@ impl AgentRuntime {
     ) -> Result<ResolvedContext, ConversationError> {
         match &self.deps.conversations {
             Some(store) => store.read_snapshot(tenant, id).await,
-            None => Err(ConversationError::Unavailable),
+            None => Err(ConversationError::Store(StoreError::Unavailable)),
         }
     }
 
@@ -501,11 +501,13 @@ impl AgentRuntime {
                 &record.tenant_id,
                 conversation_id,
                 &record.response_id,
-                record.input_items.clone(),
-                produced.to_vec(),
-                reasoning,
-                usage,
-                status,
+                TurnCommit {
+                    input_items: record.input_items.clone(),
+                    output_items: produced.to_vec(),
+                    reasoning,
+                    usage,
+                    status,
+                },
                 now_ms,
             )
             .await
@@ -631,7 +633,7 @@ fn spawn_heartbeat(
             tokio::time::sleep(Duration::from_millis(interval_ms)).await;
             match ledger.heartbeat(agent_id, (now)()).await {
                 Ok(()) => {}
-                Err(LedgerError::ReadOnly) => break,
+                Err(LedgerError::Store(StoreError::ReadOnly)) => break,
                 Err(e) => warn!(error = %e, "heartbeat failed"),
             }
         }

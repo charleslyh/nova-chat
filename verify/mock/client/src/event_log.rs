@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nova_responses::{AppendEvent, EventLogError, ResponseEvent, ResponseEventLog, ResponseId};
+use nova_responses::{
+    AppendEvent, EventLogError, ResponseEvent, ResponseEventLog, ResponseId, StoreError,
+};
 
 use mock_server::proto::{ProtoError, Request, Response};
 
@@ -26,10 +28,10 @@ async fn event_rpc(rpc: &Rpc, req: Request) -> Result<Response, EventLogError> {
     let resp = rpc
         .call(req)
         .await
-        .map_err(|e| EventLogError::Internal(e.to_string()))?;
+        .map_err(|e| EventLogError::Store(StoreError::Internal(e.to_string())))?;
     match resp {
         Response::Err(ProtoError::EventLog(e)) => Err(e),
-        Response::Err(ProtoError::Internal(s)) => Err(EventLogError::Internal(s)),
+        Response::Err(ProtoError::Internal(s)) => Err(EventLogError::Store(StoreError::Internal(s))),
         ok => Ok(ok),
     }
 }
@@ -38,13 +40,13 @@ async fn event_rpc(rpc: &Rpc, req: Request) -> Result<Response, EventLogError> {
 impl ResponseEventLog for MemEventLogClient {
     async fn append(&self, event: AppendEvent) -> Result<u64, EventLogError> {
         if self.read_only.load(Ordering::SeqCst) {
-            return Err(EventLogError::ReadOnly);
+            return Err(EventLogError::Store(StoreError::ReadOnly));
         }
         match event_rpc(&self.rpc, Request::EventLogAppend { event: event.into() }).await? {
             Response::EventLogAppend(seq) => Ok(seq),
-            other => Err(EventLogError::Internal(format!(
+            other => Err(EventLogError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
@@ -67,9 +69,9 @@ impl ResponseEventLog for MemEventLogClient {
         .await?
         {
             Response::EventLogReadAfter(events) => Ok(events.into_iter().map(Into::into).collect()),
-            other => Err(EventLogError::Internal(format!(
+            other => Err(EventLogError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
@@ -90,18 +92,18 @@ impl ResponseEventLog for MemEventLogClient {
         .await?
         {
             Response::EventLogClose => Ok(()),
-            other => Err(EventLogError::Internal(format!(
+            other => Err(EventLogError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
     async fn sweep_expired(&self, now_ms: u64) -> Result<u64, EventLogError> {
         match event_rpc(&self.rpc, Request::EventLogSweepExpired { now_ms }).await? {
             Response::EventLogSweepExpired(n) => Ok(n),
-            other => Err(EventLogError::Internal(format!(
+            other => Err(EventLogError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
@@ -115,9 +117,9 @@ impl ResponseEventLog for MemEventLogClient {
         .await?
         {
             Response::EventLogRemove => Ok(()),
-            other => Err(EventLogError::Internal(format!(
+            other => Err(EventLogError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 }

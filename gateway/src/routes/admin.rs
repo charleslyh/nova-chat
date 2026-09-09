@@ -90,7 +90,7 @@ pub async fn purge_tenant(
     };
     match state.ledger.delete_by_tenant(&tenant).await {
         Ok(deleted) => {
-            state.metrics.incr("tenant_purges", 1).await;
+            state.metrics.incr("tenant_purges", 1);
             Json(serde_json::json!({
                 "ok": true,
                 "tenant": tenant.as_str(),

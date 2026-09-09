@@ -68,21 +68,9 @@ fn sorted_entries(map: &Map<String, Value>) -> Vec<(&String, &Value)> {
 }
 
 fn write_json_string(s: &str, out: &mut String) {
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
+    // serde_json's string escaping is well-tested and matches what the wire
+    // will carry; hand-rolling a parallel escaper risks drifting from it.
+    out.push_str(&serde_json::to_string(s).expect("serializing a &str cannot fail"));
 }
 
 /// Canonical encoding of an item list, used as the signing input for stored

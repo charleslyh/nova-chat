@@ -8,7 +8,8 @@ use mock_server::{MemWorld, MemWorldConfig};
 use nova_responses::{
     AppendEvent, Attempt, Conversation, ConversationId, ConversationStore, EventBody,
     EventLogError, IdempotencyKey, NodeTag, ResponseEventKind, ResponseEventLog, ResponseId,
-    ResponseItem, ResponseLedger, ResponseRecord, ResponseStatus, TenantId, Usage,
+    ResponseItem, ResponseLedger, ResponseRecord, ResponseStatus, StoreError, TenantId, TurnCommit,
+    Usage,
 };
 
 fn tag() -> NodeTag {
@@ -39,7 +40,6 @@ fn record(id: &ResponseId, tenant_id: &str, stored: bool) -> ResponseRecord {
         expires_at_ms: None,
         integrity: None,
         integrity_alg: None,
-        node_tag: tag(),
         idempotency_key: None,
         owner: None,
         attempt: Attempt::default(),
@@ -47,21 +47,16 @@ fn record(id: &ResponseId, tenant_id: &str, stored: bool) -> ResponseRecord {
 }
 
 fn event(id: &ResponseId, kind: ResponseEventKind, payload: &str) -> AppendEvent {
-    let body = if payload.is_empty() {
-        EventBody::Empty {}
-    } else {
-        EventBody::Delta {
-            item_id: String::new(),
-            output_index: 0,
-            content_index: None,
-            delta: payload.to_string(),
-        }
-    };
     AppendEvent {
         response_id: id.clone(),
         kind,
         attempt: None,
-        body,
+        body: EventBody::Delta {
+            item_id: String::new(),
+            output_index: 0,
+            content_index: None,
+            delta: payload.to_string(),
+        },
     }
 }
 
@@ -91,11 +86,13 @@ async fn seed_conversation(
                 &tenant(tenant_id),
                 &conversation.id,
                 &id,
-                vec![ResponseItem::user_text(format!("in-{i}"))],
-                vec![ResponseItem::assistant_text(format!("out-{i}"))],
-                None,
-                Usage::new(1, 1),
-                ResponseStatus::Completed,
+                TurnCommit {
+                    input_items: vec![ResponseItem::user_text(format!("in-{i}"))],
+                    output_items: vec![ResponseItem::assistant_text(format!("out-{i}"))],
+                    reasoning: None,
+                    usage: Usage::new(1, 1),
+                    status: ResponseStatus::Completed,
+                },
                 0,
             )
             .await
@@ -363,7 +360,7 @@ async fn partial_usage_survives_cancellation() {
     let total = world.ledger.total_usage(&id);
     assert_eq!(total.input_tokens, 7);
     assert_eq!(total.output_tokens, 3);
-    assert_eq!(total.total_tokens, 10, "billing must not lose burnt tokens");
+    assert_eq!(total.total_tokens(), 10, "billing must not lose burnt tokens");
 }
 
 #[tokio::test]
@@ -449,7 +446,7 @@ async fn read_only_degrade_blocks_writes_but_not_reads() {
             .event_log
             .append(event(&id, ResponseEventKind::OutputTextDelta, "x"))
             .await,
-        Err(EventLogError::ReadOnly)
+        Err(EventLogError::Store(StoreError::ReadOnly))
     );
     assert!(world.ledger.get(&id).await.unwrap().is_some());
 }

@@ -8,6 +8,7 @@ use crate::context::{ResolvedContext, ResponseId, ResponseStatus, Usage};
 use crate::conversation::{Conversation, ConversationEvent, ConversationEventKind, ConversationId};
 use crate::protocol::ResponseItem;
 use crate::shared::TenantId;
+use crate::StoreError;
 
 #[derive(Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConversationError {
@@ -22,12 +23,6 @@ pub enum ConversationError {
     Busy { holder: ResponseId },
     #[error("capacity exceeded")]
     CapacityExceeded,
-    /// Store is unreachable. Callers must **reject the write** rather than
-    /// proceed without persisting (INV-46).
-    #[error("unavailable")]
-    Unavailable,
-    #[error("read only")]
-    ReadOnly,
     /// The anchor this response inherits from does not exist or belongs to
     /// another tenant. Reported identically for "absent" and "foreign" so ids
     /// cannot be probed (SEC-2).
@@ -45,8 +40,22 @@ pub enum ConversationError {
     CrossTenant,
     #[error("integrity mismatch")]
     IntegrityMismatch,
-    #[error("internal: {0}")]
-    Internal(String),
+    /// Infrastructure failure (read-only / unreachable / internal).
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// The durable content one turn commits to a conversation snapshot at terminal
+/// time (D30). Grouped as a value object so `append_turn` does not take a
+/// nine-argument call whose items, usage and status are really one fact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnCommit {
+    pub input_items: Vec<ResponseItem>,
+    pub output_items: Vec<ResponseItem>,
+    /// Render-only, placed immediately before the output block.
+    pub reasoning: Option<String>,
+    pub usage: Usage,
+    pub status: ResponseStatus,
 }
 
 /// Storage for the conversation: the **long-term record of a dialogue** (D30).
@@ -102,11 +111,7 @@ pub trait ConversationStore: Send + Sync {
         tenant: &TenantId,
         id: &ConversationId,
         response_id: &ResponseId,
-        input_items: Vec<ResponseItem>,
-        output_items: Vec<ResponseItem>,
-        reasoning: Option<String>,
-        usage: Usage,
-        status: ResponseStatus,
+        commit: TurnCommit,
         now_ms: u64,
     ) -> Result<u64, ConversationError>;
 

@@ -15,7 +15,8 @@ use nova_responses::{
     canonical_items, AgentId, AppendEvent, Attempt, ContentIntegrity, Conversation,
     ConversationError, ConversationEventKind, ConversationId, ConversationStore, CreateOutcome,
     EventBody, EventLogError, IdempotencyKey, LedgerError, NodeTag, ResponseEventKind,
-    ResponseEventLog, ResponseId, ResponseLedger, ResponseRecord, ResponseStatus, TenantId, Usage,
+    ResponseEventLog, ResponseId, ResponseLedger, ResponseRecord, ResponseStatus, TenantId,
+    TurnCommit, Usage,
 };
 
 /// The set of ports under test. Backend-agnostic by construction.
@@ -60,7 +61,6 @@ fn fresh_key() -> IdempotencyKey {
 }
 
 fn record(
-    ports: &PortSet,
     id: &ResponseId,
     previous: Option<&ResponseId>,
     tenant: &TenantId,
@@ -89,7 +89,6 @@ fn record(
         expires_at_ms: None,
         integrity: None,
         integrity_alg: None,
-        node_tag: ports.node_tag.clone(),
         idempotency_key: None,
         owner: None,
         attempt: Attempt::default(),
@@ -97,21 +96,16 @@ fn record(
 }
 
 fn event(id: &ResponseId, kind: ResponseEventKind, payload: &str) -> AppendEvent {
-    let body = if payload.is_empty() {
-        EventBody::Empty {}
-    } else {
-        EventBody::Delta {
-            item_id: String::new(),
-            output_index: 0,
-            content_index: None,
-            delta: payload.to_string(),
-        }
-    };
     AppendEvent {
         response_id: id.clone(),
         kind,
         attempt: None,
-        body,
+        body: EventBody::Delta {
+            item_id: String::new(),
+            output_index: 0,
+            content_index: None,
+            delta: payload.to_string(),
+        },
     }
 }
 
@@ -204,7 +198,7 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
     let outcome = ports
         .ledger
         .create(
-            record(ports, &id, None, &tenant, true, ResponseStatus::Queued),
+            record(&id, None, &tenant, true, ResponseStatus::Queued),
             key.clone(),
             1_000,
         )
@@ -217,7 +211,7 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
     let replay = ports
         .ledger
         .create(
-            record(ports, &ports.new_id(), None, &tenant, true, ResponseStatus::Queued),
+            record(&ports.new_id(), None, &tenant, true, ResponseStatus::Queued),
             key,
             u64::MAX,
         )
@@ -297,7 +291,7 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
         .expect("get")
         .expect("present");
     assert_eq!(fetched.status, ResponseStatus::Completed);
-    assert_eq!(fetched.usage.total_tokens, 7);
+    assert_eq!(fetched.usage.total_tokens(), 7);
 }
 
 /// Cancellation contract.
@@ -314,7 +308,7 @@ pub async fn assert_cancel_conformance(ports: &PortSet) {
     ports
         .ledger
         .create(
-            record(ports, &id, None, &tenant, true, ResponseStatus::Queued),
+            record(&id, None, &tenant, true, ResponseStatus::Queued),
             fresh_key(),
             1_000,
         )
@@ -413,11 +407,13 @@ pub async fn assert_context_conformance(ports: &PortSet) {
                 &tenant,
                 &conversation.id,
                 &id,
-                vec![ResponseItem::user_text(format!("in-{i}"))],
-                vec![ResponseItem::assistant_text("answer")],
-                None,
-                Usage::new(1, 2),
-                ResponseStatus::Completed,
+                TurnCommit {
+                    input_items: vec![ResponseItem::user_text(format!("in-{i}"))],
+                    output_items: vec![ResponseItem::assistant_text("answer")],
+                    reasoning: None,
+                    usage: Usage::new(1, 2),
+                    status: ResponseStatus::Completed,
+                },
                 2_000,
             )
             .await
@@ -491,11 +487,13 @@ pub async fn assert_context_conformance(ports: &PortSet) {
             &foreign_tenant,
             &foreign_conv.id,
             &ports.new_id(),
-            vec![ResponseItem::user_text("theirs")],
-            vec![ResponseItem::assistant_text("answer")],
-            None,
-            Usage::new(1, 2),
-            ResponseStatus::Completed,
+            TurnCommit {
+                input_items: vec![ResponseItem::user_text("theirs")],
+                output_items: vec![ResponseItem::assistant_text("answer")],
+                reasoning: None,
+                usage: Usage::new(1, 2),
+                status: ResponseStatus::Completed,
+            },
             2_000,
         )
         .await
@@ -720,8 +718,7 @@ pub async fn assert_global_claim(ports: &PortSet) {
     // Two queued responses with different node tags.
     let other_node = NodeTag::parse("node-zz").expect("static tag");
     let foreign_id = ResponseId::new(other_node.clone());
-    let mut foreign = record(ports, &foreign_id, None, &tenant, true, ResponseStatus::Queued);
-    foreign.node_tag = other_node.clone();
+    let foreign = record(&foreign_id, None, &tenant, true, ResponseStatus::Queued);
     ports
         .ledger
         .create(foreign, fresh_key(), 1_000)
@@ -732,7 +729,7 @@ pub async fn assert_global_claim(ports: &PortSet) {
     ports
         .ledger
         .create(
-            record(ports, &mine, None, &tenant, true, ResponseStatus::Queued),
+            record(&mine, None, &tenant, true, ResponseStatus::Queued),
             fresh_key(),
             1_100,
         )
@@ -844,7 +841,7 @@ pub async fn assert_overload_integrity(ports: &PortSet) {
     for _ in 0..RACERS {
         let ledger = ports.ledger.clone();
         let id = ports.new_id();
-        let rec = record(ports, &id, None, &tenant, true, ResponseStatus::Queued);
+        let rec = record(&id, None, &tenant, true, ResponseStatus::Queued);
         handles.push(tokio::spawn(async move {
             ledger.create(rec, fresh_key(), 2_000).await
         }));
@@ -984,11 +981,13 @@ pub async fn assert_output_provenance(ports: &PortSet) {
             &tenant,
             &conversation.id,
             &id,
-            vec![ResponseItem::user_text("question")],
-            vec![ResponseItem::assistant_text("Stable answer")],
-            None,
-            Usage::new(3, 4),
-            ResponseStatus::Completed,
+            TurnCommit {
+                input_items: vec![ResponseItem::user_text("question")],
+                output_items: vec![ResponseItem::assistant_text("Stable answer")],
+                reasoning: None,
+                usage: Usage::new(3, 4),
+                status: ResponseStatus::Completed,
+            },
             2_000,
         )
         .await
@@ -1032,7 +1031,7 @@ pub async fn assert_output_provenance(ports: &PortSet) {
     ports
         .ledger
         .create(
-            record(ports, &fenced, None, &tenant, true, ResponseStatus::Queued),
+            record(&fenced, None, &tenant, true, ResponseStatus::Queued),
             fresh_key(),
             1_000,
         )
@@ -1088,7 +1087,7 @@ pub async fn assert_output_provenance(ports: &PortSet) {
 pub async fn assert_durability_order(ports: &PortSet) {
     let tenant = fresh_tenant("durability");
     let id = ports.new_id();
-    let mut rec = record(ports, &id, None, &tenant, true, ResponseStatus::Queued);
+    let mut rec = record(&id, None, &tenant, true, ResponseStatus::Queued);
     rec.input_items = vec![ResponseItem::user_text("durable-marker")];
 
     let outcome = ports
@@ -1124,7 +1123,7 @@ pub async fn assert_durability_order(ports: &PortSet) {
     // A rejected create must leave nothing behind: a partial write would be a
     // silent inconsistency that no error message accounts for.
     let ghost = ports.new_id();
-    let ghost_rec = record(ports, &ghost, None, &tenant, true, ResponseStatus::Queued);
+    let ghost_rec = record(&ghost, None, &tenant, true, ResponseStatus::Queued);
     let key = fresh_key();
     ports
         .ledger
@@ -1168,7 +1167,7 @@ pub async fn assert_concurrency_conformance(ports: &PortSet) {
     let created = ports
         .ledger
         .create(
-            record(ports, &id, None, &tenant, true, ResponseStatus::Queued),
+            record(&id, None, &tenant, true, ResponseStatus::Queued),
             fresh_key(),
             1_000,
         )
@@ -1234,7 +1233,7 @@ pub async fn assert_concurrency_conformance(ports: &PortSet) {
         let key = key.clone();
         // Each racer proposes a *different* id, as independent retries would.
         let candidate = ports.new_id();
-        let rec = record(ports, &candidate, None, &tenant, true, ResponseStatus::Queued);
+        let rec = record(&candidate, None, &tenant, true, ResponseStatus::Queued);
         handles.push(tokio::spawn(
             async move { ledger.create(rec, key, 2_000).await },
         ));
@@ -1330,7 +1329,7 @@ pub async fn assert_conversation_conformance(ports: &PortSet) {
 
     let created = ports.fresh_conversation(&tenant).await;
     assert!(
-        created.is_empty(),
+        created.has_no_turns(),
         "a new conversation has no tail: the first turn must start from empty context"
     );
 
@@ -1406,7 +1405,7 @@ pub async fn assert_conversation_conformance(ports: &PortSet) {
         .expect("get")
         .expect("present");
     assert_eq!(after.last_response_id.as_ref(), Some(&first));
-    assert!(!after.is_empty());
+    assert!(!after.has_no_turns());
 
     // INV-55: last write wins. Two turns racing on one conversation leave
     // whichever finished last as the tail; the other's chain survives and stays

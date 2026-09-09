@@ -7,7 +7,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use nova_responses::{ConversationError, LedgerError};
+use nova_responses::{ConversationError, LedgerError, StoreError};
 
 pub fn api_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
     (
@@ -55,17 +55,17 @@ pub fn map_ledger_error(err: &LedgerError) -> Response {
         LedgerError::InvalidTransition(msg) => {
             api_error(StatusCode::CONFLICT, "invalid_transition", msg.clone())
         }
-        LedgerError::ReadOnly => api_error(
+        LedgerError::Store(StoreError::ReadOnly) => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "read_only",
             "service is read-only",
         ),
-        LedgerError::Unavailable => api_error(
+        LedgerError::Store(StoreError::Unavailable) => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "unavailable",
             "ledger is unavailable",
         ),
-        LedgerError::Internal(msg) => {
+        LedgerError::Store(StoreError::Internal(msg)) => {
             api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg.clone())
         }
     }
@@ -95,17 +95,17 @@ pub fn map_conversation_stream_error(
             "capacity_exceeded",
             "conversation event capacity exceeded".into(),
         ),
-        ConversationError::Unavailable => (
+        ConversationError::Store(StoreError::Unavailable) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "store_unavailable",
             "conversation store is unavailable; the request was not stored".into(),
         ),
-        ConversationError::ReadOnly => (
+        ConversationError::Store(StoreError::ReadOnly) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "read_only",
             "service is read-only".into(),
         ),
-        ConversationError::Internal(msg) => (
+        ConversationError::Store(StoreError::Internal(msg)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
             msg.clone(),
@@ -192,7 +192,9 @@ mod tests {
     #[test]
     fn an_unavailable_conversation_store_never_reports_success() {
         assert_eq!(
-            status_of(map_conversation_error(&ConversationError::Unavailable)),
+            status_of(map_conversation_error(&ConversationError::Store(
+                StoreError::Unavailable,
+            ))),
             StatusCode::SERVICE_UNAVAILABLE
         );
     }
@@ -209,9 +211,9 @@ mod tests {
                 ),
             },
             ConversationError::CapacityExceeded,
-            ConversationError::Unavailable,
-            ConversationError::ReadOnly,
-            ConversationError::Internal("x".into()),
+            ConversationError::Store(StoreError::Unavailable),
+            ConversationError::Store(StoreError::ReadOnly),
+            ConversationError::Store(StoreError::Internal("x".into())),
         ] {
             assert_eq!(
                 map_conversation_stream_error(&err).0,

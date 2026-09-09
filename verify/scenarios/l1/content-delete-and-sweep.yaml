@@ -20,8 +20,6 @@ steps:
     target: doomed
     expect_deleted: false
   - action: sweep_expired_content
-    now_ms: 4999
     expect_removed: 0
   - action: sweep_expired_content
-    now_ms: 5000
     expect_removed: 1

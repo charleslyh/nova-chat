@@ -18,11 +18,9 @@ steps:
     label: c
   - action: resolve_chain
     from: c
-    max_depth: 3
     expect_depth: 3
   # Over the bound: an explicit error. Truncating here would silently drop
   # context and be invisible to the caller.
   - action: expect_chain_error
     from: c
-    max_depth: 2
     reason: chain_too_long

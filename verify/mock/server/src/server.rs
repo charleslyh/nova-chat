@@ -4,7 +4,7 @@
 //! Pure logic, no transport: the HTTP wiring lives in the `nova-responses-mem-server`
 //! binary, so this stays unit-testable without a socket.
 
-use nova_responses::{ConversationStore, ResponseEventLog, ResponseLedger};
+use nova_responses::{ConversationStore, ResponseEventLog, ResponseLedger, TurnCommit};
 
 use crate::proto::{ProtoError, Request, Response};
 use crate::MemWorld;
@@ -270,11 +270,13 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
                 &tenant,
                 &id,
                 &response_id,
-                input_items,
-                output_items,
-                reasoning,
-                usage,
-                status,
+                TurnCommit {
+                    input_items,
+                    output_items,
+                    reasoning,
+                    usage,
+                    status,
+                },
                 now_ms,
             )
             .await

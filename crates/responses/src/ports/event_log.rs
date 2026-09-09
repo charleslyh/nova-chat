@@ -4,6 +4,7 @@ use thiserror::Error;
 
 use crate::events::{AppendEvent, ResponseEvent};
 use crate::context::ResponseId;
+use crate::StoreError;
 
 #[derive(Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventLogError {
@@ -20,13 +21,12 @@ pub enum EventLogError {
     Expired,
     #[error("stale attempt")]
     StaleAttempt,
-    #[error("read only")]
-    ReadOnly,
     /// Ring is full for this response; refuse rather than evict live data.
     #[error("capacity exceeded")]
     CapacityExceeded,
-    #[error("internal: {0}")]
-    Internal(String),
+    /// Infrastructure failure (read-only / internal).
+    #[error(transparent)]
+    Store(#[from] StoreError),
 }
 
 /// Per-response bounded event buffer.

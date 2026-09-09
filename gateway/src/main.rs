@@ -17,11 +17,12 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use nova_responses::{
-    ConversationStore, ConversationsService, CountingMetrics, MetricsSink, ResponseEventLog,
-    ResponseLedger, ResponsesService,
+    ConversationStore, ConversationsService, MetricsSink, ResponseEventLog, ResponseLedger,
+    ResponsesService,
 };
 use tracing::info;
 
+use nova_responses_gateway::metrics::CountingMetrics;
 use nova_responses_gateway::{AppState, KeyTable};
 
 mod config;

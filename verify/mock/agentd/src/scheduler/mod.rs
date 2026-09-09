@@ -40,7 +40,7 @@ pub enum SchedulerError {
     #[error("scheduler produced no output items")]
     EmptyOutcome,
     #[error("scheduler produced a `{item_type}` item, which cannot be fed back as input")]
-    UnusableOutput { item_type: &'static str },
+    UnusableOutput { item_type: String },
     #[error("scheduler produced an invalid item: {0}")]
     InvalidOutput(String),
     #[error("could not deliver incremental output: {0}")]
@@ -76,7 +76,7 @@ pub fn validate_outcome(outcome: &CompletionsOutcome) -> Result<(), SchedulerErr
     for item in &outcome.items {
         if !item.is_acceptable_as_input() {
             return Err(SchedulerError::UnusableOutput {
-                item_type: item.item_type(),
+                item_type: item.item_type().to_string(),
             });
         }
         item.validate()

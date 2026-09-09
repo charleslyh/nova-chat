@@ -5,6 +5,7 @@
 //! budget (`parameters.md` §4.5) meaningful.
 
 use serde::{Deserialize, Serialize};
+use strum::AsRefStr;
 use thiserror::Error;
 
 use super::url_guard::{ensure_public_https, UrlRejection};
@@ -17,8 +18,9 @@ pub enum ImageDetail {
     High,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AsRefStr)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[strum(serialize_all = "snake_case")]
 pub enum ContentPart {
     InputText {
         text: String,
@@ -62,14 +64,8 @@ pub enum ContentViolation {
 }
 
 impl ContentPart {
-    pub fn part_type(&self) -> &'static str {
-        match self {
-            ContentPart::InputText { .. } => "input_text",
-            ContentPart::OutputText { .. } => "output_text",
-            ContentPart::Refusal { .. } => "refusal",
-            ContentPart::InputImage { .. } => "input_image",
-            ContentPart::InputFile { .. } => "input_file",
-        }
+    pub fn part_type(&self) -> &str {
+        self.as_ref()
     }
 
     /// Byte cost counted against the chain budget. References are short, which

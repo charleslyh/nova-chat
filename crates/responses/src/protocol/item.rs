@@ -12,6 +12,7 @@
 //! behaviour, not a limitation to work around.
 
 use serde::{Deserialize, Serialize};
+use strum::AsRefStr;
 use thiserror::Error;
 
 use super::content::{ContentPart, ContentViolation};
@@ -33,8 +34,9 @@ pub enum ItemStatus {
     Incomplete,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AsRefStr)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[strum(serialize_all = "snake_case")]
 pub enum ResponseItem {
     Message {
         role: Role,
@@ -79,12 +81,8 @@ pub enum ItemViolation {
 
 impl ResponseItem {
     /// For metrics and diagnostics only — never branch business logic on this.
-    pub fn item_type(&self) -> &'static str {
-        match self {
-            ResponseItem::Message { .. } => "message",
-            ResponseItem::FunctionCall { .. } => "function_call",
-            ResponseItem::FunctionCallOutput { .. } => "function_call_output",
-        }
+    pub fn item_type(&self) -> &str {
+        self.as_ref()
     }
 
     /// Chain closure predicate (INV-47 / CR-12).

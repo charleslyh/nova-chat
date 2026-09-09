@@ -172,8 +172,6 @@ pub enum EventBody {
     },
     /// Lifecycle events carry the full response object as `response`.
     Response { response: Value },
-    /// No kind-specific fields. Kept for tests that construct bare events.
-    Empty {},
 }
 
 impl AppendEvent {

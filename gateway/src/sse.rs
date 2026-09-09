@@ -23,6 +23,7 @@ use futures::future::BoxFuture;
 use futures::StreamExt;
 use nova_responses::{
     ConversationEvent, ConversationId, ConversationStore, EventLogError, ResponseEvent,
+    StoreError,
     ResponseEventLog, ResponseId, TenantId,
 };
 
@@ -63,17 +64,22 @@ pub fn map_event_log_error(err: &EventLogError) -> StreamFailure {
             "stale_attempt",
             "attempt superseded".into(),
         ),
-        EventLogError::ReadOnly => (
+        EventLogError::Store(StoreError::ReadOnly) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "read_only",
             "service is read-only".into(),
+        ),
+        EventLogError::Store(StoreError::Unavailable) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "event buffer is unavailable".into(),
         ),
         EventLogError::CapacityExceeded => (
             StatusCode::SERVICE_UNAVAILABLE,
             "capacity_exceeded",
             "event buffer capacity exceeded".into(),
         ),
-        EventLogError::Internal(msg) => (
+        EventLogError::Store(StoreError::Internal(msg)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
             msg.clone(),

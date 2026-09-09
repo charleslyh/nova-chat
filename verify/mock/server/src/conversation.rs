@@ -11,7 +11,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use nova_responses::{
     Conversation, ConversationError, ConversationEvent, ConversationEventKind, ConversationId,
-    ConversationStore, ResolvedContext, ResponseId, ResponseItem, ResponseStatus, TenantId, Usage,
+    ConversationStore, ResolvedContext, ResponseId, ResponseItem, ResponseStatus, StoreError,
+    TenantId, TurnCommit,
 };
 
 use crate::store::{Inner, MemStore};
@@ -28,7 +29,7 @@ impl MemConversationStore {
     fn guard_available(&self) -> Result<(), ConversationError> {
         if self.store.is_unavailable() {
             // Callers must refuse the write, never proceed unstored (INV-46).
-            return Err(ConversationError::Unavailable);
+            return Err(ConversationError::Store(StoreError::Unavailable));
         }
         Ok(())
     }
@@ -36,7 +37,7 @@ impl MemConversationStore {
     fn guard_writable(&self) -> Result<(), ConversationError> {
         self.guard_available()?;
         if self.store.is_read_only() {
-            return Err(ConversationError::ReadOnly);
+            return Err(ConversationError::Store(StoreError::ReadOnly));
         }
         Ok(())
     }
@@ -114,17 +115,12 @@ impl ConversationStore for MemConversationStore {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn append_turn(
         &self,
         tenant: &TenantId,
         id: &ConversationId,
         _response_id: &ResponseId,
-        input_items: Vec<ResponseItem>,
-        output_items: Vec<ResponseItem>,
-        reasoning: Option<String>,
-        _usage: Usage,
-        _status: ResponseStatus,
+        commit: TurnCommit,
         _now_ms: u64,
     ) -> Result<u64, ConversationError> {
         self.guard_writable()?;
@@ -135,6 +131,12 @@ impl ConversationStore for MemConversationStore {
         if &existing.tenant_id != tenant {
             return Err(ConversationError::NotFound);
         }
+        let TurnCommit {
+            input_items,
+            output_items,
+            reasoning,
+            ..
+        } = commit;
         let snap = g.snapshots.entry(id.clone()).or_default();
         let turn_start = snap.items.len();
         let input_len = input_items.len();

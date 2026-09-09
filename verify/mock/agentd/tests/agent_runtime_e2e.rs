@@ -65,7 +65,6 @@ fn record(id: &ResponseId, text: &str, stored: bool) -> ResponseRecord {
         expires_at_ms: None,
         integrity: None,
         integrity_alg: None,
-        node_tag: id.node_tag().clone(),
         idempotency_key: None,
         owner: None,
         attempt: Attempt::default(),
@@ -143,7 +142,7 @@ async fn a_queued_response_runs_to_completion_with_no_socket_and_no_model() {
 
     let rec = world.ledger.get(&id).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Completed);
-    assert!(rec.usage.total_tokens > 0, "usage must be booked");
+    assert!(rec.usage.total_tokens() > 0, "usage must be booked");
 
     let snap = snapshot(&world, &conv).await;
     let output = output_of(&snap);

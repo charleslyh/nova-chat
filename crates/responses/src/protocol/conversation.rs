@@ -23,20 +23,21 @@ use thiserror::Error;
 use super::limits::{json_depth, InputLimits};
 use super::request::{validate_metadata, RequestViolation};
 
-/// `POST /v1/conversations`.
+/// `POST /v1/conversations` and `POST /v1/conversations/{id}`.
 ///
-/// Upstream also accepts an initial `items` array here. It is not accepted:
-/// there is nowhere to put items that is not a second copy of content the
-/// response chain already owns. Callers seed a conversation by making the first
-/// generation against it.
+/// Both endpoints accept only `metadata` (create seeds it, update replaces it
+/// wholesale). A merge would need a way to spell "delete this key", which the
+/// wire format does not have — so a merge would make deletion impossible rather
+/// than merely verbose. One body type serves both so the two cannot drift into
+/// disagreeing about what a valid metadata key is.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CreateConversationRequest {
+pub struct ConversationMetadataRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<BTreeMap<String, String>>,
 }
 
-impl CreateConversationRequest {
+impl ConversationMetadataRequest {
     pub fn validate(&self) -> Result<(), RequestViolation> {
         if let Some(metadata) = &self.metadata {
             validate_metadata(metadata)?;
@@ -50,42 +51,17 @@ impl CreateConversationRequest {
     }
 }
 
-/// `POST /v1/conversations/{id}`.
-///
-/// Replaces metadata wholesale rather than merging. A merge would need a way to
-/// spell "delete this key", which the wire format does not have — so a merge
-/// would make deletion impossible rather than merely verbose.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UpdateConversationRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<BTreeMap<String, String>>,
-}
-
-impl UpdateConversationRequest {
-    pub fn validate(&self) -> Result<(), RequestViolation> {
-        if let Some(metadata) = &self.metadata {
-            validate_metadata(metadata)?;
-        }
-        Ok(())
-    }
-
-    pub fn metadata(&self) -> BTreeMap<String, String> {
-        self.metadata.clone().unwrap_or_default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn metadata_is_optional_on_both_bodies() {
-        let create: CreateConversationRequest = serde_json::from_str("{}").unwrap();
+        let create: ConversationMetadataRequest = serde_json::from_str("{}").unwrap();
         assert!(create.validate().is_ok());
         assert!(create.metadata().is_empty());
 
-        let update: UpdateConversationRequest = serde_json::from_str("{}").unwrap();
+        let update: ConversationMetadataRequest = serde_json::from_str("{}").unwrap();
         assert!(update.validate().is_ok());
         assert!(update.metadata().is_empty());
     }
@@ -93,8 +69,8 @@ mod tests {
     #[test]
     fn unknown_fields_are_rejected() {
         // INV-50: the compatibility layer never ignores what it does not know.
-        assert!(serde_json::from_str::<CreateConversationRequest>(r#"{"items":[]}"#).is_err());
-        assert!(serde_json::from_str::<UpdateConversationRequest>(r#"{"topic":"x"}"#).is_err());
+        assert!(serde_json::from_str::<ConversationMetadataRequest>(r#"{"items":[]}"#).is_err());
+        assert!(serde_json::from_str::<ConversationMetadataRequest>(r#"{"topic":"x"}"#).is_err());
     }
 
     #[test]
@@ -105,7 +81,7 @@ mod tests {
         for i in 0..=super::super::request::MAX_METADATA_ENTRIES {
             metadata.insert(format!("k{i}"), "v".into());
         }
-        let req = CreateConversationRequest {
+        let req = ConversationMetadataRequest {
             metadata: Some(metadata),
         };
         assert!(matches!(
@@ -114,7 +90,7 @@ mod tests {
         ));
 
         let long_key = "k".repeat(super::super::request::MAX_METADATA_KEY_BYTES + 1);
-        let req = UpdateConversationRequest {
+        let req = ConversationMetadataRequest {
             metadata: Some(BTreeMap::from([(long_key, "v".to_string())])),
         };
         assert!(matches!(
@@ -126,7 +102,7 @@ mod tests {
     #[test]
     fn accepted_metadata_round_trips() {
         let json = r#"{"metadata":{"topic":"demo"}}"#;
-        let req: CreateConversationRequest = serde_json::from_str(json).unwrap();
+        let req: ConversationMetadataRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.metadata().get("topic").map(String::as_str), Some("demo"));
         assert_eq!(serde_json::to_string(&req).unwrap(), json);
     }

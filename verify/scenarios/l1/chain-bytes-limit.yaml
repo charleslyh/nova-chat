@@ -13,5 +13,4 @@ steps:
     label: b
   - action: expect_chain_error
     from: b
-    max_bytes: 8
     reason: chain_too_large

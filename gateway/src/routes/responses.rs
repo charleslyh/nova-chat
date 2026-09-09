@@ -11,7 +11,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use nova_responses::protocol::{preflight_unsupported, CreateResponseRequest};
-use nova_responses::{ConversationId, IdempotencyKey, ResponseId, ResponseRecord, TenantId};
+use nova_responses::{
+    response_object, ConversationId, IdempotencyKey, ResponseId, TenantId,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -19,7 +21,7 @@ use crate::error::{
     api_error, bad_request, map_conversation_error, map_ledger_error, not_found,
 };
 use crate::routes::shared::tenant_or_reject;
-use nova_responses::service::{ContextSource, CreateResult, ServiceError};
+use nova_responses::service::{ContextSource, CreateIntent, CreateResult, ServiceError};
 use crate::sse::{map_event_log_error, open_stream, resolve_cursor};
 use crate::state::AppState;
 
@@ -133,11 +135,20 @@ pub async fn create(
         .and_then(|v| v.to_str().ok())
         .map(|v| IdempotencyKey(v.to_string()));
 
-    let result = match state
-        .service
-        .create(&tenant, &request, input_items, source, idempotency_key)
-        .await
-    {
+    // Resolve the wire request into a domain intent: the `input` shorthand and
+    // the `conversation` reference shape are gateway concerns, so they are
+    // settled here and the capability layer sees only plain domain values.
+    let intent = CreateIntent {
+        model: request.model.clone(),
+        instructions: request.instructions.clone(),
+        store: request.store,
+        tools: request.tools.clone().unwrap_or_default(),
+        tool_choice: request.tool_choice.clone(),
+        input_items,
+        source,
+    };
+
+    let result = match state.service.create(&tenant, &intent, idempotency_key).await {
         Ok(r) => r,
         Err(e) => return map_service_error(&e),
     };
@@ -157,7 +168,7 @@ pub async fn create(
             if request.background {
                 return (
                     StatusCode::ACCEPTED,
-                    Json(response_object(&record)),
+                    Json(response_object(&record, &[])),
                 )
                     .into_response();
             }
@@ -170,7 +181,9 @@ pub async fn create(
                 Err(e) => map_service_error(&e),
             }
         }
-        CreateResult::Duplicate { existing } => Json(response_object(&existing)).into_response(),
+        CreateResult::Duplicate { existing } => {
+            Json(response_object(&existing, &[])).into_response()
+        }
         CreateResult::ReadOnly => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "read_only",
@@ -292,8 +305,3 @@ pub async fn delete(
     }
 }
 
-/// Response object in protocol shape for a freshly created response (empty
-/// output). `instructions` is echoed here — that is its only role (INV-49).
-pub fn response_object(record: &ResponseRecord) -> Value {
-    record.to_response_value(&[])
-}

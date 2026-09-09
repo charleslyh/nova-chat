@@ -299,12 +299,13 @@ impl From<ToolChoice> for CompletionsToolChoice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nova_responses::{ContentPart, Role};
+    use nova_responses::{Attempt, ContentPart, ResponseId, Role};
 
     fn provenance() -> RequestProvenance {
         RequestProvenance {
-            response_id: "resp_node-a_1".into(),
-            attempt: 1,
+            response_id: ResponseId::parse("resp_node-a_00000000-0000-0000-0000-000000000001")
+                .unwrap(),
+            attempt: Attempt(1),
             exec_deadline_ms: 60_000,
         }
     }
@@ -376,13 +377,14 @@ mod tests {
             None,
             &[user("hi")],
             RequestProvenance {
-                response_id: "resp_node-b_9".into(),
-                attempt: 3,
+                response_id: ResponseId::parse("resp_node-b_00000000-0000-0000-0000-000000000009")
+                    .unwrap(),
+                attempt: Attempt(3),
                 exec_deadline_ms: 12_345,
             },
         )
         .expect("build");
-        assert_eq!(r.provenance.attempt, 3);
+        assert_eq!(r.provenance.attempt, Attempt(3));
         assert_eq!(r.provenance.exec_deadline_ms, 12_345);
     }
 

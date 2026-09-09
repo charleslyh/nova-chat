@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use nova_responses::{
     canonical_items, AbortedClaim, AgentId, Attempt, ClaimedResponse, ContentIntegrity,
     CreateOutcome, IdempotencyKey, LedgerError, ResponseId, ResponseItem, ResponseLedger,
-    ResponseRecord, ResponseStatus, TenantId, Usage,
+    ResponseRecord, ResponseStatus, StoreError, TenantId, Usage,
 };
 
 use crate::store::MemStore;
@@ -47,7 +47,7 @@ impl MemResponseLedger {
         attempt: Attempt,
     ) -> Result<(), LedgerError> {
         if self.store.is_read_only() {
-            return Err(LedgerError::ReadOnly);
+            return Err(LedgerError::Store(StoreError::ReadOnly));
         }
         let g = self.store.lock();
         let Some(rec) = g.records.get(response_id) else {
@@ -64,7 +64,7 @@ impl MemResponseLedger {
 
     fn guard_writable(&self) -> Result<(), LedgerError> {
         if self.store.is_read_only() {
-            Err(LedgerError::ReadOnly)
+            Err(LedgerError::Store(StoreError::ReadOnly))
         } else {
             Ok(())
         }
@@ -100,7 +100,7 @@ impl ResponseLedger for MemResponseLedger {
         if g.records.len() >= self.store.max_records() {
             // Refuse rather than evict: dropping an existing record would break
             // a chain silently (INV-43).
-            return Err(LedgerError::Unavailable);
+            return Err(LedgerError::Store(StoreError::Unavailable));
         }
         let mut record = record;
         // Sign the input items before storing, so tampering is detectable (CR-13).
@@ -108,7 +108,7 @@ impl ResponseLedger for MemResponseLedger {
             let canonical = canonical_items(&record.input_items);
             let tag = integrity
                 .sign(&canonical)
-                .map_err(|e| LedgerError::Internal(e.to_string()))?;
+                .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
             record.integrity = Some(tag);
             record.integrity_alg = Some(integrity.alg().to_string());
         }

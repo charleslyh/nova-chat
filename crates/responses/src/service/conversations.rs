@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use crate::{
     Conversation, ConversationError, ConversationEvent, ConversationEventKind, ConversationId,
-    ConversationStore, MetricsSink, ResolvedContext, ResponseId, ResponseItem, ResponseStatus,
-    TenantId, Usage,
+    ConversationStore, MetricsSink, ResolvedContext, ResponseId, ResponseStatus, TenantId,
+    TurnCommit,
 };
 
 /// 会话容器的链尾解析结果。
@@ -69,7 +69,7 @@ impl ConversationsService {
             now_ms,
         );
         let created = self.conversations.create(conversation).await?;
-        self.metrics.incr("conversations_created", 1).await;
+        self.metrics.incr("conversations_created", 1);
         Ok(created)
     }
 
@@ -102,7 +102,7 @@ impl ConversationsService {
     ) -> Result<bool, ConversationError> {
         let deleted = self.conversations.delete(tenant, id).await?;
         if deleted {
-            self.metrics.incr("conversations_deleted", 1).await;
+            self.metrics.incr("conversations_deleted", 1);
         }
         Ok(deleted)
     }
@@ -135,31 +135,16 @@ impl ConversationsService {
 
     /// 终态时把本轮 input+output 追加进会话快照（D30）。条目来自执行端最终产出，
     /// **不是**事件流回放（INV-48）。
-    #[allow(clippy::too_many_arguments)]
     pub async fn append_turn(
         &self,
         tenant: &TenantId,
         id: &ConversationId,
         response_id: &ResponseId,
-        input_items: Vec<ResponseItem>,
-        output_items: Vec<ResponseItem>,
-        reasoning: Option<String>,
-        usage: Usage,
-        status: ResponseStatus,
+        commit: TurnCommit,
     ) -> Result<u64, ConversationError> {
         let now_ms = (self.now)();
         self.conversations
-            .append_turn(
-                tenant,
-                id,
-                response_id,
-                input_items,
-                output_items,
-                reasoning,
-                usage,
-                status,
-                now_ms,
-            )
+            .append_turn(tenant, id, response_id, commit, now_ms)
             .await
     }
 

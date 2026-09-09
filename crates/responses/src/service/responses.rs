@@ -20,12 +20,12 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::protocol::CreateResponseRequest;
+use crate::protocol::{Tool, ToolChoice};
 use crate::{
-    AppendEvent, Attempt, ConversationError, ConversationEventKind, ConversationId, CreateOutcome,
-    EventBody, EventLogError, IdempotencyKey, LedgerError, MetricsSink, ResolvedContext,
-    ResponseEventKind, ResponseEventLog, ResponseId, ResponseItem, ResponseLedger, ResponseRecord,
-    ResponseStatus, SnapshotRef, TenantId, Usage,
+    response_object, AppendEvent, Attempt, ConversationError, ConversationEventKind,
+    ConversationId, CreateOutcome, EventBody, EventLogError, IdempotencyKey, LedgerError,
+    MetricsSink, ResolvedContext, ResponseEventKind, ResponseEventLog, ResponseId, ResponseItem,
+    ResponseLedger, ResponseRecord, ResponseStatus, SnapshotRef, TenantId, Usage,
 };
 
 use crate::config::Config;
@@ -69,6 +69,22 @@ pub enum CreateResult {
     Overloaded,
 }
 
+/// 创建生成的领域意图。
+///
+/// 接入层已经把 wire 形状消解掉：`input` 简写已规范化为 [`ResponseItem`]，
+/// `conversation` 引用已解析为 [`ContextSource`]。传这个结构而不是「原始请求 +
+/// 并列的 `input_items`」，消除了二者必须一致的隐含契约。
+#[derive(Debug, Clone)]
+pub struct CreateIntent {
+    pub model: String,
+    pub instructions: Option<String>,
+    pub store: bool,
+    pub tools: Vec<Tool>,
+    pub tool_choice: Option<ToolChoice>,
+    pub input_items: Vec<ResponseItem>,
+    pub source: ContextSource,
+}
+
 /// Responses 用例编排。
 pub struct ResponsesService {
     ledger: Arc<dyn ResponseLedger>,
@@ -105,34 +121,29 @@ impl ResponsesService {
 
     /// 创建生成：解析锚点 → 校验上下文 → 取会话锁 → 写账本（仅元数据）→ 发 `Created`。
     ///
-    /// `source` 是上下文来源（三个变体最终都收敛到 `resolve_context`）；`input_items`
-    /// 是接入层经协议子集校验后的输入条目。
-    ///
     /// 会话锁在这里取，而不是在接入层：这样无论调用方走标准 `/v1/responses` 还是
     /// 将来任何门面，`TurnStarted` 都不会漏发，接入层也只需做传输。
     pub async fn create(
         &self,
         tenant: &TenantId,
-        request: &CreateResponseRequest,
-        input_items: Vec<ResponseItem>,
-        source: ContextSource,
+        intent: &CreateIntent,
         idempotency_key: Option<IdempotencyKey>,
     ) -> Result<CreateResult, ServiceError> {
         let now_ms = self.now_ms();
 
         // 会话标识收敛为锚点：容器存的就是链尾指针，所以下面只有一条装配路径。
-        let (previous, conversation_id) = match source {
+        let (previous, conversation_id) = match &intent.source {
             ContextSource::Fresh => (None, None),
-            ContextSource::Previous(id) => (Some(id), None),
+            ContextSource::Previous(id) => (Some(id.clone()), None),
             ContextSource::Conversation(id) => {
-                let anchor = match self.conversations.resolve_tail(tenant, &id).await? {
+                let anchor = match self.conversations.resolve_tail(tenant, id).await? {
                     // 首轮：容器还没有链尾，空上下文。这与「容器不存在」不同，后者
                     // 已在 resolve_tail 内报 NotFound——绝不静默降级为空上下文，否则
                     // 打错 id 的调用方会拿到一个失忆的回复而无从察觉。
                     ConversationTail::Empty => None,
                     ConversationTail::At(last) => Some(last),
                 };
-                (anchor, Some(id))
+                (anchor, Some(id.clone()))
             }
         };
 
@@ -147,9 +158,7 @@ impl ResponsesService {
         };
         let resolved = self.resolve_context(tenant, &anchor).await?;
         if !matches!(anchor, SnapshotRef::Root) {
-            self.metrics
-                .incr("chain_resolved_depth", resolved.depth as u64)
-                .await;
+            self.metrics.incr("chain_resolved_depth", resolved.depth as u64);
         }
 
         // 不写前探活（D28）：库不可用由失败返回错误直接暴露。准入失败由
@@ -165,7 +174,7 @@ impl ResponsesService {
         // 缺省幂等键取 response_id，保证「同一生成仅一条记录」（FR-3）。
         let idempotency_key =
             idempotency_key.unwrap_or_else(|| IdempotencyKey(response_id.to_string()));
-        let expires_at_ms = if request.store {
+        let expires_at_ms = if intent.store {
             Some(now_ms.saturating_add(self.cfg.content_retention_ms))
         } else {
             None
@@ -176,25 +185,24 @@ impl ResponsesService {
             previous_response_id: previous,
             conversation_id,
             tenant_id: tenant.clone(),
-            model: request.model.clone(),
+            model: intent.model.clone(),
             // 仅用于检索回显，永不进入上下文（INV-49）。
-            instructions: request.instructions.clone(),
+            instructions: intent.instructions.clone(),
             // 本轮的工具体声明：由调用方 `tools` 参数逐请求声明（而非静态部署
             // 配置），原样落进 record（inbound 形状），provider 转换由执行端的
             // runner 内部完成（单一数据源：存调用方声明，不做双向转换）。
-            tools: request.tools.clone().unwrap_or_default(),
-            tool_choice: request.tool_choice.clone(),
-            input_items,
+            tools: intent.tools.clone(),
+            tool_choice: intent.tool_choice.clone(),
+            input_items: intent.input_items.clone(),
             reasoning: None,
             status: ResponseStatus::Queued,
             usage: Usage::default(),
             created_at_ms: now_ms,
             completed_at_ms: None,
-            stored: request.store,
+            stored: intent.store,
             expires_at_ms,
             integrity: None,
             integrity_alg: None,
-            node_tag: self.cfg.node_tag.clone(),
             idempotency_key: Some(idempotency_key.clone()),
             owner: None,
             attempt: Attempt::default(),
@@ -316,7 +324,7 @@ impl ResponsesService {
             released,
             "took over a turn marker whose holder had already reached a terminal state"
         );
-        self.metrics.incr("conversation_stale_locks_released", 1).await;
+        self.metrics.incr("conversation_stale_locks_released", 1);
 
         self.conversations
             .acquire_active(tenant, conversation_id, response_id)
@@ -345,11 +353,11 @@ impl ResponsesService {
                 let created = AppendEvent::lifecycle(
                     response_id.clone(),
                     ResponseEventKind::Created,
-                    record.to_response_value(&[]),
+                    response_object(record, &[]),
                 );
                 self.event_log.append(created).await?;
 
-                self.metrics.incr("responses_created", 1).await;
+                self.metrics.incr("responses_created", 1);
 
                 Ok(CreateResult::Accepted {
                     record: record.clone(),
@@ -406,7 +414,7 @@ impl ResponsesService {
             Some(record) if &record.tenant_id != tenant => Ok(None),
             Some(record) => match self.latest_response_value(response_id).await? {
                 Some(value) => Ok(Some(value)),
-                None => Ok(Some(record.to_response_value(&[]))),
+                None => Ok(Some(response_object(&record, &[]))),
             },
         }
     }
@@ -448,7 +456,7 @@ impl ResponsesService {
 
         match self.latest_response_value(response_id).await? {
             Some(value) => Ok(value),
-            None => Ok(fallback.to_response_value(&[])),
+            None => Ok(response_object(fallback, &[])),
         }
     }
 
@@ -493,7 +501,7 @@ impl ResponsesService {
 
         let response = record
             .as_ref()
-            .map(|r| r.to_response_value(&[]))
+            .map(|r| response_object(r, &[]))
             .unwrap_or_else(|| {
                 serde_json::json!({
                     "id": response_id.to_string(),
@@ -514,7 +522,7 @@ impl ResponsesService {
             .close(response_id, now_ms, self.cfg.retain_after_terminal_ms)
             .await;
 
-        self.metrics.incr("responses_cancelled", 1).await;
+        self.metrics.incr("responses_cancelled", 1);
 
         Ok(Some(response))
     }
@@ -542,7 +550,7 @@ impl ResponsesService {
         let _ = self.event_log.remove(response_id).await;
 
         if deleted {
-            self.metrics.incr("responses_deleted", 1).await;
+            self.metrics.incr("responses_deleted", 1);
 
             if let Some(conversation_id) = &conversation_id {
                 if let Err(err) = self

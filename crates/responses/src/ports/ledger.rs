@@ -6,6 +6,7 @@ use crate::context::{ResponseRecord, ResponseStatus, Usage};
 use crate::context::ResponseId;
 use crate::conversation::ConversationId;
 use crate::shared::{AgentId, Attempt, IdempotencyKey, TenantId};
+use crate::StoreError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CreateOutcome {
@@ -57,12 +58,9 @@ pub enum LedgerError {
     StaleAttempt,
     #[error("invalid transition: {0}")]
     InvalidTransition(String),
-    #[error("read only")]
-    ReadOnly,
-    #[error("unavailable")]
-    Unavailable,
-    #[error("internal: {0}")]
-    Internal(String),
+    /// Infrastructure failure (read-only / unreachable / internal).
+    #[error(transparent)]
+    Store(#[from] StoreError),
 }
 
 /// Generation ledger: lifecycle, ownership, idempotency and usage.

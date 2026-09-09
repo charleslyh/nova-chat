@@ -14,8 +14,8 @@
 mod canonical;
 mod context;
 mod conversation;
-mod domain_error;
 mod events;
+mod render;
 mod integrity_hmac;
 mod ports;
 pub mod protocol;
@@ -23,7 +23,6 @@ mod provenance;
 mod shared;
 
 pub mod config;
-pub mod metrics;
 pub mod service;
 
 pub use canonical::{canonical_items, canonical_json, canonical_output_text, nfc};
@@ -31,20 +30,19 @@ pub use context::{
     ChainLimits, ResolvedContext, ResponseId, ResponseRecord, ResponseStatus, SnapshotRef, Usage,
 };
 pub use conversation::{Conversation, ConversationEvent, ConversationEventKind, ConversationId};
-pub use domain_error::DomainError;
 pub use events::{AppendEvent, EventBody, ResponseEvent, ResponseEventKind};
 pub use shared::{AgentId, Attempt, IdError, IdempotencyKey, NodeTag, TenantId};
 pub use integrity_hmac::{HmacSha256Integrity, ALG as INTEGRITY_ALG, KEY_ENV as INTEGRITY_KEY_ENV};
 /// Re-exported for convenience: items are the unit both ports traffic in.
 pub use protocol::{ContentPart, ResponseItem, Role};
 pub use provenance::RequestProvenance;
+pub use render::response_object;
 
 pub use ports::{
     AbortedClaim, ClaimedResponse, ContentIntegrity, ConversationError, ConversationStore,
     CreateOutcome, EventLogError, IntegrityError, LedgerError, MetricsSink, ResponseEventLog,
-    ResponseLedger,
+    ResponseLedger, StoreError, TurnCommit,
 };
 
 pub use config::{Config, RawConfig};
-pub use metrics::CountingMetrics;
 pub use service::{ContextSource, ConversationsService, CreateResult, ResponsesService, ServiceError};

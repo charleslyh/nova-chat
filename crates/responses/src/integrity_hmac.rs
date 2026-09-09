@@ -81,12 +81,7 @@ impl ContentIntegrity for HmacSha256Integrity {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
-    }
-    out
+    hex::encode(bytes)
 }
 
 #[cfg(test)]

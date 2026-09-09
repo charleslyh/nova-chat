@@ -177,10 +177,6 @@ impl Attempt {
 mod tests {
     use super::*;
 
-    fn tag(s: &str) -> NodeTag {
-        NodeTag::parse(s).unwrap()
-    }
-
     #[test]
     fn rejects_node_tags_that_could_forge_routing() {
         // Anything carrying a separator, case variation or non-ASCII must be

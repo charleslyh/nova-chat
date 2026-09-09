@@ -92,26 +92,29 @@ fn default_retain_after_terminal_ms() -> u64 {
 fn default_content_retention_ms() -> u64 {
     30 * 24 * 60 * 60 * 1000
 }
+// Chain / input bounds default to the domain structs' own `Default`, so there is
+// exactly one source of truth for each number — the on-disk default cannot drift
+// from `ChainLimits::default()` / `InputLimits::default()`.
 fn default_chain_max_depth() -> usize {
-    50
+    ChainLimits::default().max_depth
 }
 fn default_chain_max_items() -> usize {
-    1000
+    ChainLimits::default().max_items
 }
 fn default_chain_max_bytes() -> usize {
-    1024 * 1024
+    ChainLimits::default().max_bytes
 }
 fn default_input_max_items() -> usize {
-    200
+    InputLimits::default().max_items
 }
 fn default_input_max_item_bytes() -> usize {
-    256 * 1024
+    InputLimits::default().max_item_bytes
 }
 fn default_input_max_bytes() -> usize {
-    1024 * 1024
+    InputLimits::default().max_total_bytes
 }
 fn default_input_max_depth() -> usize {
-    32
+    InputLimits::default().max_json_depth
 }
 fn default_sync_wait_timeout_ms() -> u64 {
     30_000

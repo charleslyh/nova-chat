@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use async_trait::async_trait;
 use nova_responses::MetricsSink;
 use parking_lot::Mutex;
 
@@ -22,13 +21,12 @@ impl Default for MemMetrics {
     }
 }
 
-#[async_trait]
 impl MetricsSink for MemMetrics {
-    async fn incr(&self, name: &str, value: u64) {
+    fn incr(&self, name: &str, value: u64) {
         *self.inner.lock().entry(name.to_string()).or_insert(0) += value;
     }
 
-    async fn get(&self, name: &str) -> u64 {
+    fn get(&self, name: &str) -> u64 {
         self.inner.lock().get(name).copied().unwrap_or(0)
     }
 }

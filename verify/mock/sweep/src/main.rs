@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use nova_responses::{ConversationStore, CountingMetrics, ResponseEventLog, ResponseLedger};
+use nova_responses::{ConversationStore, MetricsSink, ResponseEventLog, ResponseLedger};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -36,6 +36,17 @@ struct Backend {
     /// release — and it is the only release a reaped response gets, since its
     /// holder is gone and the fence has moved (D28).
     conversation: Arc<dyn ConversationStore>,
+}
+
+/// The standalone sweep process has no metrics consumer; a no-op sink keeps the
+/// assembly identical without pretending to export anything.
+struct NoopMetrics;
+
+impl MetricsSink for NoopMetrics {
+    fn incr(&self, _name: &str, _value: u64) {}
+    fn get(&self, _name: &str) -> u64 {
+        0
+    }
 }
 
 /// In-memory shared carrier.
@@ -73,7 +84,7 @@ async fn main() -> Result<()> {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0)
         }),
-        metrics: Arc::new(CountingMetrics::default()),
+        metrics: Arc::new(NoopMetrics),
         heartbeat_ttl_ms: args.heartbeat_ttl_ms,
         retain_after_terminal_ms: args.retain_after_terminal_ms,
     });

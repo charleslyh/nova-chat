@@ -115,13 +115,13 @@ async fn tick(deps: &SweepDeps) -> anyhow::Result<()> {
             }
         }
 
-        deps.metrics.incr("responses_reaped", 1).await;
+        deps.metrics.incr("responses_reaped", 1);
     }
 
     // 2. Release event buffers past their retention window.
     match deps.event_log.sweep_expired(now).await {
         Ok(0) => {}
-        Ok(n) => deps.metrics.incr("event_logs_swept", n).await,
+        Ok(n) => deps.metrics.incr("event_logs_swept", n),
         Err(e) => warn!(error = %e, "event log sweep failed"),
     }
 

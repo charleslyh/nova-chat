@@ -160,7 +160,7 @@ impl Conversation {
     }
 
     /// Whether any turn has completed against this conversation.
-    pub fn is_empty(&self) -> bool {
+    pub fn has_no_turns(&self) -> bool {
         self.last_response_id.is_none()
     }
 }
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn a_new_conversation_points_nowhere() {
         let c = conversation();
-        assert!(c.is_empty());
+        assert!(c.has_no_turns());
         assert_eq!(c.last_response_id, None);
         assert_eq!(c.created_at_ms, 7);
     }
@@ -310,7 +310,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<Conversation>(&json).unwrap(), c);
 
         c.last_response_id = Some(ResponseId::new(crate::shared::NodeTag::parse("n1").unwrap()));
-        assert!(!c.is_empty());
+        assert!(!c.has_no_turns());
         let json = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<Conversation>(&json).unwrap(), c);
     }

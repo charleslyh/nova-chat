@@ -10,9 +10,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use nova_responses::protocol::{
-    AppendBusinessEventRequest, CreateConversationRequest, UpdateConversationRequest,
-};
+use nova_responses::protocol::{AppendBusinessEventRequest, ConversationMetadataRequest};
 use nova_responses::{Conversation, ConversationEventKind, ConversationId, ResolvedContext};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -55,7 +53,7 @@ pub async fn create(
         return draining();
     }
 
-    let request: CreateConversationRequest = match serde_json::from_value(raw) {
+    let request: ConversationMetadataRequest = match serde_json::from_value(raw) {
         Ok(req) => req,
         // 未知字段一律 400，与生成入口同一姿态（INV-50）。
         Err(e) => return bad_request("invalid_request", e.to_string()),
@@ -119,7 +117,7 @@ pub async fn update(
         Err(resp) => return resp,
     };
 
-    let request: UpdateConversationRequest = match serde_json::from_value(raw) {
+    let request: ConversationMetadataRequest = match serde_json::from_value(raw) {
         Ok(req) => req,
         Err(e) => return bad_request("invalid_request", e.to_string()),
     };

@@ -195,15 +195,11 @@ pub enum ResponseInput {
 
 impl ResponseInput {
     /// Normalise to items. The string shorthand becomes one user message.
-    pub fn into_items(self) -> Vec<ResponseItem> {
-        match self {
-            ResponseInput::Text(text) => vec![ResponseItem::user_text(text)],
-            ResponseInput::Items(items) => items,
-        }
-    }
-
     pub fn to_items(&self) -> Vec<ResponseItem> {
-        self.clone().into_items()
+        match self {
+            ResponseInput::Text(text) => vec![ResponseItem::user_text(text.clone())],
+            ResponseInput::Items(items) => items.clone(),
+        }
     }
 }
 

@@ -10,10 +10,10 @@ use mock_server::MemWorld;
 use anyhow::{bail, Context, Result};
 use nova_responses::protocol::{CreateResponseRequest, InputLimits};
 use nova_responses::{
-    canonical_items, AgentId, AppendEvent, Attempt, ChainLimits, Conversation, ConversationError,
+    canonical_items, AgentId, AppendEvent, Attempt, Conversation, ConversationError,
     ConversationId, ConversationStore, CreateOutcome, EventLogError, IdempotencyKey, NodeTag,
     ResponseEventKind, ResponseEventLog, ResponseId, ResponseItem, ResponseLedger, ResponseRecord,
-    ResponseStatus, TenantId, Usage,
+    ResponseStatus, StoreError, TenantId, TurnCommit, Usage,
 };
 use serde::Deserialize;
 
@@ -125,22 +125,14 @@ enum Step {
         expect_items: Option<usize>,
         #[serde(default)]
         expect_absent_text: Option<String>,
-        #[serde(default)]
-        max_depth: Option<usize>,
-        #[serde(default)]
-        max_bytes: Option<usize>,
     },
     ExpectChainError {
         #[serde(default)]
         from: Option<String>,
         #[serde(default)]
         tenant: Option<String>,
-        /// chain_broken | not_stored | cross_tenant | chain_too_long | chain_too_large | unavailable
+        /// not_found | unavailable
         reason: String,
-        #[serde(default)]
-        max_depth: Option<usize>,
-        #[serde(default)]
-        max_bytes: Option<usize>,
     },
     /// Whether a response's stored content is still retrievable.
     ///
@@ -151,8 +143,6 @@ enum Step {
     ExpectStored {
         #[serde(default)]
         target: Option<String>,
-        #[serde(default)]
-        tenant: Option<String>,
         /// Expected presence.
         exists: bool,
         /// Optional: item count, to catch content being emptied in place rather
@@ -163,8 +153,6 @@ enum Step {
     DeleteResponse {
         #[serde(default)]
         target: Option<String>,
-        #[serde(default)]
-        tenant: Option<String>,
         #[serde(default = "default_true")]
         expect_deleted: bool,
     },
@@ -175,7 +163,6 @@ enum Step {
         expect_min: u64,
     },
     SweepExpiredContent {
-        now_ms: u64,
         #[serde(default)]
         expect_removed: Option<u64>,
     },
@@ -285,15 +272,6 @@ impl Ctx {
                 .get(label)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("unknown conversation label `{label}`")),
-        }
-    }
-
-    fn chain_limits(&self, max_depth: Option<usize>, max_bytes: Option<usize>) -> ChainLimits {
-        let base = ChainLimits::default();
-        ChainLimits {
-            max_depth: max_depth.unwrap_or(base.max_depth),
-            max_bytes: max_bytes.unwrap_or(base.max_bytes),
-            ..base
         }
     }
 }
@@ -407,7 +385,6 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 expires_at_ms: None,
                 integrity: None,
                 integrity_alg: None,
-                node_tag: ctx.node_tag.clone(),
                 idempotency_key: Some(IdempotencyKey(key.clone())),
                 owner: None,
                 attempt: Attempt::default(),
@@ -604,11 +581,13 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                             &record.tenant_id,
                             conversation_id,
                             &id,
-                            record.input_items.clone(),
-                            items,
-                            None,
-                            usage,
-                            status,
+                            TurnCommit {
+                                input_items: record.input_items.clone(),
+                                output_items: items,
+                                reasoning: None,
+                                usage,
+                                status,
+                            },
                             ctx.now_ms,
                         )
                         .await?;
@@ -789,8 +768,6 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             expect_depth,
             expect_items,
             expect_absent_text,
-            max_depth: _,
-            max_bytes: _,
         } => {
             let conv = ctx.resolve_conv(&from)?;
             let tenant_id = ctx.tenant(&tenant)?;
@@ -832,8 +809,6 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             from,
             tenant,
             reason,
-            max_depth: _,
-            max_bytes: _,
         } => {
             let conv = ctx.resolve_conv(&from)?;
             let tenant_id = ctx.tenant(&tenant)?;
@@ -844,7 +819,10 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 .await;
             let matched = match (&reason[..], &result) {
                 ("not_found", Err(ConversationError::NotFound)) => true,
-                ("unavailable", Err(ConversationError::Unavailable)) => true,
+                (
+                    "unavailable",
+                    Err(ConversationError::Store(StoreError::Unavailable)),
+                ) => true,
                 _ => false,
             };
             if !matched {
@@ -859,7 +837,6 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
 
         Step::ExpectStored {
             target,
-            tenant: _,
             exists,
             expect_items,
         } => {
@@ -882,7 +859,6 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
 
         Step::DeleteResponse {
             target,
-            tenant: _,
             expect_deleted,
         } => {
             let id = ctx.resolve(&target)?;
@@ -901,7 +877,6 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
         }
 
         Step::SweepExpiredContent {
-            now_ms: _,
             expect_removed,
         } => {
             // D30: durable content lives in the conversation snapshot (no per-response
@@ -979,7 +954,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             trace.push(TraceEvent::PartialUsageRecorded {
                 response_id: id.to_string(),
                 attempt: attempt.0,
-                total_tokens: usage.total_tokens,
+                total_tokens: usage.total_tokens(),
                 at_ms: ctx.now_ms,
             });
         }
@@ -987,10 +962,10 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
         Step::ExpectPartialUsage { min_total_tokens } => {
             let id = ctx.resolve(&None)?;
             let total = ctx.world.ledger.total_usage(&id);
-            if total.total_tokens < min_total_tokens {
+            if total.total_tokens() < min_total_tokens {
                 bail!(
                     "{sc}: expected at least {min_total_tokens} tokens booked, got {}",
-                    total.total_tokens
+                    total.total_tokens()
                 );
             }
         }

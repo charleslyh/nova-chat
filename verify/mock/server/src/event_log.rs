@@ -24,7 +24,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use nova_responses::{
     AppendEvent, EventLogError, LedgerError, ResponseEvent, ResponseEventLog, ResponseId,
-    ResponseLedger,
+    ResponseLedger, StoreError,
 };
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -126,7 +126,7 @@ impl MemResponseEventLog {
 impl ResponseEventLog for MemResponseEventLog {
     async fn append(&self, event: AppendEvent) -> Result<u64, EventLogError> {
         if self.ledger.is_read_only() {
-            return Err(EventLogError::ReadOnly);
+            return Err(EventLogError::Store(StoreError::ReadOnly));
         }
         // Attempt fence before the write (INV-6): a reaped holder must not be
         // able to inject events after its attempt was superseded.
@@ -135,9 +135,11 @@ impl ResponseEventLog for MemResponseEventLog {
                 .check_attempt_sync(&event.response_id, attempt)
                 .map_err(|e| match e {
                     LedgerError::StaleAttempt => EventLogError::StaleAttempt,
-                    LedgerError::ReadOnly => EventLogError::ReadOnly,
+                    LedgerError::Store(StoreError::ReadOnly) => {
+                        EventLogError::Store(StoreError::ReadOnly)
+                    }
                     LedgerError::NotFound => EventLogError::Unknown,
-                    other => EventLogError::Internal(other.to_string()),
+                    other => EventLogError::Store(StoreError::Internal(other.to_string())),
                 })?;
         }
 

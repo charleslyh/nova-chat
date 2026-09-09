@@ -8,7 +8,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nova_responses::{
     Conversation, ConversationError, ConversationEvent, ConversationEventKind, ConversationId,
-    ConversationStore, ResolvedContext, ResponseId, ResponseItem, ResponseStatus, TenantId, Usage,
+    ConversationStore, ResolvedContext, ResponseId, ResponseStatus, StoreError, TenantId,
+    TurnCommit,
 };
 
 use mock_server::proto::{ProtoError, Request, Response};
@@ -27,7 +28,7 @@ impl MemConversationClient {
 
     fn guard_writable(&self) -> Result<(), ConversationError> {
         if self.read_only.load(Ordering::SeqCst) {
-            return Err(ConversationError::ReadOnly);
+            return Err(ConversationError::Store(StoreError::ReadOnly));
         }
         Ok(())
     }
@@ -39,17 +40,17 @@ async fn conversation_rpc(rpc: &Rpc, req: Request) -> Result<Response, Conversat
     let resp = rpc
         .call(req)
         .await
-        .map_err(|_| ConversationError::Unavailable)?;
+        .map_err(|_| ConversationError::Store(StoreError::Unavailable))?;
     match resp {
         Response::Err(ProtoError::Conversation(e)) => Err(e),
-        Response::Err(ProtoError::Internal(s)) => Err(ConversationError::Internal(s)),
+        Response::Err(ProtoError::Internal(s)) => Err(ConversationError::Store(StoreError::Internal(s))),
         ok => Ok(ok),
     }
 }
 
 /// Reject a response shape the carrier should never have produced for this call.
 fn unexpected(other: Response) -> ConversationError {
-    ConversationError::Internal(format!("unexpected rpc response {other:?}"))
+    ConversationError::Store(StoreError::Internal(format!("unexpected rpc response {other:?}")))
 }
 
 #[async_trait]
@@ -317,20 +318,22 @@ impl ConversationStore for MemConversationClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn append_turn(
         &self,
         tenant: &TenantId,
         id: &ConversationId,
         response_id: &ResponseId,
-        input_items: Vec<ResponseItem>,
-        output_items: Vec<ResponseItem>,
-        reasoning: Option<String>,
-        usage: Usage,
-        status: ResponseStatus,
+        commit: TurnCommit,
         now_ms: u64,
     ) -> Result<u64, ConversationError> {
         self.guard_writable()?;
+        let TurnCommit {
+            input_items,
+            output_items,
+            reasoning,
+            usage,
+            status,
+        } = commit;
         match conversation_rpc(
             &self.rpc,
             Request::ConversationAppendTurn {

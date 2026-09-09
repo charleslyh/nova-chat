@@ -29,7 +29,7 @@ pub async fn drain(state: AppState) {
         drain_timeout_ms = state.cfg.drain_timeout_ms,
         "shutdown signal received; refusing new responses and draining"
     );
-    state.metrics.incr("drain_started", 1).await;
+    state.metrics.incr("drain_started", 1);
 
     let deadline =
         tokio::time::Instant::now() + Duration::from_millis(state.cfg.drain_timeout_ms);
@@ -53,7 +53,7 @@ pub async fn drain(state: AppState) {
                 in_flight,
                 "drain budget exhausted; remaining responses will be reclaimed on restart"
             );
-            state.metrics.incr("drain_timeouts", 1).await;
+            state.metrics.incr("drain_timeouts", 1);
             return;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;

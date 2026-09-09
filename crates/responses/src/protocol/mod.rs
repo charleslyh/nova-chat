@@ -25,8 +25,8 @@ mod url_guard;
 
 pub use content::{ContentPart, ContentViolation, ImageDetail};
 pub use conversation::{
-    AppendBusinessEventRequest, BusinessEventViolation, CreateConversationRequest,
-    UpdateConversationRequest, MAX_BUSINESS_KIND_BYTES, MAX_BUSINESS_PAYLOAD_BYTES,
+    AppendBusinessEventRequest, BusinessEventViolation, ConversationMetadataRequest,
+    MAX_BUSINESS_KIND_BYTES, MAX_BUSINESS_PAYLOAD_BYTES,
 };
 pub use item::{ItemStatus, ItemViolation, ResponseItem, Role};
 pub use limits::{json_depth, InputLimits, LimitViolation};

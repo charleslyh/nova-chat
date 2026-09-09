@@ -9,14 +9,17 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::context::ResponseId;
+use crate::shared::Attempt;
+
 /// Where one execution attempt came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestProvenance {
-    /// The response being produced, as its wire id string.
-    pub response_id: String,
+    /// The response being produced.
+    pub response_id: ResponseId,
     /// Fencing token. A runner that ignores this cannot tell its work was
     /// superseded, and will keep spending tokens on an abandoned attempt.
-    pub attempt: u64,
+    pub attempt: Attempt,
     /// Wall-clock milliseconds after which this attempt is forfeit.
     pub exec_deadline_ms: u64,
 }

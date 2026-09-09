@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nova_responses::{
     AbortedClaim, AgentId, Attempt, ClaimedResponse, CreateOutcome, IdempotencyKey, LedgerError,
-    ResponseId, ResponseLedger, ResponseRecord, ResponseStatus, TenantId, Usage,
+    ResponseId, ResponseLedger, ResponseRecord, ResponseStatus, StoreError, TenantId, Usage,
 };
 
 use mock_server::proto::{ProtoError, Request, Response};
@@ -35,10 +35,10 @@ async fn ledger_rpc(rpc: &Rpc, req: Request) -> Result<Response, LedgerError> {
     let resp = rpc
         .call(req)
         .await
-        .map_err(|e| LedgerError::Internal(e.to_string()))?;
+        .map_err(|e| LedgerError::Store(StoreError::Internal(e.to_string())))?;
     match resp {
         Response::Err(ProtoError::Ledger(e)) => Err(e),
-        Response::Err(ProtoError::Internal(s)) => Err(LedgerError::Internal(s)),
+        Response::Err(ProtoError::Internal(s)) => Err(LedgerError::Store(StoreError::Internal(s))),
         ok => Ok(ok),
     }
 }
@@ -71,9 +71,9 @@ impl ResponseLedger for MemLedgerClient {
         .await?
         {
             Response::Create(o) => Ok(o),
-            other => Err(LedgerError::Internal(format!(
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
@@ -84,7 +84,7 @@ impl ResponseLedger for MemLedgerClient {
         exec_ttl_ms: u64,
     ) -> Result<Option<ClaimedResponse>, LedgerError> {
         if self.read_only.load(Ordering::SeqCst) {
-            return Err(LedgerError::ReadOnly);
+            return Err(LedgerError::Store(StoreError::ReadOnly));
         }
         match ledger_rpc(
             &self.rpc,
@@ -97,9 +97,9 @@ impl ResponseLedger for MemLedgerClient {
         .await?
         {
             Response::Claim(o) => Ok(o),
-            other => Err(LedgerError::Internal(format!(
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
@@ -111,9 +111,9 @@ impl ResponseLedger for MemLedgerClient {
         .await?
         {
             Response::Heartbeat => Ok(()),
-            other => Err(LedgerError::Internal(format!(
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
@@ -126,7 +126,7 @@ impl ResponseLedger for MemLedgerClient {
         now_ms: u64,
     ) -> Result<(), LedgerError> {
         if self.read_only.load(Ordering::SeqCst) {
-            return Err(LedgerError::ReadOnly);
+            return Err(LedgerError::Store(StoreError::ReadOnly));
         }
         match ledger_rpc(
             &self.rpc,
@@ -141,9 +141,9 @@ impl ResponseLedger for MemLedgerClient {
         .await?
         {
             Response::Complete => Ok(()),
-            other => Err(LedgerError::Internal(format!(
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
@@ -154,7 +154,7 @@ impl ResponseLedger for MemLedgerClient {
         now_ms: u64,
     ) -> Result<(), LedgerError> {
         if self.read_only.load(Ordering::SeqCst) {
-            return Err(LedgerError::ReadOnly);
+            return Err(LedgerError::Store(StoreError::ReadOnly));
         }
         match ledger_rpc(
             &self.rpc,
@@ -167,9 +167,9 @@ impl ResponseLedger for MemLedgerClient {
         .await?
         {
             Response::Cancel => Ok(()),
-            other => Err(LedgerError::Internal(format!(
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
@@ -188,9 +188,9 @@ impl ResponseLedger for MemLedgerClient {
         .await?
         {
             Response::Reap(aborted) => Ok(aborted),
-            other => Err(LedgerError::Internal(format!(
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
@@ -211,9 +211,9 @@ impl ResponseLedger for MemLedgerClient {
         .await?
         {
             Response::RecordPartialUsage => Ok(()),
-            other => Err(LedgerError::Internal(format!(
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
@@ -227,15 +227,15 @@ impl ResponseLedger for MemLedgerClient {
         .await?
         {
             Response::Get(o) => Ok(o),
-            other => Err(LedgerError::Internal(format!(
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
     async fn delete(&self, response_id: &ResponseId) -> Result<bool, LedgerError> {
         if self.read_only.load(Ordering::SeqCst) {
-            return Err(LedgerError::ReadOnly);
+            return Err(LedgerError::Store(StoreError::ReadOnly));
         }
         match ledger_rpc(
             &self.rpc,
@@ -246,15 +246,15 @@ impl ResponseLedger for MemLedgerClient {
         .await?
         {
             Response::Delete(removed) => Ok(removed),
-            other => Err(LedgerError::Internal(format!(
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
     async fn delete_by_tenant(&self, tenant: &TenantId) -> Result<u64, LedgerError> {
         if self.read_only.load(Ordering::SeqCst) {
-            return Err(LedgerError::ReadOnly);
+            return Err(LedgerError::Store(StoreError::ReadOnly));
         }
         match ledger_rpc(
             &self.rpc,
@@ -265,9 +265,9 @@ impl ResponseLedger for MemLedgerClient {
         .await?
         {
             Response::DeleteByTenant(n) => Ok(n),
-            other => Err(LedgerError::Internal(format!(
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
@@ -277,7 +277,7 @@ impl ResponseLedger for MemLedgerClient {
         attempt: Attempt,
     ) -> Result<(), LedgerError> {
         if self.read_only.load(Ordering::SeqCst) {
-            return Err(LedgerError::ReadOnly);
+            return Err(LedgerError::Store(StoreError::ReadOnly));
         }
         match ledger_rpc(
             &self.rpc,
@@ -289,18 +289,18 @@ impl ResponseLedger for MemLedgerClient {
         .await?
         {
             Response::CheckAttempt => Ok(()),
-            other => Err(LedgerError::Internal(format!(
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
     async fn in_flight(&self) -> Result<usize, LedgerError> {
         match ledger_rpc(&self.rpc, Request::LedgerInFlight).await? {
             Response::InFlight(n) => Ok(n),
-            other => Err(LedgerError::Internal(format!(
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
-            ))),
+            )))),
         }
     }
 
