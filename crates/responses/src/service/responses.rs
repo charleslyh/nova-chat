@@ -7,16 +7,25 @@
 //! 测试覆盖（注入 mem/sql adapter），无需启动 HTTP 服务（D25 ⑤）。
 //!
 //! 协议解析、严格校验、租户鉴权、节点路由/转发仍是接入层的职责；本层只编排
-//! `resolve_chain → create → put → append(Created)` 这条业务主线。
+//! `resolve_context → create → append(Created)` 这条业务主线。
+//!
+//! # D30 数据流
+//!
+//! 创建只写**元数据**（锚点引用 + 本轮 input + 工具体声明），不再物化全量快照。
+//! 长期历史在会话快照里（`ConversationStore::read_snapshot`），response 自身对象
+//! 由事件流回放重建（TTL 内）。终态提交在编排层（`nova-agent-runtime`）完成：
+//! `ledger.complete` + `conversation.append_turn`（INV-34 的原子性边界迁到这里）。
 
 use std::sync::Arc;
 
+use serde_json::Value;
+
 use crate::protocol::CreateResponseRequest;
 use crate::{
-    AppendEvent, Attempt, ContextError, ContextStore, ConversationError,
-    ConversationEventKind, ConversationId, CreateOutcome, EventLogError, IdempotencyKey,
-    LedgerError, MetricsSink, ResponseEventKind, ResponseEventLog, ResponseId, ResponseItem,
-    ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
+    AppendEvent, Attempt, ConversationError, ConversationEventKind, ConversationId, CreateOutcome,
+    EventBody, EventLogError, IdempotencyKey, LedgerError, MetricsSink, ResolvedContext,
+    ResponseEventKind, ResponseEventLog, ResponseId, ResponseItem, ResponseLedger, ResponseRecord,
+    ResponseStatus, SnapshotRef, TenantId, Usage,
 };
 
 use crate::config::Config;
@@ -25,8 +34,6 @@ use crate::service::conversations::{ConversationTail, ConversationsService};
 /// 能力层错误：包装各端口错误，由接入层映射为 HTTP 状态。
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
-    #[error(transparent)]
-    Context(#[from] ContextError),
     #[error(transparent)]
     Ledger(#[from] LedgerError),
     #[error(transparent)]
@@ -37,10 +44,9 @@ pub enum ServiceError {
 
 /// 本次生成继承哪份上下文。
 ///
-/// 三个变体最终**都收敛到同一条装配路径**：解析出一个锚点 `ResponseId`，交给既有
-/// `resolve_chain` 读物化快照（D24）。`Conversation` 不是第二种上下文来源，只是
-/// 第二种指定锚点的方式——容器存的就是链尾指针。所以这里没有"两来源归一"的分支
-/// 逻辑，`resolve_chain` 仍是唯一入口。
+/// 三个变体最终**都收敛到同一条装配路径**：解析出一个锚点（`SnapshotRef`），交给
+/// `resolve_context` 从会话快照读物化历史（D30）。`Conversation` 不是第二种上下文
+/// 来源，只是第二种指定锚点的方式——容器存的就是链尾指针与会话快照。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContextSource {
     /// 无前驱，空上下文。
@@ -54,9 +60,9 @@ pub enum ContextSource {
 /// 创建结果。`ReadOnly` / `Overloaded` 不是错误，而是账本返回的正常拒绝。
 pub enum CreateResult {
     /// 新建成功，`Created` 事件已发出。
-    Accepted { record: StoredResponse },
+    Accepted { record: ResponseRecord },
     /// 幂等重放，返回原生成（绝不产生第二个，FR-3）。
-    Duplicate { existing: StoredResponse },
+    Duplicate { existing: ResponseRecord },
     /// 降级只读。
     ReadOnly,
     /// 待领取/在途量达阈值。
@@ -67,7 +73,6 @@ pub enum CreateResult {
 pub struct ResponsesService {
     ledger: Arc<dyn ResponseLedger>,
     event_log: Arc<dyn ResponseEventLog>,
-    context: Arc<dyn ContextStore>,
     conversations: Arc<ConversationsService>,
     now: Arc<dyn Fn() -> u64 + Send + Sync>,
     metrics: Arc<dyn MetricsSink>,
@@ -79,7 +84,6 @@ impl ResponsesService {
     pub fn new(
         ledger: Arc<dyn ResponseLedger>,
         event_log: Arc<dyn ResponseEventLog>,
-        context: Arc<dyn ContextStore>,
         conversations: Arc<ConversationsService>,
         now: Arc<dyn Fn() -> u64 + Send + Sync>,
         metrics: Arc<dyn MetricsSink>,
@@ -88,7 +92,6 @@ impl ResponsesService {
         Self {
             ledger,
             event_log,
-            context,
             conversations,
             now,
             metrics,
@@ -100,9 +103,9 @@ impl ResponsesService {
         (self.now)()
     }
 
-    /// 创建生成：解析锚点 → 固化快照 → 取会话锁 → 写账本 → 写内容 → 发 `Created`。
+    /// 创建生成：解析锚点 → 校验上下文 → 取会话锁 → 写账本（仅元数据）→ 发 `Created`。
     ///
-    /// `source` 是上下文来源（三个变体最终都收敛到 `resolve_chain`）；`input_items`
+    /// `source` 是上下文来源（三个变体最终都收敛到 `resolve_context`）；`input_items`
     /// 是接入层经协议子集校验后的输入条目。
     ///
     /// 会话锁在这里取，而不是在接入层：这样无论调用方走标准 `/v1/responses` 还是
@@ -133,22 +136,20 @@ impl ResponsesService {
             }
         };
 
-        // 解析前驱历史（D24）：在创建前固化扁平快照，断裂即失败，不留半创建记录。
-        let mut snapshot: Vec<ResponseItem> = Vec::new();
-        let mut snapshot_reasoning: Vec<Option<String>> = Vec::new();
-        let mut snapshot_depth: usize = 0;
-        if let Some(previous) = &previous {
-            let resolved = self
-                .context
-                .resolve_chain(tenant, previous, self.cfg.chain_limits)
-                .await?;
+        // 解析并校验前驱上下文（D30）：读会话快照校验深度/字节上界，断裂即失败，
+        // 不留半创建记录。快照本身不复制进 record。
+        let anchor = if let Some(conversation_id) = &conversation_id {
+            SnapshotRef::Conversation(conversation_id.clone())
+        } else if let Some(previous) = &previous {
+            SnapshotRef::Previous(previous.clone())
+        } else {
+            SnapshotRef::Root
+        };
+        let resolved = self.resolve_context(tenant, &anchor).await?;
+        if !matches!(anchor, SnapshotRef::Root) {
             self.metrics
                 .incr("chain_resolved_depth", resolved.depth as u64)
                 .await;
-            snapshot = resolved.items;
-            // 祖先的 reasoning 随快照一起物化，用于渲染；不进模型上下文。
-            snapshot_reasoning = resolved.reasoning;
-            snapshot_depth = resolved.depth;
         }
 
         // 不写前探活（D28）：库不可用由失败返回错误直接暴露。准入失败由
@@ -170,13 +171,13 @@ impl ResponsesService {
             None
         };
 
-        let record = StoredResponse {
+        let record = ResponseRecord {
             response_id: response_id.clone(),
             previous_response_id: previous,
             conversation_id,
             tenant_id: tenant.clone(),
             model: request.model.clone(),
-            // 仅用于检索回显，永不进入链（INV-49）。
+            // 仅用于检索回显，永不进入上下文（INV-49）。
             instructions: request.instructions.clone(),
             // 本轮的工具体声明：由调用方 `tools` 参数逐请求声明（而非静态部署
             // 配置），原样落进 record（inbound 形状），provider 转换由执行端的
@@ -184,7 +185,6 @@ impl ResponsesService {
             tools: request.tools.clone().unwrap_or_default(),
             tool_choice: request.tool_choice.clone(),
             input_items,
-            output_items: Vec::new(),
             reasoning: None,
             status: ResponseStatus::Queued,
             usage: Usage::default(),
@@ -198,16 +198,13 @@ impl ResponsesService {
             idempotency_key: Some(idempotency_key.clone()),
             owner: None,
             attempt: Attempt::default(),
-            context: snapshot,
-            context_reasoning: snapshot_reasoning,
-            context_depth: snapshot_depth,
         };
 
         // 锁已在手，之后任何一条非「已受理」的出路都必须把它还回去，否则会话永久
         // 锁死。用一个内部函数把这些出路收在一处，就不必在每个 `?` 和每个分支上
         // 各写一遍补偿——漏掉一处的后果是不可自愈的。
         let outcome = self
-            .admit(tenant, request, &record, &response_id, idempotency_key, now_ms)
+            .admit(&record, &response_id, idempotency_key, now_ms)
             .await;
 
         match &outcome {
@@ -222,13 +219,65 @@ impl ResponsesService {
         outcome
     }
 
+    /// 把锚点解析为可执行的继承上下文（D30）。只用于创建时的上界校验，快照不被
+    /// 复制进 record——执行端按锚点再次读取会话快照。
+    ///
+    /// `Previous` 裸链（无会话锚点）沿账本反查其归属会话后读快照；无会话归属的裸链
+    /// 在 D30 下没有持久载体，按 `ChainBroken` 处理（与快照物化前一致地显式失败）。
+    async fn resolve_context(
+        &self,
+        tenant: &TenantId,
+        anchor: &SnapshotRef,
+    ) -> Result<ResolvedContext, ServiceError> {
+        let resolved = match anchor {
+            SnapshotRef::Root => ResolvedContext::default(),
+            SnapshotRef::Conversation(id) => self.conversations.read_snapshot(tenant, id).await?,
+            SnapshotRef::Previous(id) => {
+                let record = self
+                    .ledger
+                    .get(id)
+                    .await?
+                    .ok_or_else(|| ConversationError::ChainBroken(id.to_string()))?;
+                if !record.is_referencable_by(tenant) {
+                    if &record.tenant_id != tenant {
+                        return Err(ConversationError::CrossTenant.into());
+                    }
+                    return Err(ConversationError::NotStored.into());
+                }
+                match record.anchor() {
+                    SnapshotRef::Conversation(cid) => {
+                        self.conversations.read_snapshot(tenant, &cid).await?
+                    }
+                    // A bare response (no conversation) holds no durable snapshot:
+                    // reconstruct its own input+output from the event stream (TTL).
+                    SnapshotRef::Root => self.reconstruct_bare(&record).await?,
+                    // A bare chain pointing at another bare response has no durable
+                    // home for the deeper history — reported as broken, not silently
+                    // truncated.
+                    SnapshotRef::Previous(_) => {
+                        return Err(ConversationError::ChainBroken(id.to_string()).into());
+                    }
+                }
+            }
+        };
+
+        // 上界校验在创建前失败，绝不静默截断（INV-41）。
+        if resolved.depth >= self.cfg.chain_limits.max_depth {
+            return Err(ConversationError::ChainTooLong {
+                limit: self.cfg.chain_limits.max_depth,
+            }
+            .into());
+        }
+        if resolved.bytes > self.cfg.chain_limits.max_bytes {
+            return Err(ConversationError::ChainTooLarge {
+                limit: self.cfg.chain_limits.max_bytes,
+            }
+            .into());
+        }
+        Ok(resolved)
+    }
+
     /// 取轮次互斥标记，必要时接管一个「持有者已终态」的残留标记（D28）。
-    ///
-    /// 标记可能比持有者活得更久：持有者进程可能在账本终态迁移与释放标记之间被杀，
-    /// 或者释放调用本身失败（reap 路径尤其如此——它释放失败后不会再被选中重试）。
-    /// 若不处理，该会话将永久 409。
-    ///
-    /// 判据用「持有者是否已终态」而非超时：账本知道确切答案，直接问它。
     async fn acquire_turn(
         &self,
         tenant: &TenantId,
@@ -245,8 +294,6 @@ impl ResponsesService {
             Err(e) => return Err(e.into()),
         };
 
-        // 账本读不到（记录已被删除或清理）同样视为可接管：既然没有记录，就不可能
-        // 还有生成在跑。
         let holder_status = self
             .ledger
             .get(&holder)
@@ -256,7 +303,6 @@ impl ResponsesService {
             .map(|record| record.status);
         let stale = holder_status.map(|s| s.is_terminal()).unwrap_or(true);
         if !stale {
-            // 真正在途：明确拒绝，绝不排队等它。
             return Err(ConversationError::Busy { holder }.into());
         }
 
@@ -272,20 +318,17 @@ impl ResponsesService {
         );
         self.metrics.incr("conversation_stale_locks_released", 1).await;
 
-        // 只重试一次。再次 Busy 说明有另一个调用方刚抢到标记，那是真冲突而非残留。
         self.conversations
             .acquire_active(tenant, conversation_id, response_id)
             .await?;
         Ok(())
     }
 
-    /// 写账本 → 写内容 → 发 `Created`。
+    /// 写账本（仅元数据）→ 发 `Created`。
     #[allow(clippy::too_many_arguments)]
     async fn admit(
         &self,
-        tenant: &TenantId,
-        request: &CreateResponseRequest,
-        record: &StoredResponse,
+        record: &ResponseRecord,
         response_id: &ResponseId,
         idempotency_key: IdempotencyKey,
         now_ms: u64,
@@ -296,17 +339,13 @@ impl ResponsesService {
             .await?
         {
             CreateOutcome::Accepted { .. } => {
-                if request.store {
-                    self.context.put(record.clone()).await?;
-                }
-
                 // 首事件，让立即订阅者看到确定起点。**携带完整 response 对象**
                 // （含 input），这正是「B 端在轮次进行中加入也能补齐全部内容」所依赖
-                // 的既有行为，不可回退为只带 id。
+                // 的既有行为，不可回退为只带 id。创建时无输出。
                 let created = AppendEvent::lifecycle(
                     response_id.clone(),
                     ResponseEventKind::Created,
-                    record.to_response_value(),
+                    record.to_response_value(&[]),
                 );
                 self.event_log.append(created).await?;
 
@@ -319,10 +358,10 @@ impl ResponsesService {
             CreateOutcome::Duplicate { response_id } => {
                 // 幂等重放返回原生成，不产生第二个。
                 let existing = self
-                    .context
-                    .get(tenant, &response_id)
+                    .ledger
+                    .get(&response_id)
                     .await?
-                    .ok_or(ContextError::NotFound)?;
+                    .ok_or(LedgerError::NotFound)?;
                 Ok(CreateResult::Duplicate { existing })
             }
             CreateOutcome::ReadOnly => Ok(CreateResult::ReadOnly),
@@ -331,10 +370,6 @@ impl ResponsesService {
     }
 
     /// 受理失败后归还轮次互斥标记（D28）。
-    ///
-    /// 归还失败只记日志、不改变调用方看到的结果：调用方要知道的是它的请求没有被
-    /// 受理，而标记的残留是服务端问题。残留本身也不是永久的——引擎侧的终态路径与
-    /// 回收路径都会再次释放。
     async fn release_after_failed_admission(
         &self,
         tenant: &TenantId,
@@ -357,12 +392,23 @@ impl ResponsesService {
     }
 
     /// 查询生成的当前状态对象（未完成返回 `in_progress` 部分对象，不失败）。
+    ///
+    /// 由事件流回放重建：账本确认存在与租户归属，最新一条生命周期事件的
+    /// `response` 载荷即当前对象（含终态 output，D30）。流已过期时账本仍可能命中，
+    /// 但事件回放为空——此时退化为元数据渲染（无 output）。
     pub async fn retrieve(
         &self,
         tenant: &TenantId,
         response_id: &ResponseId,
-    ) -> Result<Option<StoredResponse>, ServiceError> {
-        Ok(self.context.get(tenant, response_id).await?)
+    ) -> Result<Option<Value>, ServiceError> {
+        match self.ledger.get(response_id).await? {
+            None => Ok(None),
+            Some(record) if &record.tenant_id != tenant => Ok(None),
+            Some(record) => match self.latest_response_value(response_id).await? {
+                Some(value) => Ok(Some(value)),
+                None => Ok(Some(record.to_response_value(&[]))),
+            },
+        }
     }
 
     /// 同步模式：等终态事件，超时返回当前状态对象供轮询。
@@ -370,10 +416,10 @@ impl ResponsesService {
     /// 超时不是生成失败——调用方可转轮询。
     pub async fn wait_terminal(
         &self,
-        tenant: &TenantId,
+        _tenant: &TenantId,
         response_id: &ResponseId,
-        fallback: &StoredResponse,
-    ) -> Result<StoredResponse, ServiceError> {
+        fallback: &ResponseRecord,
+    ) -> Result<Value, ServiceError> {
         let budget_ms = self.cfg.sync_wait_timeout_ms;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
         let mut cursor: Option<u64> = None;
@@ -400,10 +446,9 @@ impl ResponsesService {
             }
         }
 
-        match self.context.get(tenant, response_id).await? {
-            Some(record) => Ok(record),
-            // store=false 无可读回对象，回退到已持有的内存 record。
-            None => Ok(fallback.clone()),
+        match self.latest_response_value(response_id).await? {
+            Some(value) => Ok(value),
+            None => Ok(fallback.to_response_value(&[])),
         }
     }
 
@@ -412,12 +457,12 @@ impl ResponsesService {
         &self,
         tenant: &TenantId,
         response_id: &ResponseId,
-    ) -> Result<Option<StoredResponse>, ServiceError> {
+    ) -> Result<Option<Value>, ServiceError> {
         let now_ms = self.now_ms();
 
         self.ledger.cancel(tenant, response_id, now_ms).await?;
 
-        let record = self.context.get(tenant, response_id).await.ok().flatten();
+        let record = self.ledger.get(response_id).await.ok().flatten();
 
         // Cancellation is a terminal path like any other, and the engine will
         // **not** reach its own: the ledger is already terminal, so its next
@@ -435,9 +480,6 @@ impl ResponsesService {
                     .release_active(tenant, conversation_id, response_id, ResponseStatus::Cancelled)
                     .await
                 {
-                    // Logged, not propagated: the caller asked to cancel and the
-                    // cancellation happened. Reporting a bookkeeping failure
-                    // instead would suggest it did not.
                     tracing::warn!(
                         conversation_id = %conversation_id,
                         response_id = %response_id,
@@ -451,7 +493,7 @@ impl ResponsesService {
 
         let response = record
             .as_ref()
-            .map(|r| r.to_response_value())
+            .map(|r| r.to_response_value(&[]))
             .unwrap_or_else(|| {
                 serde_json::json!({
                     "id": response_id.to_string(),
@@ -464,7 +506,7 @@ impl ResponsesService {
             .append(AppendEvent::lifecycle(
                 response_id.clone(),
                 ResponseEventKind::Failed,
-                response,
+                response.clone(),
             ))
             .await;
         let _ = self
@@ -474,13 +516,14 @@ impl ResponsesService {
 
         self.metrics.incr("responses_cancelled", 1).await;
 
-        Ok(record)
+        Ok(Some(response))
     }
 
-    /// 删除单条已存内容（记录级，D24）。返回是否确有记录被删。
+    /// 删除单条记录（记录级，D30）。返回是否确有记录被删。
     ///
-    /// 若该响应属于某会话，删除后向事件流广播一条 `ResponseDeleted`，各端据此移除
-    /// 对应气泡——否则「A 端删掉了，B 端还显示着」，而 B 端无从知晓。
+    /// 删的是账本记录与事件流；会话快照里继承的副本**原样保留**（沿用 D24 语义，
+    /// 即「从对话移除」而非「从继承它的快照抹除」）。若该响应属于某会话，广播
+    /// `ResponseDeleted` 供各端移除气泡。
     pub async fn delete(
         &self,
         tenant: &TenantId,
@@ -488,14 +531,16 @@ impl ResponsesService {
     ) -> Result<bool, ServiceError> {
         // 先读关联，再删：删掉之后就再也拿不到 conversation_id 了。
         let conversation_id = self
-            .context
-            .get(tenant, response_id)
+            .ledger
+            .get(response_id)
             .await
             .ok()
             .flatten()
             .and_then(|record| record.conversation_id);
 
-        let deleted = self.context.delete(tenant, response_id).await?;
+        let deleted = self.ledger.delete(response_id).await?;
+        let _ = self.event_log.remove(response_id).await;
+
         if deleted {
             self.metrics.incr("responses_deleted", 1).await;
 
@@ -511,8 +556,6 @@ impl ResponsesService {
                     )
                     .await
                 {
-                    // 只记日志：记录确实已删除，用一个广播失败去否认它会更糟。代价是
-                    // 其它端要等到下次拉取历史才会发现，而不是立刻。
                     tracing::warn!(
                         conversation_id = %conversation_id,
                         response_id = %response_id,
@@ -524,5 +567,58 @@ impl ResponsesService {
             }
         }
         Ok(deleted)
+    }
+
+    /// 重建一个「裸链」response（无会话锚点）的 input+output（D30）。
+    ///
+    /// input 在账本记录里；output 只在事件流里（终态事件携带完整对象），故从流
+    /// 回放取出。仅用于 `previous_response_id` 无会话的兼容路径——它的持久性受
+    /// 事件流 TTL 约束，过期即 `ChainBroken`。
+    async fn reconstruct_bare(
+        &self,
+        record: &ResponseRecord,
+    ) -> Result<ResolvedContext, ServiceError> {
+        let mut items = record.input_items.clone();
+        let mut bytes = items.iter().map(ResponseItem::byte_len).sum::<usize>();
+        if let Some(value) = self.latest_response_value(&record.response_id).await? {
+            if let Ok(output) =
+                serde_json::from_value::<Vec<ResponseItem>>(value.get("output").cloned().unwrap_or_default())
+            {
+                bytes += output.iter().map(ResponseItem::byte_len).sum::<usize>();
+                items.extend(output);
+            }
+        }
+        Ok(ResolvedContext {
+            items,
+            reasoning: Vec::new(),
+            depth: 1,
+            bytes,
+        })
+    }
+
+    /// 回放事件流，取最新一条生命周期事件的 `response` 载荷（D30 检索重建）。
+    async fn latest_response_value(
+        &self,
+        response_id: &ResponseId,
+    ) -> Result<Option<Value>, ServiceError> {
+        let mut cursor: Option<u64> = None;
+        let mut latest: Option<Value> = None;
+        loop {
+            let batch = self.event_log.read_after(response_id, cursor, 256, 0).await?;
+            if batch.is_empty() {
+                break;
+            }
+            let terminal = batch.iter().any(|e| e.kind.is_terminal());
+            cursor = batch.last().map(|e| e.sequence_number);
+            for event in &batch {
+                if let EventBody::Response { response } = &event.body {
+                    latest = Some(response.clone());
+                }
+            }
+            if terminal {
+                break;
+            }
+        }
+        Ok(latest)
     }
 }

@@ -12,11 +12,10 @@ use std::sync::Arc;
 
 use nova_responses::protocol::{CreateResponseRequest, InputLimits, ResponseItem};
 use nova_responses::{
-    canonical_items, AgentId, AppendEvent, Attempt, ChainLimits, ContentIntegrity, ContextError,
-    ContextStore, Conversation, ConversationError, ConversationEventKind, ConversationId,
-    ConversationStore, CreateOutcome, EventBody, EventLogError, IdempotencyKey, LedgerError, NodeTag,
-    ResponseEventKind, ResponseEventLog, ResponseId, ResponseLedger, ResponseStatus, StoredResponse,
-    TenantId, Usage,
+    canonical_items, AgentId, AppendEvent, Attempt, ContentIntegrity, Conversation,
+    ConversationError, ConversationEventKind, ConversationId, ConversationStore, CreateOutcome,
+    EventBody, EventLogError, IdempotencyKey, LedgerError, NodeTag, ResponseEventKind,
+    ResponseEventLog, ResponseId, ResponseLedger, ResponseRecord, ResponseStatus, TenantId, Usage,
 };
 
 /// The set of ports under test. Backend-agnostic by construction.
@@ -24,7 +23,6 @@ use nova_responses::{
 pub struct PortSet {
     pub ledger: Arc<dyn ResponseLedger>,
     pub event_log: Arc<dyn ResponseEventLog>,
-    pub context: Arc<dyn ContextStore>,
     pub conversation: Arc<dyn ConversationStore>,
     pub integrity: Option<Arc<dyn ContentIntegrity>>,
     pub node_tag: NodeTag,
@@ -68,8 +66,8 @@ fn record(
     tenant: &TenantId,
     stored: bool,
     status: ResponseStatus,
-) -> StoredResponse {
-    StoredResponse {
+) -> ResponseRecord {
+    ResponseRecord {
         response_id: id.clone(),
         previous_response_id: previous.cloned(),
         // Association is opt-in: cases that exercise it set these with
@@ -82,7 +80,6 @@ fn record(
         tools: Vec::new(),
         tool_choice: None,
         input_items: vec![ResponseItem::user_text(format!("in-{}", id.uuid()))],
-        output_items: vec![],
         reasoning: None,
         status,
         usage: Usage::default(),
@@ -96,9 +93,6 @@ fn record(
         idempotency_key: None,
         owner: None,
         attempt: Attempt::default(),
-        context: Vec::new(),
-        context_reasoning: Vec::new(),
-        context_depth: 0,
     }
 }
 
@@ -398,33 +392,106 @@ pub async fn assert_cancel_conformance(ports: &PortSet) {
 /// that never includes instructions and never truncates silently.
 pub async fn assert_context_conformance(ports: &PortSet) {
     let tenant = fresh_tenant("ctx");
-    let store = &ports.context;
+    let store = &ports.conversation;
 
-    // Round trip.
-    let solo = ports.new_id();
+    // A conversation's snapshot accumulates turns in order (D30).
+    let conversation = store
+        .create(Conversation::new(
+            ConversationId::new(),
+            tenant.clone(),
+            Default::default(),
+            1_000,
+        ))
+        .await
+        .expect("create conversation");
+
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let id = ports.new_id();
+        store
+            .append_turn(
+                &tenant,
+                &conversation.id,
+                &id,
+                vec![ResponseItem::user_text(format!("in-{i}"))],
+                vec![ResponseItem::assistant_text("answer")],
+                None,
+                Usage::new(1, 2),
+                ResponseStatus::Completed,
+                2_000,
+            )
+            .await
+            .expect("append turn");
+        ids.push(id);
+    }
+
+    let resolved = store
+        .read_snapshot(&tenant, &conversation.id)
+        .await
+        .expect("read snapshot");
+    assert_eq!(resolved.depth, 3);
+    assert!(resolved.bytes > 0);
+    assert_eq!(resolved.items.len(), 6, "each turn contributes input + output");
+
+    // Chronological order: the oldest turn's input comes first.
+    let encoded_first = canonical_items(&resolved.items[..1]);
+    assert!(
+        encoded_first.contains("in-0"),
+        "snapshot must be oldest-first, got {encoded_first}"
+    );
+
+    // Instructions must never cross into the snapshot (INV-49): they live on the
+    // record, and `append_turn` only takes items.
+    let encoded_all = canonical_items(&resolved.items);
+    assert!(
+        !encoded_all.contains("INSTRUCTIONS-MARKER"),
+        "instructions leaked into the snapshot"
+    );
+
+    // Foreign tenant reads as absent, not forbidden (SEC-2).
+    assert_eq!(
+        store
+            .read_snapshot(&fresh_tenant("other"), &conversation.id)
+            .await,
+        Err(ConversationError::NotFound)
+    );
+    let ghost = ConversationId::new();
+    assert_eq!(
+        store.read_snapshot(&tenant, &ghost).await,
+        Err(ConversationError::NotFound)
+    );
+
+    // Snapshot survives a response-record deletion (D30): deleting a response
+    // removes its ledger record, not the content the conversation inherited.
+    ports
+        .ledger
+        .delete(&ids[0])
+        .await
+        .expect("delete first response record");
+    let after_delete = store
+        .read_snapshot(&tenant, &conversation.id)
+        .await
+        .expect("snapshot must survive response deletion");
+    assert_eq!(after_delete.depth, 3);
+    assert_eq!(after_delete.items.len(), 6);
+
+    // Bulk purge is tenant-scoped.
+    let foreign_tenant = fresh_tenant("foreign");
+    let foreign_conv = store
+        .create(Conversation::new(
+            ConversationId::new(),
+            foreign_tenant.clone(),
+            Default::default(),
+            1_000,
+        ))
+        .await
+        .expect("create foreign conversation");
     store
-        .put(record(ports, &solo, None, &tenant, true, ResponseStatus::Completed))
-        .await
-        .expect("put");
-    let got = store
-        .get(&tenant, &solo)
-        .await
-        .expect("get")
-        .expect("present");
-    assert_eq!(got.response_id, solo);
-
-    // Foreign tenants see nothing.
-    assert!(store
-        .get(&fresh_tenant("other"), &solo)
-        .await
-        .expect("get")
-        .is_none());
-
-    // Output is committed by the execution side, not derived from events.
-    store
-        .append_output(
-            &tenant,
-            &solo,
+        .append_turn(
+            &foreign_tenant,
+            &foreign_conv.id,
+            &ports.new_id(),
+            vec![ResponseItem::user_text("theirs")],
             vec![ResponseItem::assistant_text("answer")],
             None,
             Usage::new(1, 2),
@@ -432,200 +499,19 @@ pub async fn assert_context_conformance(ports: &PortSet) {
             2_000,
         )
         .await
-        .expect("append output");
-    let with_output = store.get(&tenant, &solo).await.unwrap().unwrap();
-    assert_eq!(with_output.output_items.len(), 1);
-    assert_eq!(with_output.usage.total_tokens, 3);
+        .expect("append foreign turn");
 
-    // Build a three-link chain, materialising history the way the gateway does at
-    // create time (D24): each link snapshots everything before it as a flat copy.
-    let mut ids = vec![solo.clone()];
-    let mut history: Vec<ResponseItem> = {
-        let solo_rec = store.get(&tenant, &solo).await.unwrap().unwrap();
-        solo_rec.chain_items().cloned().collect::<Vec<_>>()
-    };
-    for _ in 0..2 {
-        let id = ports.new_id();
-        let mut rec = record(
-            ports,
-            &id,
-            ids.last(),
-            &tenant,
-            true,
-            ResponseStatus::Completed,
-        );
-        rec.output_items = vec![ResponseItem::assistant_text("a")];
-        rec.context = history.clone();
-        // `ids` still holds the ancestors built so far (including `solo`), so its
-        // length is exactly how many turns this link inherits.
-        rec.context_depth = ids.len();
-        let own: Vec<ResponseItem> = rec.chain_items().cloned().collect();
-        store.put(rec).await.expect("put");
-        history.extend(own);
-        ids.push(id);
-    }
-
-    let resolved = store
-        .resolve_chain(&tenant, ids.last().unwrap(), ChainLimits::default())
-        .await
-        .expect("resolve");
-    assert_eq!(resolved.depth, 3);
-    assert!(resolved.bytes > 0);
-    assert_eq!(
-        resolved.items.len(),
-        6,
-        "each link contributes its input and its output"
-    );
-
-    // Chronological order: the oldest link's input comes first.
-    let encoded_first = canonical_items(&resolved.items[..1]);
-    assert!(
-        encoded_first.contains(&format!("in-{}", ids[0].uuid())),
-        "chain must be returned oldest-first, got {encoded_first}"
-    );
-
-    // Instructions must never cross a turn boundary (INV-49).
-    let encoded_all = canonical_items(&resolved.items);
-    assert!(
-        !encoded_all.contains("INSTRUCTIONS-MARKER"),
-        "instructions leaked into chain output"
-    );
-
-    // Bounds are errors, never truncations (INV-41).
-    assert_eq!(
-        store
-            .resolve_chain(
-                &tenant,
-                ids.last().unwrap(),
-                ChainLimits {
-                    max_depth: 2,
-                    ..ChainLimits::default()
-                },
-            )
-            .await,
-        Err(ContextError::ChainTooLong { limit: 2 })
-    );
-    assert_eq!(
-        store
-            .resolve_chain(
-                &tenant,
-                ids.last().unwrap(),
-                ChainLimits {
-                    max_bytes: 4,
-                    ..ChainLimits::default()
-                },
-            )
-            .await,
-        Err(ContextError::ChainTooLarge { limit: 4 })
-    );
-
-    // A foreign anchor is indistinguishable from a missing one: reporting them
-    // differently would confirm that an id exists (SEC-2).
-    let foreign_tenant = fresh_tenant("foreign");
-    let theirs = ports.new_id();
-    store
-        .put(record(
-            ports,
-            &theirs,
-            None,
-            &foreign_tenant,
-            true,
-            ResponseStatus::Completed,
-        ))
-        .await
-        .expect("put");
-    assert!(matches!(
-        store
-            .resolve_chain(&tenant, &theirs, ChainLimits::default())
-            .await,
-        Err(ContextError::ChainBroken(_))
-    ));
-    let ghost = ports.new_id();
-    assert!(matches!(
-        store
-            .resolve_chain(&tenant, &ghost, ChainLimits::default())
-            .await,
-        Err(ContextError::ChainBroken(_))
-    ));
-
-    // Cross-tenant detection moved to create time (D24): a snapshot is built by
-    // resolving the `previous` response's own snapshot, and that resolution already
-    // checks the tenant — so a foreign link can never be materialised, and
-    // resolution no longer walks far enough to observe one.
-
-    // An unstored anchor cannot be resolved (FR-18).
-    let unstored = ports.new_id();
-    store
-        .put(record(
-            ports,
-            &unstored,
-            None,
-            &tenant,
-            false,
-            ResponseStatus::Completed,
-        ))
-        .await
-        .expect("put");
-    assert_eq!(
-        store
-            .resolve_chain(&tenant, &unstored, ChainLimits::default())
-            .await,
-        Err(ContextError::NotStored)
-    );
-
-    // Deletion is surgical (D24): the deleted link is stripped from every
-    // downstream snapshot, and descendants themselves survive — the property the
-    // snapshot exists to provide.
-    assert!(store.delete(&tenant, &solo).await.expect("delete"));
-    assert!(!store
-        .delete(&tenant, &solo)
-        .await
-        .expect("second delete is a no-op"));
-
-    // Resolving the deleted link itself is a broken anchor.
-    assert!(matches!(
-        store
-            .resolve_chain(&tenant, &solo, ChainLimits::default())
-            .await,
-        Err(ContextError::ChainBroken(_))
-    ));
-
-    // A descendant still resolves, with the full inherited history intact —
-    // deletion is record-level, not content-level (D24): "remove from the
-    // conversation" removes the record, the flat copy it contributed lives on.
-    let after_delete = store
-        .resolve_chain(&tenant, ids.last().unwrap(), ChainLimits::default())
-        .await
-        .expect("descendant must survive the deletion");
-    assert_eq!(
-        after_delete.depth, 3,
-        "the snapshot keeps every link it inherited, including the deleted head"
-    );
-    assert_eq!(after_delete.items.len(), 6);
-    let encoded_after = canonical_items(&after_delete.items);
-    assert!(
-        encoded_after.contains(&format!("in-{}", solo.uuid())),
-        "the deleted link's content must remain in the descendant's snapshot: {encoded_after}"
-    );
-
-    // Expiry sweep only removes what is due.
-    let expiring = ports.new_id();
-    let mut rec = record(ports, &expiring, None, &tenant, true, ResponseStatus::Completed);
-    rec.expires_at_ms = Some(5_000);
-    store.put(rec).await.expect("put");
-    store.sweep_expired(4_999, 100).await.expect("sweep early");
-    assert!(store.get(&tenant, &expiring).await.unwrap().is_some());
-    store.sweep_expired(5_000, 100).await.expect("sweep due");
-    assert!(store.get(&tenant, &expiring).await.unwrap().is_none());
-
-    // Bulk purge is tenant-scoped.
     let purged = store.delete_by_tenant(&tenant).await.expect("purge");
-    assert!(purged > 0);
-    assert!(store
-        .get(&foreign_tenant, &theirs)
-        .await
-        .unwrap()
-        .is_some(), "purge must not touch other tenants");
+    assert!(purged >= 1);
+    assert_eq!(
+        store
+            .read_snapshot(&foreign_tenant, &foreign_conv.id)
+            .await
+            .expect("foreign snapshot survives")
+            .depth,
+        1,
+        "purge must not touch other tenants"
+    );
 
     store.health().await.expect("health");
 }
@@ -1073,11 +959,16 @@ pub async fn assert_overload_integrity(ports: &PortSet) {
 pub async fn assert_output_provenance(ports: &PortSet) {
     let tenant = fresh_tenant("provenance");
     let id = ports.new_id();
-    ports
-        .context
-        .put(record(ports, &id, None, &tenant, true, ResponseStatus::InProgress))
+    let conversation = ports
+        .conversation
+        .create(Conversation::new(
+            ConversationId::new(),
+            tenant.clone(),
+            Default::default(),
+            1_000,
+        ))
         .await
-        .expect("put");
+        .expect("create conversation");
 
     // The executor streams deltas for the caller's benefit...
     for chunk in ["Sta", "ble ", "answer"].iter() {
@@ -1085,12 +976,15 @@ pub async fn assert_output_provenance(ports: &PortSet) {
         ports.event_log.append(ev).await.expect("append delta");
     }
 
-    // ...and separately submits the terminal items. Two write paths, deliberately.
+    // ...and separately submits the terminal items to the conversation snapshot.
+    // Two write paths, deliberately.
     ports
-        .context
-        .append_output(
+        .conversation
+        .append_turn(
             &tenant,
+            &conversation.id,
             &id,
+            vec![ResponseItem::user_text("question")],
             vec![ResponseItem::assistant_text("Stable answer")],
             None,
             Usage::new(3, 4),
@@ -1098,7 +992,7 @@ pub async fn assert_output_provenance(ports: &PortSet) {
             2_000,
         )
         .await
-        .expect("append_output");
+        .expect("append_turn");
 
     // Now discard the event stream entirely, as eviction or a node restart would.
     ports
@@ -1116,29 +1010,18 @@ pub async fn assert_output_provenance(ports: &PortSet) {
         "the event stream must be genuinely gone for this check to mean anything"
     );
 
-    // FR-20: the durable record is untouched by that loss.
-    let stored = ports
-        .context
-        .get(&tenant, &id)
+    // FR-20: the durable snapshot is untouched by that loss.
+    let snapshot = ports
+        .conversation
+        .read_snapshot(&tenant, &conversation.id)
         .await
-        .expect("context get")
-        .expect("stored content must survive the loss of the event stream");
-    assert_eq!(
-        stored.status,
-        ResponseStatus::Completed,
-        "terminal status is recorded by the submission, not inferred from events"
-    );
+        .expect("snapshot read");
     assert!(
-        canonical_items(&stored.output_items).contains("Stable answer"),
+        canonical_items(&snapshot.items).contains("Stable answer"),
         "output items must come from the executor's terminal submission (FR-20); \
          if they were derived by replaying the event stream, discarding that \
          stream would have emptied them, making durable history depend on a \
          bounded transient buffer"
-    );
-    assert_eq!(
-        stored.usage.total_tokens,
-        7,
-        "usage accompanies the terminal submission, not the delta events"
     );
 
     // CR-7 / INV-6: a superseded holder cannot inject events afterwards. Checked
@@ -1230,22 +1113,12 @@ pub async fn assert_durability_order(ports: &PortSet) {
          be resolved later"
     );
 
-    // And the content side must be visible too, since `store: true` was honoured
-    // as part of the same acknowledgement.
-    let stored = ports
-        .context
-        .get(&tenant, &id)
-        .await
-        .expect("context get")
-        .expect(
-            "content must be readable the instant create() succeeds; acknowledging \
-             before the content write means a later turn discovers a broken chain \
-             far from the request that actually failed (INV-34)",
-        );
-    assert_eq!(stored.response_id, id);
+    // The input items must be visible on the record the instant create() succeeds
+    // (D30): acknowledging before the write means a later turn discovers a broken
+    // anchor far from the request that actually failed (INV-34).
     assert!(
-        canonical_items(&stored.input_items).contains("durable-marker"),
-        "the persisted items must be the ones submitted"
+        canonical_items(&seen.input_items).contains("durable-marker"),
+        "the persisted input items must be the ones submitted"
     );
 
     // A rejected create must leave nothing behind: a partial write would be a
@@ -2176,7 +2049,6 @@ pub fn mem_ports() -> PortSet {
     PortSet {
         ledger: world.ledger.clone(),
         event_log: world.event_log.clone(),
-        context: world.context.clone(),
         conversation: world.conversation.clone(),
         integrity: world.integrity.clone(),
         node_tag: NodeTag::parse("node-a").expect("static tag"),
@@ -2383,6 +2255,10 @@ mod tests {
 
         async fn sweep_expired(&self, _now_ms: u64) -> Result<u64, EventLogError> {
             Ok(0)
+        }
+
+        async fn remove(&self, _response_id: &ResponseId) -> Result<(), EventLogError> {
+            Ok(())
         }
     }
 

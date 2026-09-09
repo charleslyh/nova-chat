@@ -8,7 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nova_responses::{
     Conversation, ConversationError, ConversationEvent, ConversationEventKind, ConversationId,
-    ConversationStore, ResponseId, ResponseStatus, TenantId,
+    ConversationStore, ResolvedContext, ResponseId, ResponseItem, ResponseStatus, TenantId, Usage,
 };
 
 use mock_server::proto::{ProtoError, Request, Response};
@@ -294,6 +294,60 @@ impl ConversationStore for MemConversationClient {
         .await?
         {
             Response::ConversationList(list) => Ok(list),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn read_snapshot(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+    ) -> Result<ResolvedContext, ConversationError> {
+        match conversation_rpc(
+            &self.rpc,
+            Request::ConversationReadSnapshot {
+                tenant: tenant.clone(),
+                id: id.clone(),
+            },
+        )
+        .await?
+        {
+            Response::ConversationReadSnapshot(ctx) => Ok(ctx),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn append_turn(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        response_id: &ResponseId,
+        input_items: Vec<ResponseItem>,
+        output_items: Vec<ResponseItem>,
+        reasoning: Option<String>,
+        usage: Usage,
+        status: ResponseStatus,
+        now_ms: u64,
+    ) -> Result<u64, ConversationError> {
+        self.guard_writable()?;
+        match conversation_rpc(
+            &self.rpc,
+            Request::ConversationAppendTurn {
+                tenant: tenant.clone(),
+                id: id.clone(),
+                response_id: response_id.clone(),
+                input_items,
+                output_items,
+                reasoning,
+                usage,
+                status,
+                now_ms,
+            },
+        )
+        .await?
+        {
+            Response::ConversationAppendTurn(idx) => Ok(idx),
             other => Err(unexpected(other)),
         }
     }

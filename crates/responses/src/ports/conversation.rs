@@ -4,10 +4,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::context::ResponseStatus;
-use crate::conversation::{Conversation, ConversationEvent, ConversationEventKind};
-use crate::context::ResponseId;
-use crate::conversation::ConversationId;
+use crate::context::{ResolvedContext, ResponseId, ResponseStatus, Usage};
+use crate::conversation::{Conversation, ConversationEvent, ConversationEventKind, ConversationId};
+use crate::protocol::ResponseItem;
 use crate::shared::TenantId;
 
 #[derive(Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,18 +28,38 @@ pub enum ConversationError {
     Unavailable,
     #[error("read only")]
     ReadOnly,
+    /// The anchor this response inherits from does not exist or belongs to
+    /// another tenant. Reported identically for "absent" and "foreign" so ids
+    /// cannot be probed (SEC-2).
+    #[error("chain broken at {0}")]
+    ChainBroken(String),
+    /// The referenced response was created with `store: false`, so it holds no
+    /// durable snapshot to inherit (FR-18).
+    #[error("referenced response was not stored")]
+    NotStored,
+    #[error("chain exceeds depth limit {limit}")]
+    ChainTooLong { limit: usize },
+    #[error("chain exceeds byte limit {limit}")]
+    ChainTooLarge { limit: usize },
+    #[error("chain crosses tenant boundary")]
+    CrossTenant,
+    #[error("integrity mismatch")]
+    IntegrityMismatch,
     #[error("internal: {0}")]
     Internal(String),
 }
 
-/// Storage for the upstream-compatible conversation pointer.
+/// Storage for the conversation: the **long-term record of a dialogue** (D30).
 ///
-/// Six methods, and none of them touches an item. That is the whole point: the
-/// conversation records *where* the chain ends, and the chain itself is already
-/// persisted by [`crate::ports::ContextStore`]. There is no `snapshot_items`
-/// here, and no hot read path to keep indexed, because assembling context
-/// remains a single `resolve_chain` call against the materialised snapshot
-/// (D24) — unchanged by the presence of conversations.
+/// In the D30 design the conversation is the system of record for content — it
+/// holds the materialised snapshot (a growing, per-turn-delta list of items) and
+/// the turn lock and event stream it already held under D28. Responses are
+/// short-lived (event stream with a TTL); the conversation survives them, so
+/// history assembly reads here rather than from a per-response snapshot.
+///
+/// The snapshot methods below replace the removed [`ContextStore`] and its
+/// `resolve_chain`. `append_turn` must take its items **from the execution
+/// side's final output**, never from replaying the event stream (INV-48).
 #[async_trait]
 pub trait ConversationStore: Send + Sync {
     async fn create(
@@ -53,6 +72,43 @@ pub trait ConversationStore: Send + Sync {
         tenant: &TenantId,
         id: &ConversationId,
     ) -> Result<Option<Conversation>, ConversationError>;
+
+    /// Read the conversation's materialised snapshot — the full history as it
+    /// currently stands — in chronological order. This is what an execution
+    /// builds its LLM context from (one read per turn, D30), and what the
+    /// transcript endpoint renders.
+    ///
+    /// The turn lock serialises turns per conversation, so the snapshot is
+    /// stable for the in-flight turn: no other turn appends concurrently.
+    async fn read_snapshot(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+    ) -> Result<ResolvedContext, ConversationError>;
+
+    /// Append one turn's items to the conversation snapshot at terminal time.
+    ///
+    /// Both the turn's input and output are appended, so the next turn's model
+    /// context is complete without the caller re-supplying history. The items
+    /// come from the execution side's final result — **never** derived by
+    /// replaying the event stream (INV-48). This is the single place durable
+    /// content is written; it is paired with `ResponseLedger::complete` in one
+    /// transaction boundary (INV-34).
+    ///
+    /// `reasoning` (render-only) is placed immediately before the output block.
+    /// Returns the turn's index (0-based, monotonically increasing).
+    async fn append_turn(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        response_id: &ResponseId,
+        input_items: Vec<ResponseItem>,
+        output_items: Vec<ResponseItem>,
+        reasoning: Option<String>,
+        usage: Usage,
+        status: ResponseStatus,
+        now_ms: u64,
+    ) -> Result<u64, ConversationError>;
 
     /// Replace `metadata` wholesale and return the updated record.
     ///

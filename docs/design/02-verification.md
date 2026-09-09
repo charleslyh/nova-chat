@@ -8,12 +8,14 @@
 
 | 层 | 内容 | 后端 | Docker |
 |---|---|---|---|
-| **L0** | 端口契约（14 用例，含全局领取、并发、过载完整性、输出溯源） | **内存 + SQL 共用同一套断言** | 内存部分无需 |
-| **L1** | 场景（进程内，直驱端口） | 内存 | 无 |
-| **L2** | 场景（三节点 HTTP） | 共享载体 `mem-server` + 独立 agentd + 独立 sweep | 无 |
-| **L3** | 端到端 | SQL | 允许（D17） |
+| **L0** | 端口契约（含全局领取、并发、过载完整性、输出溯源、会话快照） | **mock（参考实现）** | 无 |
+| **L1** | 场景（进程内，直驱端口） | mock | 无 |
+| **L2** | 场景（三节点 HTTP） | 共享载体 `mock-server` + 独立 `mock-agentd` + 独立 `mock-sweep` | 无 |
+| **L4** | 官方 Python SDK 驱动 conversation 端点 | mock（经 gateway HTTP） | 无 |
 
-**L0–L2 完全不依赖基础设施**。L3 无数据库时**跳过而非失败**，否则没有基础设施的开发机会被门禁挡住。
+**L0–L2 完全不依赖基础设施**。L4 无 python3/openai 时**跳过而非失败**，否则没有 Python 环境的开发机会被门禁挡住。
+
+> 无 L3：D30 后存储后端选型不归领域层管，SQL 等真库端到端由**接入方**按 [`07-storage-integration.md`](./07-storage-integration.md) 的契约自行验证，不再是本仓库的验证分层。
 
 ---
 
@@ -25,13 +27,13 @@
 pub struct PortSet {
     pub ledger: Arc<dyn ResponseLedger>,
     pub event_log: Arc<dyn ResponseEventLog>,
-    pub context: Arc<dyn ContextStore>,
+    pub conversation: Arc<dyn ConversationStore>,
     pub integrity: Option<Arc<dyn ContentIntegrity>>,
     pub node_tag: NodeTag,
 }
 ```
 
-内存后端由 `conformance::mem_ports()` 装配；SQL 后端由 L3 runner 装配后调用**同一个** `run_suite`。断言一行不改。
+mock 后端由 `conformance::mem_ports()` 装配；接入方的存储后端实现同一组端口 trait 后调用**同一个** `run_suite`，断言一行不改。
 
 ### 2.1 用例清单是单一真相源
 
@@ -92,9 +94,9 @@ pub struct ContractCase {
 
 区分的意义：协议用例在两个后端各跑一次**不等于协议被验证了两次**，那样呈现会高估后端覆盖。
 
-### 2.6 conformance 不依赖 adapters-sql
+### 2.6 conformance 不依赖任何存储后端驱动
 
-否则 L0 编译需要数据库驱动，违反 D17。SQL 后端由 L3 runner 注入。此约束由 `just check-deps` 强制。
+否则 L0 编译需要数据库驱动，违反 D17。真库后端由接入方实现端口 trait 注入（D30）。此约束由 `just check-deps` 强制。
 
 ### 2.7 每个用例使用独立租户
 
@@ -112,15 +114,15 @@ pub struct ContractCase {
 
 FR-20「输出条目由执行端在终态直接提交；**不由事件流回放派生**」是整个重构的支点决策（D20），而它**没有任何验证**——编号挂在 cancel 用例上，而该用例根本不触及它。
 
-新增 `output-provenance` 用例，以其决定性后果验证：**销毁事件流，已存输出必须依然完整**。
+新增 `output-provenance` 用例，以其决定性后果验证：**销毁事件流，会话快照必须依然完整**。
 
 ```
-append 三个 delta → append_output 提交终态条目
+append 三个 delta → append_turn 提交终态条目（数据源是 AgentOutcome.items）
 → close + sweep 事件流（read_after 确认返回 Expired）
-→ 断言 output_items 仍含完整文本
+→ 断言会话快照仍含完整文本
 ```
 
-若输出由回放派生，这一步会得到空条目。缺少此验证时，未来修 bug 最省事的做法恰恰是「回放 delta 重建输出」——而事件缓冲是有界瞬态的，那会让持久历史依赖于一个随时可被驱逐的缓存。
+若会话快照由回放派生，这一步会得到空条目。缺少此验证时，未来修 bug 最省事的做法恰恰是「回放 delta 重建快照」——而事件缓冲是有界瞬态的，那会让持久历史依赖于一个随时可被驱逐的缓存。
 
 同一用例还接管了 CR-3/CR-7/INV-6：用**真实 append 路径**验证失效持有者被拒。原先 ledger 用例只调 `check_attempt` 探测——实现完全可以通过探测、却接受紧随其后的写入。
 
@@ -242,7 +244,7 @@ fn saw_relevant_data(&self, trace: &Trace) -> bool;   // 无默认实现
 
 ## 7. L2 场景（13 个）与进程拓扑
 
-**fixture 进程**（`xtask procs up` 启动）：`nova-responses-mem-server`（数据面 19000 + 控制面 19001）· `nova-responses-sweep`（短 heartbeat TTL）· `nova-agentd-mock`（scripted scheduler，含 `hang` 规则）· 三个**对等** gateway（node-a/b/c，18080/18081/18082）。
+**fixture 进程**（`xtask procs up` 启动）：`mock-server`（数据面 19000 + 控制面 19001）· `mock-sweep`（短 heartbeat TTL）· `mock-agentd`（scripted scheduler，含 `hang` 规则）· 三个**对等** gateway（node-a/b/c，18080/18081/18082）。
 
 三节点共享同一载体，执行由全局 agentd 完成，节点之间完全对等——不再有「node-c 挂起」「node-b 路由」这种固定分工。
 
@@ -278,14 +280,16 @@ requires_nodes: [18080, 18081]
 
 两者各停一个节点（node-c 用 SIGKILL 模拟故障，node-b 用 SIGTERM 模拟优雅停机），互不干扰地排在非破坏性场景之后。这两个性质（跨实例续订无粘性、优雅停机无损）在共享载体下才可在 L2 验证——进程内内存时代它们根本无法表达。
 
-## 8. L3 检查（5 项 + 契约复用）
+## 8. 存储后端的验证职责（D30 后移交接入方）
 
-| 检查 | 只有共享持久化才能显现的性质 |
+D30 后真库端到端不再属于本仓库分层——存储后端由接入方注入，其验证义务由 [`07-storage-integration.md`](./07-storage-integration.md) 规定。接入方实现 `ResponseLedger` / `ConversationStore` / `ResponseEventLog` 后，用**同一套 L0 契约**（`conformance::run_suite`）自证，并至少覆盖：
+
+| 检查 | 只有真实持久化才能显现的性质 |
 |---|---|
-| `sql-port-contract` | **同一套 L0 契约跑 SQL 后端** |
-| `sql-multi-turn-chain` | 物化快照跨节点固化；链可跨节点；快照不选 instructions 列 |
-| `sql-restart-history-intact` | 重启后在途明确失败、**历史完好** |
-| `sql-expiry-sweep` / `sql-tenant-purge` | 到期清理与租户清除 |
+| 端口契约 | **同一套 L0 契约跑真实后端**，断言不改 |
+| 会话快照跨节点 | 主快照跨节点一致；快照不选 instructions 列 |
+| 重启历史完好 | 重启后在途明确失败、会话快照完好 |
+| 到期清理与租户清除 | 事件流 TTL 清理、会话快照保留策略、租户清除 |
 
 ---
 

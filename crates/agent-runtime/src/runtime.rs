@@ -14,10 +14,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nova_responses::{
-    AgentId, AppendEvent, Attempt, ChainLimits, ClaimedResponse, ContextStore,
-    ConversationStore, LedgerError, RequestProvenance, ResponseEventKind, ResponseEventLog,
-    ResponseId, ResponseItem, ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
+    AgentId, AppendEvent, Attempt, ChainLimits, ClaimedResponse, ConversationError,
+    ConversationStore, LedgerError, RequestProvenance, ResolvedContext, ResponseEventKind,
+    ResponseEventLog, ResponseId, ResponseItem, ResponseLedger, ResponseRecord, ResponseStatus,
+    SnapshotRef, TenantId, Usage,
 };
+use serde_json::Value;
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
@@ -29,7 +31,6 @@ use crate::sink::EventSink;
 pub struct AgentRuntimeDeps {
     pub ledger: Arc<dyn ResponseLedger>,
     pub event_log: Arc<dyn ResponseEventLog>,
-    pub context: Arc<dyn ContextStore>,
     /// The execution seam. The orchestrator never sees how a task runs.
     pub runner: Arc<dyn AgentRunner>,
     /// Timestamp source: `SystemTime` in production, a virtual clock the test
@@ -210,13 +211,20 @@ impl AgentRuntime {
                 id.clone(),
                 ResponseEventKind::InProgress,
                 attempt,
-                record.to_response_value(),
+                record.to_response_value(&[]),
             ))
             .await;
 
-        // History is materialised onto the record (D24): read the snapshot rather
-        // than walking the chain.
-        let mut items: Vec<ResponseItem> = record.context.clone();
+        // History lives in the conversation snapshot (D30): read it once from the
+        // anchor rather than walking a chain, then append this turn's own input.
+        let snapshot = match self.resolve_snapshot(&record).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                warn!(response = %id, error = %e, "could not resolve context snapshot");
+                return self.fail(&record, attempt, Usage::default(), &e.to_string(), now_ms).await;
+            }
+        };
+        let mut items: Vec<ResponseItem> = snapshot.items;
         items.extend(record.input_items.clone());
 
         let task = AgentTask {
@@ -272,7 +280,7 @@ impl AgentRuntime {
     /// Terminal funnel for a response that produced output.
     async fn complete(
         &self,
-        record: &StoredResponse,
+        record: &ResponseRecord,
         attempt: Attempt,
         produced: Vec<ResponseItem>,
         reasoning: String,
@@ -281,7 +289,6 @@ impl AgentRuntime {
         now_ms: u64,
     ) -> Executed {
         let id = &record.response_id;
-        let tenant = &record.tenant_id;
 
         if let Err(e) = self
             .deps
@@ -293,23 +300,24 @@ impl AgentRuntime {
             return Executed::Failed;
         }
 
+        // Durable output goes to the conversation snapshot (D30), sourced from the
+        // runner's final items — never from replaying the event stream (INV-48).
+        //
+        // A conversation-anchored response must persist its turn to the snapshot;
+        // a bare response (no conversation) has no snapshot to append to, but it is
+        // still "stored": its record and the terminal event (carrying the full
+        // object, output included) are its retention under D30.
         let output_stored = if record.stored {
-            let reasoning = if reasoning.is_empty() {
-                None
+            if record.conversation_id.is_none() {
+                true
             } else {
-                Some(reasoning)
-            };
-            match self
-                .deps
-                .context
-                .append_output(tenant, id, produced, reasoning, usage, status, now_ms)
-                .await
-            {
-                Ok(()) => true,
-                Err(e) => {
-                    warn!(response = %id, error = %e, "storing output failed");
-                    false
-                }
+                let reasoning = if reasoning.is_empty() {
+                    None
+                } else {
+                    Some(reasoning.clone())
+                };
+                self.append_turn(record, &produced, reasoning, usage, status, now_ms)
+                    .await
             }
         } else {
             false
@@ -325,7 +333,19 @@ impl AgentRuntime {
             ResponseStatus::Incomplete => ResponseEventKind::Incomplete,
             _ => ResponseEventKind::Completed,
         };
-        self.close_stream(id, tenant, kind, now_ms).await;
+        // Re-read the record: `ledger.complete` has written the terminal status
+        // and usage, and the terminal event must carry them (the claimed record
+        // still says `in_progress`).
+        let updated = self
+            .deps
+            .ledger
+            .get(id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| record.clone());
+        let value = updated.to_response_value(&produced);
+        self.close_stream(id, kind, value, now_ms).await;
         info!(response = %id, "completed");
         Executed::Completed
     }
@@ -333,14 +353,13 @@ impl AgentRuntime {
     /// Terminal funnel for a response that produced nothing usable.
     async fn fail(
         &self,
-        record: &StoredResponse,
+        record: &ResponseRecord,
         attempt: Attempt,
         usage: Usage,
         reason: &str,
         now_ms: u64,
     ) -> Executed {
         let id = &record.response_id;
-        let tenant = &record.tenant_id;
 
         if let Err(e) = self
             .deps
@@ -356,15 +375,158 @@ impl AgentRuntime {
             .await;
 
         debug!(response = %id, reason, "failed");
-        self.close_stream(id, tenant, ResponseEventKind::Failed, now_ms)
+        // Re-read for the same reason as the completion path: `ledger.complete`
+        // holds the terminal status the failure event must report.
+        let updated = self
+            .deps
+            .ledger
+            .get(id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| record.clone());
+        let value = updated.to_response_value(&[]);
+        self.close_stream(id, ResponseEventKind::Failed, value, now_ms)
             .await;
         Executed::Failed
+    }
+
+    /// Resolve the context a claim inherits, from the record's anchor (D30).
+    ///
+    /// `Previous` bare chains are mapped through the ledger to their conversation,
+    /// then read here. `Root` yields empty. A bare chain with no conversation has
+    /// no durable snapshot and is reported as broken.
+    async fn resolve_snapshot(&self, record: &ResponseRecord) -> Result<ResolvedContext, ConversationError> {
+        let tenant = &record.tenant_id;
+        let anchor = record.anchor();
+        let resolved = match &anchor {
+            SnapshotRef::Root => ResolvedContext::default(),
+            SnapshotRef::Conversation(id) => self.read_snapshot(tenant, id).await?,
+            SnapshotRef::Previous(id) => {
+                let prev = self
+                    .deps
+                    .ledger
+                    .get(id)
+                    .await
+                    .map_err(|_| ConversationError::ChainBroken(id.to_string()))?
+                    .ok_or_else(|| ConversationError::ChainBroken(id.to_string()))?;
+                match prev.anchor() {
+                    SnapshotRef::Conversation(cid) => self.read_snapshot(tenant, &cid).await?,
+                    // Bare response: reconstruct its own input+output from the stream.
+                    SnapshotRef::Root => self.reconstruct_bare(&prev).await?,
+                    SnapshotRef::Previous(_) => {
+                        return Err(ConversationError::ChainBroken(id.to_string()));
+                    }
+                }
+            }
+        };
+        Ok(resolved)
+    }
+
+    /// Reconstruct a bare (conversation-less) response's input+output from the
+    /// event stream: input from the record, output from the terminal event.
+    async fn reconstruct_bare(
+        &self,
+        record: &ResponseRecord,
+    ) -> Result<ResolvedContext, ConversationError> {
+        let mut items = record.input_items.clone();
+        let mut bytes = items.iter().map(ResponseItem::byte_len).sum::<usize>();
+        let mut cursor: Option<u64> = None;
+        loop {
+            let batch = self
+                .deps
+                .event_log
+                .read_after(&record.response_id, cursor, 256, 0)
+                .await
+                .map_err(|e| ConversationError::Internal(e.to_string()))?;
+            if batch.is_empty() {
+                break;
+            }
+            let terminal = batch.iter().any(|e| e.kind.is_terminal());
+            cursor = batch.last().map(|e| e.sequence_number);
+            for event in &batch {
+                if let nova_responses::EventBody::Response { response } = &event.body {
+                    if let Ok(output) = serde_json::from_value::<Vec<ResponseItem>>(
+                        response.get("output").cloned().unwrap_or_default(),
+                    ) {
+                        bytes += output.iter().map(ResponseItem::byte_len).sum::<usize>();
+                        items.extend(output);
+                    }
+                }
+            }
+            if terminal {
+                break;
+            }
+        }
+        Ok(ResolvedContext {
+            items,
+            reasoning: Vec::new(),
+            depth: 1,
+            bytes,
+        })
+    }
+
+    /// Read a conversation snapshot, returning `Unavailable` when no conversation
+    /// port is mounted (the runtime can then fail the turn explicitly).
+    async fn read_snapshot(
+        &self,
+        tenant: &TenantId,
+        id: &nova_responses::ConversationId,
+    ) -> Result<ResolvedContext, ConversationError> {
+        match &self.deps.conversations {
+            Some(store) => store.read_snapshot(tenant, id).await,
+            None => Err(ConversationError::Unavailable),
+        }
+    }
+
+    /// Append this turn's output to its conversation snapshot. Returns `true` when
+    /// durably stored; `false` when there is no conversation to store into (a bare
+    /// response has no durable home, so `stored` cannot be honoured).
+    async fn append_turn(
+        &self,
+        record: &ResponseRecord,
+        produced: &[ResponseItem],
+        reasoning: Option<String>,
+        usage: Usage,
+        status: ResponseStatus,
+        now_ms: u64,
+    ) -> bool {
+        let (Some(store), Some(conversation_id)) =
+            (&self.deps.conversations, &record.conversation_id)
+        else {
+            return false;
+        };
+        match store
+            .append_turn(
+                &record.tenant_id,
+                conversation_id,
+                &record.response_id,
+                record.input_items.clone(),
+                produced.to_vec(),
+                reasoning,
+                usage,
+                status,
+                now_ms,
+            )
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                warn!(
+                    response = %record.response_id,
+                    conversation = %conversation_id,
+                    error = %e,
+                    "storing output to the conversation snapshot failed"
+                );
+                false
+            }
+        }
     }
 
     /// Release the turn lock, and advance the conversation tail when asked.
     async fn settle(
         &self,
-        record: &StoredResponse,
+        record: &ResponseRecord,
         status: ResponseStatus,
         advance_tail: bool,
         now_ms: u64,
@@ -401,26 +563,19 @@ impl AgentRuntime {
         }
     }
 
-    /// Emit the terminal event and start the retention window.
+    /// Emit the terminal event (carrying the full response object, output included)
+    /// and start the retention window.
     async fn close_stream(
         &self,
         id: &ResponseId,
-        tenant: &TenantId,
         kind: ResponseEventKind,
+        value: Value,
         now_ms: u64,
     ) {
-        let response = match self.deps.context.get(tenant, id).await {
-            Ok(Some(record)) => record.to_response_value(),
-            _ => serde_json::json!({
-                "id": id.to_string(),
-                "object": "response",
-                "status": kind.as_str().strip_prefix("response.").unwrap_or(kind.as_str()),
-            }),
-        };
         let _ = self
             .deps
             .event_log
-            .append(AppendEvent::lifecycle(id.clone(), kind, response))
+            .append(AppendEvent::lifecycle(id.clone(), kind, value))
             .await;
         let _ = self
             .deps

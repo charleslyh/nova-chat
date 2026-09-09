@@ -26,6 +26,7 @@
 | [D27](#d27-会话容器退化为链尾指针) | conversation = 指向响应链尾的指针，不存条目 | ⛔ SUPERSEDED BY D28 |
 | [D28](#d28-会话能力下沉数据层conversation-吸收-session) | conversation 单实体承载链尾 + 互斥 + 事件流；互斥下沉数据层；端点统一 conversations | ✅ 生效 |
 | [D29](#d29-agent-结构解耦编排器--agentrunner--模拟验证进程) | 编排器 AgentRuntime + AgentRunner trait；completions 出站抽象下沉到模拟验证进程 | ✅ 生效 |
+| [D30](#d30-存储分工重构responses-走事件流conversation-存持久快照) | responses 由事件流承载（短期 TTL）；conversation 存持久物化主快照；移除 ContextStore | ✅ 生效 |
 
 其余条目多为任务系统时代决策，已 ⛔ SUPERSEDED BY D19，正文保留备查。D18 / D19 中的会话资源、开屏快照、热→冷、跨区镜像条款由 D20–D22 收口，正文同样保留备查。
 
@@ -58,12 +59,13 @@
 | [D21](#d21-可靠性分层三类存储的差异化投入) | 可靠性 | **分层投入；在途共享化 + 四项缓解** | ⚠ 部分 SUPERSEDED BY D25 |
 | [D22](#d22-协议封闭子集与严格拒绝) | 对外协议 | **封闭子集；严格拒绝未知** | ✅ 生效 |
 | [D23](#d23-生成由宿主节点内部执行取消拉取式执行端) | 执行位置 | 宿主节点内部执行 | ⛔ SUPERSEDED BY D25 |
-| [D24](#d24-上下文物化每个生成保存完整上下文快照) | 上下文 | 每生成物化完整快照 | ✅ 生效 |
+| [D24](#d24-上下文物化每个生成保存完整上下文快照) | 上下文 | 每生成物化完整快照 | ⛔ SUPERSEDED BY D30（物化快照条款） |
 | [D25](#d25-执行进程独立与在途缓冲共享化能力层抽离) | 执行与分层 | 执行独立 + 缓冲共享化 + 能力层 | ✅ 生效 |
 | [D26](#d26-自研会话层状态如何广播) | 会话层 | 状态广播：事件流 + 锁 + 业务事件 | ⛔ SUPERSEDED BY D28 |
 | [D27](#d27-会话容器退化为链尾指针) | 兼容层 | conversation = 链尾指针 | ⛔ SUPERSEDED BY D28 |
-| [D28](#d28-会话能力下沉数据层conversation-吸收-session) | 会话层 | conversation 单实体：链尾 + 互斥 + 事件流 | ✅ 生效 |
+| [D28](#d28-会话能力下沉数据层conversation-吸收-session) | 会话层 | conversation 单实体：链尾 + 互斥 + 事件流 | ⚠ 部分 SUPERSEDED BY D30（「不存条目」→ 存持久快照） |
 | [D29](#d29-agent-结构解耦编排器--agentrunner--模拟验证进程) | Agent 结构 | 编排器 + AgentRunner；completions 下沉验证进程 | ✅ 生效 |
+| [D30](#d30-存储分工重构responses-走事件流conversation-存持久快照) | 存储分工 | responses 事件流承载；conversation 持久快照；移除 ContextStore | ✅ 生效 |
 
 ---
 
@@ -1162,3 +1164,31 @@ completions 出站（`CompletionsRequest` / `CompletionsRequestScheduler` 等）
 ### 取消正确性与及时性分离
 
 fence（`attempt`）保证**正确性**——过期 attempt 的写入被拒绝。但 fence 无法让一段正在进行的模型调用停下（期间无 append，感知不到取消）。及时性由 sink `Stop` 单一承担：流式场景（tokens/sec 100~200）下每个 token 都 append，几 ms 内传导取消并让 scheduler 停止模型调用；heartbeat 是低频保活，不承担取消通知通道。模型 / tool 的「无输出等待期」取消靠 `exec_deadline` 超时 + 输出开始后的 `Stop` + reap 兜底。
+
+---
+
+## D30 存储分工重构：responses 走事件流，conversation 存持久快照
+
+| | |
+|---|---|
+| **需求** | 会话是长期对话的权威来源；responses 有明确 TTL，不适合做长期还原的数据源；存储选型不归领域层管，只提供 trait 接口与接入文档 |
+| **结论** | ① **移除 `ContextStore` 端口**，职责拆分：快照读写并入 `ConversationStore`，response 对象检索重建并入 `ResponseEventLog`（回放流）。② **responses 由事件流承载（短期 TTL）**：账本 `ResponseRecord` 只存元数据（`response_id`/`tenant_id`/`previous_response_id`/`conversation_id`/`input_items`/`tools`/`model`/`instructions`/`store`/状态/用量/时间戳），**不再物化祖先快照**；`GET /v1/responses/{id}` 在 TTL 内由事件流回放重建，TTL 后 404。③ **conversation 存持久物化主快照**：新增 `read_snapshot`（agent 取上下文 / transcript 渲染）与 `append_turn`（终态把本轮 input+output 追加进快照）；存储从 D24 的 O(n²) 降为 O(n)。④ **创建只记元数据**：新轮不再物化快照，只解析锚点并校验链上限（fail-fast 保留）；执行时 agent 按锚点读一次主快照重建 LLM 上下文。⑤ **终态数据源禁止回放**：`append_turn` 的条目来自编排层 `AgentOutcome.items` 直接提交，**绝不从事件流回放派生**（INV-48 RESTATE）。⑥ **原子性边界迁移**：INV-34 从「创建时 ledger+context 同事务」改写为「终态时 `ledger.complete` + `conversation.append_turn` 同事务」。⑦ **裸链（`previous_response_id` 无会话）**：沿账本反查归属会话读快照；无会话归属的裸链从事件流重建其 input+output（TTL 内），更深裸链按 `ChainBroken` 显式失败。⑧ **delete 为记录级**：删账本记录 + 事件流，会话快照副本保留（沿用 D24 语义），广播 `ResponseDeleted`。⑨ **存储选型不做**：只交付领域层 trait + mock 参考实现 + 接入要求文档（`07-storage-integration.md`），外部接入方自行实现 `ResponseLedger`/`ConversationStore`/`ResponseEventLog` 并注入。 |
+| **代价** | 会话快照单调增长（需冷存储保留策略）；裸链恢复受事件流 TTL 约束；`store=false` 无持久载体；L1 场景（harness + YAML）需随语义重设计 |
+| **SUPERSEDES** | D24 的「每生成物化完整快照（O(n²)）」条款；D28 的「conversation 不存条目」条款 |
+| **RESTATES** | INV-48（输出非回放派生，断言改为「销毁流后会话快照完整」）；INV-34（原子性边界迁到终态） |
+
+### 为何由 conversation 承担长期内容，而非 responses
+
+responses 有 `expires_at_ms` TTL，会被清扫；把「长期对话还原」寄生其上，还原窗口就等于 responses 的保留期——这正是上游用 conversation 存 items（不受 30 天限制）而 responses 只有 30 天 TTL 的分工。D30 对齐这一分工：conversation 是 system of record，responses 是短期执行记录。
+
+### 为何移除 ContextStore 而非保留改名
+
+D28 已论证 conversation 不合并快照的理由（锁/事件流的写事务形状不同）。但该理由成立的前提是「快照在 responses 上」。D30 把快照移回 conversation 后，ContextStore 与 ConversationStore 的边界重叠——快照读写归会话、检索重建归事件流，中间不再需要独立的「内容库」端口，故整端口移除，职责拆分。
+
+### 为何原子性边界从创建时迁到终态
+
+D24 下创建时要 `ledger.create` + `context.put` 同事务（INV-34），因为创建即物化快照。D30 下创建只写元数据，无需双写；真正的持久内容在终态提交（`ledger.complete` + `conversation.append_turn`），故原子性约束迁到这里。
+
+### 为何禁止回放派生（INV-48 保留）
+
+事件流是有界瞬态，随时可被驱逐；若 `append_turn` 从流回放派生，持久历史就依赖一个可驱逐缓存。数据源必须是编排层手中的 `AgentOutcome.items`——L0 `output-provenance` 断言「销毁事件流后会话快照仍完整」。

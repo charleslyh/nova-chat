@@ -10,7 +10,7 @@
 #   NOVA_CHAT_MODEL      可选，固定模型名；不设则用页面里填的 model
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 : "${NOVA_CHAT_BASE_URL:?请先 export NOVA_CHAT_BASE_URL（chat completions 的 base url）}"
 : "${NOVA_CHAT_API_KEY:?请先 export NOVA_CHAT_API_KEY}"

@@ -27,7 +27,9 @@ pub mod metrics;
 pub mod service;
 
 pub use canonical::{canonical_items, canonical_json, canonical_output_text, nfc};
-pub use context::{ChainLimits, ResolvedContext, ResponseId, ResponseStatus, StoredResponse, Usage};
+pub use context::{
+    ChainLimits, ResolvedContext, ResponseId, ResponseRecord, ResponseStatus, SnapshotRef, Usage,
+};
 pub use conversation::{Conversation, ConversationEvent, ConversationEventKind, ConversationId};
 pub use domain_error::DomainError;
 pub use events::{AppendEvent, EventBody, ResponseEvent, ResponseEventKind};
@@ -38,9 +40,9 @@ pub use protocol::{ContentPart, ResponseItem, Role};
 pub use provenance::RequestProvenance;
 
 pub use ports::{
-    AbortedClaim, ClaimedResponse, ContentIntegrity, ContextError, ContextStore,
-    ConversationError, ConversationStore, CreateOutcome, EventLogError, IntegrityError, LedgerError,
-    MetricsSink, ResponseEventLog, ResponseLedger,
+    AbortedClaim, ClaimedResponse, ContentIntegrity, ConversationError, ConversationStore,
+    CreateOutcome, EventLogError, IntegrityError, LedgerError, MetricsSink, ResponseEventLog,
+    ResponseLedger,
 };
 
 pub use config::{Config, RawConfig};

@@ -159,7 +159,7 @@ async fn tamper(
     State(world): State<Arc<MemWorld>>,
     Json(req): Json<TamperReq>,
 ) -> Json<bool> {
-    Json(world.context.tamper_for_test(&req.response_id, req.items))
+    Json(world.ledger.tamper_for_test(&req.response_id, req.items))
 }
 
 #[derive(Deserialize)]

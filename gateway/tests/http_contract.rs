@@ -146,15 +146,12 @@ async fn start() -> Harness {
     // does it — this fixture is only worth anything if it is wired the same way.
     let conversations = Arc::new(ConversationsService::new(
         world.conversation.clone(),
-        world.context.clone(),
         world.now_fn(),
         world.metrics.clone(),
-        cfg.clone(),
     ));
     let service = Arc::new(ResponsesService::new(
         world.ledger.clone(),
         world.event_log.clone(),
-        world.context.clone(),
         conversations.clone(),
         world.now_fn(),
         world.metrics.clone(),
@@ -165,7 +162,6 @@ async fn start() -> Harness {
         cfg,
         ledger: world.ledger.clone(),
         event_log: world.event_log.clone(),
-        context: world.context.clone(),
         conversation_store: world.conversation.clone(),
         now: world.now_fn(),
         metrics: world.metrics.clone(),
@@ -282,7 +278,6 @@ impl Harness {
             AgentRuntimeDeps {
                 ledger: self.world.ledger.clone(),
                 event_log: self.world.event_log.clone(),
-                context: self.world.context.clone(),
                 runner,
                 now: self.world.now_fn(),
                 // Mounted, not `None`: with the port absent every terminal path

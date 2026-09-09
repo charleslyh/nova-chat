@@ -11,7 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use nova_responses::{
     Conversation, ConversationError, ConversationEvent, ConversationEventKind, ConversationId,
-    ConversationStore, ResponseId, ResponseStatus, TenantId,
+    ConversationStore, ResolvedContext, ResponseId, ResponseItem, ResponseStatus, TenantId, Usage,
 };
 
 use crate::store::{Inner, MemStore};
@@ -90,6 +90,70 @@ impl ConversationStore for MemConversationStore {
             Some(c) if &c.tenant_id != tenant => None,
             Some(c) => Some(c.clone()),
         })
+    }
+
+    async fn read_snapshot(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+    ) -> Result<ResolvedContext, ConversationError> {
+        self.guard_available()?;
+        let g = self.store.lock();
+        let Some(existing) = g.conversations.get(id) else {
+            return Err(ConversationError::NotFound);
+        };
+        if &existing.tenant_id != tenant {
+            return Err(ConversationError::NotFound);
+        }
+        let snap = g.snapshots.get(id);
+        Ok(ResolvedContext {
+            items: snap.map(|s| s.items.clone()).unwrap_or_default(),
+            reasoning: snap.map(|s| s.reasoning.clone()).unwrap_or_default(),
+            depth: snap.map(|s| s.turn_count).unwrap_or(0),
+            bytes: snap.map(|s| s.bytes).unwrap_or(0),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn append_turn(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        _response_id: &ResponseId,
+        input_items: Vec<ResponseItem>,
+        output_items: Vec<ResponseItem>,
+        reasoning: Option<String>,
+        _usage: Usage,
+        _status: ResponseStatus,
+        _now_ms: u64,
+    ) -> Result<u64, ConversationError> {
+        self.guard_writable()?;
+        let mut g = self.store.lock();
+        let Some(existing) = g.conversations.get(id) else {
+            return Err(ConversationError::NotFound);
+        };
+        if &existing.tenant_id != tenant {
+            return Err(ConversationError::NotFound);
+        }
+        let snap = g.snapshots.entry(id.clone()).or_default();
+        let turn_start = snap.items.len();
+        let input_len = input_items.len();
+        snap.bytes += input_items.iter().map(ResponseItem::byte_len).sum::<usize>();
+        snap.bytes += output_items.iter().map(ResponseItem::byte_len).sum::<usize>();
+        snap.items.extend(input_items);
+        snap.items.extend(output_items);
+        snap.reasoning.resize(snap.items.len(), None);
+        if let Some(text) = reasoning {
+            // Reasoning precedes this turn's output, i.e. the item right after the
+            // input block.
+            let output_start = turn_start + input_len;
+            if output_start < snap.reasoning.len() {
+                snap.reasoning[output_start] = Some(text);
+            }
+        }
+        let turn_index = snap.turn_count as u64;
+        snap.turn_count += 1;
+        Ok(turn_index)
     }
 
     async fn update_metadata(

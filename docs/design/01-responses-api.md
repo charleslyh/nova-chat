@@ -15,12 +15,12 @@
 | `POST` | `/v1/responses/{id}/cancel` | 取消在途生成 | FR-7 |
 | `DELETE` | `/v1/responses/{id}` | 删除已存内容 | FR-21 |
 | `POST` | `/v1/tenants/{tenant}/purge` | 租户级批量清除（需管理凭据） | FR-21 |
-| `GET` | `/health` | 探活（含上下文库状态与 accepting 标志） | OR-3 |
+| `GET` | `/health` | 探活（含持久存储状态与 accepting 标志） | OR-3 |
 | `POST` | `/v1/admin/{read_only,pending_limit}` | 运行时降级与过载阈值 | INV-32, FR-33 |
 **已删除**：
 
 - 全部 `/v1/sessions/*` 与 `/v1/admin/trim_hot` —— 随会话资源与冷层一并移除（D20）。
-- `/v1/agent/{claim,heartbeat,append,complete}` —— 外部执行端拉取协议。D25 起生成由**独立执行进程 `nova-agentd-mock`** 经 `ResponseLedger` 端口直连共享账本领活（claim 全局），该 HTTP 协议不再存在。执行侧的 FR-4~6 仍有效，由执行工作循环满足，而非任何 HTTP 端点。
+- `/v1/agent/{claim,heartbeat,append,complete}` —— 外部执行端拉取协议。D25 起生成由**独立执行进程 `mock-agentd`** 经 `ResponseLedger` 端口直连共享账本领活（claim 全局），该 HTTP 协议不再存在。执行侧的 FR-4~6 仍有效，由执行工作循环满足，而非任何 HTTP 端点。
 
 ---
 
@@ -31,7 +31,7 @@
 ```mermaid
 %%{init: {"flowchart": {"curve": "basis", "rankSpacing": 60, "nodeSpacing": 26}}}%%
 flowchart LR
-    create["POST /v1/responses"] --> ledger["ledger.create<br/>+ 写上下文库"]
+    create["POST /v1/responses"] --> ledger["ledger.create（仅元数据）"]
     ledger --> ev0["append response.created (seq 0)"]
     ev0 --> mode{"模式"}
     mode -->|"stream:true"| sse["同连接 SSE"]
@@ -121,7 +121,7 @@ data: {"sequence_number":3,"type":"response.output_text.delta","item_id":"msg_1"
 | `409` | attempt 已被取代、已达终态仍取消 | |
 | `410` | 续订位点已驱逐或超保留窗口 | **无恢复路径**（INV-40） |
 | `429` | 过载 | 可重试 |
-| `503` | 只读降级、优雅停机中、**上下文库不可用** | 拒写而非静默不存（INV-46） |
+| `503` | 只读降级、优雅停机中、**持久存储不可用** | 拒写而非静默不存（INV-46） |
 
 ### 6.1 为何链错误是 400 而非 404
 
@@ -152,7 +152,7 @@ axum 的 `Json<T>` 提取器对反序列化失败返回 `422`。为守住「一�
 
 单次生成事件数超过环容量时，**驱逐最旧并抬高驱逐水位**，而非拒绝追加。
 
-理由：拒绝追加会把「订阅缓冲不足」升级为「生成失败」，代价过大。驱逐则生成继续、终态输出完整写入上下文库（两者是独立写入路径），只有落后的订阅者收到 `410`。
+理由：拒绝追加会把「订阅缓冲不足」升级为「生成失败」，代价过大。驱逐则生成继续、终态输出完整写入会话主快照（两者是独立写入路径），只有落后的订阅者收到 `410`。
 
 节点级日志总数上限是另一回事——那里**拒绝新建**，用于保护内存。
 

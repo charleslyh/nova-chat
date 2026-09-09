@@ -104,4 +104,20 @@ impl ResponseEventLog for MemEventLogClient {
             ))),
         }
     }
+
+    async fn remove(&self, response_id: &ResponseId) -> Result<(), EventLogError> {
+        match event_rpc(
+            &self.rpc,
+            Request::EventLogRemove {
+                response_id: response_id.clone(),
+            },
+        )
+        .await?
+        {
+            Response::EventLogRemove => Ok(()),
+            other => Err(EventLogError::Internal(format!(
+                "unexpected rpc response {other:?}"
+            ))),
+        }
+    }
 }

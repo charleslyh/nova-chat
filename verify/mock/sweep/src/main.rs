@@ -9,9 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use nova_responses::{
-    ContextStore, ConversationStore, CountingMetrics, ResponseEventLog, ResponseLedger,
-};
+use nova_responses::{ConversationStore, CountingMetrics, ResponseEventLog, ResponseLedger};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -34,7 +32,6 @@ struct Args {
 struct Backend {
     ledger: Arc<dyn ResponseLedger>,
     event_log: Arc<dyn ResponseEventLog>,
-    context: Arc<dyn ContextStore>,
     /// Reaping is a terminal transition, so it owes the conversation a marker
     /// release — and it is the only release a reaped response gets, since its
     /// holder is gone and the fence has moved (D28).
@@ -49,7 +46,6 @@ async fn mount_mem(args: &Args) -> Result<Backend> {
     Ok(Backend {
         ledger: world.ledger.clone(),
         event_log: world.event_log.clone(),
-        context: world.context.clone(),
         conversation: world.conversation.clone(),
     })
 }
@@ -70,7 +66,6 @@ async fn main() -> Result<()> {
     nova_responses_sweep::spawn(nova_responses_sweep::SweepDeps {
         ledger: backend.ledger,
         event_log: backend.event_log,
-        context: backend.context,
         conversations: backend.conversation,
         now: Arc::new(|| {
             std::time::SystemTime::now()

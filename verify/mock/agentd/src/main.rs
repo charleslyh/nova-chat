@@ -10,9 +10,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use nova_agent_runtime::{AgentRuntime, AgentRuntimeConfig, AgentRuntimeDeps};
-use nova_responses::{
-    ChainLimits, ContextStore, ConversationStore, ResponseEventLog, ResponseLedger,
-};
+use nova_responses::{ChainLimits, ConversationStore, ResponseEventLog, ResponseLedger};
 use tracing::info;
 
 use mock_agentd::{
@@ -80,7 +78,6 @@ struct Args {
 struct Backend {
     ledger: Arc<dyn ResponseLedger>,
     event_log: Arc<dyn ResponseEventLog>,
-    context: Arc<dyn ContextStore>,
     conversation: Arc<dyn ConversationStore>,
 }
 
@@ -130,7 +127,6 @@ async fn mount_mem(args: &Args) -> Result<Backend> {
     Ok(Backend {
         ledger: world.ledger.clone(),
         event_log: world.event_log.clone(),
-        context: world.context.clone(),
         conversation: world.conversation.clone(),
     })
 }
@@ -172,7 +168,6 @@ async fn main() -> Result<()> {
         AgentRuntimeDeps {
             ledger: backend.ledger,
             event_log: backend.event_log,
-            context: backend.context,
             runner,
             now: Arc::new(now_ms),
             conversations: Some(backend.conversation),

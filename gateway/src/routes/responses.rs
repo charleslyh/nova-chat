@@ -11,14 +11,12 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use nova_responses::protocol::{preflight_unsupported, CreateResponseRequest};
-use nova_responses::{
-    ContextError, ConversationId, IdempotencyKey, ResponseId, StoredResponse, TenantId,
-};
+use nova_responses::{ConversationId, IdempotencyKey, ResponseId, ResponseRecord, TenantId};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::{
-    api_error, bad_request, map_context_error, map_conversation_error, map_ledger_error, not_found,
+    api_error, bad_request, map_conversation_error, map_ledger_error, not_found,
 };
 use crate::routes::shared::tenant_or_reject;
 use nova_responses::service::{ContextSource, CreateResult, ServiceError};
@@ -43,7 +41,6 @@ fn parse_id(raw: &str) -> Result<ResponseId, Response> {
 /// status of each port error (INV-43).
 fn map_service_error(err: &ServiceError) -> Response {
     match err {
-        ServiceError::Context(e) => map_context_error(e),
         ServiceError::Ledger(e) => map_ledger_error(e),
         ServiceError::EventLog(e) => {
             let (status, code, message) = map_event_log_error(e);
@@ -169,7 +166,7 @@ pub async fn create(
                 .wait_terminal(&tenant, &response_id, &record)
                 .await
             {
-                Ok(record) => Json(response_object(&record)).into_response(),
+                Ok(value) => Json(value).into_response(),
                 Err(e) => map_service_error(&e),
             }
         }
@@ -208,7 +205,7 @@ pub async fn retrieve(
     }
 
     match state.service.retrieve(&tenant, &response_id).await {
-        Ok(Some(record)) => Json(response_object(&record)).into_response(),
+        Ok(Some(value)) => Json(value).into_response(),
         Ok(None) => not_found(),
         Err(e) => map_service_error(&e),
     }
@@ -224,20 +221,13 @@ async fn stream_impl(
     let last_event_id = headers.get("last-event-id").and_then(|v| v.to_str().ok());
     let cursor = resolve_cursor(starting_after, last_event_id);
 
-    // Ownership is verified before any events are exposed. When the response was
-    // not stored there is no record to check against, so fall through: the id is
-    // unguessable and its buffer is short-lived.
-    match state.context.get(&tenant, &response_id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            if let Ok(Some(record)) = state.ledger.get(&response_id).await {
-                if &record.tenant_id != &tenant {
-                    return not_found();
-                }
-            }
+    // Ownership is verified before any events are exposed, via the ledger record
+    // (D30). The response itself is reconstructable from the event stream; a
+    // missing ledger record means the response never existed or was deleted.
+    if let Ok(Some(record)) = state.ledger.get(&response_id).await {
+        if &record.tenant_id != &tenant {
+            return not_found();
         }
-        Err(ContextError::Unavailable) => {} // reads may proceed
-        Err(e) => return map_context_error(&e),
     }
 
     open_stream(state.event_log.clone(), response_id, cursor).await
@@ -259,7 +249,7 @@ pub async fn cancel(
     };
 
     match state.service.cancel(&tenant, &response_id).await {
-        Ok(Some(record)) => Json(response_object(&record)).into_response(),
+        Ok(Some(value)) => Json(value).into_response(),
         Ok(None) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -302,10 +292,8 @@ pub async fn delete(
     }
 }
 
-/// Response object in protocol shape.
-///
-/// `instructions` is echoed here — that is its only role. It is never part of
-/// `input`/`output` items and never enters a chain (INV-49).
-pub fn response_object(record: &StoredResponse) -> Value {
-    record.to_response_value()
+/// Response object in protocol shape for a freshly created response (empty
+/// output). `instructions` is echoed here — that is its only role (INV-49).
+pub fn response_object(record: &ResponseRecord) -> Value {
+    record.to_response_value(&[])
 }

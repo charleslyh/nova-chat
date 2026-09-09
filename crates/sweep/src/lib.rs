@@ -12,20 +12,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nova_responses::{
-    AppendEvent, ContextStore, ConversationStore, MetricsSink, ResponseEventKind,
-    ResponseEventLog, ResponseLedger, ResponseStatus,
+    AppendEvent, ConversationStore, MetricsSink, ResponseEventKind, ResponseEventLog,
+    ResponseLedger, ResponseStatus,
 };
 use tracing::warn;
 
 const TICK: Duration = Duration::from_secs(2);
-/// Bounded per pass so one tick cannot turn into a long transaction.
-const SWEEP_BATCH: usize = 500;
 
 /// The ports and knobs the sweep loop needs, independent of any HTTP surface.
 pub struct SweepDeps {
     pub ledger: Arc<dyn ResponseLedger>,
     pub event_log: Arc<dyn ResponseEventLog>,
-    pub context: Arc<dyn ContextStore>,
     /// Reaping is a terminal transition, so it owes the conversation a marker
     /// release (D28). It is also the **only** release a reaped response gets: its
     /// holder is gone and the fence has moved, so that holder's own terminal path
@@ -128,12 +125,9 @@ async fn tick(deps: &SweepDeps) -> anyhow::Result<()> {
         Err(e) => warn!(error = %e, "event log sweep failed"),
     }
 
-    // 3. Clear expired stored content (FR-22 / OR-5).
-    match deps.context.sweep_expired(now, SWEEP_BATCH).await {
-        Ok(0) => {}
-        Ok(n) => deps.metrics.incr("content_expired", n).await,
-        Err(e) => warn!(error = %e, "content sweep failed"),
-    }
+    // Under D30 the durable content lives in the conversation snapshot (no
+    // per-response expiry to sweep); its retention policy is an operator-side
+    // concern on the conversation store, not this loop.
 
     Ok(())
 }

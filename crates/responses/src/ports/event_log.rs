@@ -31,6 +31,12 @@ pub enum EventLogError {
 
 /// Per-response bounded event buffer.
 ///
+/// Under D30 this is the **short-lived carrier of a response's own record**: a
+/// completed response's object (including its output) is reconstructable by
+/// replaying this stream until the retention window elapses, after which
+/// retrieval yields `Expired` (no cold tier to fall back to, INV-40). It never
+/// substitutes for the durable conversation snapshot.
+///
 /// Deliberately absent compared to the previous session-scoped channel:
 /// `read_from`, gap reporting, trimming and any cold tier. Sequence numbers are
 /// 0-based and contiguous (INV-11), which is exactly what makes those
@@ -76,4 +82,7 @@ pub trait ResponseEventLog: Send + Sync {
 
     /// Drop buffers whose retention window has elapsed. Returns the count.
     async fn sweep_expired(&self, now_ms: u64) -> Result<u64, EventLogError>;
+
+    /// Remove a response's buffer immediately (record-level delete, D30).
+    async fn remove(&self, response_id: &ResponseId) -> Result<(), EventLogError>;
 }

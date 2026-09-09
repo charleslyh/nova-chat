@@ -10,7 +10,7 @@ use axum::Json;
 use nova_responses::TenantId;
 use serde::Deserialize;
 
-use crate::error::{api_error, bad_request, map_context_error, map_conversation_error};
+use crate::error::{api_error, bad_request, map_conversation_error, map_ledger_error};
 use crate::state::AppState;
 
 fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
@@ -82,38 +82,33 @@ pub async fn purge_tenant(
     };
 
     // Erasure must cover every store holding tenant data, or "purged" would be a
-    // false claim. Conversations first, then content: `conversation_events` goes
-    // with conversations through CASCADE.
+    // false claim. Conversations first (their snapshots and event streams go with
+    // them), then the tenant's response records (D30).
     let conversations = match state.conversation_store.delete_by_tenant(&tenant).await {
         Ok(n) => n,
         Err(e) => return map_conversation_error(&e),
     };
-    match state.context.delete_by_tenant(&tenant).await {
+    match state.ledger.delete_by_tenant(&tenant).await {
         Ok(deleted) => {
             state.metrics.incr("tenant_purges", 1).await;
             Json(serde_json::json!({
                 "ok": true,
                 "tenant": tenant.as_str(),
-                // `deleted` keeps its meaning (response records) so existing
-                // callers are unaffected.
                 "deleted": deleted,
                 "conversations_deleted": conversations,
             }))
             .into_response()
         }
-        Err(e) => map_context_error(&e),
+        Err(e) => map_ledger_error(&e),
     }
 }
 
 /// GET /health
 pub async fn health(State(state): State<AppState>) -> Response {
-    // Store liveness is part of health: a node that cannot store must not look
-    // healthy, because it will refuse every `store: true` create (INV-46). Each
-    // store is probed and reported separately — `ok` alone tells an operator to
-    // look, the breakdown tells them where.
-    let context_ok = state.context.health().await.is_ok();
+    // Store liveness is part of health: a node that cannot reach the durable
+    // conversation store must not look healthy (INV-46).
     let conversation_ok = state.conversation_store.health().await.is_ok();
-    let ok = context_ok && conversation_ok;
+    let ok = conversation_ok;
 
     let in_flight = state.ledger.in_flight().await.unwrap_or(0);
     let status = if ok {
@@ -130,7 +125,6 @@ pub async fn health(State(state): State<AppState>) -> Response {
             "read_only": state.ledger.is_read_only(),
             "in_flight": in_flight,
             "stores": {
-                "context": context_ok,
                 "conversation": conversation_ok,
             },
         })),

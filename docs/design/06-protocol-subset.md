@@ -35,8 +35,8 @@
 
 | 内部术语 | 含义 |
 |---|---|
-| 物化快照（materialised snapshot） | 创建时把祖先条目扁平拷贝进 `context`（D24） |
-| 在途缓冲（in-flight buffer） | 共享载体上有界的事件缓冲（Redis Streams / mem-server），瞬态 |
+| 会话主快照（conversation snapshot） | 会话持有的持久物化条目列表，每轮终态 delta 追加（D30） |
+| 在途缓冲（in-flight buffer） | 共享载体上有界的事件缓冲（mem-server / 接入方存储），瞬态（TTL） |
 | 栅栏（fence / attempt） | 防止并发或过期写入的尝试号 |
 | 领取（claim） | 执行端从共享 ledger **全局**认领待执行响应 |
 
@@ -52,8 +52,8 @@
 | `store` | bool | **`true`** | 是否持久化本次条目 |
 | `stream` | bool | `false` | 同连接 SSE |
 | `background` | bool | `false` | 立即返回，另行订阅 |
-| `previous_response_id` | string | — | 上一环标识；服务端据此拼接历史 |
-| `conversation` | string \| `{id}` | — | 会话容器标识；服务端解析其链尾指针后拼历史。**与 `previous_response_id` 互斥**（同时提供返回 400） |
+| `previous_response_id` | string | — | 上一环标识；服务端据此解析锚点续接历史 |
+| `conversation` | string \| `{id}` | — | 会话容器标识；服务端读会话主快照续接历史。**与 `previous_response_id` 互斥**（同时提供返回 400） |
 | `max_output_tokens` | int > 0 | — | |
 | `metadata` | map<string,string> | — | ≤ 16 项，键 ≤ 64B，值 ≤ 512B |
 | `tools` | 数组 | — | 仅 `type: "function"` |
@@ -68,7 +68,7 @@
 | `context_management` | `400 unsupported_parameter` | 自行控制链长；超限会明确报错 |
 | `prompt` | `400 unsupported_parameter` | 直接传 `instructions` 与 `input` |
 
-> `conversation` 自本版起**不再是拒绝项**（D27）：它作为会话容器指针被接受，服务端据其链尾指针拼接历史。`conversation` 的 `items` **子资源**（`GET/POST/DELETE /v1/conversations/{id}/items`）仍不在子集内——容器不持有条目，读历史走自研的 session transcript（见 §9）。
+> `conversation` 自本版起**不再是拒绝项**（D27）：它作为会话容器被接受，服务端读其持久主快照续接历史（D30）。`conversation` 的 `items` **子资源**（`GET/POST/DELETE /v1/conversations/{id}/items`）仍不在子集内——主快照是服务端维护的物化状态，不暴露条目级增删，读历史走自研的 transcript（见 §9）。
 
 其余未列出的上游参数返回 `400 invalid_request`，错误信息**指明字段名**。
 
@@ -198,7 +198,8 @@
 
 | 项 | 归属 |
 |---|---|
-| 完整事件历史（transcript） | **调用方**。服务只缓冲在途事件 |
+| 完整对话历史（transcript） | **服务端**：会话主快照（D30），`GET /conversations/{id}/transcript` 一次取回 |
+| 完整事件历史 | **调用方**。response 事件流只缓冲 TTL 内事件 |
 | 渲染中间态（工具进度） | **调用方**从实时流自取。`GET` 返回生成对象的**当前状态**：未完成时返回 `status: in_progress` 的部分对象（**不失败**），终态返回完整对象 |
 | 思考过程（reasoning） | **服务端持久化**：随生成对象（`GET` 的 `reasoning` 字段）与 transcript 一起返回，刷新后仍可见；**不进模型上下文** |
 | `file_id` 归属 | **文件服务** |
@@ -220,36 +221,34 @@ CI 会定期拉取上游做字段级 diff 并**告警**。该检查的性质是�
 
 ---
 
-## 9. 会话容器（官方兼容）与会话层（自研扩展）
+## 9. 会话容器（官方兼容 + 自研子资源）
 
-本节把两块容易混为一谈的面**分开标注**：conversation 是官方协议的兼容实现（D27），session 是本服务自研的扩展面（D26）。二者都不持有条目——对话内容的唯一真相源仍是 §5 的物化链。
+conversation 是**唯一**的会话资源（D28 吸收自研 session 后，D30 再扩展持久主快照）。官方 SDK 只谈 conversation；多端同步能力（轮次锁 + 事件流）已下沉到 conversation 数据层，不依赖任何自研的 session 面。
 
-### 9.1 conversation 端点（官方兼容，D27）
+### 9.1 conversation 端点（官方兼容，D27/D28）
 
 | 端点 | 说明 |
 |---|---|
 | `POST /v1/conversations` | 建容器；`metadata` 整体替换语义（键可被移除） |
-| `GET /v1/conversations/{id}` | 读取 |
+| `GET /v1/conversations` | 列出本租户的会话（自研扩展） |
+| `GET /v1/conversations/{id}` | 读取（官方对象纯净：不暴露 `last`/`active`） |
 | `POST /v1/conversations/{id}` | 更新 metadata（官方用 POST 而非 PATCH） |
 | `DELETE /v1/conversations/{id}` | 删容器；**不级联**删响应记录 |
 
 - `metadata` 上限与 responses 一致：≤ 16 项，键 ≤ 64B，值 ≤ 512B。
-- **不实现 `items` 子资源**：容器只存「指向响应链尾的指针」（`last_response_id`），没有条目可增删。
-- 创建响应时携带 `conversation`，服务端把它解析为链尾指针，再走 §5 的同一条链装配——**与 `previous_response_id` 互斥**。
+- **不实现官方 `items` 子资源**：会话持有服务端维护的持久主快照（D30），不暴露条目级增删；读历史走 transcript。
+- 创建响应时携带 `conversation`，服务端读会话主快照续接历史——**与 `previous_response_id` 互斥**。
 
-### 9.2 session 端点（自研，非官方协议）
+### 9.2 自研子资源（非官方协议）
 
-`/v1/sessions` 是**本服务自有**的面，官方 SDK 不感知它，接入方须按本表约定调用：
+以下子资源挂载在 conversation 下，是本服务自有的面，官方 SDK 不感知，接入方须按本表约定调用：
 
 | 端点 | 说明 |
 |---|---|
-| `POST /v1/sessions` | 建会话；`conversation` 缺省时新建容器，否则绑定既有（一个容器至多一个会话，冲突 `409`） |
-| `GET /v1/sessions/{id}` | `status`（`idle`/`busy`）+ `active_response_id` |
-| `DELETE /v1/sessions/{id}` | 删会话与事件流；**不删关联容器** |
-| `GET /v1/sessions/{id}/events` | SSE 订阅：先回放持久历史再转实时，游标 `starting_after` / `Last-Event-ID` |
-| `POST /v1/sessions/{id}/events` | 业务事件，与轮次事件同序号空间严格保序；**不进入模型上下文** |
-| `GET /v1/sessions/{id}/transcript` | 单次取回完整对话历史（`object: "list"` + `data`，无分页） |
+| `GET /v1/conversations/{id}/transcript` | 单次取回完整对话历史（读主快照，`object: "list"` + `data`，无分页） |
+| `GET /v1/conversations/{id}/events` | SSE 订阅：先回放持久历史再转实时，游标 `starting_after` / `Last-Event-ID` |
+| `POST /v1/conversations/{id}/events` | 业务事件，与轮次事件同序号空间严格保序；**不进入模型上下文** |
 
-事件命名空间为 `session.*`（`session.created` / `session.turn_started` / `session.turn_completed` / `session.response_deleted` / `session.business`），**不复用**上游的 `response.*` 命名空间。
+事件命名空间为 `conversation.*`（`conversation.turn_started` / `conversation.turn_completed` / `conversation.response_deleted` / `conversation.business`），**不复用**上游的 `response.*` 命名空间。
 
-**没有自研的「发起轮次」端点**：轮次一律经标准 `POST /v1/responses { conversation }`，服务端据容器找到所属会话并取锁——官方 SDK 因此无需任何扩展字段即可参与多端同步。
+**没有自研的「发起轮次」端点**：轮次一律经标准 `POST /v1/responses { conversation }`，服务端据容器取轮次锁并读主快照——官方 SDK 因此无需任何扩展字段即可参与多端同步。

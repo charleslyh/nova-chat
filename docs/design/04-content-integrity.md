@@ -55,13 +55,13 @@ pub fn canonical_output_text<'a, I: IntoIterator<Item = &'a str>>(deltas: I) -> 
 |---|---|
 | 算法 | HMAC-SHA256 |
 | 标记 | `hmac-sha256-v1`（随记录保存，供轮换识别） |
-| 签名输入 | `canonical_items(input) + "\|" + canonical_items(output)` |
+| 签名输入 | `canonical_items(input_items)`（record 只存 input；output 在会话快照，见 §5.1） |
 | 比较 | `subtle::ConstantTimeEq` |
 | 密钥来源 | **仅环境变量** `NOVA_INTEGRITY_KEY`，≥ 16 字节 |
 
 ### 3.1 为何实现放在领域层
 
-`HmacSha256Integrity` 位于 `crates/core`，而非各适配器内。
+`HmacSha256Integrity` 位于 `crates/responses`（领域层），而非各适配器内。
 
 它是纯计算、无 I/O，不属于「承载产品」。更关键的是：**若在 mem 与 sql 各写一份，两者会漂移**，表现为切换后端后出现虚假失配。一份实现从构造上排除该风险。
 
@@ -91,16 +91,16 @@ pub fn canonical_output_text<'a, I: IntoIterator<Item = &'a str>>(deltas: I) -> 
 ```
 读取 → 重算标签 → 比对
   ├─ 一致 → 正常返回
-  └─ 不一致 → ContextError::IntegrityMismatch → 500 + 计入指标
+  └─ 不一致 → ConversationError::IntegrityMismatch → 500 + 计入指标
 ```
 
 **不返回可疑内容**。失配意味着存储层已不可信，返回内容等于把污染数据交给调用方。
 
 指标 `integrity_mismatch` 应配告警：单次失配可能是硬件问题，连续失配意味着存储层被篡改。
 
-### 5.1 快照读取时校验
+### 5.1 会话快照读取时校验
 
-`resolve_chain` 读取时调用 `verify` 校验当前环节的快照——物化后是单次读（不再逐环回溯）。代价是每次读算一次 HMAC（数 KB 内容约微秒级，见 `parameters.md` §5.1），换取的是**被篡改的历史不会进入模型上下文**。
+`ConversationStore::read_snapshot` 读取时调用 `verify` 校验会话主快照——单次读（不再逐环回溯）。代价是每次读算一次 HMAC（数 KB 内容约微秒级），换取的是**被篡改的历史不会进入模型上下文**。
 
 ---
 
@@ -110,6 +110,6 @@ pub fn canonical_output_text<'a, I: IntoIterator<Item = &'a str>>(deltas: I) -> 
 |---|---|
 | 规范化 + HMAC（数 KB） | < 1ms（微秒量级） |
 | 每次生成签名次数 | 2（创建时 + 终态时） |
-| 每次快照固化校验 | 1（单次解析前驱快照） |
+| 每次快照读取校验 | 1（单次读会话主快照） |
 
 在 70/s 峰值下可忽略。这也是为何默认开启：默认关闭会让「有校验」变成例外而非常态。

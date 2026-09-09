@@ -1,19 +1,18 @@
-//! Conversations 能力层：用例编排，无 axum 依赖（D27）。
+//! Conversations 能力层：用例编排，无 axum 依赖。
 //!
-//! 会话容器只是「指向响应链尾的指针」。本层负责 CRUD 编排与写前探活，以及把
-//! 会话标识解析为链尾 `ResponseId`——这是 `/v1/responses` 携带 `conversation`
-//! 时唯一需要的解析步骤，之后上下文装配仍走既有 `resolve_chain`（D24 零改动）。
+//! 会话是对话内容的**长期权威来源**（D30）：它存链尾指针、轮次锁、事件流，以及
+//! 物化的主快照（每轮 delta 追加）。`transcript` 与生成入口的上下文装配都从这里读。
+//! 本层负责 CRUD 编排，以及把会话标识解析为链尾 `ResponseId`——这是 `/v1/responses`
+//! 携带 `conversation` 时唯一需要的解析步骤，之后上下文装配走 `read_snapshot`。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::{
-    ContextError, ContextStore, Conversation, ConversationError, ConversationEvent,
-    ConversationEventKind, ConversationId, ConversationStore, MetricsSink, ResolvedContext,
-    ResponseId, ResponseStatus, TenantId,
+    Conversation, ConversationError, ConversationEvent, ConversationEventKind, ConversationId,
+    ConversationStore, MetricsSink, ResolvedContext, ResponseId, ResponseItem, ResponseStatus,
+    TenantId, Usage,
 };
-
-use crate::config::Config;
 
 /// 会话容器的链尾解析结果。
 ///
@@ -29,41 +28,29 @@ pub enum ConversationTail {
 }
 
 /// 读取对话历史的失败原因。
-///
-/// 容器端口与内容端口的错误分开保留：容器不存在是调用方问题，内容库不可用是服务
-/// 端降级，接入层要据此给出不同状态码。
 #[derive(Debug, thiserror::Error)]
 pub enum TranscriptError {
     #[error(transparent)]
     Conversation(#[from] ConversationError),
-    #[error(transparent)]
-    Context(#[from] ContextError),
 }
 
 /// Conversations 用例编排。
 pub struct ConversationsService {
     conversations: Arc<dyn ConversationStore>,
-    /// 读对话历史用：容器只存链尾指针，内容在响应链的物化快照里（D24）。
-    context: Arc<dyn ContextStore>,
     now: Arc<dyn Fn() -> u64 + Send + Sync>,
     metrics: Arc<dyn MetricsSink>,
-    cfg: Arc<Config>,
 }
 
 impl ConversationsService {
     pub fn new(
         conversations: Arc<dyn ConversationStore>,
-        context: Arc<dyn ContextStore>,
         now: Arc<dyn Fn() -> u64 + Send + Sync>,
         metrics: Arc<dyn MetricsSink>,
-        cfg: Arc<Config>,
     ) -> Self {
         Self {
             conversations,
-            context,
             now,
             metrics,
-            cfg,
         }
     }
 
@@ -105,8 +92,9 @@ impl ConversationsService {
             .await
     }
 
-    /// 删除容器。**不级联删除响应记录**——与 D24 的记录级删除一致，也与官方
-    /// 「Items in the conversation will not be deleted」一致。
+    /// 删除容器。**不级联删除会话快照里的内容？**——D30 下快照就是会话自己的内容，
+    /// 删会话即删快照；但响应记录不级联（与 D24 的记录级删除、官方「Items in the
+    /// conversation will not be deleted」的措辞需按 D30 语义重估，见 D30 正文）。
     pub async fn delete(
         &self,
         tenant: &TenantId,
@@ -120,9 +108,6 @@ impl ConversationsService {
     }
 
     /// 解析链尾，供生成入口取上下文锚点。
-    ///
-    /// 容器不存在返回 `NotFound`，由接入层翻译；绝不静默降级为空上下文——那会让
-    /// 打错 id 的调用方拿到一个「失忆」的回复而无从察觉。
     pub async fn resolve_tail(
         &self,
         tenant: &TenantId,
@@ -137,6 +122,45 @@ impl ConversationsService {
             None => ConversationTail::Empty,
             Some(last) => ConversationTail::At(last),
         })
+    }
+
+    /// 读会话物化主快照（D30）。生成入口用它装配 LLM 上下文，`transcript` 用它渲染。
+    pub async fn read_snapshot(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+    ) -> Result<ResolvedContext, ConversationError> {
+        self.conversations.read_snapshot(tenant, id).await
+    }
+
+    /// 终态时把本轮 input+output 追加进会话快照（D30）。条目来自执行端最终产出，
+    /// **不是**事件流回放（INV-48）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_turn(
+        &self,
+        tenant: &TenantId,
+        id: &ConversationId,
+        response_id: &ResponseId,
+        input_items: Vec<ResponseItem>,
+        output_items: Vec<ResponseItem>,
+        reasoning: Option<String>,
+        usage: Usage,
+        status: ResponseStatus,
+    ) -> Result<u64, ConversationError> {
+        let now_ms = (self.now)();
+        self.conversations
+            .append_turn(
+                tenant,
+                id,
+                response_id,
+                input_items,
+                output_items,
+                reasoning,
+                usage,
+                status,
+                now_ms,
+            )
+            .await
     }
 
     /// 轮次终态后推进链尾指针。**后写胜出**，见端口文档。
@@ -218,26 +242,16 @@ impl ConversationsService {
         self.conversations.list(tenant).await
     }
 
-    /// 一次取回容器的完整对话历史。
+    /// 一次取回容器的完整对话历史（D30）。
     ///
-    /// 用 `resolve_chain` 而非分页遍历：链尾响应已携带全部祖先条目的扁平副本
-    /// （D24），所以「完整历史」本来就是一次读取。这也是不实现官方 `items`
-    /// 子资源的原因——那会把分页强加给每一个只想恢复页面的调用方。
-    ///
-    /// 沿用 `chain_limits` 是安全的而非将就：任何一轮生成都在创建时受同一组上界
-    /// 约束，超限的链根本不可能被创建出来，所以这里不会因为上界而读不全。
+    /// 直接读会话物化主快照：它本就是完整历史的单一权威来源，一次读取即得全部。
+    /// 这也是不实现官方 `items` 子资源的原因——那会把分页强加给每一个只想恢复
+    /// 页面的调用方。
     pub async fn transcript(
         &self,
         tenant: &TenantId,
         id: &ConversationId,
     ) -> Result<ResolvedContext, TranscriptError> {
-        match self.resolve_tail(tenant, id).await? {
-            // 空容器返回空历史而非报错：刚建好的会话是正常状态。
-            ConversationTail::Empty => Ok(ResolvedContext::default()),
-            ConversationTail::At(last) => Ok(self
-                .context
-                .resolve_chain(tenant, &last, self.cfg.chain_limits)
-                .await?),
-        }
+        Ok(self.conversations.read_snapshot(tenant, id).await?)
     }
 }

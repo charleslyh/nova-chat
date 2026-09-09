@@ -23,7 +23,7 @@ pub struct AgentTask {
     /// (the caller's declaration); provider translation is the runner's job.
     pub tools: Vec<Tool>,
     pub tool_choice: Option<ToolChoice>,
-    /// Initial conversation (`record.context + input_items`).
+    /// Initial conversation (`snapshot.items + input_items`, D30).
     pub items: Vec<ResponseItem>,
     pub provenance: RequestProvenance,
     pub max_tool_rounds: usize,

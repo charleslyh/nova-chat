@@ -11,19 +11,28 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nova_responses::{
-    AbortedClaim, AgentId, Attempt, ClaimedResponse, CreateOutcome, IdempotencyKey, LedgerError,
-    ResponseId, ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
+    canonical_items, AbortedClaim, AgentId, Attempt, ClaimedResponse, ContentIntegrity,
+    CreateOutcome, IdempotencyKey, LedgerError, ResponseId, ResponseItem, ResponseLedger,
+    ResponseRecord, ResponseStatus, TenantId, Usage,
 };
 
 use crate::store::MemStore;
 
 pub struct MemResponseLedger {
     store: Arc<MemStore>,
+    integrity: Option<Arc<dyn ContentIntegrity>>,
 }
 
 impl MemResponseLedger {
     pub fn new(store: Arc<MemStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            integrity: None,
+        }
+    }
+
+    pub fn with_integrity(store: Arc<MemStore>, integrity: Option<Arc<dyn ContentIntegrity>>) -> Self {
+        Self { store, integrity }
     }
 
     pub fn store(&self) -> &Arc<MemStore> {
@@ -66,7 +75,7 @@ impl MemResponseLedger {
 impl ResponseLedger for MemResponseLedger {
     async fn create(
         &self,
-        record: StoredResponse,
+        record: ResponseRecord,
         idempotency_key: IdempotencyKey,
         _now_ms: u64,
     ) -> Result<CreateOutcome, LedgerError> {
@@ -92,6 +101,16 @@ impl ResponseLedger for MemResponseLedger {
             // Refuse rather than evict: dropping an existing record would break
             // a chain silently (INV-43).
             return Err(LedgerError::Unavailable);
+        }
+        let mut record = record;
+        // Sign the input items before storing, so tampering is detectable (CR-13).
+        if let Some(integrity) = &self.integrity {
+            let canonical = canonical_items(&record.input_items);
+            let tag = integrity
+                .sign(&canonical)
+                .map_err(|e| LedgerError::Internal(e.to_string()))?;
+            record.integrity = Some(tag);
+            record.integrity_alg = Some(integrity.alg().to_string());
         }
         let response_id = record.response_id.clone();
         g.queued.push_back(response_id.clone());
@@ -281,8 +300,31 @@ impl ResponseLedger for MemResponseLedger {
         Ok(())
     }
 
-    async fn get(&self, response_id: &ResponseId) -> Result<Option<StoredResponse>, LedgerError> {
+    async fn get(&self, response_id: &ResponseId) -> Result<Option<ResponseRecord>, LedgerError> {
         Ok(self.store.lock().records.get(response_id).cloned())
+    }
+
+    async fn delete(&self, response_id: &ResponseId) -> Result<bool, LedgerError> {
+        self.guard_writable()?;
+        let mut g = self.store.lock();
+        Ok(g.remove_record(response_id).is_some())
+    }
+
+    async fn delete_by_tenant(&self, tenant: &TenantId) -> Result<u64, LedgerError> {
+        self.guard_writable()?;
+        let mut g = self.store.lock();
+        let ids: Vec<ResponseId> = g
+            .by_tenant
+            .get(tenant)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut removed = 0u64;
+        for id in ids {
+            if g.remove_record(&id).is_some() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     async fn check_attempt(
@@ -327,5 +369,22 @@ impl MemResponseLedger {
             .keys()
             .filter(|(id, _)| id == response_id)
             .count()
+    }
+
+    /// Test hook: corrupt stored input without updating the tag, to prove
+    /// tampering is detectable (CR-13).
+    pub fn tamper_for_test(&self, response_id: &ResponseId, replacement: Vec<ResponseItem>) -> bool {
+        let mut g = self.store.lock();
+        match g.records.get_mut(response_id) {
+            Some(rec) => {
+                rec.input_items = replacement;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn record_count(&self) -> usize {
+        self.store.lock().records.len()
     }
 }

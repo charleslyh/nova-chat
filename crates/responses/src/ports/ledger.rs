@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::context::{ResponseStatus, StoredResponse, Usage};
+use crate::context::{ResponseRecord, ResponseStatus, Usage};
 use crate::context::ResponseId;
 use crate::conversation::ConversationId;
 use crate::shared::{AgentId, Attempt, IdempotencyKey, TenantId};
@@ -22,7 +22,10 @@ pub enum CreateOutcome {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClaimedResponse {
-    pub record: StoredResponse,
+    /// Ledger metadata for the claimed response. Carries **no** history: the
+    /// snapshot to run against is read from the conversation store via
+    /// [`ResponseRecord::anchor`] (D30).
+    pub record: ResponseRecord,
     pub attempt: Attempt,
     pub exec_deadline_ms: u64,
 }
@@ -68,11 +71,13 @@ pub enum LedgerError {
 /// created response and its stored items can never disagree.
 #[async_trait]
 pub trait ResponseLedger: Send + Sync {
-    /// Persist a new response in `Queued` state. Must be atomic with the
-    /// context write when `record.stored` is true (INV-34).
+    /// Persist a new response in `Queued` state, carrying metadata only (D30):
+    /// the record holds no snapshot, so there is no context write to pair this
+    /// with at create time. The atomicity boundary moved to terminal time
+    /// (ledger `complete` + `ConversationStore::append_turn`, INV-34).
     async fn create(
         &self,
-        record: StoredResponse,
+        record: ResponseRecord,
         idempotency_key: IdempotencyKey,
         now_ms: u64,
     ) -> Result<CreateOutcome, LedgerError>;
@@ -130,7 +135,16 @@ pub trait ResponseLedger: Send + Sync {
         usage: Usage,
     ) -> Result<(), LedgerError>;
 
-    async fn get(&self, response_id: &ResponseId) -> Result<Option<StoredResponse>, LedgerError>;
+    async fn get(&self, response_id: &ResponseId) -> Result<Option<ResponseRecord>, LedgerError>;
+
+    /// Remove a response's record (record-level delete, D30). Returns whether a
+    /// record was removed. The conversation snapshot is **not** touched — the
+    /// inherited copy lives on there, exactly as "remove from the conversation"
+    /// requires.
+    async fn delete(&self, response_id: &ResponseId) -> Result<bool, LedgerError>;
+
+    /// Bulk-erase every response a tenant owns (FR-21).
+    async fn delete_by_tenant(&self, tenant: &TenantId) -> Result<u64, LedgerError>;
 
     /// Append fence validation (INV-6).
     async fn check_attempt(

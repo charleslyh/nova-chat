@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nova_responses::{
     AbortedClaim, AgentId, Attempt, ClaimedResponse, CreateOutcome, IdempotencyKey, LedgerError,
-    ResponseId, ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
+    ResponseId, ResponseLedger, ResponseRecord, ResponseStatus, TenantId, Usage,
 };
 
 use mock_server::proto::{ProtoError, Request, Response};
@@ -47,7 +47,7 @@ async fn ledger_rpc(rpc: &Rpc, req: Request) -> Result<Response, LedgerError> {
 impl ResponseLedger for MemLedgerClient {
     async fn create(
         &self,
-        record: StoredResponse,
+        record: ResponseRecord,
         idempotency_key: IdempotencyKey,
         now_ms: u64,
     ) -> Result<CreateOutcome, LedgerError> {
@@ -217,7 +217,7 @@ impl ResponseLedger for MemLedgerClient {
         }
     }
 
-    async fn get(&self, response_id: &ResponseId) -> Result<Option<StoredResponse>, LedgerError> {
+    async fn get(&self, response_id: &ResponseId) -> Result<Option<ResponseRecord>, LedgerError> {
         match ledger_rpc(
             &self.rpc,
             Request::LedgerGet {
@@ -227,6 +227,44 @@ impl ResponseLedger for MemLedgerClient {
         .await?
         {
             Response::Get(o) => Ok(o),
+            other => Err(LedgerError::Internal(format!(
+                "unexpected rpc response {other:?}"
+            ))),
+        }
+    }
+
+    async fn delete(&self, response_id: &ResponseId) -> Result<bool, LedgerError> {
+        if self.read_only.load(Ordering::SeqCst) {
+            return Err(LedgerError::ReadOnly);
+        }
+        match ledger_rpc(
+            &self.rpc,
+            Request::LedgerDelete {
+                response_id: response_id.clone(),
+            },
+        )
+        .await?
+        {
+            Response::Delete(removed) => Ok(removed),
+            other => Err(LedgerError::Internal(format!(
+                "unexpected rpc response {other:?}"
+            ))),
+        }
+    }
+
+    async fn delete_by_tenant(&self, tenant: &TenantId) -> Result<u64, LedgerError> {
+        if self.read_only.load(Ordering::SeqCst) {
+            return Err(LedgerError::ReadOnly);
+        }
+        match ledger_rpc(
+            &self.rpc,
+            Request::LedgerDeleteByTenant {
+                tenant: tenant.clone(),
+            },
+        )
+        .await?
+        {
+            Response::DeleteByTenant(n) => Ok(n),
             other => Err(LedgerError::Internal(format!(
                 "unexpected rpc response {other:?}"
             ))),

@@ -149,57 +149,46 @@ impl Usage {
     }
 }
 
-/// A persisted response record: the unit of both the ledger and the context
-/// store (they share one row / one transaction — D21 ①).
+/// A persisted response record: ledger metadata for one generation.
+///
+/// Unlike the D24 design, the record carries **no materialised ancestor
+/// snapshot**. Long-term history lives in the conversation's snapshot (D30);
+/// this record holds only what identifies the response and the context it
+/// inherits from (its anchor), plus the turn's own input. Output is appended to
+/// the conversation snapshot at terminal and is reconstructable from the event
+/// stream within the retention window.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StoredResponse {
+pub struct ResponseRecord {
     pub response_id: ResponseId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<ResponseId>,
 
-    /// Conversation whose tail pointer this response advances on completion
-    /// (D27).
-    ///
-    /// Recorded here rather than looked up later because the execution side has
-    /// only the record when it reaches a terminal status, and the alternative —
-    /// scanning conversations for one pointing at this response — cannot work:
-    /// the pointer still refers to the *previous* response until this one
-    /// finishes.
+    /// Conversation this response belongs to, if any (D28). Recorded at create
+    /// time because the execution side has only the record when it reaches a
+    /// terminal status, and the alternative — scanning conversations for one
+    /// pointing at this response — cannot work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<ConversationId>,
 
     pub tenant_id: TenantId,
     pub model: String,
 
-    /// Echoed on retrieval, **never** fed into chain resolution (INV-49).
+    /// Echoed on retrieval, **never** fed into context assembly (INV-49).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
 
     /// Functions offered to the model this turn, in outbound provider shape.
-    ///
-    /// Declared per-response from the caller's `tools` request field (not a
-    /// static deployment config), so a single fleet can serve callers with
-    /// different tool sets. Empty means the model is offered none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
 
     /// Per-response `tool_choice` selection, in outbound provider shape.
-    /// `None` lets the provider default; a specific function forces a call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
 
     pub input_items: Vec<ResponseItem>,
-    #[serde(default)]
-    pub output_items: Vec<ResponseItem>,
 
-    /// Reasoning / thinking text streamed by a reasoning model for this
-    /// response, concatenated into one string.
-    ///
-    /// Persisted so a re-render shows the same thinking it showed during
-    /// streaming, but **never** fed back as context: a model does not read its
-    /// own thinking, and [`ResponseItem`] keeps `reasoning` out of the subset.
-    /// Like `instructions`, it is render-only and therefore not part of the
-    /// integrity tag.
+    /// Reasoning / thinking text streamed by a reasoning model this turn,
+    /// concatenated into one string. Render-only, never fed back as context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
 
@@ -231,85 +220,23 @@ pub struct StoredResponse {
     pub owner: Option<AgentId>,
     #[serde(default)]
     pub attempt: Attempt,
-
-    /// The full context this response inherited, as a flat copy of every
-    /// ancestor's items in chronological order.
-    ///
-    /// This is the **materialised history** (D24): instead of walking
-    /// `previous_response_id` on every read, each response carries the whole
-    /// conversation that led up to it. A later response therefore never depends
-    /// on its ancestors still existing — deleting a middle response removes only
-    /// that response's own record; the flat copy lives on inside every
-    /// descendant, exactly as "remove from the conversation" (rather than
-    /// "erase from the conversation") requires.
-    ///
-    /// It is flat on purpose: there is no source tag, because nothing ever needs
-    /// to strip a single ancestor out again. Deletion is record-level, not
-    /// content-level.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub context: Vec<ResponseItem>,
-
-    /// Materialised reasoning of every ancestor, aligned to [`Self::context`]:
-    /// one entry per item, where `Some(text)` marks a reasoning block to render
-    /// immediately before that item.
-    ///
-    /// Kept separate from `context` so reasoning can be materialised for
-    /// rendering (D24) **without** ever entering the model context, which is
-    /// assembled from `context` alone.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub context_reasoning: Vec<Option<String>>,
-
-    /// How many ancestors contributed to `context`.
-    ///
-    /// Kept separate because a flat list cannot recover this — one turn may hold
-    /// any number of items (a tool-call turn contributes several), so the count
-    /// of items is not the count of turns. It backs the `ChainTooLong` check at
-    /// create time and the `depth` reported by `resolve_chain`.
-    #[serde(default)]
-    pub context_depth: usize,
 }
 
-impl StoredResponse {
-    /// Items contributed by this link when walking a chain, in chronological
-    /// order: what went in, then what came out.
+impl ResponseRecord {
+    /// Where this response inherits its context from.
     ///
-    /// Instructions are **absent by construction** — the field is simply not
-    /// consulted here (INV-49).
-    pub fn chain_items(&self) -> impl Iterator<Item = &ResponseItem> {
-        self.input_items.iter().chain(self.output_items.iter())
-    }
-
-    pub fn chain_byte_len(&self) -> usize {
-        self.chain_items().map(ResponseItem::byte_len).sum()
-    }
-
-    /// The resolved history this record anchors: the materialised ancestors plus
-    /// this record's own items, paired with reasoning blocks aligned to the item
-    /// list (one entry per item; `Some(text)` marks a reasoning block to render
-    /// immediately before that item).
-    ///
-    /// The alignment rule lives here — not in each backend — so both stores
-    /// materialise reasoning identically. Reasoning precedes this record's
-    /// output: it is the thinking that produced the answer, and it never enters
-    /// the model context (that is assembled from `context`/`items` alone).
-    pub fn resolved_items_and_reasoning(&self) -> (Vec<ResponseItem>, Vec<Option<String>>) {
-        let mut items = self.context.clone();
-        let mut reasoning = self.context_reasoning.clone();
-        // Defensive: a legacy or hand-built record may carry mismatched lengths.
-        // Reasoning is render-only, so recovering by padding is always safe.
-        reasoning.resize(items.len(), None);
-
-        items.extend(self.input_items.iter().cloned());
-        reasoning.extend(std::iter::repeat(None).take(self.input_items.len()));
-
-        items.extend(self.output_items.iter().cloned());
-        // The reasoning block sits at the boundary before the first output item;
-        // `resize` pads the remaining output items (or trims when output is
-        // empty, where reasoning is meaningless).
-        reasoning.push(self.reasoning.clone());
-        reasoning.resize(items.len(), None);
-
-        (items, reasoning)
+    /// The anchor is derived from the record's own fields — it is not a second
+    /// copy of state, just the view the execution/service layers consume to know
+    /// where to read history from (a conversation snapshot, a previous response,
+    /// or nothing).
+    pub fn anchor(&self) -> SnapshotRef {
+        if let Some(id) = &self.conversation_id {
+            SnapshotRef::Conversation(id.clone())
+        } else if let Some(id) = &self.previous_response_id {
+            SnapshotRef::Previous(id.clone())
+        } else {
+            SnapshotRef::Root
+        }
     }
 
     /// Whether this record may be used as `previous_response_id` by `tenant`.
@@ -317,16 +244,15 @@ impl StoredResponse {
         self.stored && &self.tenant_id == tenant
     }
 
-    /// The OpenAI-shaped response object, embedded in lifecycle events and
-    /// returned by `GET`. Only protocol fields are exposed — the internal
-    /// bookkeeping (`tenant_id`, `node_tag`, `attempt`, `context`, …) never
-    /// leaves the node.
+    /// The OpenAI-shaped response object for a response whose output is known,
+    /// embedded in lifecycle events and returned by `GET`. Only protocol fields
+    /// are exposed — the internal bookkeeping (`tenant_id`, `node_tag`,
+    /// `attempt`, …) never leaves the node.
     ///
-    /// `session_id` is absent for the same reason: the session layer is ours, not
-    /// upstream's, and this object has an upstream shape. Devices learn which
-    /// session a response belongs to from the session event stream, which is
-    /// where that relationship is expressed.
-    pub fn to_response_value(&self) -> Value {
+    /// `output_items` is supplied by the caller rather than read from the record:
+    /// the record holds no output (output lives in the conversation snapshot and
+    /// the event stream), so the renderer passes in what it reconstructed.
+    pub fn to_response_value(&self, output_items: &[ResponseItem]) -> Value {
         serde_json::json!({
             "id": self.response_id.to_string(),
             "object": "response",
@@ -341,7 +267,7 @@ impl StoredResponse {
             "instructions": self.instructions,
             "store": self.stored,
             "input": self.input_items,
-            "output": self.output_items,
+            "output": output_items,
             "reasoning": self.reasoning,
             "usage": {
                 "input_tokens": self.usage.input_tokens,
@@ -350,6 +276,22 @@ impl StoredResponse {
             },
         })
     }
+}
+
+/// Where a response inherits its context from (D30).
+///
+/// The three variants replace D24's materialised snapshot: history is read from
+/// a single authoritative source — the conversation snapshot for anchored
+/// turns, or resolved through a previous response — rather than copied onto
+/// every record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SnapshotRef {
+    /// No prior context.
+    Root,
+    /// Continue from a previous response (bare chain, no conversation anchor).
+    Previous(ResponseId),
+    /// Continue from a conversation's materialised snapshot.
+    Conversation(ConversationId),
 }
 
 /// Bounds for chain resolution. Exceeding any of them is an **error**, never a
@@ -429,8 +371,8 @@ mod tests {
         assert!(ResponseId::parse("resp_../../etc_x").is_err());
     }
 
-    fn record(stored: bool, tenant_id: &str) -> StoredResponse {
-        StoredResponse {
+    fn record(stored: bool, tenant_id: &str) -> ResponseRecord {
+        ResponseRecord {
             response_id: ResponseId::new(NodeTag::parse("n1").unwrap()),
             previous_response_id: None,
             conversation_id: None,
@@ -440,7 +382,6 @@ mod tests {
             tools: Vec::new(),
             tool_choice: None,
             input_items: vec![ResponseItem::user_text("in")],
-            output_items: vec![ResponseItem::assistant_text("out")],
             reasoning: None,
             status: ResponseStatus::Completed,
             usage: Usage::new(1, 2),
@@ -454,34 +395,23 @@ mod tests {
             idempotency_key: None,
             owner: None,
             attempt: Attempt::default(),
-            context: Vec::new(),
-            context_reasoning: Vec::new(),
-            context_depth: 0,
         }
     }
 
     #[test]
-    fn chain_items_are_input_then_output() {
-        let rec = record(true, "t1");
-        let items: Vec<_> = rec.chain_items().cloned().collect();
-        assert_eq!(items, vec![
-            ResponseItem::user_text("in"),
-            ResponseItem::assistant_text("out"),
-        ]);
-    }
+    fn anchor_is_derived_from_the_record() {
+        let root = record(true, "t1");
+        assert_eq!(root.anchor(), SnapshotRef::Root);
 
-    #[test]
-    fn chain_items_never_contain_instructions() {
-        // INV-49: the instructions text must not leak into chain output even
-        // though it is stored on the record for echo purposes.
-        let rec = record(true, "t1");
-        let encoded = crate::canonical::canonical_items(
-            &rec.chain_items().cloned().collect::<Vec<_>>(),
-        );
-        assert!(
-            !encoded.contains("secret system prompt"),
-            "instructions leaked into chain items: {encoded}"
-        );
+        let prev = ResponseId::new(NodeTag::parse("n1").unwrap());
+        let mut chained = record(true, "t1");
+        chained.previous_response_id = Some(prev.clone());
+        assert_eq!(chained.anchor(), SnapshotRef::Previous(prev));
+
+        let conv = ConversationId::new();
+        let mut anchored = record(true, "t1");
+        anchored.conversation_id = Some(conv.clone());
+        assert_eq!(anchored.anchor(), SnapshotRef::Conversation(conv));
     }
 
     #[test]

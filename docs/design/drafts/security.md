@@ -11,8 +11,8 @@
 > |---|---|---|
 > | Bearer → 租户解析 | `nova-responses/src/auth.rs` | SEC-1 |
 > | **越权返回「不存在」而非「禁止访问」** | 同上 + `nova-responses/src/error.rs` | SEC-2 |
-> | **快照固化时校验租户**（创建时校验 previous，物化后快照自洽） | `ContextStore`（创建路径） | SEC-3 |
-> | **密钥仅从环境变量读取**；启用校验但缺失时启动即失败 | `core/src/integrity_hmac.rs` | SEC-4 |
+> | **快照读取时校验租户**（`read_snapshot` / 创建时校验锚点，会话主快照自洽） | `ConversationStore`（`read_snapshot`） | SEC-3 |
+> | **密钥仅从环境变量读取**；启用校验但缺失时启动即失败 | `crates/responses/src/integrity_hmac.rs` | SEC-4 |
 > | **无节点间转发**（转发子系统随共享缓冲化整体删除；不再存在由标识推导转发地址的路径） | —（结构上无 SSRF 向量） | SEC-5 |
 > | **引用链接内网拦截**（仅 https + 私有段拒绝） | `core/src/protocol/url_guard.rs` | SEC-6 |
 > | **请求体限长限深** | `core/src/protocol/limits.rs` | SEC-7 |

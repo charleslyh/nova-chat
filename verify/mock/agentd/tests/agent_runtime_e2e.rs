@@ -1,8 +1,11 @@
 //! End-to-end execution against the in-memory adapters and a mock scheduler.
 //!
 //! No socket, no database, no model. This is what the port-based runtime buys: the
-//! paths that matter — a moved fence, an unusable outcome, a broken chain, a
-//! provider failure — are all reachable and cheap.
+//! paths that matter — a moved fence, an unusable outcome, a provider failure —
+//! are all reachable and cheap.
+//!
+//! Durable output now lives in the conversation snapshot (D30), so tests that
+//! assert persistence read `read_snapshot` rather than a per-response record.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,8 +24,9 @@ use mock_agentd::{
 };
 use nova_responses::protocol::{ContentPart, ResponseItem, Role};
 use nova_responses::{
-    Attempt, ContextStore, EventBody, IdempotencyKey, NodeTag, ResponseEventKind,
-    ResponseEventLog, ResponseId, ResponseLedger, ResponseStatus, StoredResponse, TenantId, Usage,
+    Attempt, Conversation, ConversationId, ConversationStore, EventBody, IdempotencyKey, NodeTag,
+    ResolvedContext, ResponseEventKind, ResponseEventLog, ResponseId, ResponseLedger,
+    ResponseRecord, ResponseStatus, TenantId, Usage,
 };
 use tokio::sync::Notify;
 
@@ -36,8 +40,8 @@ fn tenant() -> TenantId {
     TenantId::parse("t-engine").expect("static tenant")
 }
 
-fn record(id: &ResponseId, text: &str, stored: bool) -> StoredResponse {
-    StoredResponse {
+fn record(id: &ResponseId, text: &str, stored: bool) -> ResponseRecord {
+    ResponseRecord {
         conversation_id: None,
         response_id: id.clone(),
         previous_response_id: None,
@@ -52,7 +56,6 @@ fn record(id: &ResponseId, text: &str, stored: bool) -> StoredResponse {
             id: None,
             status: None,
         }],
-        output_items: vec![],
         reasoning: None,
         status: ResponseStatus::Queued,
         usage: Usage::default(),
@@ -66,9 +69,6 @@ fn record(id: &ResponseId, text: &str, stored: bool) -> StoredResponse {
         idempotency_key: None,
         owner: None,
         attempt: Attempt::default(),
-        context: Vec::new(),
-        context_reasoning: Vec::new(),
-        context_depth: 0,
     }
 }
 
@@ -76,8 +76,6 @@ fn engine(world: &MemWorld, scheduler: Arc<dyn Scheduler>) -> AgentRuntime {
     agent_with(world, scheduler, Arc::new(NoopToolExecutor), AgentRuntimeConfig::default())
 }
 
-/// An orchestrator wired with a specific tool executor and config, for the
-/// multi-round tests.
 fn agent_with(
     world: &MemWorld,
     scheduler: Arc<dyn Scheduler>,
@@ -89,7 +87,6 @@ fn agent_with(
         AgentRuntimeDeps {
             ledger: world.ledger.clone(),
             event_log: world.event_log.clone(),
-            context: world.context.clone(),
             runner,
             now: world.now_fn(),
             conversations: Some(world.conversation.clone()),
@@ -98,28 +95,48 @@ fn agent_with(
     )
 }
 
-async fn queue(world: &MemWorld, text: &str, stored: bool) -> ResponseId {
+/// Queue one response, anchored to a fresh conversation so its output has a
+/// durable home (D30). Returns the response id and its conversation.
+async fn queue(world: &MemWorld, text: &str, stored: bool) -> (ResponseId, ConversationId) {
+    let conv = world
+        .conversation
+        .create(Conversation::new(
+            ConversationId::new(),
+            tenant(),
+            Default::default(),
+            1_000,
+        ))
+        .await
+        .expect("create conversation");
     let id = ResponseId::new(node());
-    let rec = record(&id, text, stored);
+    let mut rec = record(&id, text, stored);
+    rec.conversation_id = Some(conv.id.clone());
     world
         .ledger
-        .create(
-            rec.clone(),
-            IdempotencyKey(uuid::Uuid::new_v4().to_string()),
-            1_000,
-        )
+        .create(rec, IdempotencyKey(uuid::Uuid::new_v4().to_string()), 1_000)
         .await
         .expect("create");
-    if stored {
-        world.context.put(rec).await.expect("put");
-    }
-    id
+    (id, conv.id)
+}
+
+async fn snapshot(world: &MemWorld, conv: &ConversationId) -> ResolvedContext {
+    world
+        .conversation
+        .read_snapshot(&tenant(), conv)
+        .await
+        .expect("read snapshot")
+}
+
+/// The output half of a single-turn snapshot: everything after the input item.
+fn output_of(snap: &ResolvedContext) -> Vec<ResponseItem> {
+    // One turn contributes input then output; the input is the first item.
+    snap.items.iter().skip(1).cloned().collect()
 }
 
 #[tokio::test]
 async fn a_queued_response_runs_to_completion_with_no_socket_and_no_model() {
     let world = MemWorld::new();
-    let id = queue(&world, "hello", true).await;
+    let (id, conv) = queue(&world, "hello", true).await;
 
     let e = engine(&world, Arc::new(EchoScheduler::new(4)));
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
@@ -128,15 +145,11 @@ async fn a_queued_response_runs_to_completion_with_no_socket_and_no_model() {
     assert_eq!(rec.status, ResponseStatus::Completed);
     assert!(rec.usage.total_tokens > 0, "usage must be booked");
 
-    let stored = world
-        .context
-        .get(&tenant(), &id)
-        .await
-        .expect("ctx get")
-        .expect("stored");
+    let snap = snapshot(&world, &conv).await;
+    let output = output_of(&snap);
     assert!(
-        nova_responses::canonical_items(&stored.output_items).contains("hello"),
-        "the echoed answer must be persisted"
+        nova_responses::canonical_items(&output).contains("hello"),
+        "the echoed answer must be persisted to the snapshot"
     );
 
     let events = world
@@ -144,16 +157,8 @@ async fn a_queued_response_runs_to_completion_with_no_socket_and_no_model() {
         .read_after(&id, None, 64, 0)
         .await
         .expect("read");
-    assert!(
-        events.iter().any(|ev| ev.kind.is_terminal()),
-        "the stream must reach a terminal event or subscribers hang forever"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|ev| matches!(ev.kind, ResponseEventKind::OutputTextDelta)),
-        "increments must land in this node's buffer"
-    );
+    assert!(events.iter().any(|ev| ev.kind.is_terminal()));
+    assert!(events.iter().any(|ev| matches!(ev.kind, ResponseEventKind::OutputTextDelta)));
 }
 
 #[tokio::test]
@@ -167,10 +172,11 @@ async fn an_empty_queue_is_idle_not_an_error() {
 async fn any_nodes_work_can_be_executed_here() {
     let world = MemWorld::new();
     let foreign = ResponseId::new(NodeTag::parse("node-b").expect("tag"));
+    // store=false: the test only asserts global claim, not persistence.
     world
         .ledger
         .create(
-            record(&foreign, "not yours", true),
+            record(&foreign, "not yours", false),
             IdempotencyKey(uuid::Uuid::new_v4().to_string()),
             1_000,
         )
@@ -178,24 +184,16 @@ async fn any_nodes_work_can_be_executed_here() {
         .expect("create");
 
     let e = engine(&world, Arc::new(EchoScheduler::new(2)));
-    assert_eq!(
-        e.run_once(2_000).await,
-        Executed::Completed,
-        "any execution process must be able to run any node's response"
-    );
+    assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
     let rec = world.ledger.get(&foreign).await.expect("get").expect("present");
-    assert_eq!(
-        rec.status,
-        ResponseStatus::Completed,
-        "and the response must reach a terminal state"
-    );
+    assert_eq!(rec.status, ResponseStatus::Completed);
 }
 
 #[tokio::test]
 async fn a_scheduler_failure_terminates_the_response() {
     let world = MemWorld::new();
-    let id = queue(&world, "flaky", true).await;
+    let (id, _conv) = queue(&world, "flaky", true).await;
 
     let scheduler = ScriptedScheduler::from_rules(vec![]).with_rule(
         Match::Any,
@@ -215,33 +213,26 @@ async fn a_scheduler_failure_terminates_the_response() {
         .read_after(&id, None, 64, 0)
         .await
         .expect("read");
-    assert!(
-        events.iter().any(|ev| ev.kind.is_terminal()),
-        "a failed attempt must still terminate the stream"
-    );
+    assert!(events.iter().any(|ev| ev.kind.is_terminal()));
 }
 
 #[tokio::test]
 async fn an_unusable_outcome_is_refused_before_submission() {
     let world = MemWorld::new();
-    let id = queue(&world, "anything", true).await;
+    let (id, _conv) = queue(&world, "anything", true).await;
 
     let scheduler = ScriptedScheduler::from_rules(vec![]).with_rule(Match::Any, Script::Empty);
     let e = engine(&world, Arc::new(scheduler));
     assert_eq!(e.run_once(2_000).await, Executed::Failed);
 
     let rec = world.ledger.get(&id).await.expect("get").expect("present");
-    assert_eq!(
-        rec.status,
-        ResponseStatus::Failed,
-        "an empty outcome must not complete the response as an empty success"
-    );
+    assert_eq!(rec.status, ResponseStatus::Failed);
 }
 
 #[tokio::test]
 async fn a_refusal_completes_the_turn_and_is_stored() {
     let world = MemWorld::new();
-    let id = queue(&world, "secret", true).await;
+    let (_id, conv) = queue(&world, "secret", true).await;
 
     let scheduler = ScriptedScheduler::from_rules(vec![]).with_rule(
         Match::Any,
@@ -252,14 +243,9 @@ async fn a_refusal_completes_the_turn_and_is_stored() {
     let e = engine(&world, Arc::new(scheduler));
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
-    let stored = world
-        .context
-        .get(&tenant(), &id)
-        .await
-        .expect("ctx get")
-        .expect("stored");
+    let snap = snapshot(&world, &conv).await;
     assert!(
-        nova_responses::canonical_items(&stored.output_items).contains("can't help"),
+        nova_responses::canonical_items(&output_of(&snap)).contains("can't help"),
         "the refusal must be readable afterwards"
     );
 }
@@ -267,7 +253,7 @@ async fn a_refusal_completes_the_turn_and_is_stored() {
 #[tokio::test]
 async fn store_false_completes_without_persisting_content() {
     let world = MemWorld::new();
-    let id = queue(&world, "ephemeral", false).await;
+    let (id, conv) = queue(&world, "ephemeral", false).await;
 
     let e = engine(&world, Arc::new(EchoScheduler::new(2)));
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
@@ -276,29 +262,15 @@ async fn store_false_completes_without_persisting_content() {
     assert_eq!(rec.status, ResponseStatus::Completed);
     assert!(!rec.stored, "the flag must survive the round trip");
 
-    assert!(
-        matches!(
-            world
-                .context
-                .resolve_chain(&tenant(), &id, Default::default())
-                .await,
-            Err(nova_responses::ContextError::NotStored)
-        ),
-        "a response created with store=false must be refused as a chain anchor"
-    );
-
-    if let Some(stored) = world.context.get(&tenant(), &id).await.expect("ctx get") {
-        assert!(
-            stored.output_items.is_empty(),
-            "store=false must not retain output items for later turns"
-        );
-    }
+    let snap = snapshot(&world, &conv).await;
+    assert_eq!(snap.depth, 0, "store=false must not write a snapshot turn");
+    assert!(snap.items.is_empty());
 }
 
 #[tokio::test]
 async fn a_stall_leaves_partial_output_but_does_not_complete() {
     let world = MemWorld::new();
-    let id = queue(&world, "stall", true).await;
+    let (id, _conv) = queue(&world, "stall", true).await;
 
     let scheduler = ScriptedScheduler::from_rules(vec![]).with_rule(
         Match::Any,
@@ -314,18 +286,9 @@ async fn a_stall_leaves_partial_output_but_does_not_complete() {
         .read_after(&id, None, 64, 0)
         .await
         .expect("read");
-    assert!(
-        events
-            .iter()
-            .any(|ev| matches!(ev.kind, ResponseEventKind::OutputTextDelta)),
-        "the partial output that was streamed is still visible"
-    );
+    assert!(events.iter().any(|ev| matches!(ev.kind, ResponseEventKind::OutputTextDelta)));
     let rec = world.ledger.get(&id).await.expect("get").expect("present");
-    assert_eq!(
-        rec.status,
-        ResponseStatus::Failed,
-        "but the response must not be recorded as complete"
-    );
+    assert_eq!(rec.status, ResponseStatus::Failed);
 }
 
 #[tokio::test]
@@ -342,85 +305,43 @@ async fn drain_clears_the_backlog_and_then_reports_idle() {
         results.iter().filter(|r| **r == Executed::Completed).count(),
         3
     );
-    assert_eq!(
-        results.last(),
-        Some(&Executed::Idle),
-        "drain must stop on the first empty claim rather than spinning"
-    );
+    assert_eq!(results.last(), Some(&Executed::Idle));
 }
 
 #[tokio::test]
-async fn history_is_assembled_server_side_from_the_chain() {
+async fn history_is_assembled_from_the_conversation_snapshot() {
     let world = MemWorld::new();
 
-    let first = queue(&world, "my name is Ada", true).await;
+    let (first, conv) = queue(&world, "my name is Ada", true).await;
     let e = engine(&world, Arc::new(EchoScheduler::new(2)));
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
+    // Second turn anchored to the same conversation (no previous_response_id):
+    // the server reads the conversation snapshot for history.
     let second = ResponseId::new(node());
     let mut rec = record(&second, "what is my name", true);
-    rec.previous_response_id = Some(first.clone());
+    rec.conversation_id = Some(conv.clone());
     world
         .ledger
-        .create(
-            rec.clone(),
-            IdempotencyKey(uuid::Uuid::new_v4().to_string()),
-            3_000,
-        )
+        .create(rec, IdempotencyKey(uuid::Uuid::new_v4().to_string()), 3_000)
         .await
         .expect("create");
-    world.context.put(rec).await.expect("put");
 
     let e = engine(&world, Arc::new(EchoScheduler::new(2)));
     assert_eq!(e.run_once(4_000).await, Executed::Completed);
 
-    let stored = world
-        .context
-        .get(&tenant(), &second)
-        .await
-        .expect("ctx get")
-        .expect("stored");
-    assert!(
-        nova_responses::canonical_items(&stored.output_items).contains("what is my name"),
-        "the newest input must still be the one answered"
-    );
-}
-
-#[tokio::test]
-async fn a_deleted_ancestor_does_not_strand_execution() {
-    let world = MemWorld::new();
-    let missing = ResponseId::new(node());
-
-    let id = ResponseId::new(node());
-    let mut rec = record(&id, "continue", true);
-    rec.previous_response_id = Some(missing.clone());
-    rec.context = vec![ResponseItem::assistant_text("earlier answer")];
-    rec.context_depth = 1;
-    world
-        .ledger
-        .create(
-            rec.clone(),
-            IdempotencyKey(uuid::Uuid::new_v4().to_string()),
-            1_000,
-        )
-        .await
-        .expect("create");
-    world.context.put(rec).await.expect("put");
-
-    let e = engine(&world, Arc::new(EchoScheduler::new(2)));
-    assert_eq!(
-        e.run_once(2_000).await,
-        Executed::Completed,
-        "execution must use the snapshot, not re-walk a broken pointer"
-    );
-
-    let after = world.ledger.get(&id).await.expect("get").expect("present");
-    assert_eq!(after.status, ResponseStatus::Completed);
+    // The snapshot now holds both turns.
+    let snap = snapshot(&world, &conv).await;
+    assert_eq!(snap.depth, 2);
+    assert_eq!(snap.items.len(), 4, "2 turns x (input + output)");
+    let rendered = nova_responses::canonical_items(&snap.items);
+    assert!(rendered.contains("my name is Ada"));
+    assert!(rendered.contains("what is my name"));
+    let _ = first;
 }
 
 // ===== Agent loop (ReAct) =====
 
-/// A tool executor whose answers are declared up front.
 #[derive(Default)]
 struct MapTools {
     outputs: std::collections::HashMap<String, String>,
@@ -447,7 +368,6 @@ impl ToolExecutor for MapTools {
     }
 }
 
-/// First schedule asks for a tool; the next one answers.
 struct ToolThenAnswer;
 
 #[async_trait]
@@ -485,7 +405,7 @@ impl Scheduler for ToolThenAnswer {
 #[tokio::test]
 async fn a_tool_using_turn_runs_the_loop_and_stores_the_whole_trace() {
     let world = MemWorld::new();
-    let id = queue(&world, "what is the weather in Paris", true).await;
+    let (id, conv) = queue(&world, "what is the weather in Paris", true).await;
 
     let scheduler = Arc::new(ToolThenAnswer);
     let tools = Arc::new(MapTools::default().with("get_weather", r#"{"temp":20}"#));
@@ -496,49 +416,25 @@ async fn a_tool_using_turn_runs_the_loop_and_stores_the_whole_trace() {
     let rec = world.ledger.get(&id).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Completed);
 
-    let stored = world
-        .context
-        .get(&tenant(), &id)
-        .await
-        .expect("ctx get")
-        .expect("stored");
+    let snap = snapshot(&world, &conv).await;
+    let output = output_of(&snap);
+    assert_eq!(output.len(), 3, "call + output + answer");
+    assert!(matches!(&output[0], ResponseItem::FunctionCall { name, .. } if name == "get_weather"));
+    assert!(matches!(&output[1], ResponseItem::FunctionCallOutput { output, .. } if output.contains("20")));
+    assert!(matches!(&output[2], ResponseItem::Message { role: Role::Assistant, content, .. }
+        if content.iter().any(|p| matches!(p, ContentPart::OutputText { text } if text.contains("sunny")))));
 
-    assert_eq!(stored.output_items.len(), 3, "call + output + answer");
-    assert!(matches!(
-        &stored.output_items[0],
-        ResponseItem::FunctionCall { name, .. } if name == "get_weather"
-    ));
-    assert!(matches!(
-        &stored.output_items[1],
-        ResponseItem::FunctionCallOutput { output, .. } if output.contains("20")
-    ));
-    assert!(matches!(
-        &stored.output_items[2],
-        ResponseItem::Message { role: Role::Assistant, content, .. }
-            if content.iter().any(|p| matches!(p, ContentPart::OutputText { text } if text.contains("sunny")))
-    ));
-
-    let events = world
-        .event_log
-        .read_after(&id, None, 64, 0)
-        .await
-        .expect("read");
+    let events = world.event_log.read_after(&id, None, 64, 0).await.expect("read");
     let kinds: Vec<_> = events.iter().map(|ev| ev.kind).collect();
-    assert!(
-        kinds.contains(&ResponseEventKind::OutputItemAdded),
-        "a function_call item must be announced: {kinds:?}"
-    );
-    assert!(
-        kinds.contains(&ResponseEventKind::OutputItemDone),
-        "a function_call item must be completed: {kinds:?}"
-    );
+    assert!(kinds.contains(&ResponseEventKind::OutputItemAdded), "{kinds:?}");
+    assert!(kinds.contains(&ResponseEventKind::OutputItemDone), "{kinds:?}");
     assert!(events.iter().any(|ev| ev.kind.is_terminal()));
 }
 
 #[tokio::test]
 async fn a_tool_error_fails_the_response_loudly() {
     let world = MemWorld::new();
-    let id = queue(&world, "what is the weather in Paris", true).await;
+    let (id, _conv) = queue(&world, "what is the weather in Paris", true).await;
 
     let scheduler = Arc::new(ToolThenAnswer);
     let tools = Arc::new(MapTools::default());
@@ -551,7 +447,6 @@ async fn a_tool_error_fails_the_response_loudly() {
     assert!(rec.status.is_terminal());
 }
 
-/// Always asks for a tool, never answers.
 struct AlwaysToolCall;
 
 #[async_trait]
@@ -578,7 +473,7 @@ impl Scheduler for AlwaysToolCall {
 #[tokio::test]
 async fn a_model_that_keeps_calling_tools_hits_the_round_ceiling() {
     let world = MemWorld::new();
-    let id = queue(&world, "loop forever", true).await;
+    let (id, conv) = queue(&world, "loop forever", true).await;
 
     let scheduler = Arc::new(AlwaysToolCall);
     let tools = Arc::new(MapTools::default().with("ping", "pong"));
@@ -591,22 +486,12 @@ async fn a_model_that_keeps_calling_tools_hits_the_round_ceiling() {
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
     let rec = world.ledger.get(&id).await.expect("get").expect("present");
-    assert_eq!(
-        rec.status,
-        ResponseStatus::Incomplete,
-        "a never-ending tool loop must be cut off, not left running"
-    );
+    assert_eq!(rec.status, ResponseStatus::Incomplete);
 
-    let stored = world
-        .context
-        .get(&tenant(), &id)
-        .await
-        .expect("ctx get")
-        .expect("stored");
-    assert_eq!(stored.output_items.len(), 6);
+    let snap = snapshot(&world, &conv).await;
+    assert_eq!(output_of(&snap).len(), 6);
 }
 
-/// Streams a tool call incrementally.
 struct StreamingToolThenAnswer;
 
 #[async_trait]
@@ -672,7 +557,7 @@ impl Scheduler for StreamingToolThenAnswer {
 #[tokio::test]
 async fn tool_calls_stream_incrementally_to_the_subscriber() {
     let world = MemWorld::new();
-    let id = queue(&world, "what is the weather", true).await;
+    let (id, _conv) = queue(&world, "what is the weather", true).await;
 
     let scheduler = Arc::new(StreamingToolThenAnswer);
     let tools = Arc::new(MapTools::default().with("get_weather", "20"));
@@ -680,22 +565,12 @@ async fn tool_calls_stream_incrementally_to_the_subscriber() {
 
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
-    let events = world
-        .event_log
-        .read_after(&id, None, 128, 0)
-        .await
-        .expect("read");
+    let events = world.event_log.read_after(&id, None, 128, 0).await.expect("read");
     let kinds: Vec<_> = events.iter().map(|ev| ev.kind).collect();
 
     assert!(kinds.contains(&ResponseEventKind::OutputItemAdded), "{kinds:?}");
-    assert!(
-        kinds.contains(&ResponseEventKind::FunctionCallArgumentsDelta),
-        "{kinds:?}"
-    );
-    assert!(
-        kinds.contains(&ResponseEventKind::FunctionCallArgumentsDone),
-        "{kinds:?}"
-    );
+    assert!(kinds.contains(&ResponseEventKind::FunctionCallArgumentsDelta), "{kinds:?}");
+    assert!(kinds.contains(&ResponseEventKind::FunctionCallArgumentsDone), "{kinds:?}");
     assert!(kinds.contains(&ResponseEventKind::OutputItemDone), "{kinds:?}");
 
     let deltas: Vec<String> = events
@@ -710,7 +585,6 @@ async fn tool_calls_stream_incrementally_to_the_subscriber() {
     assert_eq!(deltas.concat(), r#"{"city":"Paris"}"#);
 }
 
-/// Emits reasoning text, then the answer.
 struct ReasoningThenAnswer;
 
 #[async_trait]
@@ -735,31 +609,24 @@ impl Scheduler for ReasoningThenAnswer {
 #[tokio::test]
 async fn reasoning_is_persisted_but_never_fed_back_as_context() {
     let world = MemWorld::new();
-    let id = queue(&world, "think", true).await;
+    let (id, conv) = queue(&world, "think", true).await;
 
     let e = engine(&world, Arc::new(ReasoningThenAnswer));
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
-    let stored = world
-        .context
-        .get(&tenant(), &id)
-        .await
-        .expect("ctx get")
-        .expect("stored");
-    assert_eq!(stored.reasoning.as_deref(), Some("Let me think about this."));
-    assert_eq!(stored.output_items.len(), 1, "reasoning must not become an item");
+    let snap = snapshot(&world, &conv).await;
+    let output = output_of(&snap);
+    assert_eq!(output.len(), 1, "reasoning must not become an item");
     assert!(
-        !nova_responses::canonical_items(&stored.output_items).contains("Let me think"),
+        !nova_responses::canonical_items(&output).contains("Let me think"),
         "reasoning must not leak into output items"
     );
-
-    let resolved = world
-        .context
-        .resolve_chain(&tenant(), &id, Default::default())
-        .await
-        .expect("resolve");
-    assert_eq!(resolved.reasoning, vec![None, Some("Let me think about this.".into())]);
-    assert_eq!(resolved.items.len(), 2, "input + answer, no reasoning item");
+    // The reasoning block is recorded on the snapshot, aligned before the output.
+    assert_eq!(
+        snap.reasoning,
+        vec![None, Some("Let me think about this.".into())]
+    );
+    let _ = id;
 }
 
 // ===== Heartbeat: long generation vs. reap =====
@@ -797,7 +664,7 @@ async fn settle() {
 #[tokio::test(start_paused = true)]
 async fn a_long_generation_is_not_reaped_while_its_heartbeat_stays_fresh() {
     let world = MemWorld::new();
-    let id = queue(&world, "long", true).await;
+    let (id, _conv) = queue(&world, "long", true).await;
 
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -822,10 +689,7 @@ async fn a_long_generation_is_not_reaped_while_its_heartbeat_stays_fresh() {
     settle().await;
 
     let aborted = world.ledger.reap(2_000, 1_500).await.expect("reap");
-    assert!(
-        aborted.is_empty(),
-        "a generation whose owner keeps heartbeating must not be reaped"
-    );
+    assert!(aborted.is_empty());
 
     release.notify_one();
     let result = handle.await.expect("join");
@@ -838,7 +702,7 @@ async fn a_long_generation_is_not_reaped_while_its_heartbeat_stays_fresh() {
 #[tokio::test(start_paused = true)]
 async fn a_generation_is_reaped_once_its_heartbeat_stops() {
     let world = MemWorld::new();
-    let id = queue(&world, "long", true).await;
+    let (id, _conv) = queue(&world, "long", true).await;
 
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());

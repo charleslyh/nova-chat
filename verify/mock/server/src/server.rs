@@ -4,9 +4,7 @@
 //! Pure logic, no transport: the HTTP wiring lives in the `nova-responses-mem-server`
 //! binary, so this stays unit-testable without a socket.
 
-use nova_responses::{
-    ContextStore, ConversationStore, ResponseEventLog, ResponseLedger,
-};
+use nova_responses::{ConversationStore, ResponseEventLog, ResponseLedger};
 
 use crate::proto::{ProtoError, Request, Response};
 use crate::MemWorld;
@@ -84,6 +82,16 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
             Ok(o) => Response::Get(o),
             Err(e) => Response::Err(ProtoError::Ledger(e)),
         },
+        Request::LedgerDelete { response_id } => match world.ledger.delete(&response_id).await {
+            Ok(removed) => Response::Delete(removed),
+            Err(e) => Response::Err(ProtoError::Ledger(e)),
+        },
+        Request::LedgerDeleteByTenant { tenant } => {
+            match world.ledger.delete_by_tenant(&tenant).await {
+                Ok(n) => Response::DeleteByTenant(n),
+                Err(e) => Response::Err(ProtoError::Ledger(e)),
+            }
+        }
         Request::LedgerCheckAttempt {
             response_id,
             attempt,
@@ -129,65 +137,12 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
                 Err(e) => Response::Err(ProtoError::EventLog(e)),
             }
         }
-
-        Request::ContextPut { record } => match world.context.put(record).await {
-            Ok(()) => Response::ContextPut,
-            Err(e) => Response::Err(ProtoError::Context(e)),
-        },
-        Request::ContextAppendOutput {
-            tenant,
-            response_id,
-            items,
-            reasoning,
-            usage,
-            status,
-            now_ms,
-        } => match world
-            .context
-            .append_output(&tenant, &response_id, items, reasoning, usage, status, now_ms)
-            .await
-        {
-            Ok(()) => Response::ContextAppendOutput,
-            Err(e) => Response::Err(ProtoError::Context(e)),
-        },
-        Request::ContextGet {
-            tenant,
-            response_id,
-        } => match world.context.get(&tenant, &response_id).await {
-            Ok(o) => Response::ContextGet(o),
-            Err(e) => Response::Err(ProtoError::Context(e)),
-        },
-        Request::ContextResolveChain {
-            tenant,
-            from,
-            limits,
-        } => match world.context.resolve_chain(&tenant, &from, limits).await {
-            Ok(ctx) => Response::ContextResolveChain(ctx),
-            Err(e) => Response::Err(ProtoError::Context(e)),
-        },
-        Request::ContextDelete {
-            tenant,
-            response_id,
-        } => match world.context.delete(&tenant, &response_id).await {
-            Ok(removed) => Response::ContextDelete(removed),
-            Err(e) => Response::Err(ProtoError::Context(e)),
-        },
-        Request::ContextDeleteByTenant { tenant } => {
-            match world.context.delete_by_tenant(&tenant).await {
-                Ok(n) => Response::ContextDeleteByTenant(n),
-                Err(e) => Response::Err(ProtoError::Context(e)),
+        Request::EventLogRemove { response_id } => {
+            match world.event_log.remove(&response_id).await {
+                Ok(()) => Response::EventLogRemove,
+                Err(e) => Response::Err(ProtoError::EventLog(e)),
             }
         }
-        Request::ContextSweepExpired { now_ms, limit } => {
-            match world.context.sweep_expired(now_ms, limit).await {
-                Ok(n) => Response::ContextSweepExpired(n),
-                Err(e) => Response::Err(ProtoError::Context(e)),
-            }
-        }
-        Request::ContextHealth => match world.context.health().await {
-            Ok(()) => Response::ContextHealth,
-            Err(e) => Response::Err(ProtoError::Context(e)),
-        },
 
         Request::ConversationCreate { conversation } => {
             match world.conversation.create(conversation).await {
@@ -291,6 +246,40 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
         },
         Request::ConversationList { tenant } => match world.conversation.list(&tenant).await {
             Ok(list) => Response::ConversationList(list),
+            Err(e) => Response::Err(ProtoError::Conversation(e)),
+        },
+        Request::ConversationReadSnapshot { tenant, id } => {
+            match world.conversation.read_snapshot(&tenant, &id).await {
+                Ok(ctx) => Response::ConversationReadSnapshot(ctx),
+                Err(e) => Response::Err(ProtoError::Conversation(e)),
+            }
+        }
+        Request::ConversationAppendTurn {
+            tenant,
+            id,
+            response_id,
+            input_items,
+            output_items,
+            reasoning,
+            usage,
+            status,
+            now_ms,
+        } => match world
+            .conversation
+            .append_turn(
+                &tenant,
+                &id,
+                &response_id,
+                input_items,
+                output_items,
+                reasoning,
+                usage,
+                status,
+                now_ms,
+            )
+            .await
+        {
+            Ok(idx) => Response::ConversationAppendTurn(idx),
             Err(e) => Response::Err(ProtoError::Conversation(e)),
         },
         Request::ConversationHealth => match world.conversation.health().await {

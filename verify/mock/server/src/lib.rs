@@ -12,7 +12,6 @@
 //!   `adapters-mem-client` stubs — mirroring the production process topology.
 
 mod clock;
-mod context;
 mod conversation;
 mod event_log;
 mod ledger;
@@ -22,7 +21,6 @@ pub mod server;
 mod store;
 
 pub use clock::MemClock;
-pub use context::MemContextStore;
 pub use conversation::MemConversationStore;
 pub use event_log::MemResponseEventLog;
 pub use ledger::MemResponseLedger;
@@ -64,15 +62,13 @@ impl Default for MemWorldConfig {
 
 #[derive(Clone)]
 pub struct MemWorld {
-    /// Shared state behind both the ledger and the context store, so their
+    /// Shared state behind the ledger, event log and conversation store, so their
     /// writes are atomic with respect to each other (D21 ①).
     pub store: Arc<MemStore>,
     pub ledger: Arc<MemResponseLedger>,
     pub event_log: Arc<MemResponseEventLog>,
-    pub context: Arc<MemContextStore>,
-    /// Conversation records: chain tail, in-flight marker and event stream (D28),
-    /// backed by the same `store` so a turn boundary and the response it names
-    /// cannot be observed out of step.
+    /// Conversation records: chain tail, in-flight marker, event stream and
+    /// materialised snapshot (D28 + D30), backed by the same `store`.
     pub conversation: Arc<MemConversationStore>,
     pub integrity: Option<Arc<dyn ContentIntegrity>>,
     pub clock: Arc<MemClock>,
@@ -113,17 +109,12 @@ impl MemWorld {
         store.set_max_records(cfg.max_records);
         store.set_max_events_per_conversation(cfg.events_per_conversation);
 
-        let ledger = Arc::new(MemResponseLedger::new(store.clone()));
+        let ledger = Arc::new(MemResponseLedger::with_integrity(store.clone(), integrity.clone()));
         let event_log = Arc::new(MemResponseEventLog::with_capacity(
             ledger.clone(),
             cfg.events_per_response,
             cfg.max_logs,
         ));
-
-        let context = Arc::new(match &integrity {
-            Some(i) => MemContextStore::with_integrity(store.clone(), i.clone()),
-            None => MemContextStore::new(store.clone()),
-        });
 
         let conversation = Arc::new(MemConversationStore::new(store.clone()));
 
@@ -131,7 +122,6 @@ impl MemWorld {
             store,
             ledger,
             event_log,
-            context,
             conversation,
             integrity,
             clock: Arc::new(MemClock::new()),

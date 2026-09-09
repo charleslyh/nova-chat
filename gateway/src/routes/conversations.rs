@@ -329,7 +329,6 @@ fn transcript_object(id: &ConversationId, context: &ResolvedContext) -> Value {
 fn map_transcript_error(err: &TranscriptError) -> Response {
     match err {
         TranscriptError::Conversation(e) => map_conversation_error(e),
-        TranscriptError::Context(e) => crate::error::map_context_error(e),
     }
 }
 

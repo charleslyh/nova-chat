@@ -15,10 +15,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use nova_responses::{
-    AbortedClaim, AgentId, AppendEvent, Attempt, ChainLimits, ClaimedResponse, ContextError,
-    Conversation, ConversationError, ConversationEvent, ConversationEventKind, ConversationId,
-    CreateOutcome, EventLogError, IdempotencyKey, LedgerError, ResolvedContext, ResponseEvent,
-    ResponseEventKind, ResponseId, ResponseItem, ResponseStatus, StoredResponse, TenantId, Usage,
+    AbortedClaim, AgentId, AppendEvent, Attempt, ClaimedResponse, Conversation, ConversationError,
+    ConversationEvent, ConversationEventKind, ConversationId, CreateOutcome, EventLogError,
+    IdempotencyKey, LedgerError, ResolvedContext, ResponseEvent, ResponseEventKind, ResponseId,
+    ResponseItem, ResponseRecord, ResponseStatus, TenantId, Usage,
 };
 
 /// Internal wire form of a stream event.
@@ -104,7 +104,6 @@ impl From<AppendWireEvent> for AppendEvent {
 pub enum ProtoError {
     Ledger(LedgerError),
     EventLog(EventLogError),
-    Context(ContextError),
     Conversation(ConversationError),
     /// A failure in the carrier itself (serialization, dispatch) rather than in
     /// a domain operation. Carried as text for debuggability.
@@ -116,7 +115,7 @@ pub enum ProtoError {
 pub enum Request {
     // --- ledger ---
     LedgerCreate {
-        record: StoredResponse,
+        record: ResponseRecord,
         idempotency_key: IdempotencyKey,
         now_ms: u64,
     },
@@ -153,6 +152,12 @@ pub enum Request {
     LedgerGet {
         response_id: ResponseId,
     },
+    LedgerDelete {
+        response_id: ResponseId,
+    },
+    LedgerDeleteByTenant {
+        tenant: TenantId,
+    },
     LedgerCheckAttempt {
         response_id: ResponseId,
         attempt: Attempt,
@@ -177,43 +182,11 @@ pub enum Request {
     EventLogSweepExpired {
         now_ms: u64,
     },
+    EventLogRemove {
+        response_id: ResponseId,
+    },
 
-    // --- context ---
-    ContextPut {
-        record: StoredResponse,
-    },
-    ContextAppendOutput {
-        tenant: TenantId,
-        response_id: ResponseId,
-        items: Vec<ResponseItem>,
-        reasoning: Option<String>,
-        usage: Usage,
-        status: ResponseStatus,
-        now_ms: u64,
-    },
-    ContextGet {
-        tenant: TenantId,
-        response_id: ResponseId,
-    },
-    ContextResolveChain {
-        tenant: TenantId,
-        from: ResponseId,
-        limits: ChainLimits,
-    },
-    ContextDelete {
-        tenant: TenantId,
-        response_id: ResponseId,
-    },
-    ContextDeleteByTenant {
-        tenant: TenantId,
-    },
-    ContextSweepExpired {
-        now_ms: u64,
-        limit: usize,
-    },
-    ContextHealth,
-
-    // --- conversation (D27) ---
+    // --- conversation (D28 + D30) ---
     ConversationCreate {
         conversation: Conversation,
     },
@@ -272,6 +245,21 @@ pub enum Request {
     ConversationList {
         tenant: TenantId,
     },
+    ConversationReadSnapshot {
+        tenant: TenantId,
+        id: ConversationId,
+    },
+    ConversationAppendTurn {
+        tenant: TenantId,
+        id: ConversationId,
+        response_id: ResponseId,
+        input_items: Vec<ResponseItem>,
+        output_items: Vec<ResponseItem>,
+        reasoning: Option<String>,
+        usage: Usage,
+        status: ResponseStatus,
+        now_ms: u64,
+    },
     ConversationHealth,
 }
 
@@ -286,7 +274,9 @@ pub enum Response {
     Cancel,
     Reap(Vec<AbortedClaim>),
     RecordPartialUsage,
-    Get(Option<StoredResponse>),
+    Get(Option<ResponseRecord>),
+    Delete(bool),
+    DeleteByTenant(u64),
     CheckAttempt,
     InFlight(usize),
 
@@ -294,15 +284,7 @@ pub enum Response {
     EventLogReadAfter(Vec<WireEvent>),
     EventLogClose,
     EventLogSweepExpired(u64),
-
-    ContextPut,
-    ContextAppendOutput,
-    ContextGet(Option<StoredResponse>),
-    ContextResolveChain(ResolvedContext),
-    ContextDelete(bool),
-    ContextDeleteByTenant(u64),
-    ContextSweepExpired(u64),
-    ContextHealth,
+    EventLogRemove,
 
     ConversationCreate(Conversation),
     ConversationGet(Option<Conversation>),
@@ -316,6 +298,8 @@ pub enum Response {
     ConversationAppendEvent(u64),
     ConversationReadAfter(Vec<ConversationEvent>),
     ConversationList(Vec<Conversation>),
+    ConversationReadSnapshot(ResolvedContext),
+    ConversationAppendTurn(u64),
     ConversationHealth,
 
     Err(ProtoError),

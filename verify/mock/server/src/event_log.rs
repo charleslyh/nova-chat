@@ -236,6 +236,14 @@ impl ResponseEventLog for MemResponseEventLog {
         Ok(())
     }
 
+    async fn remove(&self, response_id: &ResponseId) -> Result<(), EventLogError> {
+        let mut g = self.inner.lock();
+        if g.logs.remove(response_id).is_none() {
+            return Err(EventLogError::Unknown);
+        }
+        Ok(())
+    }
+
     async fn sweep_expired(&self, now_ms: u64) -> Result<u64, EventLogError> {
         let mut swept = 0u64;
         let mut g = self.inner.lock();

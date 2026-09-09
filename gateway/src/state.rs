@@ -8,9 +8,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use nova_responses::{
-    ContextStore, ConversationStore, MetricsSink, ResponseEventLog, ResponseLedger,
-};
+use nova_responses::{ConversationStore, MetricsSink, ResponseEventLog, ResponseLedger};
 
 use crate::auth::KeyTable;
 use nova_responses::config::Config;
@@ -21,7 +19,6 @@ pub struct AppState {
     pub cfg: Arc<Config>,
     pub ledger: Arc<dyn ResponseLedger>,
     pub event_log: Arc<dyn ResponseEventLog>,
-    pub context: Arc<dyn ContextStore>,
     /// Held directly, not only behind [`ConversationsService`], because the SSE
     /// skeleton reads the stream itself: streaming is transport, and routing it
     /// through the capability layer would mean a service method whose only job is

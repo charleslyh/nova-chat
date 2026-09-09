@@ -17,8 +17,8 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use nova_responses::{
-    ContextStore, ConversationStore, ConversationsService, CountingMetrics, MetricsSink,
-    ResponseEventLog, ResponseLedger, ResponsesService,
+    ConversationStore, ConversationsService, CountingMetrics, MetricsSink, ResponseEventLog,
+    ResponseLedger, ResponsesService,
 };
 use tracing::info;
 
@@ -42,7 +42,6 @@ const ADMIN_KEY_ENV: &str = "NOVA_ADMIN_KEY";
 struct Ports {
     ledger: Arc<dyn ResponseLedger>,
     event_log: Arc<dyn ResponseEventLog>,
-    context: Arc<dyn ContextStore>,
     conversation: Arc<dyn ConversationStore>,
     now: Arc<dyn Fn() -> u64 + Send + Sync>,
     metrics: Arc<dyn MetricsSink>,
@@ -74,31 +73,21 @@ async fn main() -> Result<()> {
     let ports = mount(&mem_server_url_env).await?;
     ports.ledger.set_pending_limit(cfg.pending_limit);
 
-    // Liveness probe before serving: a node that cannot store would refuse every
-    // `store: true` create, so failing fast is clearer than serving 503s. The
-    // conversation store is probed for the same reason — a gateway that answers
-    // `/v1/conversations` with a 503 on every call is worse than one that never
-    // came up.
-    if let Err(e) = ports.context.health().await {
-        bail!("context store is not reachable at startup: {e}");
-    }
+    // Liveness probe before serving: a gateway that answers `/v1/conversations`
+    // with a 503 on every call is worse than one that never came up.
     if let Err(e) = ports.conversation.health().await {
         bail!("conversation store is not reachable at startup: {e}");
     }
 
-    // Assembly order follows the dependency direction: conversations know about
-    // content, responses knows about conversations.
+    // Assembly order follows the dependency direction.
     let conversations = Arc::new(ConversationsService::new(
         ports.conversation.clone(),
-        ports.context.clone(),
         ports.now.clone(),
         ports.metrics.clone(),
-        cfg.clone(),
     ));
     let service = Arc::new(ResponsesService::new(
         ports.ledger.clone(),
         ports.event_log.clone(),
-        ports.context.clone(),
         conversations.clone(),
         ports.now.clone(),
         ports.metrics.clone(),
@@ -109,7 +98,6 @@ async fn main() -> Result<()> {
         cfg: cfg.clone(),
         ledger: ports.ledger.clone(),
         event_log: ports.event_log.clone(),
-        context: ports.context.clone(),
         conversation_store: ports.conversation.clone(),
         now: ports.now.clone(),
         metrics: ports.metrics.clone(),
@@ -126,7 +114,6 @@ async fn main() -> Result<()> {
         nova_responses_sweep::spawn(nova_responses_sweep::SweepDeps {
             ledger: state.ledger.clone(),
             event_log: state.event_log.clone(),
-            context: state.context.clone(),
             conversations: state.conversation_store.clone(),
             now: state.now.clone(),
             metrics: state.metrics.clone(),
@@ -168,7 +155,6 @@ async fn mount(mem_server_url_env: &str) -> Result<Ports> {
     Ok(Ports {
         ledger: world.ledger.clone(),
         event_log: world.event_log.clone(),
-        context: world.context.clone(),
         conversation: world.conversation.clone(),
         now: Arc::new(|| {
             std::time::SystemTime::now()

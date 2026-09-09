@@ -1,8 +1,8 @@
-# 当期计划 · Agent 结构重构（编排器 + AgentRunner + 模拟验证进程）
+# 当期计划 · 存储分工重构（responses 走事件流，conversation 存持久快照）
 
 > 状态：**已完成**
-> 依据：[D29](../architecture/decisions.md#d29-agent-结构解耦编排器--agentrunner--模拟验证进程)（Agent 结构解耦）
-> 上一期（Y/Z 期）成果见 §3
+> 依据：[D30](../architecture/decisions.md#d30-存储分工重构responses-走事件流conversation-存持久快照)
+> 上一期（D29 Agent 结构解耦）成果见 §3
 
 ---
 
@@ -10,26 +10,30 @@
 
 | # | 交付 | 状态 |
 |---|---|---|
-| **1** | crate `nova-agent` 改名 `nova-agent-runtime`，新增 `AgentRunner` trait + `AgentTask` / `AgentOutcome` / `AgentEventSink`（强类型契约，字段用 core 稳定类型） | ✅ |
-| **2** | 拆分编排器：`AgentRuntime`（claim → 组装 → 提交）+ `EventSink`（事件 append）；`new` / `start` 分离以支持缩扩容 | ✅ |
-| **3** | completions 出站抽象（`CompletionsRequestScheduler` / `CompletionsSink` / `ToolExecutor` 及 completions 类型）从 core 下沉到 `testing/agentd-mock` | ✅ |
-| **4** | 模拟验证进程 `nova-agentd-mock` 移到 `testing/` 下，装配 mem-server + `MockAgentRunner`（React 循环）+ `AgentRuntime` | ✅ |
-| **5** | `StoredResponse.tools` 改存 inbound 形状（单一数据源）；测试迁移（`engine_end_to_end` → `agent_runtime_e2e`，`http_contract` 改用 `AgentRuntime` + `MockAgentRunner`） | ✅ |
+| **1** | 移除 `ContextStore` 端口，职责拆分：快照读写并入 `ConversationStore`（`read_snapshot` / `append_turn`），response 检索重建并入 `ResponseEventLog`（回放流） | ✅ |
+| **2** | `StoredResponse` → `ResponseRecord`（仅元数据，含 `SnapshotRef` 锚点，不再物化祖先快照）；`ClaimedResponse` 改带元数据 | ✅ |
+| **3** | service 层重写：`create` 只写元数据 + 解析锚点校验上界；`retrieve` TTL 内回放重建；`transcript` 改读会话主快照 | ✅ |
+| **4** | agent-runtime 编排：claim 后按锚点 `read_snapshot` 一次；终态 settle 改为 `complete + append_turn + advance/release_active`，`append_turn` 直接传 `AgentOutcome.items` | ✅ |
+| **5** | mock 参考实现同步改造：MemWorld 会话主快照 + delta、`/rpc` 新操作、client 新端口桩 | ✅ |
+| **6** | 验证层适配：L0 `output-provenance` 改为「销毁流后会话快照完整」；L1/L2 harness 驱动适配 | ✅ |
+| **7** | 文档：`decisions.md` D30、`invariants.md` INV-34/48/54、新建 `07-storage-integration.md`、更新架构复验图与各设计文档 | ✅ |
 
 ## 2. 成果
 
-- **三层解耦**：进程壳（agentd-mock）只装配；编排器（`AgentRuntime`）负责 claim / 组装 / 提交；执行（`AgentRunner` 实现）负责 React 循环。换 provider / 换 agent SDK 不再改编排器。
-- **completions 下沉**：core 只保留存储 / 领域 / 协议契约（`ResponseItem` / `EventBody` / `StoredResponse` / `protocol::Tool` / `RequestProvenance` 等）；completions 出站抽象归入验证进程，抽象与否由具体 runner 实现自决。
-- **取消正确性 / 及时性分离**：fence（`attempt`）保证正确性（拒绝过期写入），sink `Stop` 单一传导取消及时性（流式场景几 ms 内传导并中断模型调用），heartbeat 仅保活、不承担取消通知。
-- 生产 agentd 只预留 `AgentRunner` 抽象，本期不落地：未来对接真实 agent SDK（Moray）+ redis/mq。
-- 全部测试通过（含 103 个 conformance 契约用例、18 个 agent_runtime_e2e、21 个 http_contract）。
+- **存储 O(n²) → O(n)**：会话主快照 + 每轮 delta 取代 D24 每环物化全量快照。
+- **与上游对齐**：responses 短命（TTL），conversation 是长期对话的 system of record。
+- **原子性边界迁移**：INV-34 从「创建时 ledger+context 同事务」到「终态时 ledger.complete + append_turn 同事务」；INV-48 RESTATE（输出非回放派生）。
+- **存储选型解耦**：领域层只交付 trait + mock 参考实现 + 接入要求文档，后端由外部接入方注入。
+- 全部测试通过（`cargo test --workspace` 全绿、`check-deps` 通过、`coverage` 100%）。
 
-## 3. 上一期（Y/Z 期）成果
+## 3. 上一期（D29）成果
 
-Y/Z 期（能力层独立成 crate + 验证拓扑同构）已完成：
+Agent 结构解耦（编排器 + AgentRunner + 模拟验证进程）已完成：
 
-- **Y1** 新建 `nova-responses` library，平移 gateway 的能力层 + HTTP 层 + 后台维护。
-- **Y2** gateway 后端改为编译期 feature 门控（mem / sql 互斥）。
-- **Z 期** 验证拓扑与生产同构：mem 改为共享载体（`nova-responses-mem-server` + `adapters-mem-client`），执行 / 维护独立进程（`nova-agentd-mock` / `nova-responses-sweep`），L2 覆盖提升到 baseline 100%。
+- **1** `nova-agent` → `nova-agent-runtime`，新增 `AgentRunner` trait + `AgentTask` / `AgentOutcome` / `AgentEventSink` 强类型契约。
+- **2** 编排器 `AgentRuntime`（claim → 组装 → 提交）与 `EventSink` 分离；`new` / `start` 分离支持缩扩容。
+- **3** completions 出站抽象（Scheduler / ToolExecutor / completions 类型）从 core 下沉到 `mock-agentd`。
+- **4** 模拟验证进程 `mock-agentd` 移到 `verify/mock/`，装配 mem-server + `MockAgentRunner`（ReAct loop）+ `AgentRuntime`。
+- **5** `ResponseRecord.tools` 改存 inbound 形状（单一数据源）；测试迁移。
 
-更早的 X 期（D25 执行进程独立 + 在途缓冲共享化）与 W 期（D20/21/22 子集重构）成果见归档。
+更早的 Y/Z 期（能力层独立成 crate + 验证拓扑同构）与 X 期（D25 执行进程独立 + 在途缓冲共享化）成果见归档。

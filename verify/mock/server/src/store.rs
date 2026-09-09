@@ -15,10 +15,23 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nova_responses::{
     AgentId, Attempt, Conversation, ConversationEvent, ConversationEventKind, ConversationId,
-    ResponseId, StoredResponse, TenantId, Usage,
+    ResponseId, ResponseItem, ResponseRecord, TenantId, Usage,
 };
 use parking_lot::{Mutex, MutexGuard};
 use tokio::sync::Notify;
+
+/// A conversation's materialised snapshot (D30): the accumulated input+output of
+/// every completed turn, plus aligned reasoning blocks. This is the long-term
+/// record of the dialogue; responses are short-lived and reconstructable only
+/// while their event stream is retained.
+#[derive(Default)]
+pub(crate) struct Snapshot {
+    pub items: Vec<ResponseItem>,
+    pub reasoning: Vec<Option<String>>,
+    /// Number of completed turns (== `depth` in `ResolvedContext`).
+    pub turn_count: usize,
+    pub bytes: usize,
+}
 
 /// A conversation's event stream (D28). Held beside the conversation under the
 /// same mutex so the in-flight marker and the turn boundary events land together.
@@ -33,7 +46,7 @@ pub(crate) struct ConversationEventStream {
 }
 
 pub(crate) struct Inner {
-    pub records: HashMap<ResponseId, StoredResponse>,
+    pub records: HashMap<ResponseId, ResponseRecord>,
     /// Tenant secondary index, so bulk purge does not scan the whole map.
     pub by_tenant: HashMap<TenantId, BTreeSet<ResponseId>>,
     /// Expiry index keyed by deadline: sweeping is O(log n) per removal instead
@@ -55,6 +68,10 @@ pub(crate) struct Inner {
     /// same mutex, so a turn boundary (marker transition + event) and the
     /// response it refers to cannot be observed out of step.
     pub conversation_events: HashMap<ConversationId, ConversationEventStream>,
+
+    /// Per-conversation materialised snapshots (D30). The long-term content
+    /// record: `append_turn` grows it, `read_snapshot` reads it back.
+    pub snapshots: HashMap<ConversationId, Snapshot>,
 }
 
 pub struct MemStore {
@@ -85,6 +102,7 @@ impl MemStore {
                 conversations: HashMap::new(),
                 conversations_by_tenant: HashMap::new(),
                 conversation_events: HashMap::new(),
+                snapshots: HashMap::new(),
             }),
             read_only: AtomicBool::new(false),
             unavailable: AtomicBool::new(false),
@@ -176,7 +194,7 @@ impl Default for MemStore {
 }
 
 impl Inner {
-    pub fn insert_record(&mut self, record: StoredResponse) {
+    pub fn insert_record(&mut self, record: ResponseRecord) {
         let id = record.response_id.clone();
         if let Some(deadline) = record.expires_at_ms {
             self.expiry.insert((deadline, id.clone()), ());
@@ -188,7 +206,7 @@ impl Inner {
         self.records.insert(id, record);
     }
 
-    pub fn remove_record(&mut self, id: &ResponseId) -> Option<StoredResponse> {
+    pub fn remove_record(&mut self, id: &ResponseId) -> Option<ResponseRecord> {
         let record = self.records.remove(id)?;
         if let Some(deadline) = record.expires_at_ms {
             self.expiry.remove(&(deadline, id.clone()));
@@ -214,9 +232,10 @@ impl Inner {
             &conversation.tenant_id,
             id,
         );
-        // The event stream goes with it; response records are deliberately
-        // untouched (D24, and upstream's own wording).
+        // The event stream and snapshot go with it; response records are
+        // deliberately untouched (D24, and upstream's own wording).
         self.conversation_events.remove(id);
+        self.snapshots.remove(id);
         Some(conversation)
     }
 
