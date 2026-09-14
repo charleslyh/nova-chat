@@ -463,6 +463,16 @@ impl ResponseEvent {
     pub fn into_append(self) -> AppendEvent {
         self.event
     }
+
+    /// Assembly from parts, for first-party tests that drive the event log ports
+    /// with an in-memory stub instead of a backend. Production code gets events
+    /// back from the port, never from this.
+    pub fn from_parts(sequence_number: u64, event: AppendEvent) -> Self {
+        Self {
+            sequence_number,
+            event,
+        }
+    }
 }
 
 /// The SSE wire shape: `type`, `sequence_number`, and the body's own fields.

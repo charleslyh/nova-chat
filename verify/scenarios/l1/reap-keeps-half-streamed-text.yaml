@@ -1,0 +1,23 @@
+name: reap-keeps-half-streamed-text
+covers: [FR-35, INV-61]
+oracles: [CreatedResponsesTerminal]
+steps:
+  - action: create_conversation
+    label: conv
+  - action: create_response
+    input: "interrupted"
+    key: rhk-1
+    conversation: conv
+  - action: claim
+  # The holder dies mid-stream (an open item plus a delta, no `done`); the reaper
+  # must still archive the input and reconstruct the half-streamed message from its
+  # deltas (INV-61).
+  - action: append_delta
+    open_item: true
+    payload: "half streamed"
+  - action: reap
+  - action: resolve_chain
+    from: conv
+    expect_depth: 1
+    expect_items: 2
+    expect_text: "half streamed"

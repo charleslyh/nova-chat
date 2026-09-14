@@ -227,13 +227,14 @@ fn saw_relevant_data(&self, trace: &Trace) -> bool;   // 无默认实现
 
 ---
 
-## 6. L1 场景（30 个）
+## 6. L1 场景（29 个）
 
 | 组 | 场景 |
 |---|---|
 | 生命周期 | sequential-responses · idempotent-create · double-claim · claim-when-empty · attempt-fence |
 | 流式 | resume-starting-after · event-expired-explicit |
 | 上下文链 | chain-multi-turn · chain-depth-limit · chain-bytes-limit · chain-broken-explicit · chain-cross-tenant-denied · chain-delete-middle-link-blast-radius · instructions-not-inherited · store-false-not-referencable |
+| 未完成轮次归档 | cancel-keeps-half-streamed-text · reap-keeps-half-streamed-text |
 | 存储治理 | content-delete-and-sweep · tenant-purge · integrity-tamper-detected |
 | 可靠性 | reap-closes-lost-claim · partial-usage-accounted · context-store-down-rejects-write |
 | 过载 / 降级 | pending-limit-overload · overload-reject-consistent · read-only-reject |
@@ -242,7 +243,7 @@ fn saw_relevant_data(&self, trace: &Trace) -> bool;   // 无默认实现
 
 ---
 
-## 7. L2 场景（13 个）与进程拓扑
+## 7. L2 场景（15 个）与进程拓扑
 
 **fixture 进程**（`xtask procs up` 启动）：`mock-server`（数据面 19000 + 控制面 19001）· `mock-agentd`（scripted scheduler，含 `hang` 规则）· 三个**对等** gateway（node-a/b/c，18080/18081/18082，各自内嵌 sweep，短 heartbeat TTL）。
 

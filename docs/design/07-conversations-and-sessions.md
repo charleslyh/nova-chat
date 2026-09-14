@@ -104,10 +104,10 @@ sequenceDiagram
 失败、取消、回收的轮次不再「什么都不写」——它们也把**用户输入 + 已完成 items** 归档进主快照（INV-61），保证异常终止不丢当前轮次上下文、不破坏对话链：
 
 - **成功**：`AgentOutcome.items`（权威终态结果）直接提交。
-- **失败**：执行端仍存活，`EventSink` 累积「已到达 `done` 边界的 items」随失败一起归档。
-- **取消/回收/崩溃**：执行端不可达，从事件流回放 `OutputItemDone` 得到已完成 items（INV-48 RESTATE：保留窗口内立即回放并物化，不残留对事件流的依赖）。
+- **失败**：执行端仍存活，`EventSink` 累积「已到达 `done` 边界的 items」与流式中途的消息（由已流出的 deltas 重建，标 `ItemStatus::Incomplete`）随失败一起归档。
+- **取消/回收/崩溃**：执行端不可达，从事件流回放 `OutputItemDone` 得到已完成 items，并由 `OutputItemAdded` + `OutputTextDelta` 重建流式中途的消息（INV-48 RESTATE：保留窗口内立即回放并物化，不残留对事件流的依赖）。
 
-**粒度**：只归档「已完成 item」（完整 tool call / function_call output / 完整文本段落）；半截流式 token 永不入快照——它会污染下一轮上下文。
+**粒度**：归档「已完成 item」（完整 tool call / function_call output / 完整文本段落）+ 流式中途的**文本消息**（以 `ItemStatus::Incomplete` 重建，用户已看到的 token 刷新后不消失，且带不完整标记可被下游识别）；半截 function-call **参数**不重建——不可执行、也无法作为下一轮输入回传。
 
 **幂等**：`append_turn` 按 `response_id` 幂等。执行端的终态漏斗与 service 层的取消/回收漏斗可能竞态写同一轮次，谁先写谁生效，重复调用返回原 turn index、不重复追加。
 

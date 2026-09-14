@@ -1,0 +1,23 @@
+name: cancel-keeps-half-streamed-text
+covers: [FR-7, FR-20, INV-61]
+oracles: []
+steps:
+  - action: create_conversation
+    label: conv
+  - action: create_response
+    input: "interrupt me"
+    key: chk-1
+    conversation: conv
+  - action: claim
+  # Stream into an open item, then cancel: the message never reaches `done`, so the
+  # snapshot must be rebuilt from the deltas as an incomplete message (INV-61) — the
+  # tokens the user was reading survive the refresh.
+  - action: append_delta
+    open_item: true
+    payload: "half streamed"
+  - action: cancel
+  - action: resolve_chain
+    from: conv
+    expect_depth: 1
+    expect_items: 2
+    expect_text: "half streamed"

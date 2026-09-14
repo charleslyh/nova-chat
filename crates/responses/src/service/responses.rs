@@ -415,10 +415,11 @@ impl ResponsesService {
 
         let record = self.deps.ledger.get(response_id).await.ok().flatten();
 
-        // Archive the cancelled turn's input and whatever output it completed (D30
+        // Archive the cancelled turn's input and whatever output it reached (D30
         // incomplete-turn archival). The executing agent is unreachable from here, so
-        // completed items are replayed from the event stream (INV-48 RESTATE, still
-        // within the retention window); half-streamed output never appears.
+        // output comes from replaying the event stream (INV-48 RESTATE, still within
+        // the retention window); a half-streamed message is reconstructed from its
+        // deltas so the tokens the user saw survive the refresh.
         if let Some(record) = &record {
             if record.is_stored() {
                 if let Some(conversation_id) = record.conversation_id() {

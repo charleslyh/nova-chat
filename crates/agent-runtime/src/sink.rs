@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nova_responses::ports::{EventLogError, ResponseEventLog};
-use nova_responses::{AppendEvent, Attempt, ContentPart, ResponseId, ResponseItem};
+use nova_responses::{AppendEvent, Attempt, ContentPart, ItemStatus, ResponseId, ResponseItem};
 
 use crate::runner::{AgentEventSink, SinkError, SinkVerdict};
 
@@ -33,6 +33,12 @@ pub struct EventSink {
     /// orchestrator can archive completed items when a turn ends without a full outcome
     /// (failure / cancellation), rather than losing them.
     completed: Vec<ResponseItem>,
+    /// The output item currently being streamed (announced via `added`, not yet
+    /// `done`). Kept so a turn that dies mid-stream can still archive the text the
+    /// user was reading, as an incomplete message.
+    open_item: Option<ResponseItem>,
+    /// Text streamed into `open_item` so far.
+    open_text: String,
 }
 
 impl EventSink {
@@ -51,6 +57,8 @@ impl EventSink {
             current_content_index: None,
             reasoning: String::new(),
             completed: Vec::new(),
+            open_item: None,
+            open_text: String::new(),
         }
     }
 
@@ -66,10 +74,31 @@ impl EventSink {
 
     /// Output items that reached a `done` boundary, in order. This is the partial
     /// result the orchestrator archives when a turn ends without a full outcome
-    /// (failure / cancellation): completed tool calls and finished text parts survive,
-    /// while half-streamed tokens are never included.
+    /// (failure / cancellation): completed tool calls and finished text parts survive.
     pub fn completed(&self) -> &[ResponseItem] {
         &self.completed
+    }
+
+    /// The item still being streamed, reconstructed from its accumulated deltas as
+    /// a message with `ItemStatus::Incomplete`, when it carries any text. This is
+    /// what a turn that dies mid-stream archives: the tokens the user was reading
+    /// are kept, rather than vanishing on refresh.
+    pub fn partial_item(&self) -> Option<ResponseItem> {
+        let item = self.open_item.as_ref()?;
+        let ResponseItem::Message { role, id, .. } = item else {
+            return None;
+        };
+        if self.open_text.is_empty() {
+            return None;
+        }
+        Some(ResponseItem::Message {
+            role: role.clone(),
+            content: vec![ContentPart::OutputText {
+                text: self.open_text.clone(),
+            }],
+            id: id.clone(),
+            status: Some(ItemStatus::Incomplete),
+        })
     }
 
     fn id(&self) -> ResponseId {
@@ -109,6 +138,10 @@ impl EventSink {
 #[async_trait]
 impl AgentEventSink for EventSink {
     async fn text_delta(&mut self, text: &str) -> Result<SinkVerdict, SinkError> {
+        // Recorded even if the append below is refused as stale: those tokens were
+        // already streamed to the user, and `partial_item` is what archives them when
+        // the turn ends without a full outcome.
+        self.open_text.push_str(text);
         let event = AppendEvent::text_delta(
             self.id(),
             self.attempt,
@@ -130,6 +163,8 @@ impl AgentEventSink for EventSink {
         let index = self.output_index;
         self.output_index += 1;
         self.current_item_id = Some(item.stream_item_id().to_string());
+        self.open_item = Some(item.clone());
+        self.open_text.clear();
         let event = AppendEvent::item(self.id(), self.attempt, false, index, item.clone());
         self.push(event).await
     }
@@ -139,6 +174,8 @@ impl AgentEventSink for EventSink {
         // orchestrator can archive completed items even when the turn ends without a
         // full outcome (failure / cancellation).
         self.completed.push(item.clone());
+        self.open_item = None;
+        self.open_text.clear();
         let event = AppendEvent::item(
             self.id(),
             self.attempt,
@@ -229,5 +266,144 @@ impl AgentEventSink for EventSink {
             },
         );
         self.push(event).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nova_responses::ports::EventLogError;
+    use nova_responses::{ResponseEvent, Role};
+    use std::sync::Mutex;
+
+    fn id() -> ResponseId {
+        ResponseId::new(nova_responses::NodeTag::parse("n1").unwrap())
+    }
+
+    /// Accepting in-memory log: enough of the port to drive the sink.
+    struct Log {
+        events: Mutex<Vec<ResponseEvent>>,
+    }
+
+    impl Log {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ResponseEventLog for Log {
+        async fn append(&self, event: AppendEvent) -> Result<u64, EventLogError> {
+            let mut g = self.events.lock().unwrap();
+            let seq = g.len() as u64;
+            g.push(ResponseEvent::from_parts(seq, event));
+            Ok(seq)
+        }
+
+        async fn read_after(
+            &self,
+            _response_id: &ResponseId,
+            _starting_after: Option<u64>,
+            _limit: usize,
+            _wait: std::time::Duration,
+        ) -> Result<Vec<ResponseEvent>, EventLogError> {
+            Ok(self.events.lock().unwrap().clone())
+        }
+
+        async fn close(
+            &self,
+            _response_id: &ResponseId,
+            _now_ms: u64,
+            _retain: std::time::Duration,
+        ) -> Result<(), EventLogError> {
+            Ok(())
+        }
+
+        async fn sweep_expired(&self, _now_ms: u64) -> Result<u64, EventLogError> {
+            Ok(0)
+        }
+
+        async fn remove(&self, _response_id: &ResponseId) -> Result<(), EventLogError> {
+            Ok(())
+        }
+    }
+
+    fn sink() -> EventSink {
+        EventSink::new(std::sync::Arc::new(Log::new()), id(), Attempt(1))
+    }
+
+    async fn open_message(sink: &mut EventSink) {
+        sink.output_item_added(&ResponseItem::Message {
+            role: Role::Assistant,
+            content: vec![],
+            id: Some("m0".into()),
+            status: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_partial_before_any_item_is_streamed() {
+        let sink = sink();
+        assert!(sink.partial_item().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_open_item_without_text_has_no_partial() {
+        let mut sink = sink();
+        open_message(&mut sink).await;
+        assert!(sink.partial_item().is_none());
+    }
+
+    #[tokio::test]
+    async fn streamed_text_comes_back_as_an_incomplete_message() {
+        let mut sink = sink();
+        open_message(&mut sink).await;
+        sink.text_delta("half ").await.unwrap();
+        sink.text_delta("way").await.unwrap();
+        match sink.partial_item() {
+            Some(ResponseItem::Message { status, content, .. }) => {
+                assert_eq!(status, Some(ItemStatus::Incomplete));
+                assert_eq!(
+                    content,
+                    vec![ContentPart::OutputText {
+                        text: "half way".into()
+                    }]
+                );
+            }
+            other => panic!("expected an incomplete message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn done_clears_the_partial() {
+        let mut sink = sink();
+        open_message(&mut sink).await;
+        sink.text_delta("full").await.unwrap();
+        let item = ResponseItem::assistant_text("full");
+        sink.output_item_done(&item).await.unwrap();
+        assert!(sink.partial_item().is_none());
+        assert_eq!(sink.completed(), &[item]);
+    }
+
+    #[tokio::test]
+    async fn a_non_message_open_item_has_no_partial() {
+        let mut sink = sink();
+        sink.output_item_added(&ResponseItem::FunctionCall {
+            call_id: "call_1".into(),
+            name: "search".into(),
+            arguments: String::new(),
+            id: None,
+            status: None,
+        })
+        .await
+        .unwrap();
+        sink.function_call_arguments_delta("call_1", "{\"q\":")
+            .await
+            .unwrap();
+        assert!(sink.partial_item().is_none());
     }
 }

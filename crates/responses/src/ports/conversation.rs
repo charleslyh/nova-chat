@@ -111,8 +111,10 @@ pub trait ConversationSnapshots: Send + Sync {
     ///
     /// A turn that ended without producing output (failed, cancelled, reaped) still
     /// archives its input, so the conversation chain is not left with a gap: `output_items`
-    /// is legitimately empty in that case. Only completed items are archived — a
-    /// half-streamed token is never reconstructed.
+    /// is legitimately empty in that case. Completed items are archived as they finished;
+    /// a message that was still streaming is archived as an `ItemStatus::Incomplete`
+    /// message reconstructed from its deltas, so the tokens the user already saw survive
+    /// (INV-61).
     ///
     /// **Idempotent per `response_id`**: every terminal path may call this for the same
     /// response (the runtime's completion/failure funnel and the service layer's

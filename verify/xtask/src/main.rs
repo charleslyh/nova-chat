@@ -466,7 +466,8 @@ fn coverage_baseline() -> std::collections::BTreeSet<&'static str> {
         "INV-1", "INV-2", "INV-5", "INV-6", "INV-11", "INV-12", "INV-16", "INV-29", "INV-30",
         "INV-32", "INV-34", "INV-35", "INV-40", "INV-41", "INV-42", "INV-43",
         "INV-44", "INV-45", "INV-46", "INV-47", "INV-48", "INV-49", "INV-50", "INV-51",
-        "INV-52", "INV-54", "INV-55", "INV-56", "INV-57", "INV-58", "INV-59",
+        "INV-52", "INV-54", "INV-55", "INV-56", "INV-57", "INV-58", "INV-59", "INV-60",
+        "INV-61",
         // Security.
         "SEC-2", "SEC-3", "SEC-5", "SEC-6", "SEC-7",
     ]

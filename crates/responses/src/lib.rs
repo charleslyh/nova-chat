@@ -54,4 +54,4 @@ pub use usage::Usage;
 
 /// Re-exported for convenience: these are the protocol shapes that are also the
 /// domain values every port traffics in. See the module header.
-pub use protocol::{ContentPart, ResponseItem, Role, Tool, ToolChoice};
+pub use protocol::{ContentPart, ItemStatus, ResponseItem, Role, Tool, ToolChoice};

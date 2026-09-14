@@ -930,6 +930,219 @@ async fn a_cancelled_turn_archives_completed_output() {
     );
 }
 
+/// Streams an item's `added` event and a few text deltas, then blocks forever — used
+/// to cancel a turn *mid-stream* so the half-finished message must be reconstructed
+/// from its deltas and archived (INV-61).
+struct StreamThenHangScheduler {
+    produced: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Scheduler for StreamThenHangScheduler {
+    fn name(&self) -> &str {
+        "stream-then-hang"
+    }
+
+    async fn schedule(
+        &self,
+        _request: &CompletionsRequest,
+        sink: &mut dyn AgentEventSink,
+    ) -> Result<CompletionsOutcome, SchedulerError> {
+        let item = nova_responses::ResponseItem::assistant_text("");
+        sink.output_item_added(&item).await?;
+        sink.content_part_added(item.stream_item_id(), 0).await?;
+        sink.text_delta("halfway ").await?;
+        sink.text_delta("through the answer").await?;
+        self.produced.notify_one();
+        std::future::pending::<()>().await;
+        unreachable!("cancelled before completion")
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_turn_archives_its_half_streamed_text() {
+    let h = start().await;
+
+    let (status, conv) = h.post("/v1/conversations", json!({})).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let conv_id = conv["id"].as_str().unwrap().to_string();
+
+    let (status, body) = h
+        .post(
+            "/v1/responses",
+            json!({
+                "model": "m",
+                "input": "answer me",
+                "conversation": conv_id,
+                "background": true,
+            }),
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED);
+    let id = body["id"].as_str().unwrap().to_string();
+
+    // Stream part of a message, then hang inside the scheduler call; cancelling
+    // there leaves the message at `added` + deltas, never `done`.
+    let produced = Arc::new(tokio::sync::Notify::new());
+    let engine = h.engine_with(Arc::new(StreamThenHangScheduler {
+        produced: produced.clone(),
+    }));
+    let clock = h.world.clock.clone();
+    let handle = tokio::spawn(async move { engine.run_once(clock.now_ms()).await });
+
+    produced.notified().await;
+
+    let (status, _cancelled) = h.post(&format!("/v1/responses/{id}/cancel"), Value::Null).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    // The tokens the user was reading must survive the cancellation: the
+    // half-streamed message is reconstructed from its deltas and archived as an
+    // incomplete message.
+    let (status, transcript) = h
+        .get(&format!("/v1/conversations/{conv_id}/transcript"))
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let rendered = transcript.to_string();
+    assert!(rendered.contains("answer me"), "input must be archived: {rendered}");
+    assert!(
+        rendered.contains("halfway through the answer"),
+        "half-streamed text must be reconstructed and archived: {rendered}"
+    );
+
+    let result = handle.await.expect("join");
+    assert_eq!(result, Executed::Superseded);
+}
+
+#[tokio::test]
+async fn the_turn_after_a_cancel_inherits_the_half_streamed_answer() {
+    // Pins the design decision that the reconstructed incomplete message is
+    // ordinary context: the next turn reads it from the snapshot, so the
+    // conversation continues from what the user actually saw (INV-61), not from a
+    // silent gap.
+    let h = start().await;
+
+    let (status, conv) = h.post("/v1/conversations", json!({})).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let conv_id = conv["id"].as_str().unwrap().to_string();
+
+    let (status, body) = h
+        .post(
+            "/v1/responses",
+            json!({
+                "model": "m",
+                "input": "first question",
+                "conversation": conv_id,
+                "background": true,
+            }),
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED);
+    let id = body["id"].as_str().unwrap().to_string();
+
+    let produced = Arc::new(tokio::sync::Notify::new());
+    let engine = h.engine_with(Arc::new(StreamThenHangScheduler {
+        produced: produced.clone(),
+    }));
+    let clock = h.world.clock.clone();
+    let handle = tokio::spawn(async move { engine.run_once(clock.now_ms()).await });
+    produced.notified().await;
+    let (status, _) = h.post(&format!("/v1/responses/{id}/cancel"), Value::Null).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(handle.await.expect("join"), Executed::Superseded);
+
+    // The next turn on the conversation must be admitted (the lock was released)
+    // and see both the question and the half-streamed answer in its context.
+    let (status, body) = h
+        .post(
+            "/v1/responses",
+            json!({
+                "model": "m",
+                "input": "second question",
+                "conversation": conv_id,
+                "background": true,
+            }),
+        )
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::ACCEPTED,
+        "the cancelled turn must have released the conversation lock"
+    );
+
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let engine = h.engine_with(Arc::new(CapturingScheduler { seen: seen.clone() }));
+    assert_eq!(engine.run_once(3_000).await, Executed::Completed);
+
+    let request = seen.lock().expect("lock").clone().expect("a request was built");
+    let rendered = serde_json::to_string(&request.messages).expect("render");
+    assert!(rendered.contains("first question"), "got: {rendered}");
+    assert!(
+        rendered.contains("halfway through the answer"),
+        "the half-streamed answer must be inherited as context: {rendered}"
+    );
+    assert!(rendered.contains("second question"), "got: {rendered}");
+}
+
+/// Streams an item's `added` event and one text delta, then fails — the runner is
+/// still alive, so the fail path must archive the half-finished message from the
+/// sink's own accumulation (INV-61).
+struct StreamThenFailScheduler;
+
+#[async_trait::async_trait]
+impl Scheduler for StreamThenFailScheduler {
+    fn name(&self) -> &str {
+        "stream-then-fail"
+    }
+
+    async fn schedule(
+        &self,
+        _request: &CompletionsRequest,
+        sink: &mut dyn AgentEventSink,
+    ) -> Result<CompletionsOutcome, SchedulerError> {
+        let item = nova_responses::ResponseItem::assistant_text("");
+        sink.output_item_added(&item).await?;
+        sink.content_part_added(item.stream_item_id(), 0).await?;
+        sink.text_delta("provider died mid-sentence").await?;
+        Err(SchedulerError::DeadlineExceeded)
+    }
+}
+
+#[tokio::test]
+async fn a_failed_turn_archives_its_half_streamed_text() {
+    let h = start().await;
+
+    let (status, conv) = h.post("/v1/conversations", json!({})).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let conv_id = conv["id"].as_str().unwrap().to_string();
+
+    let (status, _body) = h
+        .post(
+            "/v1/responses",
+            json!({
+                "model": "m",
+                "input": "answer me",
+                "conversation": conv_id,
+                "background": true,
+            }),
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED);
+
+    let engine = h.engine_with(Arc::new(StreamThenFailScheduler));
+    assert_eq!(engine.run_once(2_000).await, Executed::Failed);
+
+    let (status, transcript) = h
+        .get(&format!("/v1/conversations/{conv_id}/transcript"))
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let rendered = transcript.to_string();
+    assert!(rendered.contains("answer me"), "input must be archived: {rendered}");
+    assert!(
+        rendered.contains("provider died mid-sentence"),
+        "the half-streamed text before the failure must be archived: {rendered}"
+    );
+}
+
 #[tokio::test]
 async fn an_unusable_outcome_fails_the_response_instead_of_storing_it() {
     // Was `chain_closure_violation_is_refused_at_complete`, which posted a

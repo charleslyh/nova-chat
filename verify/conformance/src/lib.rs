@@ -1946,7 +1946,7 @@ pub fn cases() -> &'static [ContractCase] {
             // CR-11 was also claimed here and dropped: the port offers no way to
             // read booked partial usage back, so this case cannot substantiate it.
             // Covered by the L1 `partial-usage-accounted` scenario via the trace.
-            covers: &["FR-7", "INV-51", "SEC-2"],
+            covers: &["FR-7", "INV-51", "INV-60", "SEC-2"],
             scope: CaseScope::Backend,
             asserts: "assert_cancel_conformance",
         },

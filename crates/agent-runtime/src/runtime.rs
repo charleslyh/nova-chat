@@ -302,9 +302,14 @@ impl AgentRuntime {
                     "agent run failed"
                 );
                 // The runner failed, but items it already completed (tool calls, finished
-                // text parts) are worth keeping: archive them with the input.
+                // text parts) are worth keeping — and so is the message it was still
+                // streaming, reconstructed from the deltas the user already saw.
+                let mut produced = sink.completed().to_vec();
+                if let Some(partial) = sink.partial_item() {
+                    produced.push(partial);
+                }
                 return self
-                    .fail(&record, attempt, usage, sink.completed(), &message, now_ms)
+                    .fail(&record, attempt, usage, &produced, &message, now_ms)
                     .await;
             }
         };
@@ -423,10 +428,11 @@ impl AgentRuntime {
             return Executed::Failed;
         }
 
-        // A failed turn still archives its input and whatever completed output it
-        // produced (D30 incomplete-turn archival), so the conversation chain keeps the
-        // user's question and any finished tool calls. Half-streamed output is not here:
-        // `produced` holds only items that reached a `done` boundary.
+        // A failed turn still archives its input and whatever output it produced (D30
+        // incomplete-turn archival), so the conversation chain keeps the user's
+        // question, any finished tool calls, and the incomplete message that was
+        // mid-stream when the failure hit (`produced` holds only `done` items plus
+        // that reconstruction).
         if record.is_stored() && record.conversation_id().is_some() {
             self.append_turn(record, produced, None, usage, ResponseStatus::Failed, now_ms)
                 .await;

@@ -71,7 +71,7 @@
 | **INV-34** | **持久化先于成功响应**（D30 RESTATE）：创建时账本记录即时可见；终态时 `ledger.complete` 与 `conversation.append_turn` 必须同存储同事务 | CR-6, D30 | 返回成功但生成不存在 / 终态提交半途而废 |
 | **INV-54** | ~~会话容器只存链尾指针，不存条目~~ **⛔ SUPERSEDED BY D30**：conversation 现持有持久物化主快照，是对话内容的唯一真相源 | CR-10, FR-40, FR-41 | —— |
 | **INV-55** | **推进链尾为后写胜出**，不设 CAS；且只有**提交了输出**的轮次才推进 | FR-41 | 上游 SDK 收到官方不存在的冲突码；或链尾指向一条没有回复的响应，下一轮读到半截对话 |
-| **INV-61** | **未完成轮次也归档 input + 已完成 items**：失败/取消/回收的轮次以「input + 已到达 `done` 边界的 items、空半截输出」落快照，`append_turn` 按 `response_id` 幂等；链尾仍只推进提交了输出的轮次（INV-55） | FR-20, FR-41, D30 | 异常终止丢当前轮次上下文 / 对话链断裂 |
+| **INV-61** | **未完成轮次也归档 input + 输出 items**：失败/取消/回收的轮次以「input + 已到达 `done` 边界的 items + 流式中途的消息（由已流出的 deltas 重建，标 `ItemStatus::Incomplete`）」落快照——半截 function-call 参数不重建；`append_turn` 按 `response_id` 幂等；链尾仍只推进提交了输出的轮次（INV-55） | FR-20, FR-41, D30 | 异常终止丢当前轮次上下文 / 对话链断裂 / 用户已看到的半截回复刷新后消失 |
 
 ---
 

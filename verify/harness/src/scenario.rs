@@ -9,7 +9,9 @@ use std::path::Path;
 
 use mock_server::MemWorld;
 use anyhow::{bail, Context, Result};
-use nova_responses::protocol::{CreateResponseRequest, ProtocolLimits, ResponseObject};
+use nova_responses::protocol::{
+    ContentPart, CreateResponseRequest, ItemStatus, ProtocolLimits, ResponseObject,
+};
 use nova_responses::{
     canonical_items, AgentId, AppendEvent, Attempt, ContextAnchor, Conversation, ConversationId,
     EventBody, IdempotencyKey, ModelParams, NodeTag, ResponseEventKind, ResponseId,
@@ -83,6 +85,11 @@ enum Step {
         payload: Option<String>,
         #[serde(default)]
         attempt: Option<u64>,
+        /// Announce an output item (`output_item.added`) before the delta, so the
+        /// delta streams into an open item — the shape a mid-stream cancel/reap
+        /// leaves behind (INV-61).
+        #[serde(default)]
+        open_item: bool,
         #[serde(default)]
         expect_stale: bool,
     },
@@ -131,6 +138,10 @@ enum Step {
         expect_depth: Option<usize>,
         #[serde(default)]
         expect_items: Option<usize>,
+        /// Assert the snapshot renders this text — the positive counterpart of
+        /// `expect_absent_text`, for archival regressions (INV-61).
+        #[serde(default)]
+        expect_text: Option<String>,
         #[serde(default)]
         expect_absent_text: Option<String>,
     },
@@ -519,6 +530,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
         Step::AppendDelta {
             payload,
             attempt,
+            open_item,
             expect_stale,
         } => {
             let id = ctx.resolve(&None)?;
@@ -526,6 +538,31 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 .map(Attempt)
                 .or(ctx.last_attempt)
                 .unwrap_or(Attempt(1));
+            if open_item {
+                ctx.world
+                    .event_log
+                    .append(AppendEvent::item(
+                        id.clone(),
+                        attempt,
+                        false,
+                        0,
+                        ResponseItem::Message {
+                            role: nova_responses::Role::Assistant,
+                            content: vec![],
+                            id: Some("m0".into()),
+                            status: Some(ItemStatus::InProgress),
+                        },
+                    ))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{sc}: open item append failed: {e}"))?;
+                trace.push(TraceEvent::EventAppended {
+                    response_id: id.to_string(),
+                    attempt: Some(attempt.0),
+                    sequence_number: 0,
+                    kind: "response.output_item.added".into(),
+                    at_ms: ctx.now_ms,
+                });
+            }
             let result = ctx
                 .world
                 .event_log
@@ -802,6 +839,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             tenant,
             expect_depth,
             expect_items,
+            expect_text,
             expect_absent_text,
         } => {
             let conv = ctx.resolve_conv(&from)?;
@@ -830,6 +868,12 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                         "{sc}: expected {want} chain items, got {}",
                         resolved.item_count()
                     );
+                }
+            }
+            if let Some(want) = expect_text {
+                let encoded = canonical_items(&resolved.clone().into_items());
+                if !encoded.contains(&want) {
+                    bail!("{sc}: `{want}` must appear in chain output: {encoded}");
                 }
             }
             if let Some(absent) = expect_absent_text {
@@ -1062,15 +1106,19 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
     Ok(())
 }
 
-/// Replay a response's event stream for the items that reached a `done` boundary, in
+/// Replay a response's event stream for its archivable output items, in
 /// `output_index` order — the harness's stand-in for the service layer's archival
-/// replay (INV-48 RESTATE). Used by the cancel/reap steps, where no engine is running
-/// to submit a terminal result.
+/// replay (INV-48 RESTATE, INV-61). Used by the cancel/reap steps, where no engine
+/// is running to submit a terminal result. Mirrors production: items that reached
+/// `done` come back as they completed, and the trailing item still being streamed
+/// is reconstructed from its text deltas as an `ItemStatus::Incomplete` message.
 async fn replay_completed_items(
     event_log: &dyn ResponseEventLog,
     response_id: &ResponseId,
 ) -> Result<Vec<ResponseItem>> {
     let mut items: Vec<(u32, ResponseItem)> = Vec::new();
+    let mut open: Option<(u32, ResponseItem)> = None;
+    let mut open_text = String::new();
     let mut cursor: Option<u64> = None;
     loop {
         let batch = event_log
@@ -1082,11 +1130,49 @@ async fn replay_completed_items(
         }
         cursor = batch.last().map(|e| e.sequence_number());
         for event in &batch {
-            if event.kind() == ResponseEventKind::OutputItemDone {
-                if let EventBody::Item { output_index, item } = event.body() {
-                    items.push((*output_index, item.clone()));
+            match event.kind() {
+                ResponseEventKind::OutputItemAdded => {
+                    if let EventBody::Item { output_index, item } = event.body() {
+                        open = Some((*output_index, item.clone()));
+                        open_text.clear();
+                    }
                 }
+                ResponseEventKind::OutputItemDone => {
+                    if let EventBody::Item { output_index, item } = event.body() {
+                        if open.as_ref().is_some_and(|(idx, _)| idx == output_index) {
+                            open = None;
+                            open_text.clear();
+                        }
+                        items.push((*output_index, item.clone()));
+                    }
+                }
+                ResponseEventKind::OutputTextDelta => {
+                    if let EventBody::Delta {
+                        output_index,
+                        delta,
+                        ..
+                    } = event.body()
+                    {
+                        if open.as_ref().is_some_and(|(idx, _)| idx == output_index) {
+                            open_text.push_str(delta);
+                        }
+                    }
+                }
+                _ => {}
             }
+        }
+    }
+    if let Some((index, ResponseItem::Message { role, id, .. })) = open {
+        if !open_text.is_empty() {
+            items.push((
+                index,
+                ResponseItem::Message {
+                    role,
+                    content: vec![ContentPart::OutputText { text: open_text }],
+                    id,
+                    status: Some(ItemStatus::Incomplete),
+                },
+            ));
         }
     }
     items.sort_by_key(|(index, _)| *index);

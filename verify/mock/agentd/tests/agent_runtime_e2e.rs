@@ -302,7 +302,9 @@ async fn a_failed_turn_archives_its_input() {
     let snap = snapshot(&world, &conv).await;
     assert_eq!(snap.turns, 1, "the failed turn is still a turn");
     // The input plus the one item that reached a `done` boundary before the stall are
-    // archived; the stall produced nothing further, and half-streamed tokens never land.
+    // archived; the stall script completes its item before failing, so there is no
+    // half-streamed message to reconstruct here (that case is covered in the gateway
+    // contract tests).
     assert_eq!(snap.item_count(), 2, "input + the one completed output item");
     let rendered = nova_responses::canonical_items(&snap.clone().into_items());
     assert!(
