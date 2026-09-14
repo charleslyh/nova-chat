@@ -150,6 +150,20 @@ pub trait AgentEventSink: Send {
     }
 }
 
+/// Active cancellation probe.
+///
+/// The passive path — the sink refusing an append as stale — only fires when a
+/// runner happens to emit an event. A blocking tool call emits nothing for
+/// seconds at a time, so the runner races it against this probe: [`cancelled`]
+/// resolves as soon as the attempt has been superseded (cancelled or reaped),
+/// and never otherwise.
+///
+/// [`cancelled`]: CancelProbe::cancelled
+#[async_trait]
+pub trait CancelProbe: Send + Sync {
+    async fn cancelled(&self);
+}
+
 /// Executes an agent task; the ReAct loop lives in the implementation.
 #[async_trait]
 pub trait AgentRunner: Send + Sync {
@@ -159,9 +173,14 @@ pub trait AgentRunner: Send + Sync {
     /// (whose implementation appends them to the event log); when the sink
     /// returns [`SinkVerdict::Stop`] the implementation must stop and return
     /// [`AgentError::Superseded`].
+    ///
+    /// `cancel` is the active counterpart to the sink's passive fence check:
+    /// the runner races blocking work (notably tool calls) against it so a
+    /// cancelled or reaped attempt stops spending tokens promptly.
     async fn run(
         &self,
         task: &AgentTask,
         sink: &mut dyn AgentEventSink,
+        cancel: &dyn CancelProbe,
     ) -> Result<AgentOutcome, AgentError>;
 }

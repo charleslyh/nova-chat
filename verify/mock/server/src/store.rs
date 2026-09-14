@@ -32,6 +32,10 @@ pub(crate) struct Snapshot {
     pub entries: Vec<ContextEntry>,
     /// Number of completed turns.
     pub turn_count: usize,
+    /// `append_turn` idempotency: response_id → the turn index it was assigned, so a
+    /// repeat append (a racing runtime funnel vs. the cancel/reap funnel) returns the
+    /// existing index instead of appending a second time.
+    pub appended: BTreeMap<ResponseId, u64>,
 }
 
 /// A conversation's event stream (D28). Held beside the conversation under the

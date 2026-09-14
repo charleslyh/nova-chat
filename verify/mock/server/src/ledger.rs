@@ -229,16 +229,20 @@ impl ResponseLedger for MemResponseLedger {
                 rec.status.as_str()
             )));
         }
-        let attempt = rec.attempt;
+        let previous_attempt = rec.attempt;
         let partial = rec.usage;
+        // Raise the fence first so the executing agent observes the cancellation — its
+        // next append and its active cancellation probe both see StaleAttempt — and
+        // stops spending tokens promptly rather than running the ReAct loop out.
+        rec.attempt = previous_attempt.next();
         rec.status = ResponseStatus::Cancelled;
         rec.owner = None;
         rec.completed_at_ms = Some(now_ms);
         // Tokens already burnt on the running attempt still have to be booked (INV-51),
-        // otherwise billing silently under-counts.
+        // otherwise billing silently under-counts. Booked against the superseded attempt.
         if !partial.is_zero() {
             g.partial_usage
-                .insert((response_id.clone(), attempt), partial);
+                .insert((response_id.clone(), previous_attempt), partial);
         }
         Ok(())
     }
@@ -277,6 +281,11 @@ impl ResponseLedger for MemResponseLedger {
             // a row this loop already holds.
             let tenant_id = rec.tenant_id.clone();
             let conversation_id = rec.conversation_id().cloned();
+            // The turn's own input and store flag travel with the claim so the sweeper can
+            // archive the input to the conversation snapshot (D30 incomplete-turn archival)
+            // without a follow-up read.
+            let input_items = rec.spec.input_items.clone();
+            let store = rec.spec.store;
             // Raise the fence first so the stale holder's next append fails.
             rec.attempt = previous_attempt.next();
             rec.status = ResponseStatus::Failed;
@@ -291,6 +300,8 @@ impl ResponseLedger for MemResponseLedger {
                 previous_attempt,
                 tenant_id,
                 conversation_id,
+                input_items,
+                store,
             });
         }
         Ok(aborted)

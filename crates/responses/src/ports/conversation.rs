@@ -105,9 +105,19 @@ pub trait ConversationSnapshots: Send + Sync {
     /// Both the turn's input and output are appended, so the next turn's model
     /// context is complete without the caller re-supplying history. The items come
     /// from the execution side's final result — **never** derived by replaying the
-    /// event stream (INV-48). This is the single place durable content is written; it
-    /// is paired with `ResponseLedger::complete` in one transaction boundary
-    /// (INV-34).
+    /// event stream for a reachable execution (INV-48). This is the single place
+    /// durable content is written; on the runtime's completion path it is paired with
+    /// `ResponseLedger::complete` in one transaction boundary (INV-34).
+    ///
+    /// A turn that ended without producing output (failed, cancelled, reaped) still
+    /// archives its input, so the conversation chain is not left with a gap: `output_items`
+    /// is legitimately empty in that case. Only completed items are archived — a
+    /// half-streamed token is never reconstructed.
+    ///
+    /// **Idempotent per `response_id`**: every terminal path may call this for the same
+    /// response (the runtime's completion/failure funnel and the service layer's
+    /// cancel/reap funnel can race). The store remembers the assigned turn index and
+    /// returns it on a repeat instead of appending twice.
     ///
     /// Returns the turn's index (0-based, monotonically increasing).
     async fn append_turn(

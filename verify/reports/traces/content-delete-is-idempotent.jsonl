@@ -1,6 +1,6 @@
-{"type":"response_created","response_id":"resp_node-a_ca7c9682-4dd5-4b1b-90b6-12ae6eda108a","key":"cds-1","outcome":"accepted","store":true,"previous":null,"at_ms":1000}
-{"type":"content_stored","response_id":"resp_node-a_ca7c9682-4dd5-4b1b-90b6-12ae6eda108a","stored":true,"at_ms":1000}
-{"type":"event_appended","response_id":"resp_node-a_ca7c9682-4dd5-4b1b-90b6-12ae6eda108a","attempt":null,"sequence_number":0,"kind":"response.created","at_ms":1000}
+{"type":"response_created","response_id":"resp_node-a_318bd612-eb4f-48c5-b753-7be8f8ce1323","key":"cds-1","outcome":"accepted","store":true,"previous":null,"at_ms":1000}
+{"type":"content_stored","response_id":"resp_node-a_318bd612-eb4f-48c5-b753-7be8f8ce1323","stored":true,"at_ms":1000}
+{"type":"event_appended","response_id":"resp_node-a_318bd612-eb4f-48c5-b753-7be8f8ce1323","attempt":null,"sequence_number":0,"kind":"response.created","at_ms":1000}
 {"type":"clock","now_ms":1001}
 {"type":"clock","now_ms":1002}
 {"type":"clock","now_ms":1003}

@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::conversation::ConversationId;
 use crate::identity::{AgentId, Attempt, IdempotencyKey, TenantId};
+use crate::protocol::ResponseItem;
 use crate::provenance::RequestProvenance;
 use crate::response::{ResponseId, ResponseRecord, ResponseStatus};
 use crate::usage::Usage;
@@ -96,6 +97,15 @@ pub struct AbortedClaim {
     /// path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<ConversationId>,
+    /// The turn's own input, read out while the reap statement already has the row in
+    /// hand, so the sweeper can archive it to the conversation snapshot (D30
+    /// incomplete-turn archival) without a follow-up read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_items: Vec<ResponseItem>,
+    /// `TurnSpec::store`; `false` means the turn has no durable snapshot home and the
+    /// reap path must skip archiving.
+    #[serde(default)]
+    pub store: bool,
 }
 
 #[derive(Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +169,11 @@ pub trait ResponseLedger: AdmissionControl {
 
     /// Terminate on request (FR-7). Records partial usage of the running attempt so
     /// billing stays correct (INV-51).
+    ///
+    /// Raises the attempt fence like `reap`, so the executing agent observes the
+    /// cancellation — both its next append (passive, INV-6) and its active
+    /// cancellation probe poll see `StaleAttempt` — and stops spending tokens
+    /// promptly rather than running the ReAct loop to completion.
     async fn cancel(
         &self,
         tenant: &TenantId,

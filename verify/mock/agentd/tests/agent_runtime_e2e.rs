@@ -284,6 +284,38 @@ async fn a_stall_leaves_partial_output_but_does_not_complete() {
 }
 
 #[tokio::test]
+async fn a_failed_turn_archives_its_input() {
+    // The turn fails (the scheduler stalls), but its input must still land in the
+    // snapshot (D30 incomplete-turn archival) so the chain keeps the user's question.
+    let world = MemWorld::new();
+    let (_, conv) = queue(&world, "stall", true).await;
+
+    let scheduler = ScriptedScheduler::from_rules(vec![]).with_rule(
+        Match::Any,
+        Script::Stall {
+            before: "starting to ans".into(),
+        },
+    );
+    let e = engine(&world, Arc::new(scheduler));
+    assert_eq!(e.run_once(2_000).await, Executed::Failed);
+
+    let snap = snapshot(&world, &conv).await;
+    assert_eq!(snap.turns, 1, "the failed turn is still a turn");
+    // The input plus the one item that reached a `done` boundary before the stall are
+    // archived; the stall produced nothing further, and half-streamed tokens never land.
+    assert_eq!(snap.item_count(), 2, "input + the one completed output item");
+    let rendered = nova_responses::canonical_items(&snap.clone().into_items());
+    assert!(
+        rendered.contains("stall"),
+        "the failed turn's input must be archived: {rendered}"
+    );
+    assert!(
+        rendered.contains("starting to ans"),
+        "completed output must be archived even though the turn failed: {rendered}"
+    );
+}
+
+#[tokio::test]
 async fn drain_clears_the_backlog_and_then_reports_idle() {
     let world = MemWorld::new();
     for i in 0..3 {
@@ -728,4 +760,131 @@ async fn a_generation_is_reaped_once_its_heartbeat_stops() {
     release.notify_one();
     let result = handle.await.expect("join");
     assert_eq!(result, Executed::Superseded);
+}
+
+// ===== Cancellation propagates into a blocking tool call =====
+
+/// A tool that announces it started, then blocks forever — only the active
+/// cancellation probe can interrupt it.
+struct BlockingTool {
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl ToolExecutor for BlockingTool {
+    fn name(&self) -> &str {
+        "blocking"
+    }
+
+    async fn call(&self, _tool: &str, _arguments: &str) -> Result<String, ToolError> {
+        self.started.notify_one();
+        std::future::pending::<()>().await;
+        unreachable!("the tool call is interrupted, never completed")
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_tool_call_is_interrupted() {
+    let world = MemWorld::new();
+    let (id, _conv) = queue(&world, "tool", true).await;
+
+    let started = Arc::new(Notify::new());
+    let tools = Arc::new(BlockingTool {
+        started: started.clone(),
+    });
+    let scheduler = Arc::new(ToolThenAnswer);
+    let cfg = AgentRuntimeConfig {
+        cancel_poll_interval: Duration::from_millis(100),
+        ..AgentRuntimeConfig::default()
+    };
+    let e = agent_with(&world, scheduler, tools, cfg);
+    let clock = world.clock.clone();
+
+    let handle = tokio::spawn(async move { e.run_once(clock.now_ms()).await });
+
+    // Wait until the runner is inside the blocking tool call.
+    started.notified().await;
+
+    // Cancel: raises the attempt fence (INV-6), which the active probe polls.
+    let t = tenant();
+    world.ledger.cancel(&t, &id, 1_000).await.expect("cancel");
+
+    // Advance past a poll interval so the probe's sleep elapses and it observes
+    // `StaleAttempt`, then let the runner act on it.
+    tokio::time::advance(Duration::from_millis(200)).await;
+    settle().await;
+
+    let result = handle.await.expect("join");
+    assert_eq!(
+        result,
+        Executed::Superseded,
+        "cancellation must interrupt a blocking tool call promptly"
+    );
+}
+
+// ===== Cancellation propagates during streaming (passive fence check) =====
+
+/// Streams one delta, then blocks on a gate before the next: cancellation during the
+/// second delta's append is caught by the sink's passive fence check, the counterpart
+/// to the active probe exercised by the tool-call test above.
+struct StreamThenGateScheduler {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Scheduler for StreamThenGateScheduler {
+    fn name(&self) -> &str {
+        "stream-then-gate"
+    }
+
+    async fn schedule(
+        &self,
+        _request: &CompletionsRequest,
+        sink: &mut dyn AgentEventSink,
+    ) -> Result<CompletionsOutcome, SchedulerError> {
+        sink.text_delta("before cancel").await?;
+        self.started.notify_one();
+        self.release.notified().await;
+        // The append now carries the superseded attempt, so the sink refuses it.
+        if matches!(
+            sink.text_delta("after cancel").await?,
+            nova_agent_runtime::SinkVerdict::Stop
+        ) {
+            return Err(SchedulerError::Superseded);
+        }
+        Ok(CompletionsOutcome::text("done", Usage::new(1, 1)))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_interrupts_a_streaming_generation() {
+    let world = MemWorld::new();
+    let (id, _conv) = queue(&world, "stream", true).await;
+
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let scheduler = Arc::new(StreamThenGateScheduler {
+        started: started.clone(),
+        release: release.clone(),
+    });
+    let e = engine(&world, scheduler);
+    let clock = world.clock.clone();
+
+    let handle = tokio::spawn(async move { e.run_once(clock.now_ms()).await });
+
+    // The first delta has streamed; the runner is now gated before the second.
+    started.notified().await;
+
+    // Cancel raises the attempt fence (INV-60), so the next append is refused.
+    let t = tenant();
+    world.ledger.cancel(&t, &id, 1_000).await.expect("cancel");
+
+    release.notify_one();
+    let result = handle.await.expect("join");
+    assert_eq!(
+        result,
+        Executed::Superseded,
+        "cancellation must interrupt a streaming generation via the passive fence check"
+    );
 }

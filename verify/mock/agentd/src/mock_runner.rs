@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nova_agent_runtime::{
-    AgentError, AgentEventSink, AgentOutcome, AgentRunner, AgentTask, SinkVerdict,
+    AgentError, AgentEventSink, AgentOutcome, AgentRunner, AgentTask, CancelProbe, SinkVerdict,
 };
 use nova_responses::protocol::ProtocolLimits;
 use nova_responses::{ResponseItem, ResponseStatus, Usage};
@@ -57,6 +57,7 @@ impl AgentRunner for MockAgentRunner {
         &self,
         task: &AgentTask,
         sink: &mut dyn AgentEventSink,
+        cancel: &dyn CancelProbe,
     ) -> Result<AgentOutcome, AgentError> {
         let mut conversation = task.items.clone();
         let base_len = conversation.len();
@@ -87,7 +88,15 @@ impl AgentRunner for MockAgentRunner {
                 }
             };
 
-            let outcome = match self.scheduler.schedule(&request, sink).await {
+            // The scheduler call is the other blocking stretch where no event append may
+            // happen for a long time (a slow stream, or a hung provider). Race it against
+            // the active cancellation probe, exactly like a tool call: dropping the
+            // schedule future is safe here because we return immediately and never touch
+            // the sink again.
+            let outcome = match tokio::select! {
+                out = self.scheduler.schedule(&request, sink) => out,
+                _ = cancel.cancelled() => return Err(AgentError::Superseded),
+            } {
                 Ok(outcome) => outcome,
                 Err(SchedulerError::Superseded) => return Err(AgentError::Superseded),
                 Err(e) => {
@@ -162,7 +171,15 @@ impl AgentRunner for MockAgentRunner {
                     usage = usage.accumulate(outcome.usage);
                     conversation.extend(outcome.items);
                     for (call_id, name, arguments) in calls {
-                        match self.tools.call(&name, &arguments).await {
+                        // A tool call is a blocking await with no event append, so the
+                        // passive fence check never fires during it. Race it against the
+                        // active cancellation probe so a cancelled/reaped attempt stops
+                        // promptly instead of burning the full tool round.
+                        let output = tokio::select! {
+                            out = self.tools.call(&name, &arguments) => out,
+                            _ = cancel.cancelled() => return Err(AgentError::Superseded),
+                        };
+                        match output {
                             Ok(output) => {
                                 let item = ResponseItem::FunctionCallOutput {
                                     call_id,

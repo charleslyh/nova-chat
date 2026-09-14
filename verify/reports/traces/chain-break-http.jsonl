@@ -2,7 +2,7 @@
 {"type":"clock","now_ms":2}
 {"type":"api_call","method":"POST","url":"http://127.0.0.1:18080/v1/responses","status_ok":true,"detail":"HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 334\r\nconnection: close\r\nda","at_ms":2}
 {"type":"clock","now_ms":3}
-{"type":"api_call","method":"GET_UNTIL","url":"http://127.0.0.1:18080/v1/responses/resp_node-a_6b3ff737-fd44-4010-ab51-946db8f8010f","status_ok":true,"detail":"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 480\r\nconnection: close\r\ndate: We","at_ms":3}
+{"type":"api_call","method":"GET_UNTIL","url":"http://127.0.0.1:18080/v1/responses/resp_node-a_3d316a72-9b37-46da-afc6-d82b7d65d0cd","status_ok":true,"detail":"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 480\r\nconnection: close\r\ndate: Mo","at_ms":3}
 {"type":"clock","now_ms":4}
 {"type":"api_call","method":"POST","url":"http://127.0.0.1:18080/v1/responses","status_ok":true,"detail":"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nvary: origin, access-control-request-method, access-control-request-headers\r\naccess-control-allow-origin: *\r\naccess-control-expose-headers: *\r\ncontent-length: 127\r\nconnection: close\r","at_ms":4}
 {"type":"clock","now_ms":5}

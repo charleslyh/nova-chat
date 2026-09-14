@@ -23,7 +23,7 @@ use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use crate::runner::{AgentError, AgentRunner, AgentTask};
+use crate::runner::{AgentError, AgentRunner, AgentTask, CancelProbe};
 use crate::sink::EventSink;
 
 /// Events per read while replaying a bare response's stream.
@@ -86,6 +86,10 @@ pub struct AgentRuntimeConfig {
     /// Interval between keep-alive heartbeats sent while the (possibly long) ReAct
     /// loop runs.
     pub heartbeat_interval: Duration,
+    /// Interval between active cancellation polls while a blocking operation (notably a
+    /// tool call) runs. Bounds the worst-case latency between a cancel/reap and the
+    /// runner observing it and stopping its spend.
+    pub cancel_poll_interval: Duration,
 }
 
 impl Default for AgentRuntimeConfig {
@@ -95,6 +99,7 @@ impl Default for AgentRuntimeConfig {
             retain_after_terminal: Duration::from_secs(60),
             max_tool_rounds: 20,
             heartbeat_interval: Duration::from_secs(30),
+            cancel_poll_interval: Duration::from_millis(250),
         }
     }
 }
@@ -257,8 +262,10 @@ impl AgentRuntime {
             Ok(ctx) => ctx,
             Err(e) => {
                 warn!(response = %id, error = %e, "could not resolve context snapshot");
+                // No sink exists yet, so there is no completed output to archive — only
+                // the turn's input.
                 return self
-                    .fail(&record, attempt, Usage::default(), &e.to_string(), now_ms)
+                    .fail(&record, attempt, Usage::default(), &[], &e.to_string(), now_ms)
                     .await;
             }
         };
@@ -274,7 +281,14 @@ impl AgentRuntime {
 
         let mut sink = EventSink::new(self.deps.event_log.clone(), id.clone(), attempt);
 
-        let outcome = match self.deps.runner.run(&task, &mut sink).await {
+        let cancel = LedgerCancelProbe {
+            ledger: self.deps.ledger.clone(),
+            response_id: id.clone(),
+            attempt,
+            interval: self.cfg.cancel_poll_interval,
+        };
+
+        let outcome = match self.deps.runner.run(&task, &mut sink, &cancel).await {
             Ok(outcome) => outcome,
             Err(AgentError::Superseded) => {
                 info!(response = %id, "attempt superseded");
@@ -287,7 +301,11 @@ impl AgentRuntime {
                     error = %message,
                     "agent run failed"
                 );
-                return self.fail(&record, attempt, usage, &message, now_ms).await;
+                // The runner failed, but items it already completed (tool calls, finished
+                // text parts) are worth keeping: archive them with the input.
+                return self
+                    .fail(&record, attempt, usage, sink.completed(), &message, now_ms)
+                    .await;
             }
         };
 
@@ -389,6 +407,7 @@ impl AgentRuntime {
         record: &ResponseRecord,
         attempt: Attempt,
         usage: Usage,
+        produced: &[ResponseItem],
         reason: &str,
         now_ms: u64,
     ) -> Executed {
@@ -402,6 +421,15 @@ impl AgentRuntime {
         {
             warn!(response = %id, error = %e, "could not record failure");
             return Executed::Failed;
+        }
+
+        // A failed turn still archives its input and whatever completed output it
+        // produced (D30 incomplete-turn archival), so the conversation chain keeps the
+        // user's question and any finished tool calls. Half-streamed output is not here:
+        // `produced` holds only items that reached a `done` boundary.
+        if record.is_stored() && record.conversation_id().is_some() {
+            self.append_turn(record, produced, None, usage, ResponseStatus::Failed, now_ms)
+                .await;
         }
 
         self.settle(record, ResponseStatus::Failed, false, now_ms)
@@ -619,6 +647,34 @@ impl AgentRuntime {
             .event_log
             .close(id, now_ms, self.cfg.retain_after_terminal)
             .await;
+    }
+}
+
+/// Active cancellation probe: polls the ledger fence (INV-6) until the attempt has been
+/// superseded. The passive path — the sink refusing an append as stale — only fires when
+/// a runner emits an event; a blocking tool call emits nothing for seconds, so the runner
+/// races it against this probe.
+struct LedgerCancelProbe {
+    ledger: Arc<dyn ResponseLedger>,
+    response_id: ResponseId,
+    attempt: Attempt,
+    interval: Duration,
+}
+
+#[async_trait::async_trait]
+impl CancelProbe for LedgerCancelProbe {
+    async fn cancelled(&self) {
+        loop {
+            if matches!(
+                self.ledger
+                    .check_attempt(&self.response_id, self.attempt)
+                    .await,
+                Err(LedgerError::StaleAttempt)
+            ) {
+                return;
+            }
+            tokio::time::sleep(self.interval).await;
+        }
     }
 }
 

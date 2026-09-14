@@ -196,20 +196,27 @@ impl ConversationSnapshots for MemConversationStore {
         &self,
         tenant: &TenantId,
         id: &ConversationId,
-        _response_id: &ResponseId,
+        response_id: &ResponseId,
         commit: TurnCommit,
         _now_ms: u64,
     ) -> Result<u64, ConversationError> {
         self.guard_writable()?;
         let mut g = self.store.lock();
         Self::owned(&g, tenant, id).ok_or(ConversationError::NotFound)?;
+        let snap = g.snapshots.entry(id.clone()).or_default();
+        // Idempotent per response: the runtime's completion/failure funnel and the
+        // service layer's cancel/reap funnel can both attempt the same turn (D30
+        // incomplete-turn archival), so a repeat returns the assigned index instead of
+        // appending twice.
+        if let Some(index) = snap.appended.get(response_id) {
+            return Ok(*index);
+        }
         let TurnCommit {
             input_items,
             output_items,
             reasoning,
             ..
         } = commit;
-        let snap = g.snapshots.entry(id.clone()).or_default();
         snap.entries
             .extend(input_items.into_iter().map(ContextEntry::new));
         // Reasoning precedes this turn's output, i.e. it belongs to the first output item.
@@ -222,6 +229,7 @@ impl ConversationSnapshots for MemConversationStore {
         }
         let turn_index = snap.turn_count as u64;
         snap.turn_count += 1;
+        snap.appended.insert(response_id.clone(), turn_index);
         Ok(turn_index)
     }
 

@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 // process instead of a real carrier.
 use nova_responses::config::Config;
 use nova_responses::service::{ConversationsService, ResponsesDeps, ResponsesService};
+use nova_responses::Clock;
 use nova_responses_gateway::{AppState, GatewayConfig, KeyTable};
 
 use nova_agent_runtime::{
@@ -161,6 +162,7 @@ async fn start_with_config(raw_text: &str) -> Harness {
         event_log: world.event_log.clone(),
         conversations: conversations.clone(),
         turn_lock: world.conversation.clone(),
+        snapshots: world.conversation.clone(),
         clock: world.clock.clone(),
         metrics: world.metrics.clone(),
         cfg: responses_cfg,
@@ -764,6 +766,168 @@ async fn cancel_moves_to_terminal_and_emits_a_failure_event() {
     assert!(text.contains("event: response.failed"), "got: {text}");
     // The cancellation itself is reported by the cancel endpoint's status
     // (`cancelled`), not as a free-text payload on the stream event.
+}
+
+#[tokio::test]
+async fn a_cancelled_conversation_turn_archives_its_input() {
+    // A conversation-anchored turn cancelled before it runs must still archive its
+    // input (D30 incomplete-turn archival), so the chain keeps the user's question.
+    let h = start().await;
+
+    let (status, conv) = h.post("/v1/conversations", json!({})).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let conv_id = conv["id"].as_str().unwrap().to_string();
+
+    let (status, body) = h
+        .post(
+            "/v1/responses",
+            json!({
+                "model": "m",
+                "input": "cancel me",
+                "conversation": conv_id,
+                "background": true,
+            }),
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED);
+    let id = body["id"].as_str().unwrap().to_string();
+
+    let (status, cancelled) = h.post(&format!("/v1/responses/{id}/cancel"), Value::Null).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(cancelled["status"], "cancelled");
+
+    let (status, transcript) = h
+        .get(&format!("/v1/conversations/{conv_id}/transcript"))
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(
+        transcript.to_string().contains("cancel me"),
+        "cancelled input must be archived: {transcript}"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_store_false_turn_is_not_archived() {
+    // `store=false` keeps its existing semantics on every terminal path: a cancelled
+    // ephemeral turn must not land in the conversation snapshot.
+    let h = start().await;
+
+    let (status, conv) = h.post("/v1/conversations", json!({})).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let conv_id = conv["id"].as_str().unwrap().to_string();
+
+    let (status, body) = h
+        .post(
+            "/v1/responses",
+            json!({
+                "model": "m",
+                "input": "ephemeral",
+                "conversation": conv_id,
+                "store": false,
+                "background": true,
+            }),
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED);
+    let id = body["id"].as_str().unwrap().to_string();
+
+    let (status, _cancelled) = h.post(&format!("/v1/responses/{id}/cancel"), Value::Null).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    let (status, transcript) = h
+        .get(&format!("/v1/conversations/{conv_id}/transcript"))
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(
+        !transcript.to_string().contains("ephemeral"),
+        "store=false must not be archived: {transcript}"
+    );
+}
+
+/// Produces one complete output item (reaching a `done` boundary), then blocks forever —
+/// used to leave a turn in flight with completed output so the cancel path must replay
+/// that output from the event stream and archive it.
+struct OutputThenHangScheduler {
+    produced: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Scheduler for OutputThenHangScheduler {
+    fn name(&self) -> &str {
+        "output-then-hang"
+    }
+
+    async fn schedule(
+        &self,
+        _request: &CompletionsRequest,
+        sink: &mut dyn AgentEventSink,
+    ) -> Result<CompletionsOutcome, SchedulerError> {
+        let item = nova_responses::ResponseItem::assistant_text("partial answer");
+        sink.output_item_added(&item).await?;
+        sink.output_item_done(&item).await?;
+        self.produced.notify_one();
+        std::future::pending::<()>().await;
+        unreachable!("cancelled before completion")
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_turn_archives_completed_output() {
+    let h = start().await;
+
+    let (status, conv) = h.post("/v1/conversations", json!({})).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let conv_id = conv["id"].as_str().unwrap().to_string();
+
+    let (status, body) = h
+        .post(
+            "/v1/responses",
+            json!({
+                "model": "m",
+                "input": "answer me",
+                "conversation": conv_id,
+                "background": true,
+            }),
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED);
+    let id = body["id"].as_str().unwrap().to_string();
+
+    // Run the runner in the background: it produces one completed item, then hangs
+    // inside the scheduler call — the cancellation probe must interrupt it there.
+    let produced = Arc::new(tokio::sync::Notify::new());
+    let engine = h.engine_with(Arc::new(OutputThenHangScheduler {
+        produced: produced.clone(),
+    }));
+    let clock = h.world.clock.clone();
+    let handle = tokio::spawn(async move { engine.run_once(clock.now_ms()).await });
+
+    produced.notified().await;
+
+    // Cancel while the turn is in flight; the service layer replays the completed item
+    // from the event stream and archives it with the input (INV-48 RESTATE).
+    let (status, _cancelled) = h.post(&format!("/v1/responses/{id}/cancel"), Value::Null).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    let (status, transcript) = h
+        .get(&format!("/v1/conversations/{conv_id}/transcript"))
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let rendered = transcript.to_string();
+    assert!(rendered.contains("answer me"), "input must be archived: {rendered}");
+    assert!(
+        rendered.contains("partial answer"),
+        "completed output must be replayed and archived: {rendered}"
+    );
+
+    // P2: the runner itself must observe the cancellation (the probe races the hung
+    // scheduler call) and stop — no external abort.
+    let result = handle.await.expect("join");
+    assert_eq!(
+        result,
+        Executed::Superseded,
+        "cancellation must interrupt a hung scheduler call, not just tool calls"
+    );
 }
 
 #[tokio::test]

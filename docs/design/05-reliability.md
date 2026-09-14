@@ -88,6 +88,14 @@ RETURNING response_id, attempt - 1 AS previous_attempt
 
 claim 全局化（D25）后**不再按 node_tag 收口**——在途缓冲共享，任何执行进程可领取任意 queued 生成，孤儿回收同样是全局的。
 
+### 4.2.1 取消传播：执行端主动感知并停止
+
+用户取消必须让执行端**及时停止**，否则 ReAct loop 继续生成、持续计费。`cancel` 因此与 `reap` 一样**抬 attempt fence**（INV-60）：执行端下一次 append 会被 `StaleAttempt` 拒绝（被动），主动取消探测（`CancelProbe`）也观察到同一信号。
+
+被动检测只在执行端恰好 append 事件时触发；阻塞的 **tool call 执行期间没有任何 append**，故 runner 用 `tokio::select!` 把工具调用与 `CancelProbe::cancelled()` 竞速，tool call 中途也能及时终止。
+
+`CancelProbe` 底层是轮询 `ledger.check_attempt`（INV-6），间隔可配（默认 250ms，`cancel_poll_interval`）——轮询贴合独立执行进程（D25）无内存共享的现实，一次轻量账本读的代价可忽略，换来 tool call 最多延迟一个间隔即感知取消。
+
 ### 4.3 部分用量入账
 
 中途作废时 token 已消耗，必须记录，否则计费对不上账。

@@ -22,12 +22,12 @@ use tokio::sync::watch;
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::context::ResolvedContext;
-use crate::conversation::{ConversationEventKind, ConversationId};
+use crate::conversation::{ConversationEventKind, ConversationId, TurnCommit};
 use crate::events::AppendEvent;
 use crate::identity::{IdempotencyKey, TenantId};
 use crate::ports::{
-    metric, ConversationError, CreateOutcome, MetricsSink, ResponseEventLog, ResponseLedger,
-    TurnLock,
+    metric, ConversationError, ConversationSnapshots, CreateOutcome, MetricsSink, ResponseEventLog,
+    ResponseLedger, TurnLock,
 };
 use crate::protocol::{ResponseItem, ResponseObject};
 use crate::response::{
@@ -35,6 +35,9 @@ use crate::response::{
 };
 use crate::service::conversations::ConversationsService;
 use crate::service::error::{ContextError, ServiceError};
+use crate::usage::Usage;
+
+use super::sweep::replay_completed_items;
 
 /// `ResponsesService` 的依赖集合。
 ///
@@ -50,6 +53,10 @@ pub struct ResponsesDeps {
     /// rather than reached through `conversations` because the sweeper needs only this
     /// facet, not the whole conversation store.
     pub turn_lock: Arc<dyn TurnLock>,
+    /// The snapshot facet, for archiving incomplete turns (failed/cancelled/reaped) to
+    /// the conversation snapshot (D30). Held directly for the same reason as `turn_lock`:
+    /// `cancel` and the sweeper need only this facet.
+    pub snapshots: Arc<dyn ConversationSnapshots>,
     pub clock: Arc<dyn Clock>,
     pub metrics: Arc<dyn MetricsSink>,
     pub cfg: Arc<Config>,
@@ -407,6 +414,53 @@ impl ResponsesService {
         self.deps.ledger.cancel(tenant, response_id, now_ms).await?;
 
         let record = self.deps.ledger.get(response_id).await.ok().flatten();
+
+        // Archive the cancelled turn's input and whatever output it completed (D30
+        // incomplete-turn archival). The executing agent is unreachable from here, so
+        // completed items are replayed from the event stream (INV-48 RESTATE, still
+        // within the retention window); half-streamed output never appears.
+        if let Some(record) = &record {
+            if record.is_stored() {
+                if let Some(conversation_id) = record.conversation_id() {
+                    match replay_completed_items(self.deps.event_log.as_ref(), response_id).await {
+                        Ok(output_items) => {
+                            if let Err(e) = self
+                                .deps
+                                .snapshots
+                                .append_turn(
+                                    tenant,
+                                    conversation_id,
+                                    response_id,
+                                    TurnCommit {
+                                        input_items: record.spec.input_items.clone(),
+                                        output_items,
+                                        reasoning: None,
+                                        usage: Usage::default(),
+                                        status: ResponseStatus::Cancelled,
+                                    },
+                                    now_ms,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    response = %response_id,
+                                    conversation = %conversation_id,
+                                    error = %e,
+                                    "could not archive a cancelled turn to the conversation snapshot"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                response = %response_id,
+                                error = %e,
+                                "replaying completed items for archival failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         // Cancellation is a terminal path like any other, and the engine will **not**
         // reach its own: the ledger is already terminal, so its next `complete` is

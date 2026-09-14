@@ -18,7 +18,8 @@ mod runtime;
 mod sink;
 
 pub use runner::{
-    AgentError, AgentEventSink, AgentOutcome, AgentRunner, AgentTask, SinkError, SinkVerdict,
+    AgentError, AgentEventSink, AgentOutcome, AgentRunner, AgentTask, CancelProbe, SinkError,
+    SinkVerdict,
 };
 pub use runtime::{
     AgentRuntime, AgentRuntimeConfig, AgentRuntimeDeps, AgentRuntimeHandle, Executed,

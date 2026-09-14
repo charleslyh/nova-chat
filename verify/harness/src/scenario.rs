@@ -12,8 +12,8 @@ use anyhow::{bail, Context, Result};
 use nova_responses::protocol::{CreateResponseRequest, ProtocolLimits, ResponseObject};
 use nova_responses::{
     canonical_items, AgentId, AppendEvent, Attempt, ContextAnchor, Conversation, ConversationId,
-    IdempotencyKey, ModelParams, NodeTag, ResponseEventKind, ResponseId, ResponseItem,
-    ResponseRecord, ResponseStatus, TenantId, TurnCommit, TurnSpec, Usage,
+    EventBody, IdempotencyKey, ModelParams, NodeTag, ResponseEventKind, ResponseId,
+    ResponseItem, ResponseRecord, ResponseStatus, TenantId, TurnCommit, TurnSpec, Usage,
 };
 use nova_responses::ports::{
     AdmissionControl, ConversationError, ConversationRepo, ConversationSnapshots, CreateOutcome, EventLogError, ResponseEventLog, ResponseLedger, StoreError,
@@ -682,6 +682,23 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
         Step::Reap => {
             let aborted = ctx.world.ledger.reap(ctx.now_ms, Duration::from_millis(0)).await?;
             for claim in &aborted {
+                // Archive the reaped turn's input plus completed output (INV-61) **before**
+                // the lock is released, mirroring the sweeper's ordering: a client that
+                // acts on `turn_completed` must not read a snapshot still missing this
+                // turn's input.
+                if claim.store {
+                    if let Some(conversation_id) = &claim.conversation_id {
+                        archive_incomplete_turn(
+                            ctx,
+                            &claim.tenant_id,
+                            conversation_id,
+                            &claim.response_id,
+                            &claim.input_items,
+                            ResponseStatus::Failed,
+                        )
+                        .await?;
+                    }
+                }
                 // Reap is the only release a reaped response gets: its holder is
                 // gone and the fence has moved, so that holder's own terminal path
                 // is refused as stale.
@@ -1045,6 +1062,72 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
     Ok(())
 }
 
+/// Replay a response's event stream for the items that reached a `done` boundary, in
+/// `output_index` order — the harness's stand-in for the service layer's archival
+/// replay (INV-48 RESTATE). Used by the cancel/reap steps, where no engine is running
+/// to submit a terminal result.
+async fn replay_completed_items(
+    event_log: &dyn ResponseEventLog,
+    response_id: &ResponseId,
+) -> Result<Vec<ResponseItem>> {
+    let mut items: Vec<(u32, ResponseItem)> = Vec::new();
+    let mut cursor: Option<u64> = None;
+    loop {
+        let batch = event_log
+            .read_after(response_id, cursor, 256, Duration::ZERO)
+            .await
+            .context("replaying completed items for archival")?;
+        if batch.is_empty() {
+            break;
+        }
+        cursor = batch.last().map(|e| e.sequence_number());
+        for event in &batch {
+            if event.kind() == ResponseEventKind::OutputItemDone {
+                if let EventBody::Item { output_index, item } = event.body() {
+                    items.push((*output_index, item.clone()));
+                }
+            }
+        }
+    }
+    items.sort_by_key(|(index, _)| *index);
+    Ok(items.into_iter().map(|(_, item)| item).collect())
+}
+
+/// Archive an incomplete turn (failed/cancelled/reaped) to the conversation snapshot:
+/// the turn's input plus whatever output reached a `done` boundary. Mirrors the service
+/// layer's cancel/reap archival (INV-61) so L1 scenarios exercise the same behaviour
+/// production shows. `append_turn`'s per-response idempotency makes this safe even when
+/// the engine stand-in already committed the turn: the repeat returns the assigned
+/// index and appends nothing.
+async fn archive_incomplete_turn(
+    ctx: &Ctx,
+    tenant: &TenantId,
+    conversation_id: &ConversationId,
+    response_id: &ResponseId,
+    input_items: &[ResponseItem],
+    status: ResponseStatus,
+) -> Result<()> {
+    let output_items = replay_completed_items(ctx.world.event_log.as_ref(), response_id).await?;
+    ctx.world
+        .conversation
+        .append_turn(
+            tenant,
+            conversation_id,
+            response_id,
+            TurnCommit {
+                input_items: input_items.to_vec(),
+                output_items,
+                reasoning: None,
+                usage: Usage::default(),
+                status,
+            },
+            ctx.now_ms,
+        )
+        .await
+        .context("archiving an incomplete turn to the conversation snapshot")?;
+    Ok(())
+}
+
 /// Session and conversation bookkeeping for a response that just reached a
 /// terminal state.
 ///
@@ -1072,6 +1155,23 @@ async fn settle_session(
                 .conversation
                 .advance(&record.tenant_id, conversation_id, &record.response_id)
                 .await?;
+        }
+    }
+    // An incomplete turn still archives its input and whatever output completed
+    // (INV-61), before the lock is released — the same ordering the engine and the
+    // service layer use. Idempotent per response, so a turn the engine stand-in
+    // already committed is left untouched.
+    if matches!(status, ResponseStatus::Failed | ResponseStatus::Cancelled) && record.is_stored() {
+        if let Some(conversation_id) = &record.conversation_id() {
+            archive_incomplete_turn(
+                ctx,
+                &record.tenant_id,
+                conversation_id,
+                &record.response_id,
+                &record.spec.input_items,
+                status,
+            )
+            .await?;
         }
     }
     if let Some(conversation_id) = &record.conversation_id() {

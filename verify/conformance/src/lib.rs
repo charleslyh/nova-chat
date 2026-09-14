@@ -389,6 +389,17 @@ pub async fn assert_cancel_conformance(ports: &PortSet) {
     assert_eq!(after.status, ResponseStatus::Cancelled);
     assert!(after.status.is_terminal());
 
+    // INV-60: cancelling raises the attempt fence, so the (now void) executing agent
+    // observes `StaleAttempt` — both its next append and its active cancellation probe.
+    assert_eq!(
+        ports
+            .ledger
+            .check_attempt(&id, Attempt::UNCLAIMED)
+            .await,
+        Err(LedgerError::StaleAttempt),
+        "cancel must raise the attempt fence so the executor observes it"
+    );
+
     // Cancelling twice is a conflict, not a silent no-op.
     assert!(matches!(
         ports.ledger.cancel(&tenant, &id, 2_100).await,
@@ -408,6 +419,8 @@ pub async fn assert_cancel_conformance(ports: &PortSet) {
 ///   tenant-wide purge is tenant-scoped.
 /// - **INV-42 / SEC-2 / SEC-3**: tenancy is checked on snapshot reads; a foreign
 ///   conversation reads as absent rather than forbidden.
+/// - **INV-61**: `append_turn` is idempotent per `response_id`, and a turn with
+///   empty output still archives its input (incomplete-turn archival).
 pub async fn assert_context_conformance(ports: &PortSet) {
     let tenant = fresh_tenant("ctx");
     let store = &ports.conversation;
@@ -494,6 +507,70 @@ pub async fn assert_context_conformance(ports: &PortSet) {
         .expect("snapshot must survive response deletion");
     assert_eq!(after_delete.turns, 3);
     assert_eq!(after_delete.item_count(), 6);
+
+    // Idempotency per response_id (D30 incomplete-turn archival): the runtime's
+    // terminal funnel and the service layer's cancel/reap funnel can both attempt the
+    // same turn; the repeat must return the assigned index and add nothing.
+    let duplicate = store
+        .append_turn(
+            &tenant,
+            &conversation.id,
+            &ids[0],
+            TurnCommit {
+                input_items: vec![ResponseItem::user_text("in-0")],
+                output_items: vec![ResponseItem::assistant_text("answer")],
+                reasoning: None,
+                usage: Usage::new(1, 2),
+                status: ResponseStatus::Completed,
+            },
+            2_000,
+        )
+        .await
+        .expect("repeat append must succeed");
+    assert_eq!(
+        duplicate, 0,
+        "a repeat append returns the assigned index, not a new turn"
+    );
+    let after_duplicate = store
+        .read_snapshot(&tenant, &conversation.id)
+        .await
+        .expect("read after duplicate");
+    assert_eq!(after_duplicate.turns, 3, "a repeat append must not add a turn");
+    assert_eq!(
+        after_duplicate.item_count(),
+        6,
+        "a repeat append must not duplicate items"
+    );
+
+    // A turn that ended without output (failed/cancelled/reaped) still archives its
+    // input, with empty `output_items` (INV-61): the chain keeps the question.
+    let input_only = ports.new_id();
+    store
+        .append_turn(
+            &tenant,
+            &conversation.id,
+            &input_only,
+            TurnCommit {
+                input_items: vec![ResponseItem::user_text("unanswered")],
+                output_items: vec![],
+                reasoning: None,
+                usage: Usage::default(),
+                status: ResponseStatus::Failed,
+            },
+            2_000,
+        )
+        .await
+        .expect("input-only append must be legal");
+    let after_input_only = store
+        .read_snapshot(&tenant, &conversation.id)
+        .await
+        .expect("read after input-only turn");
+    assert_eq!(after_input_only.turns, 4);
+    assert_eq!(after_input_only.item_count(), 7);
+    assert!(
+        canonical_items(&after_input_only.clone().into_items()).contains("unanswered"),
+        "the input-only turn's question must be archived"
+    );
 
     // Bulk purge is tenant-scoped.
     let foreign_tenant = fresh_tenant("foreign");
@@ -1881,7 +1958,7 @@ pub fn cases() -> &'static [ContractCase] {
             // substantiated by L2 instead. FR-22 (content expiry) is removed
             // with D30 (content is the conversation snapshot's, not a
             // per-response record to sweep).
-            covers: &["FR-16", "FR-19", "FR-21", "CR-9", "INV-42", "INV-49", "SEC-2", "SEC-3"],
+            covers: &["FR-16", "FR-19", "FR-21", "CR-9", "INV-42", "INV-49", "INV-61", "SEC-2", "SEC-3"],
             scope: CaseScope::Backend,
             asserts: "assert_context_conformance",
         },

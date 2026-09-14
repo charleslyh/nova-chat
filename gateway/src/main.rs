@@ -83,6 +83,7 @@ async fn main() -> Result<()> {
         event_log: ports.event_log.clone(),
         conversations: conversations.clone(),
         turn_lock: ports.conversation.clone(),
+        snapshots: ports.conversation.clone(),
         clock: ports.clock.clone(),
         metrics: ports.metrics.clone(),
         cfg: Arc::new(cfg.responses.clone()),

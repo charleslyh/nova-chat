@@ -292,6 +292,93 @@ async fn snapshot_accumulates_turns_in_chronological_order() {
 }
 
 #[tokio::test]
+async fn append_turn_is_idempotent_per_response() {
+    // The runtime's terminal funnel and the service layer's cancel/reap funnel can both
+    // attempt the same turn; the second append must return the assigned index without
+    // duplicating entries.
+    let world = MemWorld::new();
+    let conversation = world
+        .conversation
+        .create(Conversation::new(
+            ConversationId::new(),
+            tenant("t1"),
+            Default::default(),
+            1_000,
+        ))
+        .await
+        .expect("create");
+    let id = ResponseId::new(tag());
+    let commit = TurnCommit {
+        input_items: vec![ResponseItem::user_text("q")],
+        output_items: vec![ResponseItem::assistant_text("a")],
+        reasoning: None,
+        usage: Usage::new(1, 1),
+        status: ResponseStatus::Completed,
+    };
+    let first = world
+        .conversation
+        .append_turn(&tenant("t1"), &conversation.id, &id, commit.clone(), 0)
+        .await
+        .expect("first append");
+    let second = world
+        .conversation
+        .append_turn(&tenant("t1"), &conversation.id, &id, commit, 0)
+        .await
+        .expect("second append");
+    assert_eq!(first, second, "a repeat append returns the assigned index");
+    let snap = world
+        .conversation
+        .read_snapshot(&tenant("t1"), &conversation.id)
+        .await
+        .unwrap();
+    assert_eq!(snap.turns, 1, "the repeat must not add a turn");
+    assert_eq!(snap.item_count(), 2, "the repeat must not duplicate items");
+}
+
+#[tokio::test]
+async fn an_input_only_turn_is_archived() {
+    // A failed/cancelled/reaped turn commits no output, but its input must still land
+    // in the snapshot (D30 incomplete-turn archival) so the chain keeps the question.
+    let world = MemWorld::new();
+    let conversation = world
+        .conversation
+        .create(Conversation::new(
+            ConversationId::new(),
+            tenant("t1"),
+            Default::default(),
+            1_000,
+        ))
+        .await
+        .expect("create");
+    let id = ResponseId::new(tag());
+    world
+        .conversation
+        .append_turn(
+            &tenant("t1"),
+            &conversation.id,
+            &id,
+            TurnCommit {
+                input_items: vec![ResponseItem::user_text("unanswered")],
+                output_items: vec![],
+                reasoning: None,
+                usage: Usage::default(),
+                status: ResponseStatus::Failed,
+            },
+            0,
+        )
+        .await
+        .expect("append");
+    let snap = world
+        .conversation
+        .read_snapshot(&tenant("t1"), &conversation.id)
+        .await
+        .unwrap();
+    assert_eq!(snap.turns, 1);
+    assert_eq!(snap.item_count(), 1);
+    assert!(nova_responses::canonical_items(&snap.clone().into_items()).contains("unanswered"));
+}
+
+#[tokio::test]
 async fn snapshot_never_contains_instructions() {
     // INV-49: instructions live on the response record, never in the snapshot.
     let world = MemWorld::new();
@@ -411,6 +498,56 @@ async fn stale_attempt_cannot_append_after_reaping() {
     assert_eq!(
         world.event_log.append(ev).await,
         Err(EventLogError::StaleAttempt)
+    );
+}
+
+#[tokio::test]
+async fn reap_carries_the_turns_input_and_store_flag() {
+    // The sweeper archives a reaped turn from what `reap` returns, so the input and
+    // store flag must travel with the claim (D30 incomplete-turn archival).
+    let world = MemWorld::new();
+    let conversation = world
+        .conversation
+        .create(Conversation::new(
+            ConversationId::new(),
+            tenant("t1"),
+            Default::default(),
+            1_000,
+        ))
+        .await
+        .expect("create conversation");
+
+    let id = ResponseId::new(tag());
+    let mut rec = record(&id, "t1", true);
+    rec.spec.anchor = ContextAnchor::Conversation(conversation.id.clone());
+    world
+        .ledger
+        .create(rec, IdempotencyKey::parse("k").unwrap(), 0)
+        .await
+        .unwrap();
+
+    let agent = nova_responses::AgentId::new();
+    world
+        .ledger
+        .claim(agent, 0, Duration::from_millis(60_000))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // No heartbeat was ever recorded, so the claim is immediately lost and reaped.
+    let aborted = world
+        .ledger
+        .reap(1_000, Duration::from_millis(0))
+        .await
+        .unwrap();
+    assert_eq!(aborted.len(), 1);
+    assert_eq!(aborted[0].response_id, id);
+    assert_eq!(aborted[0].conversation_id, Some(conversation.id.clone()));
+    assert!(aborted[0].store, "the store flag must travel with the claim");
+    assert_eq!(
+        aborted[0].input_items.len(),
+        1,
+        "the turn's input must travel with the claim"
     );
 }
 

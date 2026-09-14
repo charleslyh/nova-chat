@@ -29,6 +29,10 @@ pub struct EventSink {
     /// Reasoning / thinking text accumulated across the whole loop, persisted with the
     /// final output (render-only, never re-enters context).
     reasoning: String,
+    /// Output items that reached a `done` boundary, in order. Carried so the
+    /// orchestrator can archive completed items when a turn ends without a full outcome
+    /// (failure / cancellation), rather than losing them.
+    completed: Vec<ResponseItem>,
 }
 
 impl EventSink {
@@ -46,6 +50,7 @@ impl EventSink {
             current_item_id: None,
             current_content_index: None,
             reasoning: String::new(),
+            completed: Vec::new(),
         }
     }
 
@@ -57,6 +62,14 @@ impl EventSink {
     /// Reasoning / thinking text accumulated across the whole loop.
     pub fn reasoning(&self) -> &str {
         &self.reasoning
+    }
+
+    /// Output items that reached a `done` boundary, in order. This is the partial
+    /// result the orchestrator archives when a turn ends without a full outcome
+    /// (failure / cancellation): completed tool calls and finished text parts survive,
+    /// while half-streamed tokens are never included.
+    pub fn completed(&self) -> &[ResponseItem] {
+        &self.completed
     }
 
     fn id(&self) -> ResponseId {
@@ -122,6 +135,10 @@ impl AgentEventSink for EventSink {
     }
 
     async fn output_item_done(&mut self, item: &ResponseItem) -> Result<SinkVerdict, SinkError> {
+        // A `done` event carries the item's complete content; remember it so the
+        // orchestrator can archive completed items even when the turn ends without a
+        // full outcome (failure / cancellation).
+        self.completed.push(item.clone());
         let event = AppendEvent::item(
             self.id(),
             self.attempt,

@@ -14,14 +14,22 @@ use tokio::sync::watch;
 use tracing::warn;
 
 use crate::clock::Clock;
-use crate::events::{AppendEvent, ResponseEventKind};
-use crate::ports::{metric, MetricsSink, ResponseEventLog, ResponseLedger, TurnLock};
-use crate::protocol::ResponseObject;
-use crate::response::ResponseStatus;
+use crate::conversation::TurnCommit;
+use crate::events::{AppendEvent, EventBody, ResponseEventKind};
+use crate::ports::{
+    metric, ConversationSnapshots, EventLogError, MetricsSink, ResponseEventLog, ResponseLedger,
+    TurnLock,
+};
+use crate::protocol::{ResponseItem, ResponseObject};
+use crate::response::{ResponseId, ResponseStatus};
+use crate::usage::Usage;
 
 use super::responses::ResponsesDeps;
 
 const TICK: Duration = Duration::from_secs(2);
+
+/// Events per read while replaying a response's stream for its completed items.
+const REPLAY_PAGE: usize = 256;
 
 /// Spawn the background loop. Every peer runs one; reaping is idempotent, so the
 /// redundant loops race harmlessly.
@@ -33,6 +41,7 @@ pub(crate) fn spawn(shutdown: watch::Receiver<()>, deps: &ResponsesDeps) {
     let ledger = deps.ledger.clone();
     let event_log = deps.event_log.clone();
     let turn_lock = deps.turn_lock.clone();
+    let snapshots = deps.snapshots.clone();
     let clock = deps.clock.clone();
     let metrics = deps.metrics.clone();
     let heartbeat_ttl = deps.cfg.heartbeat_ttl();
@@ -50,6 +59,7 @@ pub(crate) fn spawn(shutdown: watch::Receiver<()>, deps: &ResponsesDeps) {
                         ledger.as_ref(),
                         event_log.as_ref(),
                         turn_lock.as_ref(),
+                        snapshots.as_ref(),
                         clock.as_ref(),
                         metrics.as_ref(),
                         heartbeat_ttl,
@@ -66,6 +76,7 @@ async fn tick(
     ledger: &dyn ResponseLedger,
     event_log: &dyn ResponseEventLog,
     turn_lock: &dyn TurnLock,
+    snapshots: &dyn ConversationSnapshots,
     clock: &dyn Clock,
     metrics: &dyn MetricsSink,
     heartbeat_ttl: Duration,
@@ -101,6 +112,53 @@ async fn tick(
         let _ = event_log
             .close(&claim.response_id, now, retain_after_terminal)
             .await;
+
+        // Archive the reaped turn's input and whatever output it completed (D30
+        // incomplete-turn archival). The holder is gone, so completed items come from
+        // replaying the event stream (INV-48 RESTATE, still within the retention window);
+        // half-streamed output never appears.
+        //
+        // Ordering mirrors the engine's settle: the snapshot lands **before** the lock is
+        // released, so a client that sees `turn_completed` and starts the next turn
+        // cannot read a snapshot that is still missing this turn's input (§3.2).
+        if claim.store {
+            if let Some(conversation_id) = &claim.conversation_id {
+                match replay_completed_items(event_log, &claim.response_id).await {
+                    Ok(output_items) => {
+                        if let Err(e) = snapshots
+                            .append_turn(
+                                &claim.tenant_id,
+                                conversation_id,
+                                &claim.response_id,
+                                TurnCommit {
+                                    input_items: claim.input_items.clone(),
+                                    output_items,
+                                    reasoning: None,
+                                    usage: Usage::default(),
+                                    status: ResponseStatus::Failed,
+                                },
+                                now,
+                            )
+                            .await
+                        {
+                            warn!(
+                                response = %claim.response_id,
+                                conversation = %conversation_id,
+                                error = %e,
+                                "could not archive a reaped turn to the conversation snapshot"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            response = %claim.response_id,
+                            error = %e,
+                            "replaying completed items for archival failed"
+                        );
+                    }
+                }
+            }
+        }
 
         // Release the in-flight marker. `Failed` rather than a status of its own: from a
         // client's point of view a reaped turn is a failed turn, and inventing a sixth
@@ -139,4 +197,38 @@ async fn tick(
         Ok(n) => metrics.incr(metric::EVENT_LOGS_SWEPT, n),
         Err(e) => warn!(error = %e, "event log sweep failed"),
     }
+}
+
+/// Replay a response's event stream for the items that reached a `done` boundary, in
+/// `output_index` order.
+///
+/// This is the archival data source for terminal paths where the executing agent is
+/// unreachable (cancel/reap): the agent has stopped or died, so its completed output
+/// exists only as `OutputItemDone` events. Half-streamed tokens never appear — a `done`
+/// boundary is what makes an item complete (D30 incomplete-turn archival, INV-48
+/// RESTATE).
+pub(crate) async fn replay_completed_items(
+    event_log: &dyn ResponseEventLog,
+    response_id: &ResponseId,
+) -> Result<Vec<ResponseItem>, EventLogError> {
+    let mut items: Vec<(u32, ResponseItem)> = Vec::new();
+    let mut cursor: Option<u64> = None;
+    loop {
+        let batch = event_log
+            .read_after(response_id, cursor, REPLAY_PAGE, Duration::ZERO)
+            .await?;
+        if batch.is_empty() {
+            break;
+        }
+        cursor = batch.last().map(|e| e.sequence_number());
+        for event in &batch {
+            if event.kind() == ResponseEventKind::OutputItemDone {
+                if let EventBody::Item { output_index, item } = event.body() {
+                    items.push((*output_index, item.clone()));
+                }
+            }
+        }
+    }
+    items.sort_by_key(|(index, _)| *index);
+    Ok(items.into_iter().map(|(_, item)| item).collect())
 }
