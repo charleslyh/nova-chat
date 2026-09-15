@@ -11,6 +11,8 @@
 //! bare chain be reconstructed from its stream — from a **typed** `output`, not by
 //! reaching into a JSON map with a string key.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::response::{ResponseRecord, ResponseStatus};
@@ -72,6 +74,10 @@ pub struct ResponseObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
 
+    /// Echoed from the caller's request metadata (see `ModelParams::metadata`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+
     #[serde(default)]
     pub usage: Usage,
 }
@@ -102,6 +108,7 @@ impl ResponseObject {
             reasoning: record.reasoning.clone(),
             tools: params.tools.clone(),
             tool_choice: params.tool_choice.clone(),
+            metadata: params.metadata.clone(),
             usage: record.usage,
         }
     }
@@ -132,6 +139,7 @@ impl ResponseObject {
             reasoning: None,
             tools: Vec::new(),
             tool_choice: None,
+            metadata: BTreeMap::new(),
             usage: Usage::default(),
         }
     }
@@ -160,6 +168,7 @@ mod tests {
                         strict: None,
                     }],
                     tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
+                    metadata: BTreeMap::new(),
                 },
                 input_items: vec![ResponseItem::user_text("hi")],
                 store: true,
@@ -224,6 +233,20 @@ mod tests {
         // `instructions` is a fixed protocol field: `None` renders as `null` rather
         // than disappearing (INV-49 — a second turn's instructions do not carry over).
         assert_eq!(json.get("instructions"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn caller_metadata_round_trips_and_empty_metadata_is_omitted() {
+        // Passthrough key-values reach the rendered object verbatim; an empty map
+        // is omitted so the common case stays byte-identical to before the field
+        // existed.
+        let mut r = record();
+        r.spec.params.metadata.insert("agent_id".into(), "decoupage".into());
+        let json = serde_json::to_value(ResponseObject::without_output(&r)).unwrap();
+        assert_eq!(json["metadata"]["agent_id"], "decoupage");
+
+        let bare = serde_json::to_value(ResponseObject::without_output(&record())).unwrap();
+        assert!(bare.get("metadata").is_none(), "{bare}");
     }
 
     #[test]

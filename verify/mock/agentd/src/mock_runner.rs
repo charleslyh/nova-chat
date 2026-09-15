@@ -77,7 +77,7 @@ impl AgentRunner for MockAgentRunner {
                 &conversation,
                 task.provenance.clone(),
             )
-            .map(|r| r.with_tools(tool_specs.clone()).with_tool_choice(tool_choice.clone()))
+            .map(|r| r.with_tools(tool_specs.clone()).with_tool_choice(tool_choice.clone()).with_metadata(task.params.metadata.clone()))
             {
                 Ok(r) => r,
                 Err(e) => {

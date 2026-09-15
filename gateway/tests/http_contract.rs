@@ -535,6 +535,39 @@ async fn instructions_are_echoed_but_never_inherited() {
     );
 }
 
+/// Caller metadata is passthrough: echoed on the response object, delivered to the
+/// executor alongside the task, and never injected into the model context.
+#[tokio::test]
+async fn caller_metadata_is_echoed_and_reaches_the_executor() {
+    let h = start().await;
+    let (_, created) = h
+        .post(
+            "/v1/responses",
+            json!({
+                "model": "m",
+                "input": "q1",
+                "background": true,
+                "metadata": { "agent_id": "decoupage" },
+            }),
+        )
+        .await;
+    // Echoed on the object.
+    assert_eq!(created["metadata"]["agent_id"], "decoupage");
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let engine = h.engine_with(Arc::new(CapturingScheduler { seen: seen.clone() }));
+    assert_eq!(engine.run_once(3_000).await, Executed::Completed);
+    let request = seen.lock().expect("lock").clone().expect("a request was built");
+
+    // Delivered to the executor as dispatch hints, not as prompt material.
+    assert_eq!(request.metadata.get("agent_id").map(String::as_str), Some("decoupage"));
+    let rendered = serde_json::to_string(&request.messages).expect("render");
+    assert!(
+        !rendered.contains("decoupage"),
+        "metadata leaked into the model context: {rendered}"
+    );
+}
+
 #[tokio::test]
 async fn unknown_field_is_rejected_with_the_field_name() {
     let h = start().await;

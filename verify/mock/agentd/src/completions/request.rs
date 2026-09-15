@@ -1,5 +1,7 @@
 //! The outbound completions request type.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use nova_responses::protocol::{Tool, ToolChoice, ToolChoiceMode};
@@ -22,6 +24,11 @@ pub struct CompletionsRequest {
     pub max_completion_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Caller passthrough key-values (e.g. agent template selection), carried from
+    /// the turn's params so an executor can dispatch on them. Never sent to the
+    /// provider.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
     /// Where this request came from. Never sent to the provider.
     pub provenance: RequestProvenance,
 }
@@ -57,6 +64,7 @@ impl CompletionsRequest {
             tool_choice: None,
             max_completion_tokens: None,
             temperature: None,
+            metadata: BTreeMap::new(),
             provenance,
         })
     }
@@ -68,6 +76,11 @@ impl CompletionsRequest {
 
     pub fn with_tool_choice(mut self, tool_choice: Option<CompletionsToolChoice>) -> Self {
         self.tool_choice = tool_choice;
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: BTreeMap<String, String>) -> Self {
+        self.metadata = metadata;
         self
     }
 

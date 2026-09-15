@@ -5,6 +5,7 @@
 //! inherits. What is *not* stored: the incremental event stream, and no
 //! materialised copy of ancestor history (D30).
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -182,6 +183,12 @@ pub struct ModelParams {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+
+    /// Caller-supplied passthrough key-values (e.g. agent template selection).
+    /// Echoed on retrieval, **never** fed into context assembly (INV-49): the
+    /// executor reads it to decide *how* to run the turn, not what the turn says.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl ModelParams {
@@ -192,6 +199,7 @@ impl ModelParams {
             instructions: None,
             tools: Vec::new(),
             tool_choice: None,
+            metadata: BTreeMap::new(),
         }
     }
 }
