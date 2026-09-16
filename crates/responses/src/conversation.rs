@@ -22,7 +22,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::identity::{IdError, TenantId};
-use crate::protocol::ResponseItem;
+use crate::protocol::{MetadataValue, ResponseItem};
 use crate::response::{ResponseId, ResponseStatus};
 use crate::usage::Usage;
 
@@ -120,7 +120,7 @@ pub struct Conversation {
     pub active_response_id: Option<ResponseId>,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub metadata: BTreeMap<String, String>,
+    pub metadata: BTreeMap<String, MetadataValue>,
 
     pub created_at_ms: u64,
 }
@@ -130,7 +130,7 @@ impl Conversation {
     pub fn new(
         id: ConversationId,
         tenant_id: TenantId,
-        metadata: BTreeMap<String, String>,
+        metadata: BTreeMap<String, MetadataValue>,
         created_at_ms: u64,
     ) -> Self {
         Self {
@@ -303,7 +303,8 @@ mod tests {
     #[test]
     fn round_trips_with_and_without_a_tail() {
         let mut c = conversation();
-        c.metadata.insert("topic".into(), "demo".into());
+        c.metadata
+            .insert("topic".into(), MetadataValue::String("demo".into()));
         let json = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<Conversation>(&json).unwrap(), c);
 

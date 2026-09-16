@@ -17,6 +17,7 @@ use thiserror::Error;
 
 use super::item::{ItemViolation, ResponseItem};
 use super::limits::{LimitViolation, ProtocolLimits};
+use super::metadata::MetadataValue;
 use super::tool::{Tool, ToolChoice};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,7 +60,7 @@ pub struct CreateResponseRequest {
     pub max_output_tokens: Option<u32>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<BTreeMap<String, String>>,
+    pub metadata: Option<BTreeMap<String, MetadataValue>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
@@ -261,7 +262,7 @@ pub enum RequestViolation {
 /// upstream applies the same numbers to both.
 pub fn validate_metadata(
     limits: &ProtocolLimits,
-    metadata: &BTreeMap<String, String>,
+    metadata: &BTreeMap<String, MetadataValue>,
 ) -> Result<(), RequestViolation> {
     if metadata.len() > limits.max_metadata_entries {
         return Err(RequestViolation::TooManyMetadataEntries {
@@ -276,7 +277,7 @@ pub fn validate_metadata(
                 max: limits.max_metadata_key_bytes,
             });
         }
-        if value.len() > limits.max_metadata_value_bytes {
+        if value.byte_len() > limits.max_metadata_value_bytes {
             return Err(RequestViolation::MetadataValueTooLong {
                 key: key.clone(),
                 max: limits.max_metadata_value_bytes,

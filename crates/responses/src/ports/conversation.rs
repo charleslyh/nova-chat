@@ -19,6 +19,7 @@ use crate::conversation::{
     Conversation, ConversationEvent, ConversationEventKind, ConversationId, TurnCommit,
 };
 use crate::identity::TenantId;
+use crate::protocol::MetadataValue;
 use crate::response::{ResponseId, ResponseStatus};
 
 use super::store_error::StoreError;
@@ -60,7 +61,7 @@ pub trait ConversationRepo: Send + Sync {
         &self,
         tenant: &TenantId,
         id: &ConversationId,
-        metadata: BTreeMap<String, String>,
+        metadata: BTreeMap<String, MetadataValue>,
     ) -> Result<Conversation, ConversationError>;
 
     /// Delete a conversation. Returns whether one was removed.

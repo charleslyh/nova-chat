@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 // process instead of a real carrier.
 use nova_responses::config::Config;
 use nova_responses::service::{ConversationsService, ResponsesDeps, ResponsesService};
+use nova_responses::protocol::MetadataValue;
 use nova_responses::Clock;
 use nova_responses_gateway::{AppState, GatewayConfig, KeyTable};
 
@@ -547,12 +548,14 @@ async fn caller_metadata_is_echoed_and_reaches_the_executor() {
                 "model": "m",
                 "input": "q1",
                 "background": true,
-                "metadata": { "agent_id": "decoupage" },
+                "metadata": { "agent_id": "decoupage", "priority": 7, "pinned": true },
             }),
         )
         .await;
-    // Echoed on the object.
+    // Echoed on the object, values in their original JSON kinds.
     assert_eq!(created["metadata"]["agent_id"], "decoupage");
+    assert_eq!(created["metadata"]["priority"], 7);
+    assert_eq!(created["metadata"]["pinned"], true);
 
     let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
     let engine = h.engine_with(Arc::new(CapturingScheduler { seen: seen.clone() }));
@@ -560,7 +563,10 @@ async fn caller_metadata_is_echoed_and_reaches_the_executor() {
     let request = seen.lock().expect("lock").clone().expect("a request was built");
 
     // Delivered to the executor as dispatch hints, not as prompt material.
-    assert_eq!(request.metadata.get("agent_id").map(String::as_str), Some("decoupage"));
+    assert_eq!(
+        request.metadata.get("agent_id").and_then(MetadataValue::as_str),
+        Some("decoupage")
+    );
     let rendered = serde_json::to_string(&request.messages).expect("render");
     assert!(
         !rendered.contains("decoupage"),

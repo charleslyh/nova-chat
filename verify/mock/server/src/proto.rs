@@ -21,6 +21,7 @@ use nova_responses::{
     ResponseRecord, ResponseStatus, TenantId, TurnCommit, Usage,
 };
 use nova_responses::ports::{AbortedClaim, ClaimedResponse, ConversationError, CreateOutcome, EventLogError, LedgerError};
+use nova_responses::protocol::MetadataValue;
 
 /// Internal wire form of an event to append.
 ///
@@ -193,7 +194,7 @@ pub enum Request {
     ConversationUpdateMetadata {
         tenant: TenantId,
         id: ConversationId,
-        metadata: BTreeMap<String, String>,
+        metadata: BTreeMap<String, MetadataValue>,
     },
     ConversationDelete {
         tenant: TenantId,

@@ -25,12 +25,14 @@ mod content;
 mod conversation;
 mod item;
 mod limits;
+mod metadata;
 mod request;
 mod response_object;
 mod tool;
 mod url_guard;
 
 pub use content::{ContentPart, ContentViolation, ImageDetail};
+pub use metadata::MetadataValue;
 pub use conversation::{
     AppendBusinessEventRequest, BusinessEventViolation, ConversationMetadataRequest,
 };

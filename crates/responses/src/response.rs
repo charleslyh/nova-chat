@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::conversation::ConversationId;
 use crate::identity::{AgentId, Attempt, IdError, IdempotencyKey, NodeTag, TenantId};
-use crate::protocol::{ResponseItem, Tool, ToolChoice};
+use crate::protocol::{MetadataValue, ResponseItem, Tool, ToolChoice};
 use crate::usage::Usage;
 
 /// `resp_{node}_{uuid}`.
@@ -188,7 +188,7 @@ pub struct ModelParams {
     /// Echoed on retrieval, **never** fed into context assembly (INV-49): the
     /// executor reads it to decide *how* to run the turn, not what the turn says.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub metadata: BTreeMap<String, String>,
+    pub metadata: BTreeMap<String, MetadataValue>,
 }
 
 impl ModelParams {

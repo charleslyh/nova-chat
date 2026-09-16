@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use nova_responses::protocol::{Tool, ToolChoice, ToolChoiceMode};
+use nova_responses::protocol::{MetadataValue, Tool, ToolChoice, ToolChoiceMode};
 use nova_responses::{RequestProvenance, ResponseItem};
 
 use super::translate::{items_to_messages, TranslationError};
@@ -28,7 +28,7 @@ pub struct CompletionsRequest {
     /// the turn's params so an executor can dispatch on them. Never sent to the
     /// provider.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub metadata: BTreeMap<String, String>,
+    pub metadata: BTreeMap<String, MetadataValue>,
     /// Where this request came from. Never sent to the provider.
     pub provenance: RequestProvenance,
 }
@@ -79,7 +79,7 @@ impl CompletionsRequest {
         self
     }
 
-    pub fn with_metadata(mut self, metadata: BTreeMap<String, String>) -> Self {
+    pub fn with_metadata(mut self, metadata: BTreeMap<String, MetadataValue>) -> Self {
         self.metadata = metadata;
         self
     }

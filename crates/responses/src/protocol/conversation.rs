@@ -20,6 +20,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::limits::ProtocolLimits;
+use super::metadata::MetadataValue;
 use super::request::{validate_metadata, RequestViolation};
 
 /// `POST /v1/conversations` and `POST /v1/conversations/{id}`.
@@ -33,7 +34,7 @@ use super::request::{validate_metadata, RequestViolation};
 #[serde(deny_unknown_fields)]
 pub struct ConversationMetadataRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<BTreeMap<String, String>>,
+    pub metadata: Option<BTreeMap<String, MetadataValue>>,
 }
 
 impl ConversationMetadataRequest {
@@ -45,7 +46,7 @@ impl ConversationMetadataRequest {
     }
 
     /// The metadata to store, defaulting to empty.
-    pub fn metadata(&self) -> BTreeMap<String, String> {
+    pub fn metadata(&self) -> BTreeMap<String, MetadataValue> {
         self.metadata.clone().unwrap_or_default()
     }
 }
@@ -147,7 +148,7 @@ mod tests {
         let limits = limits();
         let mut metadata = BTreeMap::new();
         for i in 0..=limits.max_metadata_entries {
-            metadata.insert(format!("k{i}"), "v".into());
+            metadata.insert(format!("k{i}"), MetadataValue::String("v".into()));
         }
         let req = ConversationMetadataRequest {
             metadata: Some(metadata),
@@ -159,7 +160,10 @@ mod tests {
 
         let long_key = "k".repeat(limits.max_metadata_key_bytes + 1);
         let req = ConversationMetadataRequest {
-            metadata: Some(BTreeMap::from([(long_key, "v".to_string())])),
+            metadata: Some(BTreeMap::from([(
+                long_key,
+                MetadataValue::String("v".into()),
+            )])),
         };
         assert!(matches!(
             req.validate(&limits),
@@ -171,7 +175,10 @@ mod tests {
     fn accepted_metadata_round_trips() {
         let json = r#"{"metadata":{"topic":"demo"}}"#;
         let req: ConversationMetadataRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.metadata().get("topic").map(String::as_str), Some("demo"));
+        assert_eq!(
+            req.metadata().get("topic").and_then(MetadataValue::as_str),
+            Some("demo")
+        );
         assert_eq!(serde_json::to_string(&req).unwrap(), json);
     }
 

@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use nova_responses::protocol::{CreateResponseRequest, ProtocolLimits, ResponseItem};
+use nova_responses::protocol::{CreateResponseRequest, MetadataValue, ProtocolLimits, ResponseItem};
 use nova_responses::{
     canonical_items, AgentId, AppendEvent, Attempt, ContextAnchor, Conversation,
     ConversationEventKind, ConversationId, EventBody, IdempotencyKey, ModelParams, NodeTag,
@@ -1471,8 +1471,11 @@ pub async fn assert_conversation_conformance(ports: &PortSet) {
     // Metadata replaces wholesale, so a key can be removed. A merge-patch could
     // only ever add.
     let mut metadata = std::collections::BTreeMap::new();
-    metadata.insert("topic".to_string(), "demo".to_string());
-    metadata.insert("stale".to_string(), "x".to_string());
+    metadata.insert(
+        "topic".to_string(),
+        MetadataValue::String("demo".to_string()),
+    );
+    metadata.insert("stale".to_string(), MetadataValue::String("x".to_string()));
     let updated = ports
         .conversation
         .update_metadata(&tenant, &created.id, metadata)
@@ -1481,7 +1484,10 @@ pub async fn assert_conversation_conformance(ports: &PortSet) {
     assert_eq!(updated.metadata.len(), 2);
 
     let mut narrower = std::collections::BTreeMap::new();
-    narrower.insert("topic".to_string(), "demo".to_string());
+    narrower.insert(
+        "topic".to_string(),
+        MetadataValue::String("demo".to_string()),
+    );
     let updated = ports
         .conversation
         .update_metadata(&tenant, &created.id, narrower)

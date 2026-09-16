@@ -16,6 +16,7 @@ use nova_responses::ports::{
     ConversationError, ConversationEvents, ConversationRepo, ConversationSnapshots, StoreError,
     TurnLock,
 };
+use nova_responses::protocol::MetadataValue;
 use nova_responses::{
     ContextEntry, Conversation, ConversationEvent, ConversationEventKind, ConversationId,
     ResolvedContext, ResponseId, ResponseStatus, TenantId, TurnCommit,
@@ -110,7 +111,7 @@ impl ConversationRepo for MemConversationStore {
         &self,
         tenant: &TenantId,
         id: &ConversationId,
-        metadata: BTreeMap<String, String>,
+        metadata: BTreeMap<String, MetadataValue>,
     ) -> Result<Conversation, ConversationError> {
         self.guard_writable()?;
         let mut g = self.store.lock();

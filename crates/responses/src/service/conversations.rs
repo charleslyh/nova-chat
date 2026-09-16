@@ -16,6 +16,7 @@ use crate::context::ResolvedContext;
 use crate::conversation::{Conversation, ConversationEventKind, ConversationId};
 use crate::identity::TenantId;
 use crate::ports::{metric, ConversationError, ConversationStore, MetricsSink};
+use crate::protocol::MetadataValue;
 use crate::response::{ResponseId, ResponseStatus};
 
 /// Conversations 用例编排。
@@ -41,7 +42,7 @@ impl ConversationsService {
     pub async fn create(
         &self,
         tenant: &TenantId,
-        metadata: BTreeMap<String, String>,
+        metadata: BTreeMap<String, MetadataValue>,
     ) -> Result<Conversation, ConversationError> {
         // 不写前探活（D28）：库不可用由失败返回错误直接暴露，低概率失败用「治疗」而非
         // 「预防」。启动探活（fail-fast）仍在装配处。
@@ -68,7 +69,7 @@ impl ConversationsService {
         &self,
         tenant: &TenantId,
         id: &ConversationId,
-        metadata: BTreeMap<String, String>,
+        metadata: BTreeMap<String, MetadataValue>,
     ) -> Result<Conversation, ConversationError> {
         self.conversations
             .update_metadata(tenant, id, metadata)

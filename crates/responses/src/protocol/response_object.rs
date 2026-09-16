@@ -19,6 +19,7 @@ use crate::response::{ResponseRecord, ResponseStatus};
 use crate::usage::Usage;
 
 use super::item::ResponseItem;
+use super::metadata::MetadataValue;
 use super::request::ConversationRef;
 use super::tool::{Tool, ToolChoice};
 
@@ -76,7 +77,7 @@ pub struct ResponseObject {
 
     /// Echoed from the caller's request metadata (see `ModelParams::metadata`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub metadata: BTreeMap<String, String>,
+    pub metadata: BTreeMap<String, MetadataValue>,
 
     #[serde(default)]
     pub usage: Usage,
@@ -241,7 +242,10 @@ mod tests {
         // is omitted so the common case stays byte-identical to before the field
         // existed.
         let mut r = record();
-        r.spec.params.metadata.insert("agent_id".into(), "decoupage".into());
+        r.spec.params.metadata.insert(
+            "agent_id".into(),
+            MetadataValue::String("decoupage".into()),
+        );
         let json = serde_json::to_value(ResponseObject::without_output(&r)).unwrap();
         assert_eq!(json["metadata"]["agent_id"], "decoupage");
 

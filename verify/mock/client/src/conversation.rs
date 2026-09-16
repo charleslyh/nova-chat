@@ -15,6 +15,7 @@ use nova_responses::ports::{
     ConversationError, ConversationEvents, ConversationRepo, ConversationSnapshots, StoreError,
     TurnLock,
 };
+use nova_responses::protocol::MetadataValue;
 use nova_responses::{
     Conversation, ConversationEvent, ConversationEventKind, ConversationId, ResolvedContext,
     ResponseId, ResponseStatus, TenantId, TurnCommit,
@@ -98,7 +99,7 @@ impl ConversationRepo for MemConversationClient {
         &self,
         tenant: &TenantId,
         id: &ConversationId,
-        metadata: BTreeMap<String, String>,
+        metadata: BTreeMap<String, MetadataValue>,
     ) -> Result<Conversation, ConversationError> {
         self.guard_writable()?;
         match conversation_rpc(

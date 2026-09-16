@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use nova_responses::protocol::{
-    AppendBusinessEventRequest, ConversationMetadataRequest, ResponseItem,
+    AppendBusinessEventRequest, ConversationMetadataRequest, MetadataValue, ResponseItem,
 };
 use nova_responses::{Conversation, ConversationEventKind, ConversationId, ResolvedContext};
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ struct ConversationObject {
     id: String,
     object: &'static str,
     created_at: u64,
-    metadata: std::collections::BTreeMap<String, String>,
+    metadata: std::collections::BTreeMap<String, MetadataValue>,
     /// 自建扩展：轮次是否在途，供各端在生成期间禁用输入（D28）。官方对象没有这两个字段，
     /// 所以只在列表形状里出现，检索时省略。
     #[serde(skip_serializing_if = "Option::is_none")]
