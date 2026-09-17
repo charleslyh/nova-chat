@@ -119,6 +119,13 @@ impl ResponsesService {
         idempotency_key: Option<IdempotencyKey>,
     ) -> Result<CreateOutcome, ServiceError> {
         let now_ms = self.now_ms();
+        let started = std::time::Instant::now();
+        tracing::debug!(
+            tenant = %tenant,
+            anchor = ?spec.anchor,
+            input_items = spec.input_items.len(),
+            "creating a response"
+        );
 
         // 解析并校验前驱上下文（D30）：读会话快照校验深度/条数/字节上界，断裂即失败，
         // 不留半创建记录。快照本身不复制进 record——执行端按锚点自己再读一次，所以这里
@@ -166,6 +173,34 @@ impl ResponsesService {
                 self.release_after_failed_admission(tenant, conversation_id, &response_id)
                     .await;
             }
+        }
+        match &outcome {
+            Ok(CreateOutcome::Accepted(record)) => tracing::info!(
+                response = %record.response_id,
+                conversation = ?conversation_id,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "response accepted"
+            ),
+            Ok(other) => {
+                let why = match other {
+                    CreateOutcome::Duplicate(_) => "duplicate",
+                    CreateOutcome::ReadOnly => "read-only",
+                    CreateOutcome::Overloaded => "overloaded",
+                    CreateOutcome::Accepted(_) => unreachable!("matched above"),
+                };
+                tracing::debug!(
+                    response = %response_id,
+                    outcome = why,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "admission did not accept a new record"
+                )
+            }
+            Err(e) => tracing::debug!(
+                response = %response_id,
+                error = %e,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "admission failed"
+            ),
         }
         outcome
     }
@@ -236,6 +271,12 @@ impl ResponsesService {
             }
             .into());
         }
+        tracing::debug!(
+            turns = resolved.turns,
+            items = resolved.item_count(),
+            bytes = resolved.bytes(),
+            "inherited context resolved within limits"
+        );
         Ok(resolved)
     }
 
@@ -380,6 +421,11 @@ impl ResponsesService {
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
+                tracing::debug!(
+                    response = %response_id,
+                    read_up_to = ?cursor,
+                    "sync wait reached its deadline without a terminal event; returning the current object"
+                );
                 break;
             }
             let batch = self
@@ -411,9 +457,21 @@ impl ResponsesService {
     ) -> Result<ResponseObject, ServiceError> {
         let now_ms = self.now_ms();
 
+        tracing::info!(response = %response_id, tenant = %tenant, "cancelling an in-flight response");
         self.deps.ledger.cancel(tenant, response_id, now_ms).await?;
+        tracing::debug!(response = %response_id, "cancel committed in the ledger; emitting the terminal event");
 
-        let record = self.deps.ledger.get(response_id).await.ok().flatten();
+        let record = match self.deps.ledger.get(response_id).await {
+            Ok(record) => record,
+            Err(e) => {
+                tracing::warn!(
+                    response = %response_id,
+                    error = %e,
+                    "record read-back after cancel failed; terminal event will carry a stub"
+                );
+                None
+            }
+        };
 
         // Archive the cancelled turn's input and whatever output it reached (D30
         // incomplete-turn archival). The executing agent is unreachable from here, so
@@ -499,7 +557,7 @@ impl ResponsesService {
             // still has to end, and a stub is all the terminal event needs.
             None => ResponseObject::terminal_stub(response_id, ResponseStatus::Cancelled),
         };
-        let _ = self
+        if let Err(e) = self
             .deps
             .event_log
             .append(AppendEvent::lifecycle(
@@ -507,8 +565,15 @@ impl ResponsesService {
                 crate::events::ResponseEventKind::Failed,
                 response.clone(),
             ))
-            .await;
-        let _ = self
+            .await
+        {
+            tracing::warn!(
+                response = %response_id,
+                error = %e,
+                "terminal event append after cancel failed; subscribers may hang until the stream closes"
+            );
+        }
+        if let Err(e) = self
             .deps
             .event_log
             .close(
@@ -516,7 +581,10 @@ impl ResponsesService {
                 now_ms,
                 self.deps.cfg.retain_after_terminal(),
             )
-            .await;
+            .await
+        {
+            tracing::warn!(response = %response_id, error = %e, "retention window not started");
+        }
 
         self.deps.metrics.incr(metric::RESPONSES_CANCELLED, 1);
 
@@ -534,20 +602,30 @@ impl ResponsesService {
         response_id: &ResponseId,
     ) -> Result<bool, ServiceError> {
         // 先读关联，再删：删掉之后就再也拿不到会话归属了。
-        let conversation_id = self
-            .deps
-            .ledger
-            .get(response_id)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|record| record.conversation_id().cloned());
+        let conversation_id = match self.deps.ledger.get(response_id).await {
+            Ok(record) => record.and_then(|record| record.conversation_id().cloned()),
+            Err(e) => {
+                tracing::debug!(
+                    response = %response_id,
+                    error = %e,
+                    "reading the record before deletion failed; no ResponseDeleted event can be announced"
+                );
+                None
+            }
+        };
 
         let deleted = self.deps.ledger.delete(response_id).await?;
-        let _ = self.deps.event_log.remove(response_id).await;
+        if let Err(e) = self.deps.event_log.remove(response_id).await {
+            tracing::debug!(
+                response = %response_id,
+                error = %e,
+                "event stream removal failed; the buffer lingers until the sweeper reclaims it"
+            );
+        }
 
         if deleted {
             self.deps.metrics.incr(metric::RESPONSES_DELETED, 1);
+            tracing::info!(response = %response_id, "response deleted");
 
             if let Some(conversation_id) = &conversation_id {
                 if let Err(err) = self
@@ -571,6 +649,8 @@ impl ResponsesService {
                     );
                 }
             }
+        } else {
+            tracing::debug!(response = %response_id, "delete matched no record");
         }
         Ok(deleted)
     }
@@ -624,7 +704,13 @@ impl ResponsesService {
                 Ok(batch) => batch,
                 // 流已过期/已回收：不是失败，只是无法从流里重建（INV-40 无恢复路径）。
                 Err(crate::ports::EventLogError::Unknown)
-                | Err(crate::ports::EventLogError::Expired) => return Ok(latest),
+                | Err(crate::ports::EventLogError::Expired) => {
+                    tracing::debug!(
+                        response = %response_id,
+                        "event stream expired; the object falls back to metadata rendering"
+                    );
+                    return Ok(latest);
+                }
                 Err(e) => return Err(e.into()),
             };
             if batch.is_empty() {

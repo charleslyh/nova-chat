@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tracing::{debug, info};
 use nova_responses::ports::{EventLogError, ResponseEventLog};
 use nova_responses::{AppendEvent, Attempt, ContentPart, ItemStatus, ResponseId, ResponseItem};
 
@@ -124,13 +125,29 @@ impl EventSink {
         if self.stopped {
             return Ok(SinkVerdict::Stop);
         }
+        let kind = event.kind();
         match self.event_log.append(event).await {
             Ok(_) => Ok(SinkVerdict::Continue),
             Err(EventLogError::StaleAttempt) => {
+                if !self.stopped {
+                    info!(
+                        response = %self.response_id,
+                        attempt = ?self.attempt,
+                        "append refused as stale; fence moved, stopping the sink"
+                    );
+                }
                 self.stopped = true;
                 Ok(SinkVerdict::Stop)
             }
-            Err(e) => Err(SinkError::Transport(e.to_string())),
+            Err(e) => {
+                debug!(
+                    response = %self.response_id,
+                    error = %e,
+                    kind = kind.as_str(),
+                    "event append failed"
+                );
+                Err(SinkError::Transport(e.to_string()))
+            }
         }
     }
 }

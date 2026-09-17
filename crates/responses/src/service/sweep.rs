@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::clock::Clock;
 use crate::conversation::TurnCommit;
@@ -95,6 +95,12 @@ async fn tick(
     };
 
     for claim in aborted {
+        info!(
+            response = %claim.response_id,
+            tenant = %claim.tenant_id,
+            conversation = ?claim.conversation_id,
+            "reaping a lost claim"
+        );
         // Partial usage is booked by the ledger itself during reaping, so a crash
         // between the two cannot lose it (INV-51).
         //
@@ -102,16 +108,30 @@ async fn tick(
         // now that the claim carries a tenant, but that would be an extra read per
         // reaped claim to enrich an event whose only job is to end the stream.
         // Subscribers that want the finished object use `GET`.
-        let _ = event_log
+        if let Err(e) = event_log
             .append(AppendEvent::lifecycle(
                 claim.response_id.clone(),
                 ResponseEventKind::Failed,
                 ResponseObject::terminal_stub(&claim.response_id, ResponseStatus::Failed),
             ))
-            .await;
-        let _ = event_log
+            .await
+        {
+            warn!(
+                response = %claim.response_id,
+                error = %e,
+                "terminal event append for a reaped claim failed; subscribers may hang until the stream closes"
+            );
+        }
+        if let Err(e) = event_log
             .close(&claim.response_id, now, retain_after_terminal)
-            .await;
+            .await
+        {
+            warn!(
+                response = %claim.response_id,
+                error = %e,
+                "retention window for a reaped claim not started"
+            );
+        }
 
         // Archive the reaped turn's input and whatever output it reached (D30
         // incomplete-turn archival). The holder is gone, so completed items come from

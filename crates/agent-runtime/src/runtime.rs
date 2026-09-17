@@ -151,6 +151,11 @@ impl AgentRuntime {
                 return Executed::Idle;
             }
         };
+        debug!(
+            response = %claimed.record.response_id,
+            attempt = ?claimed.record.attempt,
+            "claim acquired; serving"
+        );
 
         self.serve(claimed, agent, now_ms).await
     }
@@ -235,6 +240,12 @@ impl AgentRuntime {
         let record = claimed.record;
         let id = record.response_id.clone();
         let attempt = record.attempt;
+        let started = std::time::Instant::now();
+        debug!(
+            response = %id,
+            attempt = ?attempt,
+            "serving a claimed response"
+        );
 
         // Keep the claim alive across the whole (possibly long) run.
         let _heartbeat = spawn_heartbeat(
@@ -245,7 +256,7 @@ impl AgentRuntime {
         );
 
         // Announce the transition so a subscriber sees a defined progression.
-        let _ = self
+        if let Err(e) = self
             .deps
             .event_log
             .append(AppendEvent::lifecycle_with_attempt(
@@ -254,7 +265,15 @@ impl AgentRuntime {
                 attempt,
                 ResponseObject::without_output(&record),
             ))
-            .await;
+            .await
+        {
+            warn!(
+                response = %id,
+                attempt = ?attempt,
+                error = %e,
+                "could not announce in_progress; subscribers stay on the created state"
+            );
+        }
 
         // History lives in the conversation snapshot (D30): read it once from the
         // anchor rather than walking a chain, then append this turn's own input.
@@ -288,10 +307,21 @@ impl AgentRuntime {
             interval: self.cfg.cancel_poll_interval,
         };
 
+        debug!(
+            response = %id,
+            runner = self.deps.runner.name(),
+            items = task.items.len(),
+            max_tool_rounds = task.max_tool_rounds,
+            "handing the task to the runner"
+        );
         let outcome = match self.deps.runner.run(&task, &mut sink, &cancel).await {
             Ok(outcome) => outcome,
             Err(AgentError::Superseded) => {
-                info!(response = %id, "attempt superseded");
+                info!(
+                    response = %id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "attempt superseded"
+                );
                 return Executed::Superseded;
             }
             Err(AgentError::Failed { message, usage }) => {
@@ -315,10 +345,19 @@ impl AgentRuntime {
         };
 
         if sink.stopped() {
-            info!(response = %id, "fence moved during generation; discarding output");
+            info!(
+                response = %id,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "fence moved during generation; discarding output"
+            );
             return Executed::Superseded;
         }
 
+        debug!(
+            response = %id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "runner finished; committing the outcome"
+        );
         self.complete(
             &record,
             attempt,
@@ -349,6 +388,12 @@ impl AgentRuntime {
         } = output;
         let id = &record.response_id;
 
+        debug!(
+            response = %id,
+            attempt = ?attempt,
+            status = ?status,
+            "committing a completed run to the ledger"
+        );
         if let Err(e) = self
             .deps
             .ledger
@@ -392,14 +437,18 @@ impl AgentRuntime {
         // Re-read the record: `ledger.complete` has written the terminal status and
         // usage, and the terminal event must carry them (the claimed record still says
         // `in_progress`).
-        let updated = self
-            .deps
-            .ledger
-            .get(id)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| record.clone());
+        let updated = match self.deps.ledger.get(id).await {
+            Ok(Some(rec)) => rec,
+            Ok(None) => record.clone(),
+            Err(e) => {
+                debug!(
+                    response = %id,
+                    error = %e,
+                    "re-read after complete failed; terminal event carries the claimed record"
+                );
+                record.clone()
+            }
+        };
         self.close_stream(id, kind, ResponseObject::new(&updated, produced), now_ms)
             .await;
         info!(response = %id, "completed");
@@ -418,6 +467,11 @@ impl AgentRuntime {
     ) -> Executed {
         let id = &record.response_id;
 
+        debug!(
+            response = %id,
+            attempt = ?attempt,
+            "recording a failed run in the ledger"
+        );
         if let Err(e) = self
             .deps
             .ledger
@@ -444,14 +498,18 @@ impl AgentRuntime {
         debug!(response = %id, reason, "failed");
         // Re-read for the same reason as the completion path: `ledger.complete` holds
         // the terminal status the failure event must report.
-        let updated = self
-            .deps
-            .ledger
-            .get(id)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| record.clone());
+        let updated = match self.deps.ledger.get(id).await {
+            Ok(Some(rec)) => rec,
+            Ok(None) => record.clone(),
+            Err(e) => {
+                debug!(
+                    response = %id,
+                    error = %e,
+                    "re-read after failure failed; terminal event carries the claimed record"
+                );
+                record.clone()
+            }
+        };
         self.close_stream(
             id,
             ResponseEventKind::Failed,
@@ -472,6 +530,7 @@ impl AgentRuntime {
         record: &ResponseRecord,
     ) -> Result<ResolvedContext, SnapshotUnavailable> {
         let tenant = &record.tenant_id;
+        debug!(response = %record.response_id, anchor = ?record.anchor(), "resolving the inherited context snapshot");
         match record.anchor() {
             ContextAnchor::Root => Ok(ResolvedContext::default()),
             ContextAnchor::Conversation(id) => Ok(self.read_snapshot(tenant, id).await?),
@@ -481,7 +540,14 @@ impl AgentRuntime {
                     .ledger
                     .get(id)
                     .await
-                    .map_err(|_| SnapshotUnavailable::ChainBroken(id.clone()))?
+                    .map_err(|e| {
+                        debug!(
+                            response = %id,
+                            error = %e,
+                            "chain resolution read failed; reporting as broken"
+                        );
+                        SnapshotUnavailable::ChainBroken(id.clone())
+                    })?
                     .ok_or_else(|| SnapshotUnavailable::ChainBroken(id.clone()))?;
                 match prev.anchor() {
                     ContextAnchor::Conversation(cid) => Ok(self.read_snapshot(tenant, cid).await?),
@@ -512,7 +578,14 @@ impl AgentRuntime {
                     Duration::ZERO,
                 )
                 .await
-                .map_err(|_| SnapshotUnavailable::ChainBroken(record.response_id.clone()))?;
+                .map_err(|e| {
+                    debug!(
+                        response = %record.response_id,
+                        error = %e,
+                        "stream replay read failed; reporting chain as broken"
+                    );
+                    SnapshotUnavailable::ChainBroken(record.response_id.clone())
+                })?;
             if batch.is_empty() {
                 break;
             }
@@ -579,7 +652,14 @@ impl AgentRuntime {
             )
             .await
         {
-            Ok(_) => true,
+            Ok(_) => {
+                debug!(
+                    response = %record.response_id,
+                    conversation = %conversation_id,
+                    "turn appended to the conversation snapshot"
+                );
+                true
+            }
             Err(e) => {
                 warn!(
                     response = %record.response_id,
@@ -643,16 +723,28 @@ impl AgentRuntime {
         object: ResponseObject,
         now_ms: u64,
     ) {
-        let _ = self
+        debug!(response = %id, kind = ?kind, "closing the event stream with a terminal event");
+        if let Err(e) = self
             .deps
             .event_log
             .append(AppendEvent::lifecycle(id.clone(), kind, object))
-            .await;
-        let _ = self
+            .await
+        {
+            warn!(
+                response = %id,
+                kind = ?kind,
+                error = %e,
+                "terminal event append failed; subscribers may hang until the stream closes"
+            );
+        }
+        if let Err(e) = self
             .deps
             .event_log
             .close(id, now_ms, self.cfg.retain_after_terminal)
-            .await;
+            .await
+        {
+            warn!(response = %id, error = %e, "retention window not started");
+        }
     }
 }
 
@@ -671,13 +763,21 @@ struct LedgerCancelProbe {
 impl CancelProbe for LedgerCancelProbe {
     async fn cancelled(&self) {
         loop {
-            if matches!(
-                self.ledger
-                    .check_attempt(&self.response_id, self.attempt)
-                    .await,
-                Err(LedgerError::StaleAttempt)
-            ) {
-                return;
+            match self
+                .ledger
+                .check_attempt(&self.response_id, self.attempt)
+                .await
+            {
+                Ok(()) => {}
+                Err(LedgerError::StaleAttempt) => return,
+                Err(e) => {
+                    warn!(
+                        response = %self.response_id,
+                        attempt = ?self.attempt,
+                        error = %e,
+                        "cancel-probe fence check failed; cancellation is now passive-only"
+                    );
+                }
             }
             tokio::time::sleep(self.interval).await;
         }
@@ -726,7 +826,12 @@ fn spawn_heartbeat(
             tokio::time::sleep(interval).await;
             match ledger.heartbeat(agent_id, clock.now_ms()).await {
                 Ok(()) => {}
-                Err(LedgerError::Store(StoreError::ReadOnly)) => break,
+                Err(LedgerError::Store(StoreError::ReadOnly)) => {
+                    debug!(
+                        "heartbeat stopped: ledger is read-only; the claim will be reaped"
+                    );
+                    break;
+                }
                 Err(e) => warn!(error = %e, "heartbeat failed"),
             }
         }
