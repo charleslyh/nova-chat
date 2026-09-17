@@ -36,6 +36,7 @@ fn record(id: &ResponseId, tenant_id: &str, stored: bool) -> ResponseRecord {
             },
             input_items: vec![ResponseItem::user_text(format!("in-{}", id.uuid()))],
             store: stored,
+            ext: None,
             anchor: ContextAnchor::Root,
         },
         IdempotencyKey::parse(&id.to_string()).expect("a response id is a valid key"),

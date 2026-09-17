@@ -412,6 +412,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                     },
                     input_items: vec![ResponseItem::user_text(input)],
                     store,
+                    ext: None,
                     anchor,
                 },
                 idempotency_key.clone(),

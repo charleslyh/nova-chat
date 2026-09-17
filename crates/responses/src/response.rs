@@ -10,6 +10,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use strum::IntoStaticStr;
 use uuid::Uuid;
 
@@ -224,6 +225,13 @@ pub struct TurnSpec {
     /// be referenced as a previous link (FR-18).
     pub store: bool,
 
+    /// The caller's private extension namespace (opaque, bounded). Part of the
+    /// caller-declared surface, stored verbatim for the execution side to read
+    /// (e.g. filling a `ToolContext`) — and never rendered back: it never enters
+    /// [`crate::protocol::ResponseObject`], context assembly, or the model call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Value>,
+
     /// Where this turn inherits its context from.
     pub anchor: ContextAnchor,
 }
@@ -395,6 +403,7 @@ mod tests {
             },
             input_items: vec![ResponseItem::user_text("in")],
             store,
+            ext: None,
             anchor,
         }
     }
@@ -490,5 +499,16 @@ mod tests {
         r.spec.anchor = ContextAnchor::Conversation(ConversationId::new());
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<ResponseRecord>(&json).unwrap(), r);
+    }
+
+    #[test]
+    fn ext_round_trips_on_the_record_and_stays_absent_when_unset() {
+        let mut r = record(true, "t1");
+        r.spec.ext = Some(serde_json::json!({"tool_context": {"project": "demo"}}));
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<ResponseRecord>(&json).unwrap(), r);
+
+        let bare = serde_json::to_value(record(true, "t1").spec).unwrap();
+        assert!(bare.get("ext").is_none(), "{bare}");
     }
 }

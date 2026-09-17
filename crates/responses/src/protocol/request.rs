@@ -62,6 +62,18 @@ pub struct CreateResponseRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<BTreeMap<String, MetadataValue>>,
 
+    /// The one private extension field: an opaque caller namespace for
+    /// execution-side context (e.g. `tool_context`). It is the *only* extension
+    /// point this subset will ever grow — future private needs become sub-keys
+    /// inside it, not new top-level fields.
+    ///
+    /// Bounded, not blessed (size + depth; see `max_ext_bytes` /
+    /// `max_json_depth`). Stored on the record for the execution side, and
+    /// **never echoed**: it has no place on [`super::response_object::ResponseObject`],
+    /// which is what structurally keeps it off the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Value>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
 
@@ -242,6 +254,10 @@ pub enum RequestViolation {
     MetadataKeyTooLong { key: String, max: usize },
     #[error("metadata value for `{key}` exceeds {max} bytes")]
     MetadataValueTooLong { key: String, max: usize },
+    #[error("ext exceeds {actual} bytes, limit is {max}")]
+    ExtTooLarge { actual: usize, max: usize },
+    #[error("ext nests deeper than {max}")]
+    ExtTooDeep { max: usize },
     #[error("tool `{name}` parameters invalid: {source}")]
     ToolParameters {
         name: String,
@@ -337,6 +353,27 @@ impl CreateResponseRequest {
         }
         if let Some(metadata) = &self.metadata {
             validate_metadata(limits, metadata)?;
+        }
+        if let Some(ext) = &self.ext {
+            // Encoded length, not the raw body length: the bound has to describe what
+            // is stored (SEC-7). Depth is bounded separately (INV-52) — a small
+            // document can still nest deeply enough to blow the stack of anything
+            // that walks it recursively.
+            let encoded = serde_json::to_vec(ext).map_err(|_| RequestViolation::ExtTooLarge {
+                actual: usize::MAX,
+                max: limits.max_ext_bytes,
+            })?;
+            if encoded.len() > limits.max_ext_bytes {
+                return Err(RequestViolation::ExtTooLarge {
+                    actual: encoded.len(),
+                    max: limits.max_ext_bytes,
+                });
+            }
+            if super::limits::json_depth(ext) > limits.max_json_depth {
+                return Err(RequestViolation::ExtTooDeep {
+                    max: limits.max_json_depth,
+                });
+            }
         }
         for tool in self.tools.iter().flatten() {
             limits.validate_depth(tool.parameters()).map_err(|source| {
@@ -609,6 +646,7 @@ mod tests {
             conversation: None,
             max_output_tokens: None,
             metadata: None,
+            ext: None,
             tools: Some(vec![Tool::Function {
                 name: "f".into(),
                 description: None,
@@ -632,5 +670,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req.validate(&limits()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ext_is_accepted_and_round_trips_opaque() {
+        let req = minimal(
+            r#"{"model":"m","input":"a","ext":{"tool_context":{"project":"demo","files":[1,2]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.ext,
+            Some(serde_json::json!({"tool_context": {"project": "demo", "files": [1, 2]}}))
+        );
+        assert!(req.validate(&limits()).is_ok());
+
+        // `null` is the accepted spelling of "no ext".
+        let req = minimal(r#"{"model":"m","input":"a","ext":null}"#).unwrap();
+        assert_eq!(req.ext, None);
+
+        // Absent stays absent on the wire.
+        let req = minimal(r#"{"model":"m","input":"a"}"#).unwrap();
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("ext").is_none(), "{json}");
+    }
+
+    #[test]
+    fn ext_is_bounded_by_size_and_depth() {
+        let limits = limits();
+        let big = serde_json::json!({ "blob": "x".repeat(limits.max_ext_bytes) });
+        let req = minimal(&format!(
+            r#"{{"model":"m","input":"a","ext":{}}}"#,
+            serde_json::to_string(&big).unwrap()
+        ))
+        .unwrap();
+        assert!(matches!(
+            req.validate(&limits),
+            Err(RequestViolation::ExtTooLarge { .. })
+        ));
+
+        let mut deep = Value::Null;
+        for _ in 0..(limits.max_json_depth + 2) {
+            deep = Value::Array(vec![deep]);
+        }
+        let req = minimal(&format!(
+            r#"{{"model":"m","input":"a","ext":{}}}"#,
+            serde_json::to_string(&deep).unwrap()
+        ))
+        .unwrap();
+        assert!(matches!(
+            req.validate(&limits),
+            Err(RequestViolation::ExtTooDeep { .. })
+        ));
     }
 }

@@ -574,6 +574,76 @@ async fn caller_metadata_is_echoed_and_reaches_the_executor() {
     );
 }
 
+/// `ext` is the one private extension field: accepted on the create-request body,
+/// persisted for the execution side, and never echoed anywhere a caller can read.
+#[tokio::test]
+async fn ext_is_accepted_stored_and_never_echoed() {
+    let h = start().await;
+    let secret = json!({ "tool_context": { "project": "decoupage", "files": ["a.png"] } });
+    let (_, created) = h
+        .post(
+            "/v1/responses",
+            json!({
+                "model": "m",
+                "input": "q1",
+                "background": true,
+                "ext": secret,
+            }),
+        )
+        .await;
+    assert!(
+        created.get("ext").is_none(),
+        "ext must not be echoed on the created object: {created}"
+    );
+
+    // Not echoed on retrieval either — the only proof a caller gets that it was
+    // accepted is that the request was not rejected.
+    let id = created["id"].as_str().unwrap().to_string();
+    let (status, fetched) = h.get(&format!("/v1/responses/{id}")).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(
+        fetched.get("ext").is_none(),
+        "ext must not be echoed on retrieval: {fetched}"
+    );
+}
+
+#[tokio::test]
+async fn ext_is_rejected_when_oversized() {
+    let h = start().await;
+    let (status, body) = h
+        .post(
+            "/v1/responses",
+            json!({
+                "model": "m",
+                "input": "q1",
+                "ext": { "blob": "x".repeat(20 * 1024) },
+            }),
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ext"),
+        "unhelpful error: {body}"
+    );
+}
+
+/// The conversation endpoints stay pure protocol surface: `ext` is a property of one
+/// execution, not of a conversation container.
+#[tokio::test]
+async fn ext_is_not_accepted_on_conversation_endpoints() {
+    let h = start().await;
+    let (status, _) = h
+        .post(
+            "/v1/conversations",
+            json!({ "ext": { "tool_context": {} } }),
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn unknown_field_is_rejected_with_the_field_name() {
     let h = start().await;

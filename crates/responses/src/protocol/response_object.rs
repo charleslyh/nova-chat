@@ -173,6 +173,7 @@ mod tests {
                 },
                 input_items: vec![ResponseItem::user_text("hi")],
                 store: true,
+                ext: None,
                 anchor: ContextAnchor::Conversation(ConversationId::new()),
             },
             IdempotencyKey::parse("k").unwrap(),

@@ -296,6 +296,7 @@ impl AgentRuntime {
             items,
             provenance,
             max_tool_rounds: self.cfg.max_tool_rounds,
+            ext: record.spec.ext.clone(),
         };
 
         let mut sink = EventSink::new(self.deps.event_log.clone(), id.clone(), attempt);

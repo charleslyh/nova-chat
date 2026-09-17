@@ -12,6 +12,7 @@
 
 use async_trait::async_trait;
 use nova_responses::{ModelParams, RequestProvenance, ResponseItem, ResponseStatus, Usage};
+use serde_json::Value;
 
 /// One agent execution task, assembled by the orchestrator after a claim.
 #[derive(Debug, Clone)]
@@ -26,6 +27,10 @@ pub struct AgentTask {
     pub items: Vec<ResponseItem>,
     pub provenance: RequestProvenance,
     pub max_tool_rounds: usize,
+    /// The caller's private extension namespace (e.g. `tool_context`), carried from
+    /// the record so a runner can fill execution-side context such as a
+    /// `ToolContext`. Never sent to the provider, never part of model input.
+    pub ext: Option<Value>,
 }
 
 /// The final product of one agent execution.

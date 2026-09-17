@@ -15,7 +15,8 @@ use nova_responses::ports::{ConversationRepo, ConversationSnapshots};
 use mock_server::MemWorld;
 use async_trait::async_trait;
 use nova_agent_runtime::{
-    AgentEventSink, AgentRuntime, AgentRuntimeConfig, AgentRuntimeDeps, Executed,
+    AgentError, AgentEventSink, AgentOutcome, AgentRunner, AgentRuntime, AgentRuntimeConfig,
+    AgentRuntimeDeps, AgentTask, CancelProbe, Executed,
 };
 use mock_agentd::completions::{
     CompletionsMessage, CompletionsOutcome, CompletionsRequest, ToolCall,
@@ -56,6 +57,7 @@ fn record(id: &ResponseId, text: &str, stored: bool) -> ResponseRecord {
                 status: None,
             }],
             store: stored,
+            ext: None,
             anchor: ContextAnchor::Root,
         },
         IdempotencyKey::parse(&id.to_string()).expect("a response id is a valid key"),
@@ -180,6 +182,64 @@ async fn any_nodes_work_can_be_executed_here() {
 
     let rec = world.ledger.get(&foreign).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Completed);
+}
+
+/// A runner that records only the task's `ext`, so the record→task wiring can be
+/// asserted at the seam itself rather than through a scheduler that never sees it.
+struct ExtCapturingRunner {
+    seen: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+}
+
+#[async_trait]
+impl AgentRunner for ExtCapturingRunner {
+    fn name(&self) -> &str {
+        "ext-capturing"
+    }
+
+    async fn run(
+        &self,
+        task: &AgentTask,
+        _sink: &mut dyn AgentEventSink,
+        _cancel: &dyn CancelProbe,
+    ) -> Result<AgentOutcome, AgentError> {
+        *self.seen.lock().expect("lock") = task.ext.clone();
+        Ok(AgentOutcome {
+            items: Vec::new(),
+            usage: Usage::new(1, 1),
+            status: ResponseStatus::Completed,
+        })
+    }
+}
+
+#[tokio::test]
+async fn the_tasks_ext_is_carried_from_the_record_to_the_runner_seam() {
+    let world = MemWorld::new();
+    let ext = serde_json::json!({ "tool_context": { "project": "demo" } });
+
+    // A record with ext set, the way the gateway's create path stores it.
+    let fresh = ResponseId::new(node());
+    let mut rec = record(&fresh, "with ext", false);
+    rec.spec.ext = Some(ext.clone());
+    world
+        .ledger
+        .create(rec, IdempotencyKey::parse(&uuid::Uuid::new_v4().to_string()).expect("key"), 1_000)
+        .await
+        .expect("create");
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let runner = Arc::new(ExtCapturingRunner { seen: seen.clone() });
+    let e = AgentRuntime::new(
+        AgentRuntimeDeps {
+            ledger: world.ledger.clone(),
+            event_log: world.event_log.clone(),
+            runner,
+            clock: world.clock.clone(),
+            conversations: Some(world.conversation.clone()),
+        },
+        AgentRuntimeConfig::default(),
+    );
+    assert_eq!(e.run_once(2_000).await, Executed::Completed);
+    assert_eq!(seen.lock().expect("lock").clone(), Some(ext));
 }
 
 #[tokio::test]

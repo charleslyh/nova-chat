@@ -167,6 +167,7 @@ pub async fn create(
         },
         input_items,
         store: request.store,
+        ext: request.ext.clone(),
         anchor,
     };
 

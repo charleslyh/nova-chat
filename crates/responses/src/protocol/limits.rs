@@ -41,6 +41,12 @@ pub struct ProtocolLimits {
     /// larger belongs behind a reference.
     pub max_business_kind_bytes: usize,
     pub max_business_payload_bytes: usize,
+
+    /// The private `ext` namespace on the create-request body: an opaque,
+    /// execution-side payload (never echoed, never sent to the provider). Sized like
+    /// a business payload — anything larger belongs behind a reference. Depth reuses
+    /// `max_json_depth`.
+    pub max_ext_bytes: usize,
 }
 
 impl Default for ProtocolLimits {
@@ -57,6 +63,7 @@ impl Default for ProtocolLimits {
             max_url_bytes: 2048,
             max_business_kind_bytes: 64,
             max_business_payload_bytes: 16 * 1024,
+            max_ext_bytes: 16 * 1024,
         }
     }
 }
