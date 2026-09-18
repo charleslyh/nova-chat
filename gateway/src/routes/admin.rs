@@ -9,7 +9,6 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use nova_responses::ports::metric;
 use nova_responses::TenantId;
-use serde::Deserialize;
 
 use crate::error::{api_error, bad_request, map_conversation_error, map_ledger_error};
 use crate::routes::shared::Reject;
@@ -23,52 +22,6 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Reject> {
             "admin credentials required",
         ))
     })
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ReadOnlyBody {
-    pub enabled: bool,
-}
-
-pub async fn set_read_only(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<ReadOnlyBody>,
-) -> Response {
-    if let Err(resp) = require_admin(&state, &headers) {
-        return *resp;
-    }
-    // Applies to this node only: nodes are peers, so there is no authority to broadcast
-    // from. Reached through the admission port, not the ledger: flipping a degrade switch
-    // has nothing to do with persistence.
-    state.admission().set_read_only(body.enabled);
-    Json(serde_json::json!({
-        "ok": true,
-        "read_only": state.admission().is_read_only(),
-        "node_tag": state.responses_cfg().node_tag.as_str(),
-    }))
-    .into_response()
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PendingLimitBody {
-    pub pending_limit: usize,
-}
-
-pub async fn set_pending_limit(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<PendingLimitBody>,
-) -> Response {
-    if let Err(resp) = require_admin(&state, &headers) {
-        return *resp;
-    }
-    state.admission().set_pending_limit(body.pending_limit);
-    Json(serde_json::json!({
-        "ok": true,
-        "pending_limit": state.admission().pending_limit(),
-    }))
-    .into_response()
 }
 
 /// POST /v1/tenants/{tenant}/purge — bulk erasure (FR-21).
@@ -113,7 +66,6 @@ pub async fn health(State(state): State<AppState>) -> Response {
     let conversation_ok = state.conversation_repo.health().await.is_ok();
     let ok = conversation_ok;
 
-    let in_flight = state.ledger.in_flight().await.unwrap_or(0);
     let status = if ok {
         StatusCode::OK
     } else {
@@ -125,8 +77,6 @@ pub async fn health(State(state): State<AppState>) -> Response {
             "ok": ok,
             "node_tag": state.responses_cfg().node_tag.as_str(),
             "accepting": state.is_accepting(),
-            "read_only": state.admission().is_read_only(),
-            "in_flight": in_flight,
             "stores": {
                 "conversation": conversation_ok,
             },

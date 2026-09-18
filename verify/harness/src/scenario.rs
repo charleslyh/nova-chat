@@ -18,7 +18,7 @@ use nova_responses::{
     ResponseItem, ResponseRecord, ResponseStatus, TenantId, TurnCommit, TurnSpec, Usage,
 };
 use nova_responses::ports::{
-    AdmissionControl, ConversationError, ConversationRepo, ConversationSnapshots, CreateOutcome, EventLogError, ResponseEventLog, ResponseLedger, StoreError,
+    ConversationError, ConversationRepo, ConversationSnapshots, CreateOutcome, EventLogError, ResponseClaimSource, ResponseEventLog, ResponseIntake, StoreError,
     TurnLock,
 };
 use serde::Deserialize;
@@ -71,7 +71,7 @@ enum Step {
         /// which anchors the turn so `complete` appends to its snapshot (D30).
         #[serde(default)]
         conversation: Option<String>,
-        /// accepted | duplicate | overloaded | read_only
+        /// accepted | duplicate
         #[serde(default)]
         expect: Option<String>,
     },
@@ -214,12 +214,6 @@ enum Step {
     },
     ExpectProtocolAccept {
         body: String,
-    },
-    SetReadOnly {
-        enabled: bool,
-    },
-    SetPendingLimit {
-        limit: usize,
     },
     SetStoreUnavailable {
         enabled: bool,
@@ -428,8 +422,6 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let (resulting_id, label_str) = match &outcome {
                 CreateOutcome::Accepted(record) => (record.response_id.clone(), "accepted"),
                 CreateOutcome::Duplicate(record) => (record.response_id.clone(), "duplicate"),
-                CreateOutcome::ReadOnly => (id.clone(), "read_only"),
-                CreateOutcome::Overloaded => (id.clone(), "overloaded"),
             };
             if let Some(want) = &expect {
                 if want != label_str {
@@ -615,10 +607,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 ResponseStatus::Failed
             };
             let usage = Usage::new(input_tokens, output_tokens);
-            let record = ctx
-                .world
-                .ledger
-                .get(&id)
+            let record = ResponseIntake::get(ctx.world.ledger.as_ref(), &id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("{sc}: response vanished"))?;
 
@@ -699,7 +688,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let want = expect.as_deref().unwrap_or("ok");
             match (want, result) {
                 ("ok", Ok(())) => {
-                    if let Some(record) = ctx.world.ledger.get(&id).await? {
+                    if let Some(record) = ResponseIntake::get(ctx.world.ledger.as_ref(), &id).await? {
                         settle_session(ctx, &record, ResponseStatus::Cancelled).await?;
                     }
                     trace.push(TraceEvent::ResponseTerminal {
@@ -921,7 +910,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             expect_items,
         } => {
             let id = ctx.resolve(&target)?;
-            let found = ctx.world.ledger.get(&id).await?;
+            let found = ResponseIntake::get(ctx.world.ledger.as_ref(), &id).await?;
             match (exists, &found) {
                 (true, None) => bail!("{sc}: expected {id} to still be stored, but it is gone"),
                 (false, Some(_)) => {
@@ -973,10 +962,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             expires_at_ms,
         } => {
             let id = ctx.resolve(&target)?;
-            let mut record = ctx
-                .world
-                .ledger
-                .get(&id)
+            let mut record = ResponseIntake::get(ctx.world.ledger.as_ref(), &id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("{sc}: unknown response"))?;
             record.expires_at_ms = Some(expires_at_ms);
@@ -986,7 +972,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
 
         Step::ExpectIntegrityOk { target } => {
             let id = ctx.resolve(&target)?;
-            let ok = ctx.world.ledger.get(&id).await.is_ok();
+            let ok = ResponseIntake::get(ctx.world.ledger.as_ref(), &id).await.is_ok();
             trace.push(TraceEvent::IntegrityChecked {
                 response_id: id.to_string(),
                 ok,
@@ -1070,24 +1056,6 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
                 .map_err(|e| anyhow::anyhow!("{sc}: supported payload rejected: {e}"))?;
             req.validate(&ProtocolLimits::default())
                 .map_err(|e| anyhow::anyhow!("{sc}: supported payload failed validation: {e}"))?;
-        }
-
-        Step::SetReadOnly { enabled } => {
-            ctx.world.ledger.set_read_only(enabled);
-            trace.push(TraceEvent::MockState {
-                component: "ledger".into(),
-                detail: format!("read_only={enabled}"),
-                at_ms: ctx.now_ms,
-            });
-        }
-
-        Step::SetPendingLimit { limit } => {
-            ctx.world.ledger.set_pending_limit(limit);
-            trace.push(TraceEvent::MockState {
-                component: "ledger".into(),
-                detail: format!("pending_limit={limit}"),
-                at_ms: ctx.now_ms,
-            });
         }
 
         Step::SetStoreUnavailable { enabled } => {

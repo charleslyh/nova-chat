@@ -11,26 +11,24 @@ use crate::provenance::RequestProvenance;
 use crate::response::{ResponseId, ResponseRecord, ResponseStatus};
 use crate::usage::Usage;
 
-use super::admission::AdmissionControl;
 use super::store_error::StoreError;
 
 /// What happened to a create.
 ///
-/// `ReadOnly` and `Overloaded` are **not** errors: they are the ledger's normal
-/// refusals, and the ingress layer turns them into 503/429. `Accepted` and
-/// `Duplicate` both carry the record, so the caller never has to read back a row
-/// the ledger already had in hand — and so this one type can serve as the whole
-/// answer, instead of being re-wrapped in a near-identical capability-layer enum.
+/// `Accepted` and `Duplicate` both carry the record, so the caller never has to
+/// read back a row the ledger already had in hand — and so this one type can
+/// serve as the whole answer, instead of being re-wrapped in a near-identical
+/// capability-layer enum.
+///
+/// Admission refusals (read-only degrade, overload) are deliberately absent:
+/// they are task-management concerns owned by the hosting process, not part of
+/// the responses record-keeping contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CreateOutcome {
     /// Persisted in `Queued` state.
     Accepted(Box<ResponseRecord>),
     /// Idempotent replay: the original generation, never a second one (FR-3).
     Duplicate(Box<ResponseRecord>),
-    /// INV-32: read-only degrade rejects new writes.
-    ReadOnly,
-    /// FR-33: queued/in-flight count at or above the configured limit.
-    Overloaded,
     // Still no `Busy` here. The turn lock (D28) lives with the conversation store,
     // not the ledger: a lock outcome belongs with the store that holds the lock,
     // and admission is refused before this port is reached.
@@ -41,7 +39,6 @@ impl CreateOutcome {
     pub fn record(&self) -> Option<&ResponseRecord> {
         match self {
             CreateOutcome::Accepted(record) | CreateOutcome::Duplicate(record) => Some(record),
-            CreateOutcome::ReadOnly | CreateOutcome::Overloaded => None,
         }
     }
 
@@ -117,13 +114,17 @@ pub enum LedgerError {
     #[error("invalid transition: {0}")]
     InvalidTransition(String),
     /// Infrastructure failure (read-only / unreachable / internal).
-    #[error(transparent)]
+    #[error("transparent")]
     Store(#[from] StoreError),
 }
 
-/// Generation ledger: lifecycle, ownership, idempotency and usage.
+/// Ingress-side ledger: the record book behind the responses gateway.
+///
+/// This is what a gateway / capability layer talks to: create requests, cancel and
+/// delete by user intent, and reads. It knows nothing about execution. Hosts that
+/// already run their own task system implement only what they need here.
 #[async_trait]
-pub trait ResponseLedger: AdmissionControl {
+pub trait ResponseIntake: Send + Sync {
     /// Persist a new response in `Queued` state, carrying metadata only (D30): the
     /// record holds no snapshot, so there is no context write to pair this with at
     /// create time. The atomicity boundary moved to terminal time (`complete` +
@@ -139,6 +140,40 @@ pub trait ResponseLedger: AdmissionControl {
         now_ms: u64,
     ) -> Result<CreateOutcome, LedgerError>;
 
+    /// Terminate on request (FR-7). Records partial usage of the running attempt so
+    /// billing stays correct (INV-51).
+    ///
+    /// Raises the attempt fence like `reap`, so the executing agent observes the
+    /// cancellation — both its next append (passive, INV-6) and its active
+    /// cancellation probe poll see `StaleAttempt` — and stops spending tokens
+    /// promptly rather than running the ReAct loop to completion.
+    async fn cancel(
+        &self,
+        tenant: &TenantId,
+        response_id: &ResponseId,
+        now_ms: u64,
+    ) -> Result<(), LedgerError>;
+
+    /// Remove a response's record (record-level delete, D30). Returns whether a
+    /// record was removed. The conversation snapshot is **not** touched — the
+    /// inherited copy lives on there, exactly as "remove from the conversation"
+    /// requires.
+    async fn delete(&self, response_id: &ResponseId) -> Result<bool, LedgerError>;
+
+    /// Bulk-erase every response a tenant owns (FR-21).
+    async fn delete_by_tenant(&self, tenant: &TenantId) -> Result<u64, LedgerError>;
+
+    async fn get(&self, response_id: &ResponseId) -> Result<Option<ResponseRecord>, LedgerError>;
+}
+
+/// Claim-side ledger: the bridge from the responses gateway to the ReAct loop.
+///
+/// This is what an execution orchestrator talks to: claiming queued work,
+/// heartbeating the claim, and funneling terminal transitions. Implementations may
+/// be backed by a host's existing distributed task system instead of the same
+/// store that serves [`ResponseIntake`].
+#[async_trait]
+pub trait ResponseClaimSource: Send + Sync {
     /// Take the next queued response for execution.
     ///
     /// Single-point conditional update (INV-1): the check and the transition to
@@ -167,20 +202,6 @@ pub trait ResponseLedger: AdmissionControl {
         now_ms: u64,
     ) -> Result<(), LedgerError>;
 
-    /// Terminate on request (FR-7). Records partial usage of the running attempt so
-    /// billing stays correct (INV-51).
-    ///
-    /// Raises the attempt fence like `reap`, so the executing agent observes the
-    /// cancellation — both its next append (passive, INV-6) and its active
-    /// cancellation probe poll see `StaleAttempt` — and stops spending tokens
-    /// promptly rather than running the ReAct loop to completion.
-    async fn cancel(
-        &self,
-        tenant: &TenantId,
-        response_id: &ResponseId,
-        now_ms: u64,
-    ) -> Result<(), LedgerError>;
-
     /// Reap timed-out claims, raising the attempt fence. Returns aborted claims so
     /// the caller can emit failure events and close their buffers.
     async fn reap(
@@ -197,17 +218,6 @@ pub trait ResponseLedger: AdmissionControl {
         usage: Usage,
     ) -> Result<(), LedgerError>;
 
-    async fn get(&self, response_id: &ResponseId) -> Result<Option<ResponseRecord>, LedgerError>;
-
-    /// Remove a response's record (record-level delete, D30). Returns whether a
-    /// record was removed. The conversation snapshot is **not** touched — the
-    /// inherited copy lives on there, exactly as "remove from the conversation"
-    /// requires.
-    async fn delete(&self, response_id: &ResponseId) -> Result<bool, LedgerError>;
-
-    /// Bulk-erase every response a tenant owns (FR-21).
-    async fn delete_by_tenant(&self, tenant: &TenantId) -> Result<u64, LedgerError>;
-
     /// Append fence validation (INV-6).
     async fn check_attempt(
         &self,
@@ -215,7 +225,5 @@ pub trait ResponseLedger: AdmissionControl {
         attempt: Attempt,
     ) -> Result<(), LedgerError>;
 
-    /// Count of non-terminal responses, for overload rejection (FR-33) and for
-    /// draining during graceful shutdown (FR-34).
-    async fn in_flight(&self) -> Result<usize, LedgerError>;
+    async fn get(&self, response_id: &ResponseId) -> Result<Option<ResponseRecord>, LedgerError>;
 }

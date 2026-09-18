@@ -356,7 +356,6 @@ async fn run_one(path: &Path) -> Result<String> {
                 signal_listener(port, "TERM")?;
                 trace.push(TraceEvent::DrainStarted {
                     node_tag: format!("port:{port}"),
-                    in_flight: 0,
                     at_ms: now_ms,
                 });
                 tokio::time::sleep(Duration::from_millis(wait_ms)).await;

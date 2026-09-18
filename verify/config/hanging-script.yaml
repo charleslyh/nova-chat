@@ -7,8 +7,7 @@
 #
 # The same condition is now stated positively: node-c executes, and its scheduler
 # hangs. Closer to the real failure it stands in for — a provider that accepts the
-# request and then never answers — and it keeps the admission slot occupied, which is
-# what `pending-limit-http` and `node-down-abrupt` both depend on.
+# request and then never answers — which is what `node-down-abrupt` depends on.
 #
 # Note `hang`, not `stall`: `stall` reports the deadline exceeded and therefore
 # reaches a terminal state promptly, freeing the slot. An overload condition could

@@ -18,7 +18,7 @@
 
 | # | 事实 | 常见误解 |
 |---|---|---|
-| 1 | **执行是独立进程 `mock-agentd`**（`verify/mock/agentd`），经 `ResponseLedger` 端口直连共享账本领活 | 以为执行在网关进程内，或以为执行经 HTTP 拉取 |
+| 1 | **执行是独立进程 `mock-agentd`**（`verify/mock/agentd`），经 `ResponseClaimSource` 端口直连共享账本领活 | 以为执行在网关进程内，或以为执行经 HTTP 拉取 |
 | 2 | **claim 是全局的**：任意执行进程可领取任意 queued 生成 | 以为领取限定「创建它的那个节点」 |
 | 3 | **两条写路径彼此独立**：增量走事件缓冲（有界瞬态），终态条目走会话快照（持久） | 以为会话快照由事件流回放派生 |
 | 4 | **没有节点间转发**：存储是共享载体，任意节点直读 | 以为仍有节点间转发 |
@@ -44,12 +44,12 @@
 
 **进程拓扑**：gateway（HTTP 接入 + 内嵌 sweep）+ `mock-agentd`（执行）+ `mock-server`（共享载体）。执行是独立进程，不内嵌于 gateway；维护（reap/过期清理）内嵌于 gateway，接受「peer 崩溃 → 该 peer 的 sweep 也停」的取舍（reap 幂等，幸存 peer 继续收口）。
 
-**mock 载体如何跨进程**：数据本体留在 `mock-server` 进程，对外暴露 `POST /rpc` 数据面（另有 `/unavailable`、`/tamper`、`/advance_clock`、`/set_clock` 控制面，仅供测试注入故障）；`mock-client` 是实现了三个端口（`ResponseLedger`/`ResponseEventLog`/`ConversationStore`）的 RPC 桩，gateway / agentd / sweep 各自持有一份，连同一个 `mock-server`。
+**mock 载体如何跨进程**：数据本体留在 `mock-server` 进程，对外暴露 `POST /rpc` 数据面（另有 `/unavailable`、`/tamper`、`/advance_clock`、`/set_clock` 控制面，仅供测试注入故障）；`mock-client` 是实现了端口（`ResponseIntake` + `ResponseClaimSource` / `ResponseEventLog` / `ConversationStore`）的 RPC 桩，gateway / agentd / sweep 各自持有一份，连同一个 `mock-server`。
 
 **核对点**：
 
 - 载体装配：`verify/mock/server/src/main.rs`（数据面 `/rpc` + 控制面 `/unavailable` `/tamper` `/advance_clock` `/set_clock`）
-- 客户端桩：`verify/mock/client/src/{ledger,event_log,conversation}.rs`（`MemClientWorld` 聚合三个适配器 + 每节点本地 read_only/pending_limit atomics）
+- 客户端桩：`verify/mock/client/src/{ledger,event_log,conversation}.rs`（`MemClientWorld` 聚合三个适配器 + 每节点本地 read_only 存储降级 atomic）
 - 执行：`verify/mock/agentd/src/main.rs`（`--scheduler echo|scripted|http`，`--max-concurrent`）
 - sweep：`ResponsesService::start()` / `stop()`，由 gateway 在装配后启动、停机流程里停止
 - 端口与领域：都在 `nova-responses` library（`crates/responses`）；HTTP 层在 `gateway` crate
@@ -125,7 +125,7 @@ graph BT
 
 **核对点**：
 
-- **端口在 `nova-responses`，实现在 `verify/mock/*`** —— `crates/responses/src/ports/mod.rs` 首行即此约定。`ConversationStore`、`ResponseEventLog`、`ContentIntegrity`、`ResponseLedger`、`MetricsSink` 五个端口并列（`ContextStore` 已由 D30 移除），**没有** `Scheduler` / `ToolExecutor` / `Clock`
+- **端口在 `nova-responses`，实现在 `verify/mock/*`** —— `crates/responses/src/ports/mod.rs` 首行即此约定。`ConversationStore`、`ResponseEventLog`、`ContentIntegrity`、`ResponseIntake` + `ResponseClaimSource`、`MetricsSink` 端口并列（`ContextStore` 已由 D30 移除），**没有** `Scheduler` / `ToolExecutor` / `Clock`
 - `nova-responses` 无 workspace 内依赖（`crates/responses/Cargo.toml`），这是 `check-deps` 的不变量（`FORBIDDEN_IN_CORE`：不得依赖 mock-server / gateway / harness / conformance）
 - **时钟不是端口**：各组件持注入的 `now: Arc<dyn Fn() -> u64>`，测试注入假钟，生产用墙钟
 - **`nova-agent-runtime` 不依赖 HTTP / DB / 任何具体 scheduler**：`check-deps` 拒绝向它注入 `reqwest`/`hyper`/`axum`（已实测门禁有效）。因此 claim → run → commit 全路径可在无 socket、无模型的单测里跑完
@@ -162,8 +162,6 @@ graph BT
 | `GET` | `/v1/conversations/{id}/events` | 会话事件流 SSE（D28） |
 | `POST` | `/v1/conversations/{id}/events` | 追加业务事件（D28） |
 | `GET` | `/v1/conversations/{id}/transcript` | 全量历史（D28） |
-| `POST` | `/v1/admin/read_only` | 降级只读 |
-| `POST` | `/v1/admin/pending_limit` | 过载阈值 |
 | `POST` | `/v1/tenants/{tenant}/purge` | 租户清除 |
 
 **没有** `/v1/agent/*`（执行不是协议，走端口；`routes/mod.rs` 模块注释明记 D23/D25 已移除 claim/heartbeat/append/complete）、**没有** `/v1/sessions/*`。前者由 `check-deps` 的 `check_execution_claims_globally_through_the_port` 守门。
@@ -194,7 +192,7 @@ graph BT
 
 | 参与者 | 类比 | 存什么 | 回答的问题 | 生命周期 |
 |---|---|---|---|---|
-| **ResponseLedger** | 工单的状态栏 | 状态、attempt、幂等键、用量、锚点元数据 | 这个 response **处于什么状态、归谁**？ | 持久 |
+| **ResponseIntake / ResponseClaimSource**（原聚合 `ResponseLedger` 已拆分） | 工单的状态栏（发起侧）与派工窗口（领取侧） | 状态、attempt、幂等键、用量、锚点元数据 | 这个 response **处于什么状态、归谁**？ | 持久 |
 | **ResponseEventLog** | 现场的实时直播流 | 正在产生的增量事件 + response 对象（TTL 内） | 订阅者**此刻看到了哪些增量**？response 对象**短期如何重建**？ | 瞬态（TTL，终态后按 `retain_ms` 释放） |
 | **ConversationStore** | 对话的长期档案 | 物化主快照（每轮 delta）+ 链尾指针 + 轮次锁 + 会话事件流 | 这段对话的**完整历史**、**归到哪个会话、当前轮到谁**？ | 持久（D30，冷存储） |
 | **Agent** | 干活的工人 | 不拥有数据，只驱动流转 | **谁把活干完**？ | 独立进程（`mock-agentd`） |
@@ -202,7 +200,7 @@ graph BT
 | **Scheduler** | 外包渠道 | — | 怎么触达模型（含排队限流） | — |
 | **ToolExecutor** | 工具间 | — | 模型要调的工具怎么落地 | — |
 
-一句话记住三者：**Ledger 管「状态」，EventLog 管「正在发生的增量 + 短期对象」，ConversationStore 管「长期历史与会话归属」**；Agent 是协调它们的「工人」，自己不留数据。
+一句话记住三者：**Intake/ClaimSource 管「状态」，EventLog 管「正在发生的增量 + 短期对象」，ConversationStore 管「长期历史与会话归属」**；Agent 是协调它们的「工人」，自己不留数据。
 
 **一个 response 就是一个 agent 的完整执行**：Agent 内部跑 ReAct 循环——模型要工具就调 `ToolExecutor`，把结果喂回模型再继续，直到模型给出最终答案。工具调用与结果既在终态时追加进会话快照（下一轮模型能看到完整轨迹），也作为 `output_item.*` 事件流式推送给订阅者。
 
@@ -214,7 +212,7 @@ sequenceDiagram
     participant C as Caller
     participant GW as Gateway
     participant V as ResponsesService
-    participant LG as ResponseLedger
+    participant LG as ResponseIntake
     participant CV as ConversationStore
     participant EV as ResponseEventLog
     participant EN as Agent
@@ -223,7 +221,7 @@ sequenceDiagram
     Note over C,EN: 阶段一 · 首轮：无历史，直接生成
     C->>GW: POST /v1/responses
     GW->>V: create(tenant, request, …)
-    Note right of GW: Gateway 只做协议解析与准入，<br/>编排全部在 Service
+    Note right of GW: Gateway 只做协议解析，<br/>编排全部在 Service
     V->>V: resolve_context(Root) → 空上下文
     V->>LG: create(record, idempotency_key)
     LG-->>V: Accepted
@@ -303,7 +301,7 @@ sequenceDiagram
     participant C as 调用方
     participant R as routes（接入层，gateway）
     participant V as service（能力层，crates/responses）
-    participant L as ResponseLedger
+    participant L as ResponseIntake
     participant S as ConversationStore
     participant E as ResponseEventLog
 
@@ -341,9 +339,6 @@ sequenceDiagram
     else Duplicate
         V-->>R: Duplicate{原生成}
         R-->>C: 返回原生成（绝不产生第二个）
-    else ReadOnly / Overloaded
-        V-->>R: 降级 / 过载
-        R-->>C: 503 / 429
     end
 
     alt stream=true
@@ -616,7 +611,7 @@ graph TB
         D1["state.stop_accepting()"]
         D2["创建 → 503 draining"]
         D3["<b>读与订阅继续服务</b>"]
-        D4["轮询 ledger.in_flight() 至 0<br/>或 drain_timeout_ms 超预算后退出"]
+        D4["服务满 drain_timeout_ms 宽限窗口后退出<br/>（不再轮询 in_flight：在途计数属任务管控，<br/>由业务侧监督，越窗残余由下一节点 sweep 收口）"]
     end
 
     style T1 fill:#1a4d5c,stroke:#4db8d4,color:#fff
@@ -639,7 +634,7 @@ graph TB
 |---|---|---|---|---|
 | **L0** | 直调端口，契约用例 | mock | 端口语义：事件日志、账本、取消、会话快照、完整性、`global-claim`、输出溯源、持久化顺序、并发、协议子集、会话（conversation）… | `verify/conformance` |
 | **L1** | YAML 场景直驱端口 + Trace/Oracle | mock | 领域行为，**刻意绕过 HTTP**，故失败可定位到领域层 | `verify/scenarios/l1` |
-| **L2** | 真实多进程 + HTTP | mock（共享载体 `mock-server` + 独立 `mock-agentd` + gateway 内嵌 sweep） | 协议契约、幂等、只读、过载、跨节点订阅、会话快照、会话 | `verify/scenarios/l2` |
+| **L2** | 真实多进程 + HTTP | mock（共享载体 `mock-server` + 独立 `mock-agentd` + gateway 内嵌 sweep） | 协议契约、幂等、优雅停机、跨节点订阅、会话快照、会话 | `verify/scenarios/l2` |
 | **L4** | 官方 Python SDK 驱动 conversation 端点 | mock（经 gateway HTTP） | 上游 SDK 兼容（D27） | `verify/sdk-compat/run.py` |
 
 - 验证层级为 **L0 / L1 / L2 / L4 四档**（`verify/xtask` 的 `verify --level`，无 L3）
@@ -669,7 +664,7 @@ graph TB
 
 | # | 判断 | 现状 |
 |---|---|---|
-| 1 | **`ResponseLedger` 缺少读取部分用量的方法** | `partial_usage_count` 只在 mock 具体类型上，不在 trait 内（trait 只有写方法 `record_partial_usage`），故只持有端口的计费方取不到已记账金额。CR-11 目前由 L1 经 Trace 覆盖，而非端口契约。若计费确需经端口取数，这是一处真实缺口 |
+| 1 | **`ResponseClaimSource` 缺少读取部分用量的方法** | `partial_usage_count` 只在 mock 具体类型上，不在 trait 内（trait 只有写方法 `record_partial_usage`），故只持有端口的计费方取不到已记账金额。CR-11 目前由 L1 经 Trace 覆盖，而非端口契约。若计费确需经端口取数，这是一处真实缺口 |
 
 真实 provider（`HttpChatCompletionsScheduler`，`verify/mock/agentd/src/scheduler/http.rs`）的实现约定：
 

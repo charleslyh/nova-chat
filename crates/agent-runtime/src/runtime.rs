@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nova_responses::ports::{
-    ClaimedResponse, ConversationError, ConversationStore, LedgerError, ResponseEventLog,
-    ResponseLedger, StoreError,
+    ClaimedResponse, ConversationError, ConversationStore, LedgerError, ResponseClaimSource,
+    ResponseEventLog, StoreError,
 };
 use nova_responses::protocol::ResponseObject;
 use nova_responses::{AgentId, AppendEvent, Attempt, Clock, ContextAnchor, ConversationId, ResolvedContext, ResponseEventKind, ResponseId, ResponseItem, ResponseRecord, ResponseStatus, TenantId, TurnCommit, Usage};
@@ -57,7 +57,7 @@ struct TerminalOutput {
 
 /// Ports the orchestrator needs.
 pub struct AgentRuntimeDeps {
-    pub ledger: Arc<dyn ResponseLedger>,
+    pub ledger: Arc<dyn ResponseClaimSource>,
     pub event_log: Arc<dyn ResponseEventLog>,
     /// The execution seam. The orchestrator never sees how a task runs.
     pub runner: Arc<dyn AgentRunner>,
@@ -754,7 +754,7 @@ impl AgentRuntime {
 /// a runner emits an event; a blocking tool call emits nothing for seconds, so the runner
 /// races it against this probe.
 struct LedgerCancelProbe {
-    ledger: Arc<dyn ResponseLedger>,
+    ledger: Arc<dyn ResponseClaimSource>,
     response_id: ResponseId,
     attempt: Attempt,
     interval: Duration,
@@ -816,7 +816,7 @@ impl Drop for HeartbeatGuard {
 /// Spawn a background task that keeps the claim's heartbeat fresh while the runner
 /// executes the (possibly long) ReAct loop.
 fn spawn_heartbeat(
-    ledger: Arc<dyn ResponseLedger>,
+    ledger: Arc<dyn ResponseClaimSource>,
     agent_id: AgentId,
     clock: Arc<dyn Clock>,
     interval: Duration,

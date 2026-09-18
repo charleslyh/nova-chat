@@ -204,16 +204,6 @@ pub async fn create(
             nova_responses::protocol::ResponseObject::without_output(&existing),
         )
         .into_response(),
-        CreateOutcome::ReadOnly => api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "read_only",
-            "service is read-only",
-        ),
-        CreateOutcome::Overloaded => api_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "overloaded",
-            "too many in-flight responses; retry later",
-        ),
     }
 }
 

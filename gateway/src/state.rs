@@ -13,8 +13,7 @@ use std::sync::Arc;
 
 use nova_responses::config::Config;
 use nova_responses::ports::{
-    AdmissionControl, ConversationEvents, ConversationRepo, MetricsSink, ResponseEventLog,
-    ResponseLedger,
+    ConversationEvents, ConversationRepo, MetricsSink, ResponseEventLog, ResponseIntake,
 };
 use nova_responses::service::{ConversationsService, ResponsesService};
 use nova_responses::Clock;
@@ -25,7 +24,7 @@ use crate::config::GatewayConfig;
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<GatewayConfig>,
-    pub ledger: Arc<dyn ResponseLedger>,
+    pub ledger: Arc<dyn ResponseIntake>,
     pub event_log: Arc<dyn ResponseEventLog>,
     /// The conversation event stream, held directly because the SSE skeleton reads it
     /// itself: streaming is transport, and routing it through the capability layer would
@@ -50,12 +49,6 @@ impl AppState {
     /// The capability layer's configuration, reached through this layer's.
     pub fn responses_cfg(&self) -> &Config {
         &self.cfg.responses
-    }
-
-    /// The node's degrade switches. A separate port from the ledger, so the admin
-    /// surface depends on the four methods it flips and not on persistence.
-    pub fn admission(&self) -> &dyn AdmissionControl {
-        self.ledger.as_ref()
     }
 
     pub fn is_accepting(&self) -> bool {

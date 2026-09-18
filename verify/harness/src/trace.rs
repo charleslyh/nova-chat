@@ -92,7 +92,6 @@ pub enum TraceEvent {
     },
     DrainStarted {
         node_tag: String,
-        in_flight: usize,
         at_ms: u64,
     },
     ProtocolRejected {

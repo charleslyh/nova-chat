@@ -5,9 +5,9 @@
 # scheduler) are now expressed per-input on this single script.
 
 rules:
-  # Keeps a generation in flight indefinitely, so `pending-limit-http` can observe
-  # an occupied admission slot deterministically. `hang`, not `stall`: `stall`
-  # reaches a terminal state promptly and would free the slot.
+  # Keeps a generation in flight indefinitely, so failure-path scenarios
+  # (e.g. `node-down-abrupt`) can observe an occupied slot deterministically.
+  # `hang`, not `stall`: `stall` reaches a terminal state promptly.
   - when: !contains "hang"
     then: !hang
 

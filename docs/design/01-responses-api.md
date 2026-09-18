@@ -16,11 +16,12 @@
 | `DELETE` | `/v1/responses/{id}` | 删除已存内容 | FR-21 |
 | `POST` | `/v1/tenants/{tenant}/purge` | 租户级批量清除（需管理凭据） | FR-21 |
 | `GET` | `/health` | 探活（含持久存储状态与 accepting 标志） | OR-3 |
-| `POST` | `/v1/admin/{read_only,pending_limit}` | 运行时降级与过载阈值 | INV-32, FR-33 |
+
 **已删除**：
 
 - 全部 `/v1/sessions/*` 与 `/v1/admin/trim_hot` —— 随会话资源与冷层一并移除（D20）。
-- `/v1/agent/{claim,heartbeat,append,complete}` —— 外部执行端拉取协议。D25 起生成由**独立执行进程 `mock-agentd`** 经 `ResponseLedger` 端口直连共享账本领活（claim 全局），该 HTTP 协议不再存在。执行侧的 FR-4~6 仍有效，由执行工作循环满足，而非任何 HTTP 端点。
+- `/v1/agent/{claim,heartbeat,append,complete}` —— 外部执行端拉取协议。D25 起生成由**独立执行进程 `mock-agentd`** 经 `ResponseClaimSource` 端口直连共享账本领活（claim 全局），该 HTTP 协议不再存在。执行侧的 FR-4~6 仍有效，由执行工作循环满足，而非任何 HTTP 端点。
+- `/v1/admin/{read_only,pending_limit}` —— 随准入移除（端口拆分）：过载拒绝与降级准入属任务管控，由宿主进程/业务侧负责，不在 responses 机制内。优雅停机的 `503`（`accepting:false`）保留（FR-34）。
 
 ---
 
@@ -120,8 +121,7 @@ data: {"sequence_number":3,"type":"response.output_text.delta","item_id":"msg_1"
 | `404` | 标识未知、格式非法、**跨租户** | 三者不可区分，防标识枚举（SEC-2） |
 | `409` | attempt 已被取代、已达终态仍取消 | |
 | `410` | 续订位点已驱逐或超保留窗口 | **无恢复路径**（INV-40） |
-| `429` | 过载 | 可重试 |
-| `503` | 只读降级、优雅停机中、**持久存储不可用** | 拒写而非静默不存（INV-46） |
+| `503` | 优雅停机中、**持久存储不可用** | 拒写而非静默不存（INV-46） |
 
 ### 6.1 为何链错误是 400 而非 404
 

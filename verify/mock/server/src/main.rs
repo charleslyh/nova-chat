@@ -8,10 +8,11 @@
 //! - **control plane** (`--control-listen`): the test controller injects faults
 //!   (`unavailable`, tamper, clock advance). This is the only "God" surface.
 //!
-//! The carrier deliberately performs **no admission control**: `read_only` and
-//! `pending_limit` are per-node (client-side) state, exactly as the sql adapter
-//! holds them as process-local atomics. The carrier only owns *shared* state and
-//! the `unavailable` fault that triggers each node's own degrade.
+//! The carrier deliberately performs **no admission control**: the storage
+//! degrade switch (`read_only`) is per-node (client-side) state, exactly as the
+//! sql adapter holds it as a process-local atomic. The carrier only owns
+//! *shared* state and the `unavailable` fault that triggers each node's own
+//! degrade.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -79,8 +80,6 @@ async fn main() -> Result<()> {
             max_logs: args.max_logs,
             max_records: args.max_records,
             events_per_conversation: args.events_per_conversation,
-            // The carrier does no admission control; see module doc.
-            pending_limit: usize::MAX,
             verify_integrity: args.verify_integrity,
         },
         integrity,

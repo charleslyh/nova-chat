@@ -42,13 +42,6 @@ pub struct GatewayConfig {
     #[serde(default = "default_api_keys_env")]
     pub api_keys_env: String,
 
-    /// Overload threshold seeded into the mounted ledger at startup (FR-33). A boot
-    /// value, not something the capability layer re-reads: after startup the live value
-    /// lives behind [`nova_responses::ports::AdmissionControl`], where the admin
-    /// endpoint changes it.
-    #[serde(default = "default_pending_limit")]
-    pub pending_limit: usize,
-
     /// How many conversation events one SSE read may return. Bounds the response size
     /// of a replay-from-zero, which is what a reopened page does.
     #[serde(default = "default_conversation_events_page")]
@@ -67,9 +60,6 @@ fn default_mem_server_url_env() -> String {
 }
 fn default_api_keys_env() -> String {
     "NOVA_API_KEYS".into()
-}
-fn default_pending_limit() -> usize {
-    10_000
 }
 fn default_conversation_events_page() -> usize {
     256
@@ -102,7 +92,6 @@ impl GatewayConfig {
             self.conversation_events_page > 0,
             "conversation_events_page must be at least 1"
         );
-        anyhow::ensure!(self.pending_limit > 0, "pending_limit must be at least 1");
         self.responses.validate()?;
         Ok(())
     }
@@ -146,7 +135,6 @@ mod tests {
             r#"
             listen = "127.0.0.1:18080"
             drain_timeout_ms = 3000
-            pending_limit = 7
             api_keys_env = "OTHER_KEYS"
             [responses]
             node_tag = "node-a"
@@ -154,7 +142,6 @@ mod tests {
         )
         .expect("valid");
         assert_eq!(cfg.drain_timeout(), Duration::from_millis(3000));
-        assert_eq!(cfg.pending_limit, 7);
         assert_eq!(cfg.api_keys_env, "OTHER_KEYS");
     }
 
@@ -191,7 +178,6 @@ mod tests {
         for bad in [
             "drain_timeout_ms = 0",
             "conversation_events_page = 0",
-            "pending_limit = 0",
         ] {
             assert!(
                 parse(&format!(

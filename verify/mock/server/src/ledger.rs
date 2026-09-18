@@ -1,19 +1,19 @@
 //! Generation ledger over the shared in-memory store.
 //!
 //! Single-point conditional claim (INV-1), TTL-free idempotency gate (INV-2), monotonic
-//! attempts (INV-5), reaping that raises the fence, read-only degrade, overload rejection.
+//! attempts (INV-5), reaping that raises the fence, read-only degrade.
 //!
-//! The node-local degrade switches are a separate impl block ([`AdmissionControl`]) from
-//! the persistence operations, matching the port split: flipping `read_only` has nothing
-//! to do with writing a row.
+//! The port is split along its two consumers: `ResponseIntake` (gateway /
+//! capability layer) and `ResponseClaimSource` (execution orchestration). Both read
+//! paths forward to the inherent [`MemResponseLedger::get_record`] helper.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use nova_responses::ports::{
-    AbortedClaim, AdmissionControl, ClaimedResponse, ContentIntegrity, CreateOutcome, LedgerError,
-    ResponseLedger, StoreError,
+    AbortedClaim, ClaimedResponse, ContentIntegrity, CreateOutcome, LedgerError,
+    ResponseClaimSource, ResponseIntake, StoreError,
 };
 use nova_responses::{
     canonical_items, AgentId, Attempt, IdempotencyKey, IntegrityTag, ResponseId, ResponseItem,
@@ -66,6 +66,12 @@ impl MemResponseLedger {
         Ok(())
     }
 
+    /// The read behind both `ResponseIntake::get` and `ResponseClaimSource::get`,
+    /// so the split port does not fork the implementation.
+    fn get_record(&self, response_id: &ResponseId) -> Result<Option<ResponseRecord>, LedgerError> {
+        Ok(self.store.lock().records.get(response_id).cloned())
+    }
+
     fn guard_writable(&self) -> Result<(), LedgerError> {
         if self.store.is_read_only() {
             Err(LedgerError::Store(StoreError::ReadOnly))
@@ -92,7 +98,7 @@ impl MemResponseLedger {
 }
 
 #[async_trait]
-impl ResponseLedger for MemResponseLedger {
+impl ResponseIntake for MemResponseLedger {
     async fn create(
         &self,
         record: ResponseRecord,
@@ -121,12 +127,7 @@ impl ResponseLedger for MemResponseLedger {
                 .ok_or(LedgerError::NotFound)?;
             return Ok(CreateOutcome::duplicate(existing));
         }
-        if self.store.is_read_only() {
-            return Ok(CreateOutcome::ReadOnly);
-        }
-        if g.in_flight_count() >= self.store.pending_limit() {
-            return Ok(CreateOutcome::Overloaded);
-        }
+        self.guard_writable()?;
         if g.records.len() >= self.store.max_records() {
             // Refuse rather than evict: dropping an existing record would break a chain
             // silently (INV-43).
@@ -138,6 +139,76 @@ impl ResponseLedger for MemResponseLedger {
         Ok(CreateOutcome::accepted(record))
     }
 
+    async fn cancel(
+        &self,
+        tenant: &TenantId,
+        response_id: &ResponseId,
+        now_ms: u64,
+    ) -> Result<(), LedgerError> {
+        self.guard_writable()?;
+        let mut g = self.store.lock();
+        let Some(rec) = g.records.get_mut(response_id) else {
+            return Err(LedgerError::NotFound);
+        };
+        // Cross-tenant looks identical to missing, so ids cannot be probed (SEC-2); the
+        // edge maps both to 404.
+        if &rec.tenant_id != tenant {
+            return Err(LedgerError::NotFound);
+        }
+        if rec.status.is_terminal() {
+            return Err(LedgerError::InvalidTransition(format!(
+                "already {}",
+                rec.status.as_str()
+            )));
+        }
+        let previous_attempt = rec.attempt;
+        let partial = rec.usage;
+        // Raise the fence first so the executing agent observes the cancellation — its
+        // next append and its active cancellation probe both see StaleAttempt — and
+        // stops spending tokens promptly rather than running the ReAct loop out.
+        rec.attempt = previous_attempt.next();
+        rec.status = ResponseStatus::Cancelled;
+        rec.owner = None;
+        rec.completed_at_ms = Some(now_ms);
+        // Tokens already burnt on the running attempt still have to be booked (INV-51),
+        // otherwise billing silently under-counts. Booked against the superseded attempt.
+        if !partial.is_zero() {
+            g.partial_usage
+                .insert((response_id.clone(), previous_attempt), partial);
+        }
+        Ok(())
+    }
+
+    async fn delete(&self, response_id: &ResponseId) -> Result<bool, LedgerError> {
+        self.guard_writable()?;
+        let mut g = self.store.lock();
+        Ok(g.remove_record(response_id).is_some())
+    }
+
+    async fn delete_by_tenant(&self, tenant: &TenantId) -> Result<u64, LedgerError> {
+        self.guard_writable()?;
+        let mut g = self.store.lock();
+        let ids: Vec<ResponseId> = g
+            .by_tenant
+            .get(tenant)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut removed = 0u64;
+        for id in ids {
+            if g.remove_record(&id).is_some() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    async fn get(&self, response_id: &ResponseId) -> Result<Option<ResponseRecord>, LedgerError> {
+        self.get_record(response_id)
+    }
+}
+
+#[async_trait]
+impl ResponseClaimSource for MemResponseLedger {
     async fn claim(
         &self,
         agent_id: AgentId,
@@ -204,46 +275,6 @@ impl ResponseLedger for MemResponseLedger {
         rec.owner = None;
         rec.usage = usage;
         rec.completed_at_ms = Some(now_ms);
-        Ok(())
-    }
-
-    async fn cancel(
-        &self,
-        tenant: &TenantId,
-        response_id: &ResponseId,
-        now_ms: u64,
-    ) -> Result<(), LedgerError> {
-        self.guard_writable()?;
-        let mut g = self.store.lock();
-        let Some(rec) = g.records.get_mut(response_id) else {
-            return Err(LedgerError::NotFound);
-        };
-        // Cross-tenant looks identical to missing, so ids cannot be probed (SEC-2); the
-        // edge maps both to 404.
-        if &rec.tenant_id != tenant {
-            return Err(LedgerError::NotFound);
-        }
-        if rec.status.is_terminal() {
-            return Err(LedgerError::InvalidTransition(format!(
-                "already {}",
-                rec.status.as_str()
-            )));
-        }
-        let previous_attempt = rec.attempt;
-        let partial = rec.usage;
-        // Raise the fence first so the executing agent observes the cancellation — its
-        // next append and its active cancellation probe both see StaleAttempt — and
-        // stops spending tokens promptly rather than running the ReAct loop out.
-        rec.attempt = previous_attempt.next();
-        rec.status = ResponseStatus::Cancelled;
-        rec.owner = None;
-        rec.completed_at_ms = Some(now_ms);
-        // Tokens already burnt on the running attempt still have to be booked (INV-51),
-        // otherwise billing silently under-counts. Booked against the superseded attempt.
-        if !partial.is_zero() {
-            g.partial_usage
-                .insert((response_id.clone(), previous_attempt), partial);
-        }
         Ok(())
     }
 
@@ -325,33 +356,6 @@ impl ResponseLedger for MemResponseLedger {
         Ok(())
     }
 
-    async fn get(&self, response_id: &ResponseId) -> Result<Option<ResponseRecord>, LedgerError> {
-        Ok(self.store.lock().records.get(response_id).cloned())
-    }
-
-    async fn delete(&self, response_id: &ResponseId) -> Result<bool, LedgerError> {
-        self.guard_writable()?;
-        let mut g = self.store.lock();
-        Ok(g.remove_record(response_id).is_some())
-    }
-
-    async fn delete_by_tenant(&self, tenant: &TenantId) -> Result<u64, LedgerError> {
-        self.guard_writable()?;
-        let mut g = self.store.lock();
-        let ids: Vec<ResponseId> = g
-            .by_tenant
-            .get(tenant)
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default();
-        let mut removed = 0u64;
-        for id in ids {
-            if g.remove_record(&id).is_some() {
-                removed += 1;
-            }
-        }
-        Ok(removed)
-    }
-
     async fn check_attempt(
         &self,
         response_id: &ResponseId,
@@ -360,30 +364,19 @@ impl ResponseLedger for MemResponseLedger {
         self.check_attempt_sync(response_id, attempt)
     }
 
-    async fn in_flight(&self) -> Result<usize, LedgerError> {
-        Ok(self.store.lock().in_flight_count())
-    }
-}
-
-impl AdmissionControl for MemResponseLedger {
-    fn set_read_only(&self, enabled: bool) {
-        self.store.set_read_only(enabled);
-    }
-
-    fn is_read_only(&self) -> bool {
-        self.store.is_read_only()
-    }
-
-    fn set_pending_limit(&self, limit: usize) {
-        self.store.set_pending_limit(limit);
-    }
-
-    fn pending_limit(&self) -> usize {
-        self.store.pending_limit()
+    async fn get(&self, response_id: &ResponseId) -> Result<Option<ResponseRecord>, LedgerError> {
+        self.get_record(response_id)
     }
 }
 
 impl MemResponseLedger {
+    /// Storage-level degrade switch, for the event log's append guard. This is the
+    /// carrier's own read-only (INV-32 storage degrade), distinct from (the removed)
+    /// per-node admission.
+    pub fn is_read_only(&self) -> bool {
+        self.store.is_read_only()
+    }
+
     /// Total usage including abandoned attempts, for assertions (CR-11).
     pub fn total_usage(&self, response_id: &ResponseId) -> Usage {
         self.store.lock().total_usage(response_id)

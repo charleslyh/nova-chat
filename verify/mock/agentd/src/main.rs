@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nova_agent_runtime::{AgentRuntime, AgentRuntimeConfig, AgentRuntimeDeps};
 use nova_responses::SystemClock;
-use nova_responses::ports::{ConversationStore, ResponseEventLog, ResponseLedger};
+use nova_responses::ports::{ConversationStore, ResponseClaimSource, ResponseEventLog};
 use tracing::info;
 
 use mock_agentd::{
@@ -70,7 +70,9 @@ struct Args {
 
 /// The mounted storage ports, all as trait objects.
 struct Backend {
-    ledger: Arc<dyn ResponseLedger>,
+    /// Claim-side ledger: the execution daemon only claims, heartbeats and
+    /// completes — it never creates or reads for ingress.
+    ledger: Arc<dyn ResponseClaimSource>,
     event_log: Arc<dyn ResponseEventLog>,
     conversation: Arc<dyn ConversationStore>,
 }

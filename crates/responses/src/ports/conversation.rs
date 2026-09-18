@@ -108,7 +108,7 @@ pub trait ConversationSnapshots: Send + Sync {
     /// from the execution side's final result — **never** derived by replaying the
     /// event stream for a reachable execution (INV-48). This is the single place
     /// durable content is written; on the runtime's completion path it is paired with
-    /// `ResponseLedger::complete` in one transaction boundary (INV-34).
+    /// `ResponseClaimSource::complete` in one transaction boundary (INV-34).
     ///
     /// A turn that ended without producing output (failed, cancelled, reaped) still
     /// archives its input, so the conversation chain is not left with a gap: `output_items`

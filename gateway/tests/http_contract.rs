@@ -160,6 +160,7 @@ async fn start_with_config(raw_text: &str) -> Harness {
     ));
     let service = Arc::new(ResponsesService::new(ResponsesDeps {
         ledger: world.ledger.clone(),
+        claims: world.ledger.clone(),
         event_log: world.event_log.clone(),
         conversations: conversations.clone(),
         turn_lock: world.conversation.clone(),
@@ -1161,7 +1162,7 @@ async fn the_turn_after_a_cancel_inherits_the_half_streamed_answer() {
 
     // The next turn on the conversation must be admitted (the lock was released)
     // and see both the question and the half-streamed answer in its context.
-    let (status, body) = h
+    let (status, _body) = h
         .post(
             "/v1/responses",
             json!({
@@ -1302,59 +1303,6 @@ async fn stream_and_background_together_is_rejected() {
         )
         .await;
     assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn draining_refuses_creation_but_keeps_serving_reads() {
-    // Exercised through the admin read-only switch, which shares the refusal
-    // path with draining.
-    let h = start().await;
-    let (_, body) = h
-        .post(
-            "/v1/responses",
-            json!({ "model": "m", "input": "hi", "background": true }),
-        )
-        .await;
-    let id = body["id"].as_str().unwrap().to_string();
-
-    let (status, _) = h
-        .post("/v1/admin/read_only", json!({ "enabled": true }))
-        .await;
-    assert_eq!(status, reqwest::StatusCode::OK);
-
-    let (status, _) = h
-        .post(
-            "/v1/responses",
-            json!({ "model": "m", "input": "again", "background": true }),
-        )
-        .await;
-    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
-
-    // Reads keep working while degraded.
-    let (status, _) = h.get(&format!("/v1/responses/{id}")).await;
-    assert_eq!(status, reqwest::StatusCode::OK);
-}
-
-#[tokio::test]
-async fn overload_returns_too_many_requests() {
-    let h = start().await;
-    let (status, _) = h
-        .post("/v1/admin/pending_limit", json!({ "pending_limit": 1 }))
-        .await;
-    assert_eq!(status, reqwest::StatusCode::OK);
-
-    h.post(
-        "/v1/responses",
-        json!({ "model": "m", "input": "one", "background": true }),
-    )
-    .await;
-    let (status, _) = h
-        .post(
-            "/v1/responses",
-            json!({ "model": "m", "input": "two", "background": true }),
-        )
-        .await;
-    assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
 }
 
 #[tokio::test]

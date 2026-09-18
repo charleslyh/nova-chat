@@ -12,17 +12,18 @@
 
 | 端口 | 负责什么数据 | 生命周期 | 权威性 |
 |---|---|---|---|
-| **`ResponseLedger`** | 一次生成的**元数据**：状态、attempt 栅栏、幂等键、用量、租户、输入条目、模型/工具声明 | 短期（TTL） | 单次生成的生命周期真相 |
+| **`ResponseIntake`**（发起侧） | 一次生成的**元数据写入与查询**：create / cancel / delete / delete_by_tenant / get | 短期（TTL） | 单次生成的生命周期真相（发起视角） |
+| **`ResponseClaimSource`**（领取侧） | 执行侧的**领取与终态漏斗**：claim / heartbeat / complete / reap / record_partial_usage / check_attempt / get | 短期（TTL） | 单次生成的生命周期真相（执行视角） |
 | **`ResponseEventLog`** | 一次生成的**增量事件流**（token 级 delta、条目信封、生命周期事件） | 瞬态（终态后按 `retain_ms` 释放） | 订阅/流式与「TTL 内检索重建」的载体 |
 | **`ConversationStore`** | 一段对话的**持久物化主快照**（每轮 input+output）+ 链尾指针 + 轮次锁 + 会话事件流 | 持久 | 对话内容的长期权威来源 |
 | **`ContentIntegrity`** | 内容签名/校验（HMAC） | — | 存储层篡改检测 |
 | **`MetricsSink`** | 指标计数 | — | 可观测性 |
 
-**已移除**：`ContextStore`（D30）——它的职责已拆分：快照读写并入 `ConversationStore`，response 对象检索重建并入 `ResponseEventLog`（回放流）。
+**已移除**：`ContextStore`（D30）——它的职责已拆分：快照读写并入 `ConversationStore`，response 对象检索重建并入 `ResponseEventLog`（回放流）。原聚合端口 `ResponseLedger` 已拆分为 `ResponseIntake` + `ResponseClaimSource`（同一后端可分别实现两个 trait，`get` 各自转发到共享的读 helper）；其 `AdmissionControl` supertrait（read_only / pending_limit / in_flight）随准入移除——过载与降级属任务管控，由宿主进程/业务侧负责，不再是存储端口契约。
 
 ---
 
-## 2. `ResponseLedger`：元数据账本
+## 2. `ResponseIntake` + `ResponseClaimSource`：元数据账本（发起 / 领取分离）
 
 **存什么**：`ResponseRecord`（`response_id` / `tenant_id` / `previous_response_id` / `conversation_id` / `input_items` / `tools` / `tool_choice` / `model` / `instructions` / `store` / 状态 / 用量 / 时间戳 / attempt / 幂等键 / owner）。
 
@@ -35,7 +36,7 @@
 3. **attempt 栅栏**（INV-6）：`complete` / `cancel` / 追加路径都必须校验 attempt；过期 attempt 的写入返回 `StaleAttempt`。栅栏不可删——卡死任务的苏醒写入与 reap 是并发的。
 4. **reap 收口失联**（INV-45）：`reap` 抬高 attempt 栅栏并置失败，同时释放会话轮次标记；部分用量由账本自身记账（INV-51）。
 5. **record-level delete**（D30）：`delete` 只删账本记录；`delete_by_tenant` 只清本租户。会话快照副本**不动**。
-6. **运行时控制**：`set_read_only` / `set_pending_limit` 是进程本地状态（不跨载体）。
+6. **无准入**：端口不再承载 read_only / pending_limit / in_flight 语义；`CreateOutcome` 只有 `Accepted` / `Duplicate`。过载拒绝与降级由宿主进程在调用端口**之前**自决。
 
 ---
 
@@ -67,7 +68,7 @@
 ### 必须满足的语义
 
 1. **`append_turn` 的数据源是编排层 `AgentOutcome.items` 直接提交，绝不回放事件流**（INV-48）——这是本契约最硬的一条。若接入方在内部从事件流回放派生快照，持久历史就依赖可驱逐的有界缓存。
-2. **原子性边界（INV-34）**：终态时 `ResponseLedger::complete` 与 `append_turn` 必须**同存储同事务**（参考 D21 ① 的共享存储 + 单事务模式）。mock 以 `MemWorld` 内单一锁保证。
+2. **原子性边界（INV-34）**：终态时 `ResponseClaimSource::complete` 与 `append_turn` 必须**同存储同事务**（参考 D21 ① 的共享存储 + 单事务模式）。mock 以 `MemWorld` 内单一锁保证。
 3. **轮次互斥**（INV-58）：`acquire_active` / `release_active` 与事件原子配对；任一终态路径（含 reap）都必须释放标记。
 4. **快照单调增长**：不提供条目级删除；接入方需配置冷存储保留策略。
 5. **`advance` 后写胜出**（INV-55）：不设 CAS，只有提交了输出的轮次才推进链尾。
@@ -83,7 +84,7 @@ graph LR
     C[Caller] -->|POST /v1/responses| GW[Gateway]
     GW --> V[ResponsesService]
     V -->|resolve anchor + 校验上限| CS[ConversationStore]
-    V -->|create 元数据| LG[ResponseLedger]
+    V -->|create 元数据| LG[ResponseIntake]
     V -->|append Created| EV[ResponseEventLog]
     AG[agentd] -->|claim 元数据| LG
     AG -->|read_snapshot 一次| CS
@@ -111,9 +112,9 @@ graph LR
 
 ## 7. 注入点（接入方装配）
 
-- **gateway**：`ResponsesService::new(ledger, event_log, conversations, now, metrics, cfg)` + `ConversationsService::new(conversation, now, metrics)`，装配进 `AppState`。
-- **agentd**：`AgentRuntimeDeps { ledger, event_log, runner, now, conversations }`。
-- **sweep**：`SweepDeps { ledger, event_log, conversations, now, metrics, heartbeat_ttl_ms, retain_after_terminal_ms }`。
+- **gateway**：`ResponsesService::new(ResponsesDeps { ledger, claims, event_log, conversations, turn_lock, snapshots, clock, metrics, cfg })` + `ConversationsService::new(conversation, now, metrics)`，装配进 `AppState`（`ledger: Arc<dyn ResponseIntake>`）。
+- **agentd**：`AgentRuntimeDeps { ledger: Arc<dyn ResponseClaimSource>, event_log, runner, clock, conversations }`。
+- **sweep**：`ResponsesService::start()` 内部经 `ResponsesDeps.claims`（`Arc<dyn ResponseClaimSource>`）驱动 reap。
 
 所有端口以 `Arc<dyn Trait>` 注入，领域层不感知具体后端。
 

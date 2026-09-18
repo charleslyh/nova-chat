@@ -26,7 +26,7 @@ use mock_agentd::{
     ScriptedScheduler, ToolError, ToolExecutor,
 };
 use nova_responses::protocol::{ContentPart, ResponseItem, Role};
-use nova_responses::ports::{ResponseEventLog, ResponseLedger};
+use nova_responses::ports::{ResponseClaimSource, ResponseEventLog, ResponseIntake};
 use nova_responses::{
     Clock, ContextAnchor, Conversation, ConversationId, EventBody, IdempotencyKey, ModelParams,
     NodeTag, ResolvedContext, ResponseEventKind, ResponseId, ResponseRecord, ResponseStatus,
@@ -135,7 +135,7 @@ async fn a_queued_response_runs_to_completion_with_no_socket_and_no_model() {
     let e = engine(&world, Arc::new(EchoScheduler::new(4)));
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
-    let rec = world.ledger.get(&id).await.expect("get").expect("present");
+    let rec = ResponseIntake::get(world.ledger.as_ref(), &id).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Completed);
     assert!(rec.usage.total_tokens() > 0, "usage must be booked");
 
@@ -180,7 +180,7 @@ async fn any_nodes_work_can_be_executed_here() {
     let e = engine(&world, Arc::new(EchoScheduler::new(2)));
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
-    let rec = world.ledger.get(&foreign).await.expect("get").expect("present");
+    let rec = ResponseIntake::get(world.ledger.as_ref(), &foreign).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Completed);
 }
 
@@ -256,7 +256,7 @@ async fn a_scheduler_failure_terminates_the_response() {
     let e = engine(&world, Arc::new(scheduler));
     assert_eq!(e.run_once(2_000).await, Executed::Failed);
 
-    let rec = world.ledger.get(&id).await.expect("get").expect("present");
+    let rec = ResponseIntake::get(world.ledger.as_ref(), &id).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Failed);
     assert!(rec.status.is_terminal());
 
@@ -277,7 +277,7 @@ async fn an_unusable_outcome_is_refused_before_submission() {
     let e = engine(&world, Arc::new(scheduler));
     assert_eq!(e.run_once(2_000).await, Executed::Failed);
 
-    let rec = world.ledger.get(&id).await.expect("get").expect("present");
+    let rec = ResponseIntake::get(world.ledger.as_ref(), &id).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Failed);
 }
 
@@ -310,7 +310,7 @@ async fn store_false_completes_without_persisting_content() {
     let e = engine(&world, Arc::new(EchoScheduler::new(2)));
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
-    let rec = world.ledger.get(&id).await.expect("get").expect("present");
+    let rec = ResponseIntake::get(world.ledger.as_ref(), &id).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Completed);
     assert!(!rec.is_stored(), "the flag must survive the round trip");
 
@@ -339,7 +339,7 @@ async fn a_stall_leaves_partial_output_but_does_not_complete() {
         .await
         .expect("read");
     assert!(events.iter().any(|ev| matches!(ev.kind(), ResponseEventKind::OutputTextDelta)));
-    let rec = world.ledger.get(&id).await.expect("get").expect("present");
+    let rec = ResponseIntake::get(world.ledger.as_ref(), &id).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Failed);
 }
 
@@ -499,7 +499,7 @@ async fn a_tool_using_turn_runs_the_loop_and_stores_the_whole_trace() {
 
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
-    let rec = world.ledger.get(&id).await.expect("get").expect("present");
+    let rec = ResponseIntake::get(world.ledger.as_ref(), &id).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Completed);
 
     let snap = snapshot(&world, &conv).await;
@@ -528,7 +528,7 @@ async fn a_tool_error_fails_the_response_loudly() {
 
     assert_eq!(e.run_once(2_000).await, Executed::Failed);
 
-    let rec = world.ledger.get(&id).await.expect("get").expect("present");
+    let rec = ResponseIntake::get(world.ledger.as_ref(), &id).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Failed);
     assert!(rec.status.is_terminal());
 }
@@ -571,7 +571,7 @@ async fn a_model_that_keeps_calling_tools_hits_the_round_ceiling() {
 
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
-    let rec = world.ledger.get(&id).await.expect("get").expect("present");
+    let rec = ResponseIntake::get(world.ledger.as_ref(), &id).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Incomplete);
 
     let snap = snapshot(&world, &conv).await;
@@ -784,7 +784,7 @@ async fn a_long_generation_is_not_reaped_while_its_heartbeat_stays_fresh() {
     let result = handle.await.expect("join");
     assert_eq!(result, Executed::Completed);
 
-    let rec = world.ledger.get(&id).await.expect("get").expect("present");
+    let rec = ResponseIntake::get(world.ledger.as_ref(), &id).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Completed);
 }
 

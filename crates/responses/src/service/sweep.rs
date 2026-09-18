@@ -17,8 +17,8 @@ use crate::clock::Clock;
 use crate::conversation::TurnCommit;
 use crate::events::{AppendEvent, EventBody, ResponseEventKind};
 use crate::ports::{
-    metric, ConversationSnapshots, EventLogError, MetricsSink, ResponseEventLog, ResponseLedger,
-    TurnLock,
+    metric, ConversationSnapshots, EventLogError, MetricsSink, ResponseClaimSource,
+    ResponseEventLog, TurnLock,
 };
 use crate::protocol::{ContentPart, ItemStatus, ResponseItem, ResponseObject};
 use crate::response::{ResponseId, ResponseStatus};
@@ -38,7 +38,7 @@ const REPLAY_PAGE: usize = 256;
 /// [`crate::service::ResponsesService::stop`]) or a value is sent on it — at the next
 /// tick boundary, without interrupting an in-flight tick.
 pub(crate) fn spawn(shutdown: watch::Receiver<()>, deps: &ResponsesDeps) {
-    let ledger = deps.ledger.clone();
+    let claims = deps.claims.clone();
     let event_log = deps.event_log.clone();
     let turn_lock = deps.turn_lock.clone();
     let snapshots = deps.snapshots.clone();
@@ -56,7 +56,7 @@ pub(crate) fn spawn(shutdown: watch::Receiver<()>, deps: &ResponsesDeps) {
                 _ = shutdown.changed() => break,
                 _ = tokio::time::sleep(TICK) => {
                     tick(
-                        ledger.as_ref(),
+                        claims.as_ref(),
                         event_log.as_ref(),
                         turn_lock.as_ref(),
                         snapshots.as_ref(),
@@ -73,7 +73,7 @@ pub(crate) fn spawn(shutdown: watch::Receiver<()>, deps: &ResponsesDeps) {
 }
 
 async fn tick(
-    ledger: &dyn ResponseLedger,
+    claims: &dyn ResponseClaimSource,
     event_log: &dyn ResponseEventLog,
     turn_lock: &dyn TurnLock,
     snapshots: &dyn ConversationSnapshots,
@@ -86,7 +86,7 @@ async fn tick(
 
     // 1. Reap claims whose holder stopped heartbeating. The ledger raises the attempt
     //    fence, so the dead holder cannot append afterwards (INV-6).
-    let aborted = match ledger.reap(now, heartbeat_ttl).await {
+    let aborted = match claims.reap(now, heartbeat_ttl).await {
         Ok(aborted) => aborted,
         Err(e) => {
             warn!(error = %e, "sweeper reap failed");

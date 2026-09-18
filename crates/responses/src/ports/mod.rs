@@ -5,7 +5,6 @@
 //! here — the *values* that travel through them ([`crate::TurnCommit`],
 //! [`crate::ResponseRecord`]) live with the domain concept they describe.
 
-mod admission;
 mod conversation;
 mod event_log;
 mod integrity;
@@ -13,13 +12,14 @@ mod ledger;
 mod metrics;
 mod store_error;
 
-pub use admission::AdmissionControl;
 pub use conversation::{
     ConversationError, ConversationEvents, ConversationRepo, ConversationSnapshots,
     ConversationStore, TurnLock,
 };
 pub use event_log::{EventLogError, ResponseEventLog};
 pub use integrity::{ContentIntegrity, IntegrityError};
-pub use ledger::{AbortedClaim, ClaimedResponse, CreateOutcome, LedgerError, ResponseLedger};
+pub use ledger::{
+    AbortedClaim, ClaimedResponse, CreateOutcome, LedgerError, ResponseClaimSource, ResponseIntake,
+};
 pub use metrics::{metric, MetricsSink};
 pub use store_error::StoreError;

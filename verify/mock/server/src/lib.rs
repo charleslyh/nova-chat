@@ -40,7 +40,6 @@ pub struct MemWorldConfig {
     pub events_per_response: usize,
     pub max_logs: usize,
     pub max_records: usize,
-    pub pending_limit: usize,
     /// Upper bound on one conversation's event stream. Reaching it refuses the
     /// append rather than evicting, unlike `events_per_response` — see
     /// [`MemStore::set_max_events_per_conversation`].
@@ -54,7 +53,6 @@ impl Default for MemWorldConfig {
             events_per_response: 20_000,
             max_logs: 100_000,
             max_records: 100_000,
-            pending_limit: 10_000,
             events_per_conversation: 100_000,
             verify_integrity: true,
         }
@@ -106,7 +104,6 @@ impl MemWorld {
         integrity: Option<Arc<dyn ContentIntegrity>>,
     ) -> Self {
         let store = Arc::new(MemStore::new());
-        store.set_pending_limit(cfg.pending_limit);
         store.set_max_records(cfg.max_records);
         store.set_max_events_per_conversation(cfg.events_per_conversation);
 

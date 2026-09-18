@@ -354,11 +354,10 @@ impl Oracle for IdempotentSameResponse {
             if let TraceEvent::ResponseCreated {
                 response_id,
                 key,
-                outcome,
                 ..
             } = e
             {
-                if key.is_empty() || outcome == "overloaded" || outcome == "read_only" {
+                if key.is_empty() {
                     continue;
                 }
                 by_key

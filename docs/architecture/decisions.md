@@ -27,6 +27,7 @@
 | [D28](#d28-会话能力下沉数据层conversation-吸收-session) | conversation 单实体承载链尾 + 互斥 + 事件流；互斥下沉数据层；端点统一 conversations | ✅ 生效 |
 | [D29](#d29-agent-结构解耦编排器--agentrunner--模拟验证进程) | 编排器 AgentRuntime + AgentRunner trait；completions 出站抽象下沉到模拟验证进程 | ✅ 生效 |
 | [D30](#d30-存储分工重构responses-走事件流conversation-存持久快照) | responses 由事件流承载（短期 TTL）；conversation 存持久物化主快照；移除 ContextStore | ✅ 生效 |
+| [D31](#d31-ledger-端口拆分发起领取分离准入整体移除) | ledger 拆 `ResponseIntake`（发起）+ `ResponseClaimSource`（领取）；准入（read_only/pending_limit/in_flight）整体移除，交业务侧 | ✅ 生效 |
 
 其余条目多为任务系统时代决策，已 ⛔ SUPERSEDED BY D19，正文保留备查。D18 / D19 中的会话资源、开屏快照、热→冷、跨区镜像条款由 D20–D22 收口，正文同样保留备查。
 
@@ -1192,3 +1193,24 @@ D24 下创建时要 `ledger.create` + `context.put` 同事务（INV-34），因�
 ### 为何禁止回放派生（INV-48 保留）
 
 事件流是有界瞬态，随时可被驱逐；若 `append_turn` 从流回放派生，持久历史就依赖一个可驱逐缓存。数据源必须是编排层手中的 `AgentOutcome.items`——L0 `output-provenance` 断言「销毁事件流后会话快照仍完整」。
+
+---
+
+## D31 ledger 端口拆分：发起/领取分离，准入整体移除
+
+| | |
+|---|---|
+| **需求** | 下游宿主（nova / tuvvi）已有自己的分布式任务系统；聚合端口 `ResponseLedger`（12 方法 + `AdmissionControl` supertrait）迫使每个后端实现整套语义，且两侧消费者（gateway 能力层 / 执行编排）互相背包袱。决策讨论在 nova 主仓（`nova/docs/plans/nova-chat-ledger-port-split`），实施在 nova-chat |
+| **结论** | ① **拆分 trait**：`ResponseLedger` 删除，拆为 `ResponseIntake`（发起侧：create / cancel / delete / delete_by_tenant / get）与 `ResponseClaimSource`（领取侧：claim / heartbeat / complete / reap / record_partial_usage / check_attempt / get）；`get` 两侧各一份，实现方以固有 helper 收敛读逻辑。② **准入整体移除**（对原决策文档 §3.2 的修订，不引入 `AdmissionGate`）：`AdmissionControl` 端口删除，`CreateOutcome` 收缩为 `Accepted / Duplicate`，`in_flight` 移出契约——过载拒绝与降级属任务管控，由宿主进程在调用端口之前自决，不在 responses 机制内。③ **持有者改型**：`ResponsesDeps { ledger: Intake, claims: ClaimSource }`（sweeper 的 reap 走领取侧）、`AgentRuntimeDeps.ledger: ClaimSource`、gateway `AppState.ledger: Intake`。④ **同后端装配两次**：从具体 `Arc<T>` 分别 coerce 到两个 dyn，不依赖 trait upcasting。⑤ **drain 改固定宽限**：优雅停机不再轮询 `in_flight`（在途计数属任务管控），改为服务满 `drain_timeout` 宽限窗口后退出；越窗残余由下一节点 sweep 收口（INV-45 不变）。 |
+| **代价** | FR-33 / CR-8 / INV-29 / INV-30 / INV-32 从需求与覆盖基线划除（移交业务侧）；五个准入 verify 场景与 `overload-integrity` conformance 用例删除；下游（nova `MongoResponseLedger`、tuvvi `PgResponseLedger`）需自行拆 impl |
+| **SUPERSEDES** | 无（`ResponseLedger` 无独立 ADR；其拆分推翻的是端口聚合本身） |
+| **RESTATES** | D25 的「执行经端口直连」条款（端口名改为 `ResponseClaimSource`）；INV-45 / INV-51 / INV-5/6 / FR-3 / D25 断言原样保留 |
+
+### 为何准入彻底移除而非外移为 gateway 装饰器（AdmissionGate）
+
+原决策文档 §3.2 保留 `CreateOutcome::ReadOnly/Overloaded` 并把它产生的地方移到 gateway 装配层。实施时修订为整体移除：标准 Responses 协议中没有准入判定语义（429/503 是传输层运维行为，不是协议领域语义），read_only/pending_limit/in_flight 本质是宿主的任务管控能力——无论判定发生在后端还是 gateway 装饰器，`in_flight()` 都强制每个后端实现按状态聚合扫描的查询语义。移除后 `ResponseIntake` 回归纯记录簿，语义边界与标准协议对齐。
+
+### 为何 sweep 不随之迁移
+
+reap 的「失联判定」确属任务管控，可由宿主领取侧实现自含；但善后（Failed 终态事件、轮次归档 D30、锁释放 D28）是 responses 领域生命周期，宿主任务系统做不了。拆分后 sweeper 已只依赖 `ResponseClaimSource`——注入缝已打开（宿主 reconciler 在后端层回收时，本地 reap 空转无害），契约级迁移待下游联调时再评估。
+

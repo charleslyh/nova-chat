@@ -15,7 +15,9 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use nova_responses::ports::{ConversationStore, MetricsSink, ResponseEventLog, ResponseLedger};
+use nova_responses::ports::{
+    ConversationStore, MetricsSink, ResponseClaimSource, ResponseEventLog, ResponseIntake,
+};
 use nova_responses::service::{ConversationsService, ResponsesDeps, ResponsesService};
 use nova_responses::{Clock, SystemClock};
 use tracing::info;
@@ -36,7 +38,11 @@ const ADMIN_KEY_ENV: &str = "NOVA_ADMIN_KEY";
 /// The mounted ports, all as trait objects. Downstream sees only these; the concrete
 /// adapter type is gone past this struct.
 struct Ports {
-    ledger: Arc<dyn ResponseLedger>,
+    /// Ingress-side ledger, as seen by the gateway and the capability layer.
+    ledger: Arc<dyn ResponseIntake>,
+    /// Claim-side ledger, as seen by the sweeper's reap path. The same backend
+    /// as `ledger` here, mounted twice rather than upcast.
+    claims: Arc<dyn ResponseClaimSource>,
     event_log: Arc<dyn ResponseEventLog>,
     conversation: Arc<dyn ConversationStore>,
     clock: Arc<dyn Clock>,
@@ -64,7 +70,6 @@ async fn main() -> Result<()> {
     );
 
     let ports = mount(&cfg.mem_server_url_env).await?;
-    ports.ledger.set_pending_limit(cfg.pending_limit);
 
     // Liveness probe before serving: a gateway that answers `/v1/conversations` with a
     // 503 on every call is worse than one that never came up.
@@ -80,6 +85,7 @@ async fn main() -> Result<()> {
     ));
     let service = Arc::new(ResponsesService::new(ResponsesDeps {
         ledger: ports.ledger.clone(),
+        claims: ports.claims.clone(),
         event_log: ports.event_log.clone(),
         conversations: conversations.clone(),
         turn_lock: ports.conversation.clone(),
@@ -145,6 +151,7 @@ async fn mount(mem_server_url_env: &str) -> Result<Ports> {
 
     Ok(Ports {
         ledger: world.ledger.clone(),
+        claims: world.ledger.clone(),
         event_log: world.event_log.clone(),
         conversation: world.conversation.clone(),
         clock: Arc::new(SystemClock),

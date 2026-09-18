@@ -20,13 +20,17 @@ use nova_responses::{
 };
 use nova_responses::ports::{
     ContentIntegrity, ConversationError, ConversationStore, CreateOutcome, EventLogError,
-    LedgerError, ResponseEventLog, ResponseLedger,
+    LedgerError, ResponseClaimSource, ResponseEventLog, ResponseIntake,
 };
 
 /// The set of ports under test. Backend-agnostic by construction.
 #[derive(Clone)]
 pub struct PortSet {
-    pub ledger: Arc<dyn ResponseLedger>,
+    /// Ingress-side ledger (create / cancel / delete / get). The same backend is
+    /// usually mounted on both fields — `claims` exists separately so a host whose
+    /// execution is driven by its own task system can verify that side alone.
+    pub intake: Arc<dyn ResponseIntake>,
+    pub claims: Arc<dyn ResponseClaimSource>,
     pub event_log: Arc<dyn ResponseEventLog>,
     pub conversation: Arc<dyn ConversationStore>,
     pub integrity: Option<Arc<dyn ContentIntegrity>>,
@@ -218,7 +222,7 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
     let key = fresh_key();
 
     let outcome = ports
-        .ledger
+        .intake
         .create(
             record(&id, None, &tenant, true, ResponseStatus::Queued),
             key.clone(),
@@ -235,7 +239,7 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
     // Replay far in the future still returns the original: the gate has no TTL
     // window, so a late retry cannot produce a second response (INV-2).
     let replay = ports
-        .ledger
+        .intake
         .create(
             record(&ports.new_id(), None, &tenant, true, ResponseStatus::Queued),
             key,
@@ -251,7 +255,7 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
 
     let agent = AgentId::new();
     let claimed = ports
-        .ledger
+        .claims
         .claim(agent, 2_000, Duration::from_millis(60_000))
         .await
         .expect("claim")
@@ -261,20 +265,20 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
 
     // The fence accepts the current attempt and rejects anything else.
     ports
-        .ledger
+        .claims
         .check_attempt(&claimed_id, claimed.record.attempt)
         .await
         .expect("current attempt is valid");
     assert_eq!(
         ports
-            .ledger
+            .claims
             .check_attempt(&claimed_id, Attempt(claimed.record.attempt.0 + 1))
             .await,
         Err(LedgerError::StaleAttempt)
     );
 
     ports
-        .ledger
+        .claims
         .complete(
             &claimed_id,
             claimed.record.attempt,
@@ -288,7 +292,7 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
     // Completing twice must fail: the second call is either a duplicate delivery
     // or a superseded holder.
     assert!(ports
-        .ledger
+        .claims
         .complete(
             &claimed_id,
             claimed.record.attempt,
@@ -302,7 +306,7 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
     // A non-terminal target status is a programming error, not a transition.
     assert!(matches!(
         ports
-            .ledger
+            .claims
             .complete(
                 &claimed_id,
                 claimed.record.attempt,
@@ -315,7 +319,7 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
     ));
 
     let fetched = ports
-        .ledger
+        .intake
         .get(&claimed_id)
         .await
         .expect("get")
@@ -336,7 +340,7 @@ pub async fn assert_cancel_conformance(ports: &PortSet) {
     let tenant = fresh_tenant("cancel");
     let id = ports.new_id();
     ports
-        .ledger
+        .intake
         .create(
             record(&id, None, &tenant, true, ResponseStatus::Queued),
             fresh_key(),
@@ -348,14 +352,14 @@ pub async fn assert_cancel_conformance(ports: &PortSet) {
     // Foreign tenants are told "not found", never "forbidden" (SEC-2).
     assert_eq!(
         ports
-            .ledger
+            .intake
             .cancel(&fresh_tenant("intruder"), &id, 1_500)
             .await,
         Err(LedgerError::NotFound)
     );
 
     ports
-        .ledger
+        .claims
         .record_partial_usage(&id, Attempt(1), Usage::new(9, 1))
         .await
         .expect("record partial usage");
@@ -364,7 +368,7 @@ pub async fn assert_cancel_conformance(ports: &PortSet) {
     //
     // `record_partial_usage` files the amount under `(response_id, attempt)` in a
     // side table — deliberately, since the record's own `usage` belongs to the
-    // attempt that completes. But `ResponseLedger` exposes **no method to read
+    // attempt that completes. But the ledger port exposes **no method to read
     // that side table back**: `partial_usage_count` exists only on the concrete
     // mem adapter. So a billing consumer holding only the port cannot retrieve
     // what was booked, and this suite cannot check that it was.
@@ -376,7 +380,7 @@ pub async fn assert_cancel_conformance(ports: &PortSet) {
     assert!(
         matches!(
             ports
-                .ledger
+                .claims
                 .record_partial_usage(&missing, Attempt(1), Usage::new(1, 1))
                 .await,
             Err(LedgerError::NotFound)
@@ -384,9 +388,9 @@ pub async fn assert_cancel_conformance(ports: &PortSet) {
         "booking usage against an unknown response must fail rather than create a \
          dangling charge"
     );
-    ports.ledger.cancel(&tenant, &id, 2_000).await.expect("cancel");
+    ports.intake.cancel(&tenant, &id, 2_000).await.expect("cancel");
 
-    let after = ports.ledger.get(&id).await.expect("get").expect("present");
+    let after = ports.intake.get(&id).await.expect("get").expect("present");
     assert_eq!(after.status, ResponseStatus::Cancelled);
     assert!(after.status.is_terminal());
 
@@ -394,7 +398,7 @@ pub async fn assert_cancel_conformance(ports: &PortSet) {
     // observes `StaleAttempt` — both its next append and its active cancellation probe.
     assert_eq!(
         ports
-            .ledger
+            .claims
             .check_attempt(&id, Attempt::UNCLAIMED)
             .await,
         Err(LedgerError::StaleAttempt),
@@ -403,7 +407,7 @@ pub async fn assert_cancel_conformance(ports: &PortSet) {
 
     // Cancelling twice is a conflict, not a silent no-op.
     assert!(matches!(
-        ports.ledger.cancel(&tenant, &id, 2_100).await,
+        ports.intake.cancel(&tenant, &id, 2_100).await,
         Err(LedgerError::InvalidTransition(_))
     ));
 }
@@ -498,7 +502,7 @@ pub async fn assert_context_conformance(ports: &PortSet) {
     // Snapshot survives a response-record deletion (D30): deleting a response
     // removes its ledger record, not the content the conversation inherited.
     ports
-        .ledger
+        .intake
         .delete(&ids[0])
         .await
         .expect("delete first response record");
@@ -797,7 +801,7 @@ pub async fn assert_global_claim(ports: &PortSet) {
     // Drain the queue so the assertion is about what follows.
     loop {
         let Some(c) = ports
-            .ledger
+            .claims
             .claim(AgentId::new(), 1_000, Duration::from_millis(30_000))
             .await
             .expect("drain claim")
@@ -805,7 +809,7 @@ pub async fn assert_global_claim(ports: &PortSet) {
             break;
         };
         ports
-            .ledger
+            .claims
             .complete(
                 &c.record.response_id,
                 c.record.attempt,
@@ -822,14 +826,14 @@ pub async fn assert_global_claim(ports: &PortSet) {
     let foreign_id = ResponseId::new(other_node.clone());
     let foreign = record(&foreign_id, None, &tenant, true, ResponseStatus::Queued);
     ports
-        .ledger
+        .intake
         .create(foreign, fresh_key(), 1_000)
         .await
         .expect("create foreign");
 
     let mine = ports.new_id();
     ports
-        .ledger
+        .intake
         .create(
             record(&mine, None, &tenant, true, ResponseStatus::Queued),
             fresh_key(),
@@ -840,13 +844,13 @@ pub async fn assert_global_claim(ports: &PortSet) {
 
     // One execution process claims both, in FIFO order, regardless of node tag.
     let first = ports
-        .ledger
+        .claims
         .claim(AgentId::new(), 2_000, Duration::from_millis(30_000))
         .await
         .expect("claim first")
         .expect("something claimable");
     let second = ports
-        .ledger
+        .claims
         .claim(AgentId::new(), 2_100, Duration::from_millis(30_000))
         .await
         .expect("claim second")
@@ -871,7 +875,7 @@ pub async fn assert_global_claim(ports: &PortSet) {
     // left behind cannot consume another case's admission budget.
     for c in [&first, &second] {
         ports
-            .ledger
+            .claims
             .complete(
                 &c.record.response_id,
                 c.record.attempt,
@@ -882,163 +886,6 @@ pub async fn assert_global_claim(ports: &PortSet) {
             .await
             .expect("release claimed work");
     }
-}
-
-// ------------------------------------------------------------ overload safety
-
-/// CR-8: refusing work under pressure must not corrupt anything.
-///
-/// The existing overload scenarios establish only that a refusal *happens*: they
-/// create one response, create a second, and observe `Overloaded`. But CR-8 is
-/// about pressure — "no double claim, no lost response, no sequence fork **while
-/// rejecting**" — and a serial pair of creates applies none. Rejection paths are
-/// exactly where counters get decremented twice or a slot leaks, and none of that
-/// is visible without contention.
-///
-/// So: hammer the admission boundary concurrently and check the three properties
-/// CR-8 actually names.
-///
-/// - **FR-33**: the queued/in-flight ceiling is enforced, and a request over it is
-///   refused rather than queued without bound.
-/// - **INV-29**: the refusal is uniform — every racer receives a verdict, and no
-///   request is silently dropped instead of being answered.
-pub async fn assert_overload_integrity(ports: &PortSet) {
-    const LIMIT: usize = 3;
-    const RACERS: usize = 24;
-
-    let restore = ports.ledger.pending_limit();
-    let tenant = fresh_tenant("overload");
-
-    // Clear anything left in flight by earlier cases, so the limit applies to this
-    // case's work alone and the accepted count is attributable.
-    //
-    // Claiming is not enough: the admission counter tracks queued *and* in-progress
-    // work, so a claim merely moves a record between two states that both consume a
-    // slot. Each one has to be driven to a terminal state.
-    loop {
-        let Some(c) = ports
-            .ledger
-            .claim(AgentId::new(), 1_000, Duration::from_millis(30_000))
-            .await
-            .expect("drain claim")
-        else {
-            break;
-        };
-        ports
-            .ledger
-            .complete(
-                &c.record.response_id,
-                c.record.attempt,
-                ResponseStatus::Completed,
-                Usage::default(),
-                1_000,
-            )
-            .await
-            .expect("drain complete");
-    }
-
-    ports.ledger.set_pending_limit(LIMIT);
-
-    let mut handles = Vec::new();
-    for _ in 0..RACERS {
-        let ledger = ports.ledger.clone();
-        let id = ports.new_id();
-        let rec = record(&id, None, &tenant, true, ResponseStatus::Queued);
-        handles.push(tokio::spawn(async move {
-            ledger.create(rec, fresh_key(), 2_000).await
-        }));
-    }
-
-    let mut accepted = Vec::new();
-    let mut refused = 0usize;
-    for h in handles {
-        match h.await.expect("create task panicked").expect("create call") {
-            CreateOutcome::Accepted(record) => accepted.push(record.response_id.clone()),
-            CreateOutcome::Overloaded => refused += 1,
-            other => panic!("unexpected outcome at the admission boundary: {other:?}"),
-        }
-    }
-
-    // 1. The ceiling holds exactly. Over-admitting means the guard is a
-    //    check-then-act read; under-admitting means refusals leak slots, and the
-    //    node quietly loses capacity it was configured to have.
-    assert_eq!(
-        accepted.len(),
-        LIMIT,
-        "expected exactly {LIMIT} admissions under contention, got {} accepted and \
-         {refused} refused. Admitting more than the limit defeats the protection; \
-         admitting fewer means a rejected create consumed a slot it never held.",
-        accepted.len()
-    );
-    assert_eq!(accepted.len() + refused, RACERS, "every racer must get a verdict");
-
-    // 2. No response is lost: everything reported accepted must be retrievable.
-    //    A create that returns Accepted and leaves nothing behind is the failure
-    //    CR-8 names as "lost response", and pressure is when it happens.
-    for id in &accepted {
-        assert!(
-            ports
-                .ledger
-                .get(id)
-                .await
-                .expect("get")
-                .is_some(),
-            "response {id} was accepted while overloaded but cannot be read back"
-        );
-    }
-
-    // 3. No double claim and no sequence fork among the survivors.
-    let mut claim_handles = Vec::new();
-    for _ in 0..RACERS {
-        let ledger = ports.ledger.clone();
-        claim_handles.push(tokio::spawn(async move {
-            ledger
-                .claim(AgentId::new(), 2_100, Duration::from_millis(30_000))
-                .await
-        }));
-    }
-    let mut claimed: Vec<String> = Vec::new();
-    for h in claim_handles {
-        if let Some(c) = h.await.expect("claim task panicked").expect("claim call") {
-            claimed.push(c.record.response_id.to_string());
-        }
-    }
-    let distinct: std::collections::BTreeSet<_> = claimed.iter().cloned().collect();
-    assert_eq!(
-        distinct.len(),
-        claimed.len(),
-        "a response was claimed twice while the node was refusing work: {claimed:?}"
-    );
-    assert_eq!(
-        distinct.len(),
-        LIMIT,
-        "every admitted response must be claimable exactly once; {} admitted but \
-         {} claimable",
-        LIMIT,
-        distinct.len()
-    );
-
-    // Sequence allocation must remain sound for work admitted under pressure.
-    if let Some(first) = accepted.first() {
-        let mut seq_handles = Vec::new();
-        for i in 0..8u64 {
-            let log = ports.event_log.clone();
-            let ev = event(first, ResponseEventKind::OutputTextDelta, &format!("p{i}"));
-            seq_handles.push(tokio::spawn(async move { log.append(ev).await }));
-        }
-        let mut seqs = Vec::new();
-        for h in seq_handles {
-            seqs.push(h.await.expect("append task panicked").expect("append"));
-        }
-        seqs.sort_unstable();
-        assert_eq!(
-            seqs,
-            (0..8u64).collect::<Vec<_>>(),
-            "sequence numbers forked for a response admitted under pressure"
-        );
-    }
-
-    ports.ledger.set_pending_limit(restore);
 }
 
 // -------------------------------------------------------- output provenance
@@ -1131,7 +978,7 @@ pub async fn assert_output_provenance(ports: &PortSet) {
     // `check_attempt` probe and still accept the write that follows it.
     let fenced = ports.new_id();
     ports
-        .ledger
+        .intake
         .create(
             record(&fenced, None, &tenant, true, ResponseStatus::Queued),
             fresh_key(),
@@ -1140,7 +987,7 @@ pub async fn assert_output_provenance(ports: &PortSet) {
         .await
         .expect("create");
     let claimed = ports
-        .ledger
+        .claims
         .claim(AgentId::new(), 1_100, Duration::from_millis(30_000))
         .await
         .expect("claim")
@@ -1198,7 +1045,7 @@ pub async fn assert_durability_order(ports: &PortSet) {
     rec.spec.input_items = vec![ResponseItem::user_text("durable-marker")];
 
     let outcome = ports
-        .ledger
+        .intake
         .create(rec, fresh_key(), 1_000)
         .await
         .expect("create");
@@ -1207,7 +1054,7 @@ pub async fn assert_durability_order(ports: &PortSet) {
     // No sleep, no retry loop: "eventually visible" is precisely what this
     // invariant forbids.
     let seen = ports
-        .ledger
+        .intake
         .get(&id)
         .await
         .expect("ledger get")
@@ -1233,13 +1080,13 @@ pub async fn assert_durability_order(ports: &PortSet) {
     let ghost_rec = record(&ghost, None, &tenant, true, ResponseStatus::Queued);
     let key = fresh_key();
     ports
-        .ledger
+        .intake
         .create(ghost_rec.clone(), key.clone(), 1_000)
         .await
         .expect("first create");
     // Replaying the same key must not produce a second stored record.
     let replay = ports
-        .ledger
+        .intake
         .create(ghost_rec, key, 1_000)
         .await
         .expect("replay");
@@ -1272,7 +1119,7 @@ pub async fn assert_concurrency_conformance(ports: &PortSet) {
     let tenant = fresh_tenant("conc-claim");
     let id = ports.new_id();
     let created = ports
-        .ledger
+        .intake
         .create(
             record(&id, None, &tenant, true, ResponseStatus::Queued),
             fresh_key(),
@@ -1284,7 +1131,7 @@ pub async fn assert_concurrency_conformance(ports: &PortSet) {
 
     let mut handles = Vec::new();
     for _ in 0..RACERS {
-        let ledger = ports.ledger.clone();
+        let ledger = ports.claims.clone();
         handles.push(tokio::spawn(async move {
             ledger
                 .claim(AgentId::new(), 1_100, Duration::from_millis(30_000))
@@ -1336,7 +1183,7 @@ pub async fn assert_concurrency_conformance(ports: &PortSet) {
     let key = fresh_key();
     let mut handles = Vec::new();
     for _ in 0..RACERS {
-        let ledger = ports.ledger.clone();
+        let ledger = ports.intake.clone();
         let key = key.clone();
         // Each racer proposes a *different* id, as independent retries would.
         let candidate = ports.new_id();
@@ -1352,7 +1199,6 @@ pub async fn assert_concurrency_conformance(ports: &PortSet) {
         match h.await.expect("create task panicked").expect("create call") {
             CreateOutcome::Accepted(record) => accepted.push(record.response_id.clone()),
             CreateOutcome::Duplicate(record) => duplicates.push(record.response_id.clone()),
-            other => panic!("unexpected outcome under contention: {other:?}"),
         }
     }
     assert_eq!(
@@ -1982,12 +1828,6 @@ pub fn cases() -> &'static [ContractCase] {
             asserts: "assert_global_claim",
         },
         ContractCase {
-            name: "overload-integrity",
-            covers: &["CR-8", "FR-33", "INV-29"],
-            scope: CaseScope::Backend,
-            asserts: "assert_overload_integrity",
-        },
-        ContractCase {
             name: "output-provenance",
             covers: &["FR-20", "CR-3", "CR-7", "INV-6", "INV-48"],
             scope: CaseScope::Backend,
@@ -2098,7 +1938,6 @@ async fn run_case(ports: &PortSet, case: &ContractCase) -> CaseOutcome {
             None => return CaseOutcome::Skipped("backend supplies no ContentIntegrity port"),
         },
         "global-claim" => assert_global_claim(ports).await,
-        "overload-integrity" => assert_overload_integrity(ports).await,
         "output-provenance" => assert_output_provenance(ports).await,
         "durability-order" => assert_durability_order(ports).await,
         "concurrency" => assert_concurrency_conformance(ports).await,
@@ -2161,7 +2000,9 @@ async fn run_suite_inner(ports: &PortSet, label: &str, announce: bool) -> SuiteR
 pub fn mem_ports() -> PortSet {
     let world = mock_server::MemWorld::new();
     PortSet {
-        ledger: world.ledger.clone(),
+        // One backend, mounted on both halves of the split port.
+        intake: world.ledger.clone(),
+        claims: world.ledger.clone(),
         event_log: world.event_log.clone(),
         conversation: world.conversation.clone(),
         integrity: world.integrity.clone(),

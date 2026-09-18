@@ -2,10 +2,8 @@
 //!
 //! This is the **data plane** contract: one request/response pair per port
 //! operation. The carrier exposes the *shared* ledger / event log / context
-//! operations only. The per-node runtime controls (`read_only`,
-//! `pending_limit`) are **not** here — they are process-local admission state
-//! held by the client adapter as atomics (FR-33 / INV-32 are per-node, not
-//! per-carrier).
+//! operations only. The per-node storage degrade switch (`read_only`) is
+//! **not** here — it is process-local state held by the client adapter.
 //!
 //! The control plane (fault injection) lives in [`crate::control`] and is a
 //! separate surface, owned by the test controller.
@@ -159,7 +157,6 @@ pub enum Request {
         response_id: ResponseId,
         attempt: Attempt,
     },
-    LedgerInFlight,
 
     // --- event log ---
     EventLogAppend {
@@ -273,7 +270,6 @@ pub enum Response {
     Delete(bool),
     DeleteByTenant(u64),
     CheckAttempt,
-    InFlight(usize),
 
     EventLogAppend(u64),
     EventLogReadAfter(Vec<WireEvent>),

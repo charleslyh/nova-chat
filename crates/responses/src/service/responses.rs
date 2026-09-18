@@ -27,7 +27,7 @@ use crate::events::AppendEvent;
 use crate::identity::{IdempotencyKey, TenantId};
 use crate::ports::{
     metric, ConversationError, ConversationSnapshots, CreateOutcome, MetricsSink, ResponseEventLog,
-    ResponseLedger, TurnLock,
+    ResponseIntake, ResponseClaimSource, TurnLock,
 };
 use crate::protocol::{ResponseItem, ResponseObject};
 use crate::response::{
@@ -45,7 +45,12 @@ use super::sweep::replay_completed_items;
 /// 它本身**而不是把六个字段再抄一遍——两个同构的 struct 加一段逐字段搬运，是同一件事
 /// 的两份写法。
 pub struct ResponsesDeps {
-    pub ledger: Arc<dyn ResponseLedger>,
+    pub ledger: Arc<dyn ResponseIntake>,
+    /// Claim-side ledger, for the sweeper's reap path (reap is an execution-domain
+    /// transition: it recovers a lost executor's claim). Held separately from
+    /// `ledger` so an assembler may point both at one backend **or** split them —
+    /// e.g. claims served by the host's own task system.
+    pub claims: Arc<dyn ResponseClaimSource>,
     pub event_log: Arc<dyn ResponseEventLog>,
     pub conversations: Arc<ConversationsService>,
     /// The turn lock, for the sweeper's reap path: a reaped turn is a terminal
@@ -184,8 +189,6 @@ impl ResponsesService {
             Ok(other) => {
                 let why = match other {
                     CreateOutcome::Duplicate(_) => "duplicate",
-                    CreateOutcome::ReadOnly => "read-only",
-                    CreateOutcome::Overloaded => "overloaded",
                     CreateOutcome::Accepted(_) => unreachable!("matched above"),
                 };
                 tracing::debug!(

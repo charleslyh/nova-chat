@@ -1,15 +1,16 @@
-//! Ledger client: the per-node admission controls live here (read_only,
-//! pending_limit); the shared data operations are forwarded to the carrier.
+//! Ledger client: data-plane forwarding to the carrier. Per-node read-only
+//! degrade (storage-level, `StoreError::ReadOnly`) is checked locally on write
+//! operations; everything else is forwarded.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use nova_responses::{AgentId, Attempt, IdempotencyKey, ResponseId, ResponseRecord, ResponseStatus, TenantId, Usage};
 use nova_responses::ports::{
-    AbortedClaim, AdmissionControl, ClaimedResponse, CreateOutcome, LedgerError, ResponseLedger,
-    StoreError,
+    AbortedClaim, ClaimedResponse, CreateOutcome, LedgerError, ResponseClaimSource,
+    ResponseIntake, StoreError,
 };
 
 use mock_server::proto::{ProtoError, Request, Response};
@@ -19,16 +20,11 @@ use crate::rpc::Rpc;
 pub struct MemLedgerClient {
     rpc: Arc<Rpc>,
     read_only: Arc<AtomicBool>,
-    pending_limit: Arc<AtomicUsize>,
 }
 
 impl MemLedgerClient {
-    pub fn new(rpc: Arc<Rpc>, read_only: Arc<AtomicBool>, pending_limit: Arc<AtomicUsize>) -> Self {
-        Self {
-            rpc,
-            read_only,
-            pending_limit,
-        }
+    pub fn new(rpc: Arc<Rpc>, read_only: Arc<AtomicBool>) -> Self {
+        Self { rpc, read_only }
     }
 }
 
@@ -46,22 +42,13 @@ async fn ledger_rpc(rpc: &Rpc, req: Request) -> Result<Response, LedgerError> {
 }
 
 #[async_trait]
-impl ResponseLedger for MemLedgerClient {
+impl ResponseIntake for MemLedgerClient {
     async fn create(
         &self,
         record: ResponseRecord,
         idempotency_key: IdempotencyKey,
         now_ms: u64,
     ) -> Result<CreateOutcome, LedgerError> {
-        // Per-node admission (INV-32 / FR-33), mirroring the sql adapter's
-        // local read_only + pending_limit against a shared in-flight count.
-        if self.read_only.load(Ordering::SeqCst) {
-            return Ok(CreateOutcome::ReadOnly);
-        }
-        let in_flight = self.in_flight().await?;
-        if in_flight >= self.pending_limit.load(Ordering::SeqCst) {
-            return Ok(CreateOutcome::Overloaded);
-        }
         match ledger_rpc(
             &self.rpc,
             Request::LedgerCreate {
@@ -79,6 +66,89 @@ impl ResponseLedger for MemLedgerClient {
         }
     }
 
+    async fn cancel(
+        &self,
+        tenant: &TenantId,
+        response_id: &ResponseId,
+        now_ms: u64,
+    ) -> Result<(), LedgerError> {
+        if self.read_only.load(Ordering::SeqCst) {
+            return Err(LedgerError::Store(StoreError::ReadOnly));
+        }
+        match ledger_rpc(
+            &self.rpc,
+            Request::LedgerCancel {
+                tenant: tenant.clone(),
+                response_id: response_id.clone(),
+                now_ms,
+            },
+        )
+        .await?
+        {
+            Response::Cancel => Ok(()),
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
+                "unexpected rpc response {other:?}"
+            )))),
+        }
+    }
+
+    async fn delete(&self, response_id: &ResponseId) -> Result<bool, LedgerError> {
+        if self.read_only.load(Ordering::SeqCst) {
+            return Err(LedgerError::Store(StoreError::ReadOnly));
+        }
+        match ledger_rpc(
+            &self.rpc,
+            Request::LedgerDelete {
+                response_id: response_id.clone(),
+            },
+        )
+        .await?
+        {
+            Response::Delete(removed) => Ok(removed),
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
+                "unexpected rpc response {other:?}"
+            )))),
+        }
+    }
+
+    async fn delete_by_tenant(&self, tenant: &TenantId) -> Result<u64, LedgerError> {
+        if self.read_only.load(Ordering::SeqCst) {
+            return Err(LedgerError::Store(StoreError::ReadOnly));
+        }
+        match ledger_rpc(
+            &self.rpc,
+            Request::LedgerDeleteByTenant {
+                tenant: tenant.clone(),
+            },
+        )
+        .await?
+        {
+            Response::DeleteByTenant(n) => Ok(n),
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
+                "unexpected rpc response {other:?}"
+            )))),
+        }
+    }
+
+    async fn get(&self, response_id: &ResponseId) -> Result<Option<ResponseRecord>, LedgerError> {
+        match ledger_rpc(
+            &self.rpc,
+            Request::LedgerGet {
+                response_id: response_id.clone(),
+            },
+        )
+        .await?
+        {
+            Response::Get(o) => Ok(o),
+            other => Err(LedgerError::Store(StoreError::Internal(format!(
+                "unexpected rpc response {other:?}"
+            )))),
+        }
+    }
+}
+
+#[async_trait]
+impl ResponseClaimSource for MemLedgerClient {
     async fn claim(
         &self,
         agent_id: AgentId,
@@ -149,32 +219,6 @@ impl ResponseLedger for MemLedgerClient {
         }
     }
 
-    async fn cancel(
-        &self,
-        tenant: &TenantId,
-        response_id: &ResponseId,
-        now_ms: u64,
-    ) -> Result<(), LedgerError> {
-        if self.read_only.load(Ordering::SeqCst) {
-            return Err(LedgerError::Store(StoreError::ReadOnly));
-        }
-        match ledger_rpc(
-            &self.rpc,
-            Request::LedgerCancel {
-                tenant: tenant.clone(),
-                response_id: response_id.clone(),
-                now_ms,
-            },
-        )
-        .await?
-        {
-            Response::Cancel => Ok(()),
-            other => Err(LedgerError::Store(StoreError::Internal(format!(
-                "unexpected rpc response {other:?}"
-            )))),
-        }
-    }
-
     async fn reap(
         &self,
         now_ms: u64,
@@ -219,60 +263,6 @@ impl ResponseLedger for MemLedgerClient {
         }
     }
 
-    async fn get(&self, response_id: &ResponseId) -> Result<Option<ResponseRecord>, LedgerError> {
-        match ledger_rpc(
-            &self.rpc,
-            Request::LedgerGet {
-                response_id: response_id.clone(),
-            },
-        )
-        .await?
-        {
-            Response::Get(o) => Ok(o),
-            other => Err(LedgerError::Store(StoreError::Internal(format!(
-                "unexpected rpc response {other:?}"
-            )))),
-        }
-    }
-
-    async fn delete(&self, response_id: &ResponseId) -> Result<bool, LedgerError> {
-        if self.read_only.load(Ordering::SeqCst) {
-            return Err(LedgerError::Store(StoreError::ReadOnly));
-        }
-        match ledger_rpc(
-            &self.rpc,
-            Request::LedgerDelete {
-                response_id: response_id.clone(),
-            },
-        )
-        .await?
-        {
-            Response::Delete(removed) => Ok(removed),
-            other => Err(LedgerError::Store(StoreError::Internal(format!(
-                "unexpected rpc response {other:?}"
-            )))),
-        }
-    }
-
-    async fn delete_by_tenant(&self, tenant: &TenantId) -> Result<u64, LedgerError> {
-        if self.read_only.load(Ordering::SeqCst) {
-            return Err(LedgerError::Store(StoreError::ReadOnly));
-        }
-        match ledger_rpc(
-            &self.rpc,
-            Request::LedgerDeleteByTenant {
-                tenant: tenant.clone(),
-            },
-        )
-        .await?
-        {
-            Response::DeleteByTenant(n) => Ok(n),
-            other => Err(LedgerError::Store(StoreError::Internal(format!(
-                "unexpected rpc response {other:?}"
-            )))),
-        }
-    }
-
     async fn check_attempt(
         &self,
         response_id: &ResponseId,
@@ -297,31 +287,19 @@ impl ResponseLedger for MemLedgerClient {
         }
     }
 
-    async fn in_flight(&self) -> Result<usize, LedgerError> {
-        match ledger_rpc(&self.rpc, Request::LedgerInFlight).await? {
-            Response::InFlight(n) => Ok(n),
+    async fn get(&self, response_id: &ResponseId) -> Result<Option<ResponseRecord>, LedgerError> {
+        match ledger_rpc(
+            &self.rpc,
+            Request::LedgerGet {
+                response_id: response_id.clone(),
+            },
+        )
+        .await?
+        {
+            Response::Get(o) => Ok(o),
             other => Err(LedgerError::Store(StoreError::Internal(format!(
                 "unexpected rpc response {other:?}"
             )))),
         }
-    }
-
-}
-
-impl AdmissionControl for MemLedgerClient {
-    fn set_read_only(&self, enabled: bool) {
-        self.read_only.store(enabled, Ordering::SeqCst);
-    }
-
-    fn is_read_only(&self) -> bool {
-        self.read_only.load(Ordering::SeqCst)
-    }
-
-    fn set_pending_limit(&self, limit: usize) {
-        self.pending_limit.store(limit.max(1), Ordering::SeqCst);
-    }
-
-    fn pending_limit(&self) -> usize {
-        self.pending_limit.load(Ordering::SeqCst)
     }
 }

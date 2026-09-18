@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use mock_server::{MemWorld, MemWorldConfig};
 use nova_responses::ports::{
-    ConversationRepo, ConversationSnapshots, EventLogError, ResponseEventLog, ResponseLedger,
-    StoreError,
+    ConversationRepo, ConversationSnapshots, EventLogError, ResponseClaimSource, ResponseEventLog,
+    ResponseIntake, StoreError,
 };
 use nova_responses::{
     AppendEvent, Attempt, ContextAnchor, Conversation, ConversationId, EventBody, IdempotencyKey,
@@ -594,7 +594,7 @@ async fn read_only_degrade_blocks_writes_but_not_reads() {
             .ledger
             .create(record(&ResponseId::new(tag()), "t1", true), IdempotencyKey::parse("k2").unwrap(), 0)
             .await,
-        Ok(nova_responses::ports::CreateOutcome::ReadOnly)
+        Err(nova_responses::ports::LedgerError::Store(StoreError::ReadOnly))
     );
     assert_eq!(
         world
@@ -603,33 +603,7 @@ async fn read_only_degrade_blocks_writes_but_not_reads() {
             .await,
         Err(EventLogError::Store(StoreError::ReadOnly))
     );
-    assert!(world.ledger.get(&id).await.unwrap().is_some());
-}
-
-#[tokio::test]
-async fn overload_rejects_new_work_without_corrupting_state() {
-    let world = MemWorld::with_config(MemWorldConfig {
-        pending_limit: 1,
-        ..MemWorldConfig::default()
-    });
-    let first = ResponseId::new(tag());
-    world
-        .ledger
-        .create(record(&first, "t1", true), IdempotencyKey::parse("k1").unwrap(), 0)
-        .await
-        .unwrap();
-
-    let second = ResponseId::new(tag());
-    assert_eq!(
-        world
-            .ledger
-            .create(record(&second, "t1", true), IdempotencyKey::parse("k2").unwrap(), 0)
-            .await
-            .unwrap(),
-        nova_responses::ports::CreateOutcome::Overloaded
-    );
-    assert!(world.ledger.get(&second).await.unwrap().is_none());
-    assert_eq!(world.ledger.in_flight().await.unwrap(), 1);
+    assert!(ResponseIntake::get(world.ledger.as_ref(), &id).await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -656,6 +630,6 @@ async fn tenant_purge_removes_records_and_snapshots() {
     assert_eq!(world.ledger.delete_by_tenant(&tenant("t1")).await.unwrap(), 2);
     assert_eq!(world.conversation.delete_by_tenant(&tenant("t1")).await.unwrap(), 1);
     // The other tenant's records survive.
-    assert!(world.ledger.get(&keep).await.unwrap().is_some());
+    assert!(ResponseIntake::get(world.ledger.as_ref(), &keep).await.unwrap().is_some());
     assert!(world.conversation.get(&tenant("t2"), &conv).await.unwrap().is_none());
 }

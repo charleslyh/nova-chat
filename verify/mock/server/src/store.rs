@@ -84,7 +84,6 @@ pub struct MemStore {
     inner: Mutex<Inner>,
     read_only: AtomicBool,
     unavailable: AtomicBool,
-    pending_limit: AtomicUsize,
     max_records: AtomicUsize,
     max_conversations: AtomicUsize,
     max_events_per_conversation: AtomicUsize,
@@ -112,7 +111,6 @@ impl MemStore {
             }),
             read_only: AtomicBool::new(false),
             unavailable: AtomicBool::new(false),
-            pending_limit: AtomicUsize::new(10_000),
             max_records: AtomicUsize::new(100_000),
             max_conversations: AtomicUsize::new(100_000),
             max_events_per_conversation: AtomicUsize::new(100_000),
@@ -142,14 +140,6 @@ impl MemStore {
 
     pub fn is_read_only(&self) -> bool {
         self.read_only.load(Ordering::SeqCst)
-    }
-
-    pub fn set_pending_limit(&self, limit: usize) {
-        self.pending_limit.store(limit.max(1), Ordering::SeqCst);
-    }
-
-    pub fn pending_limit(&self) -> usize {
-        self.pending_limit.load(Ordering::SeqCst)
     }
 
     pub fn set_max_records(&self, limit: usize) {
@@ -279,13 +269,6 @@ impl Inner {
                 index.remove(tenant);
             }
         }
-    }
-
-    pub fn in_flight_count(&self) -> usize {
-        self.records
-            .values()
-            .filter(|r| !r.status.is_terminal())
-            .count()
     }
 
     /// Total usage for a response: the terminal figure plus everything booked

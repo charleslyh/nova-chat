@@ -8,7 +8,7 @@
 
 | 层 | 内容 | 后端 | Docker |
 |---|---|---|---|
-| **L0** | 端口契约（含全局领取、并发、过载完整性、输出溯源、会话快照） | **mock（参考实现）** | 无 |
+| **L0** | 端口契约（含全局领取、并发、输出溯源、会话快照） | **mock（参考实现）** | 无 |
 | **L1** | 场景（进程内，直驱端口） | mock | 无 |
 | **L2** | 场景（三节点 HTTP） | 共享载体 `mock-server` + 独立 `mock-agentd` + gateway 内嵌 sweep | 无 |
 | **L4** | 官方 Python SDK 驱动 conversation 端点 | mock（经 gateway HTTP） | 无 |
@@ -25,7 +25,8 @@
 
 ```rust
 pub struct PortSet {
-    pub ledger: Arc<dyn ResponseLedger>,
+    pub intake: Arc<dyn ResponseIntake>,
+    pub claims: Arc<dyn ResponseClaimSource>,
     pub event_log: Arc<dyn ResponseEventLog>,
     pub conversation: Arc<dyn ConversationStore>,
     pub integrity: Option<Arc<dyn ContentIntegrity>>,
@@ -138,32 +139,20 @@ D23 当时的解法是把领取限定在本节点（L0 用例 `claim-locality`�
 
 > 门禁第一版是**空过的**：它搜整个文件找 `node_tag = $3`，而解释该谓词的注释本身就能让它通过——移除真实谓词后仍报 OK。改为只在 claim 语句范围内匹配，再次变异验证确认会失败。**能被自己的文档满足的门禁什么也没检查。**
 
-### 3.3 CR-8：过载下的完整性
+### 3.3 ~~CR-8：过载下的完整性~~ —— **已随准入移除（端口拆分）**
 
-CR-8 验收明确要求「高压拒绝时**无双领、无丢生成、无序号分叉**」。原有四个场景只establish了「拒绝会发生」：串行创建两个响应，观察到 `Overloaded`。串行不构成高压，而**拒绝路径正是计数器被多减一次、名额泄漏的地方**，无竞争则不可见。
-
-新增 `overload-integrity` 用例，24 个任务并发冲击 limit=3 的准入边界，断言 CR-8 真正指名的三件事：
-
-| 断言 | 失败意味着 |
-|---|---|
-| 准入数恰为 limit | 超出=守卫是 check-then-act；不足=拒绝吃掉了未持有的名额 |
-| 全部 racer 都得到裁决 | 请求被静默丢弃而非被回答 |
-| 已准入者均可读回 | CR-8 所称「丢生成」 |
-| 无响应被领取两次 | 拒绝期间的双领 |
-| 序号无分叉 | 压力下准入的生成序号错乱 |
-
-> 写这个用例时首次运行报「limit=3 只准入 2」。并非缺陷——是清场逻辑写错了：`claim` 把 queued 变为 in_progress，**两种状态都占在途配额**，须驱动至终态才释放。
+原 `overload-integrity` 用例与 CR-8 / FR-33 / INV-29 / INV-30 一并移除：过载准入属任务管控，由宿主进程/业务侧负责，不再是 nova-chat 的端口契约与不变量。并发侧的「无双领、无序号分叉」仍由 `concurrency` 用例覆盖。
 
 ### 3.4 CR-11 无法在端口层验证（缺口如实记录）
 
 加强 CR-11 断言（改为读回已记录的用量，而非只看调用返回 Ok）后，读回值为 0。追查结论是**架构缺口，非测试问题**：
 
 - `record_partial_usage` 把金额记入 `(response_id, attempt)` 侧表
-- 读取方法 `partial_usage_count` **只存在于 mem 适配器的具体类型上，不在 `ResponseLedger` trait 内**
+- 读取方法 `partial_usage_count` **只存在于 mem 适配器的具体类型上，不在 `ResponseClaimSource` trait 内**
 
 因此只持有端口的计费消费方**取不到已记账的部分用量**，本套件也无从校验。已从 L0 移除该声明并在代码处记录原因；CR-11 由 L1 `partial-usage-accounted` 经 trace 覆盖。
 
-**这是一个待你决策的产品问题**：若计费确需经端口取数，`ResponseLedger` 缺一个读取方法。
+**这是一个待你决策的产品问题**：若计费确需经端口取数，`ResponseClaimSource` 缺一个读取方法。
 
 ---
 
@@ -227,7 +216,7 @@ fn saw_relevant_data(&self, trace: &Trace) -> bool;   // 无默认实现
 
 ---
 
-## 6. L1 场景（29 个）
+## 6. L1 场景（26 个）
 
 | 组 | 场景 |
 |---|---|
@@ -237,13 +226,12 @@ fn saw_relevant_data(&self, trace: &Trace) -> bool;   // 无默认实现
 | 未完成轮次归档 | cancel-keeps-half-streamed-text · reap-keeps-half-streamed-text |
 | 存储治理 | content-delete-and-sweep · tenant-purge · integrity-tamper-detected |
 | 可靠性 | reap-closes-lost-claim · partial-usage-accounted · context-store-down-rejects-write |
-| 过载 / 降级 | pending-limit-overload · overload-reject-consistent · read-only-reject |
 | 访问控制 | cancel-cross-tenant-denied |
 | 协议子集 | item-reference-rejected · inline-binary-rejected · internal-url-rejected · unknown-field-rejected · chain-closure |
 
 ---
 
-## 7. L2 场景（15 个）与进程拓扑
+## 7. L2 场景（13 个）与进程拓扑
 
 **fixture 进程**（`xtask procs up` 启动）：`mock-server`（数据面 19000 + 控制面 19001）· `mock-agentd`（scripted scheduler，含 `hang` 规则）· 三个**对等** gateway（node-a/b/c，18080/18081/18082，各自内嵌 sweep，短 heartbeat TTL）。
 
@@ -270,12 +258,11 @@ requires_nodes: [18080, 18081]
 | delete-response-http | 删除后链断裂显式 |
 | unknown-field-400-http | 严格拒绝含定向补救说明 |
 | cross-tenant-404-http | 未知标识 / 非法格式 / 表外节点标签同形 404（SEC-5） |
-| read-only-http · pending-limit-http | 降级与过载可见（pending_limit 经 `hang` 输入确定性占用在途配额） |
 | idempotent-create-http | 幂等 |
 | z-fr32-no-stickiness-http 🔥 | **SIGKILL** node-c 后，同一游标换 node-a 续订拿到剩余事件（FR-32） |
 | z-fr34-graceful-drain-http 🔥 | **SIGTERM** node-b：拒绝新建（503）、读继续（200）、在途从 node-a 可见不丢（FR-34） |
 
-最后两个场景的信号选择是语义的一部分：**SIGKILL 模拟实例故障，SIGTERM 触发优雅停机**——用错信号会验证相反的行为。SIGTERM 之所以能在停机窗口内观察到「拒绝新建」，是因为 drain 的 `in_flight` 是**全局共享载体计数**：一个挂起的「hang」响应让它保持非零，节点因此在 drain 预算内持续拒绝新建而不立即退出。
+最后两个场景的信号选择是语义的一部分：**SIGKILL 模拟实例故障，SIGTERM 触发优雅停机**——用错信号会验证相反的行为。SIGTERM 之所以能在停机窗口内观察到「拒绝新建」，是因为 drain 在 `drain_timeout` 宽限窗口内持续服务（原先靠轮询共享载体的 `in_flight` 计数维持窗口，准入移除后改为固定宽限——在途计数属任务管控，由业务侧监督）。
 
 ### 7.2 FR-32 与 FR-34 分别验证
 
@@ -283,7 +270,7 @@ requires_nodes: [18080, 18081]
 
 ## 8. 存储后端的验证职责（D30 后移交接入方）
 
-D30 后真库端到端不再属于本仓库分层——存储后端由接入方注入，其验证义务由 [`07-storage-integration.md`](./07-storage-integration.md) 规定。接入方实现 `ResponseLedger` / `ConversationStore` / `ResponseEventLog` 后，用**同一套 L0 契约**（`conformance::run_suite`）自证，并至少覆盖：
+D30 后真库端到端不再属于本仓库分层——存储后端由接入方注入，其验证义务由 [`07-storage-integration.md`](./07-storage-integration.md) 规定。接入方实现 `ResponseIntake` + `ResponseClaimSource`（或仅领取侧，发起侧复用宿主已有系统）/ `ConversationStore` / `ResponseEventLog` 后，用**同一套 L0 契约**（`conformance::run_suite`）自证，并至少覆盖：
 
 | 检查 | 只有真实持久化才能显现的性质 |
 |---|---|

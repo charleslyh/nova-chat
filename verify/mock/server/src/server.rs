@@ -5,8 +5,8 @@
 //! binary, so this stays unit-testable without a socket.
 
 use nova_responses::ports::{
-    ConversationEvents, ConversationRepo, ConversationSnapshots, ResponseEventLog, ResponseLedger,
-    TurnLock,
+    ConversationEvents, ConversationRepo, ConversationSnapshots, ResponseClaimSource,
+    ResponseEventLog, ResponseIntake, TurnLock,
 };
 
 use crate::proto::{ProtoError, Request, Response};
@@ -81,7 +81,7 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
             Ok(()) => Response::RecordPartialUsage,
             Err(e) => Response::Err(ProtoError::Ledger(e)),
         },
-        Request::LedgerGet { response_id } => match world.ledger.get(&response_id).await {
+        Request::LedgerGet { response_id } => match ResponseIntake::get(world.ledger.as_ref(), &response_id).await {
             Ok(o) => Response::Get(o),
             Err(e) => Response::Err(ProtoError::Ledger(e)),
         },
@@ -100,10 +100,6 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
             attempt,
         } => match world.ledger.check_attempt(&response_id, attempt).await {
             Ok(()) => Response::CheckAttempt,
-            Err(e) => Response::Err(ProtoError::Ledger(e)),
-        },
-        Request::LedgerInFlight => match world.ledger.in_flight().await {
-            Ok(n) => Response::InFlight(n),
             Err(e) => Response::Err(ProtoError::Ledger(e)),
         },
 

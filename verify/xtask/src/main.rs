@@ -451,20 +451,24 @@ fn coverage_baseline() -> std::collections::BTreeSet<&'static str> {
         "FR-15", "FR-16", "FR-17", "FR-18", "FR-19", "FR-20", "FR-21",
         // Protocol subset.
         "FR-23", "FR-24", "FR-25", "FR-26", "FR-27", "FR-28",
-        // Ingress and routing.
-        "FR-29", "FR-30", "FR-31", "FR-32", "FR-33",
+        // Ingress and routing. FR-33 (overload rejection) is removed with the
+        // admission split: admission is a task-management concern owned by the
+        // hosting process, not a nova-chat invariant.
+        "FR-29", "FR-30", "FR-31", "FR-32",
         // Reliability.
         "FR-34", "FR-35", "FR-36", "FR-37", "FR-38", "FR-39",
         // Conversation container (D28: the compatibility container plus the
         // event stream, turn lock and business events that were the D26 session
         // layer — merged into one resource).
         "FR-40", "FR-41", "FR-42", "FR-43", "FR-44", "FR-45",
-        // Correctness.
-        "CR-1", "CR-2", "CR-3", "CR-4", "CR-5", "CR-6", "CR-7", "CR-8", "CR-9", "CR-10",
+        // Correctness. CR-8 (no corruption under overload) left with FR-33.
+        "CR-1", "CR-2", "CR-3", "CR-4", "CR-5", "CR-6", "CR-7", "CR-9", "CR-10",
         "CR-11", "CR-12", "CR-13", "CR-14", "CR-15", "CR-16",
-        // Invariants still in force.
-        "INV-1", "INV-2", "INV-5", "INV-6", "INV-11", "INV-12", "INV-16", "INV-29", "INV-30",
-        "INV-32", "INV-34", "INV-35", "INV-40", "INV-41", "INV-42", "INV-43",
+        // Invariants still in force. INV-29/INV-30 (overload refusal) and
+        // INV-32 (read-only degrade admission) left with FR-33: admission
+        // moved to the business side.
+        "INV-1", "INV-2", "INV-5", "INV-6", "INV-11", "INV-12", "INV-16",
+        "INV-34", "INV-35", "INV-40", "INV-41", "INV-42", "INV-43",
         "INV-44", "INV-45", "INV-46", "INV-47", "INV-48", "INV-49", "INV-50", "INV-51",
         "INV-52", "INV-54", "INV-55", "INV-56", "INV-57", "INV-58", "INV-59", "INV-60",
         "INV-61",
@@ -969,7 +973,7 @@ fn check_coverage_baseline_tracks_invariants() -> Result<()> {
 /// Two things are guarded, and they are not the same thing.
 ///
 /// 1. **No `/v1/agent/*` pull surface.** Execution is not a protocol: `nova-agentd`
-///    reaches the ledger through `ResponseLedger`. An HTTP pull endpoint would add
+///    reaches the claim source through `ResponseClaimSource`. An HTTP pull endpoint would add
 ///    a hop, a second authorisation path, and a second place for the attempt fence
 ///    to be checked — the arrangement whose failure mode (increments landing in one
 ///    process while subscribers were routed to another, with no error on any path)
@@ -982,7 +986,7 @@ fn check_execution_claims_globally_through_the_port() -> Result<()> {
     if routes.contains("/v1/agent/") && routes.contains(".route(\"/v1/agent/") {
         bail!(
             "an /v1/agent/* route is registered again. Execution is not a protocol (D25): \
-             nova-agentd claims through the ResponseLedger port. An HTTP pull surface adds \
+             nova-agentd claims through the ResponseClaimSource port. An HTTP pull surface adds \
              a hop, a second authorisation path and a second fence check, and it is how \
              increments once landed in a process no subscriber was reading."
         );
@@ -994,7 +998,7 @@ fn check_execution_claims_globally_through_the_port() -> Result<()> {
     let ledger_port = std::fs::read_to_string("crates/responses/src/ports/ledger.rs")?;
     if ledger_port.contains("node: &NodeTag") {
         bail!(
-            "ResponseLedger::claim still takes a NodeTag. Claiming must be global (D25): \
+            "ResponseClaimSource::claim still takes a NodeTag. Claiming must be global (D25): \
              the in-flight buffer is shared, so a node filter would strand queued \
              responses on other nodes."
         );

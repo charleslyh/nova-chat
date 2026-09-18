@@ -1,18 +1,15 @@
 //! Graceful shutdown.
 //!
-//! This is the single highest-value reliability measure in the design (D21).
-//! Rolling deploys are the most frequent cause of in-flight loss, and unlike a
-//! crash they are entirely predictable — so they can be made free:
-//!
 //! 1. stop accepting new work (creation returns 503; reads and subscriptions
 //!    continue, so existing subscribers are not disturbed)
-//! 2. wait for in-flight responses to finish, up to `drain_timeout_ms`
-//! 3. exit
+//! 2. serve out the drain window, then exit
 //!
-//! Without this, one deploy across N nodes discards every in-flight response at
-//! once — measurably worse than the unplanned crash rate it is compared against.
-
-use std::time::Duration;
+//! The window used to be cut short by polling the ledger's in-flight count
+//! (FR-34). That count is a task-management concern owned by the host's
+//! execution system, not by the record book, so it left the port contract:
+//! drain supervision now belongs to the business side, and the gateway holds
+//! a fixed grace period instead. Executors that outlive the process are
+//! recovered by the reap path (INV-45) on the next node's sweep.
 
 use tokio::signal;
 use tracing::info;
@@ -26,38 +23,16 @@ pub async fn drain(state: AppState) {
     state.stop_accepting();
     info!(
         node_tag = state.responses_cfg().node_tag.as_str(),
-        drain_timeout_ms = state.cfg.drain_timeout_ms,
-        "shutdown signal received; refusing new responses and draining"
+        drain_window_ms = state.cfg.drain_timeout_ms,
+        "shutdown signal received; refusing new responses and serving out the drain window"
     );
     state.metrics.incr("drain_started", 1);
 
-    let deadline =
-        tokio::time::Instant::now() + state.cfg.drain_timeout();
-    let mut last_reported = usize::MAX;
-
-    loop {
-        let in_flight = state.ledger.in_flight().await.unwrap_or(0);
-        if in_flight == 0 {
-            info!("drain complete: no in-flight responses");
-            return;
-        }
-        if in_flight != last_reported {
-            info!(in_flight, "draining");
-            last_reported = in_flight;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            // Deliberate: a single very long generation must not block a deploy
-            // indefinitely. The remainder is failed by the next node's startup
-            // orphan reclaim (INV-45), so it fails explicitly rather than hanging.
-            info!(
-                in_flight,
-                "drain budget exhausted; remaining responses will be reclaimed on restart"
-            );
-            state.metrics.incr("drain_timeouts", 1);
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    // Fixed grace: the window is bounded by configuration alone, since the
+    // in-flight count is no longer the gateway's to observe. Work that outlives
+    // it is failed by the next node's sweeper (INV-45), not lost silently.
+    tokio::time::sleep(state.cfg.drain_timeout()).await;
+    info!("drain window elapsed; shutting down");
 }
 
 async fn wait_for_signal() {

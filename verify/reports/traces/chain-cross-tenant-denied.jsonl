@@ -1,4 +1,4 @@
-{"type":"mock_state","component":"conversation","detail":"created=conv_70b6cb09-c397-4c9e-9a62-8b36a6d35b85","at_ms":1000}
+{"type":"mock_state","component":"conversation","detail":"created=conv_afc642ef-73fe-47f0-9d42-1ef450268863","at_ms":1000}
 {"type":"clock","now_ms":1001}
-{"type":"chain_rejected","response_id":"conv_70b6cb09-c397-4c9e-9a62-8b36a6d35b85","reason":"not_found","at_ms":1001}
+{"type":"chain_rejected","response_id":"conv_afc642ef-73fe-47f0-9d42-1ef450268863","reason":"not_found","at_ms":1001}
 {"type":"clock","now_ms":1002}
