@@ -81,6 +81,7 @@
 | `message` | ✅ | `role`: user / assistant / system / developer |
 | `function_call` | ✅ | `arguments` 为不透明字符串，原样保存 |
 | `function_call_output` | ✅ | |
+| `custom_tool_call` | ✅ | `input` 为自由格式字符串，承载工具运行时的带外渲染元数据（如鉴权请求）；不进 JSON schema 约束 |
 | `item_reference` | ❌ | **见 §2.1** |
 | `reasoning` | ❌ | 加密推理内容需原样往返，不在子集内 |
 | `computer_call` / `mcp_*` / 托管工具 | ❌ | 产品范围外 |

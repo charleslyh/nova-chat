@@ -74,6 +74,34 @@ pub fn items_to_messages(items: &[ResponseItem]) -> Result<Vec<CompletionsMessag
                 }
             }
 
+            ResponseItem::CustomToolCall {
+                call_id,
+                name,
+                input,
+                ..
+            } => {
+                known_calls.push(call_id.clone());
+                let call = AssistantToolCall::new(
+                    call_id.clone(),
+                    name.clone(),
+                    input.clone(),
+                );
+                match out.last_mut() {
+                    Some(CompletionsMessage::Assistant {
+                        content,
+                        tool_calls,
+                        ..
+                    }) if content.is_none() || tool_calls.is_empty() && content.is_none() => {
+                        tool_calls.push(call);
+                    }
+                    _ => out.push(CompletionsMessage::Assistant {
+                        content: None,
+                        refusal: None,
+                        tool_calls: vec![call],
+                    }),
+                }
+            }
+
             ResponseItem::FunctionCallOutput {
                 call_id, output, ..
             } => {
@@ -150,6 +178,27 @@ mod tests {
         let msgs = items_to_messages(&[user("q1"), user("q2")]).expect("translate");
         let roles: Vec<_> = msgs.iter().map(CompletionsMessage::role_name).collect();
         assert_eq!(roles, vec!["user", "user"]);
+    }
+
+    #[test]
+    fn a_custom_tool_call_becomes_an_assistant_tool_call() {
+        let items = [
+            user("q"),
+            ResponseItem::CustomToolCall {
+                call_id: "call_1".into(),
+                name: "tool_authorization".into(),
+                input: r#"{"resource":"db://prod"}"#.into(),
+                id: None,
+                status: None,
+            },
+        ];
+        let msgs = items_to_messages(&items).expect("translate");
+        let CompletionsMessage::Assistant { tool_calls, .. } = msgs.last().unwrap() else {
+            panic!("expected assistant message");
+        };
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "tool_authorization");
+        assert_eq!(tool_calls[0].function.arguments, r#"{"resource":"db://prod"}"#);
     }
 
     #[test]

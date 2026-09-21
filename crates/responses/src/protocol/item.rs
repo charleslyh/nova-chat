@@ -66,6 +66,22 @@ pub enum ResponseItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<ItemStatus>,
     },
+    /// A custom-tool call (upstream `custom_tool_call`): a free-form `input`
+    /// string instead of JSON-schema'd `function_call` arguments. Borrowed here
+    /// to carry tool-run-time, out-of-band render metadata (e.g. an
+    /// authorization request) into the response stream — the model's arguments
+    /// cannot express it, and it rides the standard `response.output_item.*`
+    /// lifecycle like any other item.
+    CustomToolCall {
+        call_id: String,
+        name: String,
+        /// Free-form input (JSON-stringified render options), opaque passthrough.
+        input: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<ItemStatus>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -94,7 +110,8 @@ impl ResponseItem {
     pub fn stream_item_id(&self) -> &str {
         match self {
             ResponseItem::FunctionCall { call_id, .. }
-            | ResponseItem::FunctionCallOutput { call_id, .. } => call_id,
+            | ResponseItem::FunctionCallOutput { call_id, .. }
+            | ResponseItem::CustomToolCall { call_id, .. } => call_id,
             ResponseItem::Message { id, .. } => id.as_deref().unwrap_or_default(),
         }
     }
@@ -110,7 +127,8 @@ impl ResponseItem {
         match self {
             ResponseItem::Message { .. }
             | ResponseItem::FunctionCall { .. }
-            | ResponseItem::FunctionCallOutput { .. } => true,
+            | ResponseItem::FunctionCallOutput { .. }
+            | ResponseItem::CustomToolCall { .. } => true,
         }
     }
 
@@ -129,6 +147,9 @@ impl ResponseItem {
             ResponseItem::FunctionCallOutput {
                 call_id, output, ..
             } => call_id.len() + output.len(),
+            ResponseItem::CustomToolCall {
+                call_id, name, input, ..
+            } => call_id.len() + name.len() + input.len(),
         }
     }
 
@@ -155,6 +176,15 @@ impl ResponseItem {
             ResponseItem::FunctionCallOutput { call_id, .. } => {
                 if call_id.is_empty() {
                     return Err(ItemViolation::EmptyCallId);
+                }
+                Ok(())
+            }
+            ResponseItem::CustomToolCall { call_id, name, .. } => {
+                if call_id.is_empty() {
+                    return Err(ItemViolation::EmptyCallId);
+                }
+                if name.is_empty() {
+                    return Err(ItemViolation::EmptyFunctionName);
                 }
                 Ok(())
             }
@@ -199,6 +229,23 @@ mod tests {
             r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}"#
         );
         assert_eq!(serde_json::from_str::<ResponseItem>(&json).unwrap(), item);
+    }
+
+    #[test]
+    fn round_trips_custom_tool_call() {
+        let item = ResponseItem::CustomToolCall {
+            call_id: "call_1".into(),
+            name: "tool_authorization".into(),
+            input: r#"{"resource":"db://prod","risk":"high"}"#.into(),
+            id: Some("item_1".into()),
+            status: Some(ItemStatus::Completed),
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["type"], "custom_tool_call");
+        assert_eq!(json["call_id"], "call_1");
+        assert_eq!(json["name"], "tool_authorization");
+        assert_eq!(json["input"], r#"{"resource":"db://prod","risk":"high"}"#);
+        assert_eq!(serde_json::from_value::<ResponseItem>(json).unwrap(), item);
     }
 
     #[test]
@@ -248,6 +295,13 @@ mod tests {
             ResponseItem::FunctionCallOutput {
                 call_id: "c".into(),
                 output: "ok".into(),
+                id: None,
+                status: None,
+            },
+            ResponseItem::CustomToolCall {
+                call_id: "c".into(),
+                name: "tool_authorization".into(),
+                input: r#"{"resource":"db://prod"}"#.into(),
                 id: None,
                 status: None,
             },
