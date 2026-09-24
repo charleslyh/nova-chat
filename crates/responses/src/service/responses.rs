@@ -17,6 +17,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::clock::Clock;
@@ -121,6 +122,7 @@ impl ResponsesService {
         &self,
         tenant: &TenantId,
         spec: TurnSpec,
+        exec_context: Option<Value>,
         idempotency_key: Option<IdempotencyKey>,
     ) -> Result<CreateOutcome, ServiceError> {
         let now_ms = self.now_ms();
@@ -159,7 +161,7 @@ impl ResponsesService {
         let idempotency_key =
             idempotency_key.unwrap_or_else(|| IdempotencyKey::for_response(&response_id));
 
-        let record = ResponseRecord::queued(
+        let mut record = ResponseRecord::queued(
             response_id.clone(),
             tenant.clone(),
             spec,
@@ -167,6 +169,10 @@ impl ResponsesService {
             now_ms,
             self.deps.cfg.content_retention_ms,
         );
+        // Execution-side identity rides the record (not the spec): it is for the
+        // executor alone, so it must not leak into the rendered object, the
+        // conversation snapshot, or context assembly.
+        record.exec_context = exec_context;
 
         // 锁已在手，之后任何一条非「已受理」的出路都必须把它还回去，否则会话永久锁死。
         // 用一个内部函数把这些出路收在一处，就不必在每个 `?` 和每个分支上各写一遍补偿

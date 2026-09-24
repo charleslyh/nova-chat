@@ -293,10 +293,10 @@ impl AgentRuntime {
 
         let task = AgentTask {
             params: record.spec.params.clone(),
+            exec_context: record.exec_context.clone(),
             items,
             provenance,
             max_tool_rounds: self.cfg.max_tool_rounds,
-            ext: record.spec.ext.clone(),
         };
 
         let mut sink = EventSink::new(self.deps.event_log.clone(), id.clone(), attempt);

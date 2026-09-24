@@ -92,7 +92,6 @@ fn record(
             },
             input_items: vec![ResponseItem::user_text(format!("in-{}", id.uuid()))],
             store: stored,
-            ext: None,
             anchor,
         },
         fresh_key(),

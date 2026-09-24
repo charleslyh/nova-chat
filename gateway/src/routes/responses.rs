@@ -167,11 +167,14 @@ pub async fn create(
         },
         input_items,
         store: request.store,
-        ext: request.ext.clone(),
         anchor,
     };
 
-    let outcome = match state.service.create(&tenant, spec, idempotency_key).await {
+    let outcome = match state
+        .service
+        .create(&tenant, spec, request.exec_context.clone(), idempotency_key)
+        .await
+    {
         Ok(outcome) => outcome,
         Err(e) => return map_service_error(&e),
     };

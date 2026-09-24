@@ -225,13 +225,6 @@ pub struct TurnSpec {
     /// be referenced as a previous link (FR-18).
     pub store: bool,
 
-    /// The caller's private extension namespace (opaque, bounded). Part of the
-    /// caller-declared surface, stored verbatim for the execution side to read
-    /// (e.g. filling a `ToolContext`) — and never rendered back: it never enters
-    /// [`crate::protocol::ResponseObject`], context assembly, or the model call.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ext: Option<Value>,
-
     /// Where this turn inherits its context from.
     pub anchor: ContextAnchor,
 }
@@ -252,6 +245,13 @@ pub struct ResponseRecord {
     /// requested" has one representation across the create call, the record and
     /// the rendered object.
     pub spec: TurnSpec,
+
+    /// Execution-side identity context (uid/pid/conversation_id) the caller
+    /// attached for the executor to read. Persisted so a crashed run recovers
+    /// it, but never echoed on the response object, never written to the
+    /// conversation snapshot, and never fed into context assembly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_context: Option<Value>,
 
     pub status: ResponseStatus,
     #[serde(default)]
@@ -307,6 +307,7 @@ impl ResponseRecord {
             response_id,
             tenant_id,
             spec,
+            exec_context: None,
             status: ResponseStatus::Queued,
             usage: Usage::default(),
             reasoning: None,
@@ -403,7 +404,6 @@ mod tests {
             },
             input_items: vec![ResponseItem::user_text("in")],
             store,
-            ext: None,
             anchor,
         }
     }
@@ -502,13 +502,15 @@ mod tests {
     }
 
     #[test]
-    fn ext_round_trips_on_the_record_and_stays_absent_when_unset() {
+    fn exec_context_round_trips_on_the_record_and_defaults_to_absent() {
         let mut r = record(true, "t1");
-        r.spec.ext = Some(serde_json::json!({"tool_context": {"project": "demo"}}));
+        r.exec_context = Some(serde_json::json!({"uid": "u-1", "pid": "p-1"}));
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<ResponseRecord>(&json).unwrap(), r);
 
-        let bare = serde_json::to_value(record(true, "t1").spec).unwrap();
-        assert!(bare.get("ext").is_none(), "{bare}");
+        // Unset stays absent on the wire, so the common case is unchanged.
+        let bare = serde_json::to_value(record(true, "t1")).unwrap();
+        assert!(bare.get("exec_context").is_none(), "{bare}");
     }
+
 }

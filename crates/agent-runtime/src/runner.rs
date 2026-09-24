@@ -23,14 +23,14 @@ pub struct AgentTask {
     /// The same value the record stores, not a field-by-field copy of it: a new model
     /// parameter then reaches the runner without a second place to remember.
     pub params: ModelParams,
+    /// Execution-side identity context (uid/pid/conversation_id) the caller
+    /// attached for the executor to read. Opaque to the orchestrator — it just
+    /// carries the record's value through to the runner.
+    pub exec_context: Option<Value>,
     /// Initial conversation (`snapshot items + this turn's input`, D30).
     pub items: Vec<ResponseItem>,
     pub provenance: RequestProvenance,
     pub max_tool_rounds: usize,
-    /// The caller's private extension namespace (e.g. `tool_context`), carried from
-    /// the record so a runner can fill execution-side context such as a
-    /// `ToolContext`. Never sent to the provider, never part of model input.
-    pub ext: Option<Value>,
 }
 
 /// The final product of one agent execution.

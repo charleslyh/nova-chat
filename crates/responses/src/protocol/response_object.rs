@@ -173,7 +173,6 @@ mod tests {
                 },
                 input_items: vec![ResponseItem::user_text("hi")],
                 store: true,
-                ext: None,
                 anchor: ContextAnchor::Conversation(ConversationId::new()),
             },
             IdempotencyKey::parse("k").unwrap(),
@@ -210,9 +209,20 @@ mod tests {
             "integrity",
             "idempotency_key",
             "expires_at_ms",
+            "exec_context",
         ] {
             assert!(json.get(leaked).is_none(), "{leaked} leaked: {json}");
         }
+    }
+
+    #[test]
+    fn exec_context_never_reaches_the_wire_even_when_set() {
+        // The identity context is for the executor alone; a caller retrieving the
+        // response must not see it, even when it was attached.
+        let mut r = record();
+        r.exec_context = Some(serde_json::json!({"uid": "u-1", "pid": "p-1"}));
+        let json = serde_json::to_value(ResponseObject::without_output(&r)).unwrap();
+        assert!(json.get("exec_context").is_none(), "exec_context leaked: {json}");
     }
 
     #[test]
