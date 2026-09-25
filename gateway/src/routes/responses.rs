@@ -164,6 +164,7 @@ pub async fn create(
             tools: request.tools.clone().unwrap_or_default(),
             tool_choice: request.tool_choice.clone(),
             metadata: request.metadata.clone().unwrap_or_default(),
+            extra_skills: request.extra_skills.clone(),
         },
         input_items,
         store: request.store,

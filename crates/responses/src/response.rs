@@ -190,6 +190,12 @@ pub struct ModelParams {
     /// executor reads it to decide *how* to run the turn, not what the turn says.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, MetadataValue>,
+
+    /// Extra skills (ids) the caller asks to offer on top of the agent's
+    /// configured `allowed_skills`. The executor reads it to build the skills
+    /// section; it is not context itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_skills: Vec<String>,
 }
 
 impl ModelParams {
@@ -201,6 +207,7 @@ impl ModelParams {
             tools: Vec::new(),
             tool_choice: None,
             metadata: BTreeMap::new(),
+            extra_skills: Vec::new(),
         }
     }
 }

@@ -74,6 +74,12 @@ pub struct CreateResponseRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
 
+    /// Extra skills (ids) the caller asks to offer on top of the agent's
+    /// configured `allowed_skills`. Read by the executor to build the
+    /// system-prompt skills section; it is not context itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_skills: Vec<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
 
@@ -623,6 +629,7 @@ mod tests {
                 strict: None,
             }]),
             tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
+            extra_skills: Vec::new(),
             temperature: None,
             top_p: None,
         };

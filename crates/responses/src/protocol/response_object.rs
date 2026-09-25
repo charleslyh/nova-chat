@@ -170,6 +170,7 @@ mod tests {
                     }],
                     tool_choice: Some(ToolChoice::Mode(ToolChoiceMode::Auto)),
                     metadata: BTreeMap::new(),
+                    extra_skills: Vec::new(),
                 },
                 input_items: vec![ResponseItem::user_text("hi")],
                 store: true,
