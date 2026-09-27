@@ -8,7 +8,7 @@ use crate::conversation::ConversationId;
 use crate::identity::{AgentId, Attempt, IdempotencyKey, TenantId};
 use crate::protocol::ResponseItem;
 use crate::provenance::RequestProvenance;
-use crate::response::{ResponseId, ResponseRecord, ResponseStatus};
+use crate::response::{ResponseId, ResponseRecord, Terminal};
 use crate::usage::Usage;
 
 use super::store_error::StoreError;
@@ -193,11 +193,16 @@ pub trait ResponseClaimSource: Send + Sync {
 
     async fn heartbeat(&self, agent_id: AgentId, now_ms: u64) -> Result<(), LedgerError>;
 
+    /// Record the terminal transition.
+    ///
+    /// Takes a [`Terminal`] rather than a bare status so an implementation
+    /// cannot store `incomplete` without its official reason, nor a reason
+    /// alongside some other status: both fields are written from one value.
     async fn complete(
         &self,
         response_id: &ResponseId,
         expected_attempt: Attempt,
-        status: ResponseStatus,
+        terminal: Terminal,
         usage: Usage,
         now_ms: u64,
     ) -> Result<(), LedgerError>;

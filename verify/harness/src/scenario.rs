@@ -15,7 +15,7 @@ use nova_responses::protocol::{
 use nova_responses::{
     canonical_items, AgentId, AppendEvent, Attempt, ContextAnchor, Conversation, ConversationId,
     EventBody, IdempotencyKey, ModelParams, NodeTag, ResponseEventKind, ResponseId,
-    ResponseItem, ResponseRecord, ResponseStatus, TenantId, TurnCommit, TurnSpec, Usage,
+    ResponseItem, ResponseRecord, ResponseStatus, TenantId, Terminal, TurnCommit, TurnSpec, Usage,
 };
 use nova_responses::ports::{
     ConversationError, ConversationRepo, ConversationSnapshots, CreateOutcome, EventLogError, ResponseClaimSource, ResponseEventLog, ResponseIntake, StoreError,
@@ -600,11 +600,12 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let attempt = ctx
                 .last_attempt
                 .ok_or_else(|| anyhow::anyhow!("{sc}: complete without a claim"))?;
-            let status = if ok {
-                ResponseStatus::Completed
+            let terminal = if ok {
+                Terminal::Completed
             } else {
-                ResponseStatus::Failed
+                Terminal::Failed
             };
+            let status = terminal.status();
             let usage = Usage::new(input_tokens, output_tokens);
             let record = ResponseIntake::get(ctx.world.ledger.as_ref(), &id)
                 .await?
@@ -612,7 +613,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
 
             ctx.world
                 .ledger
-                .complete(&id, attempt, status, usage, ctx.now_ms)
+                .complete(&id, attempt, terminal, usage, ctx.now_ms)
                 .await?;
 
             // Output items are supplied here, not derived from the deltas above

@@ -8,10 +8,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nova_agent_runtime::{
-    AgentError, AgentEventSink, AgentOutcome, AgentRunner, AgentTask, CancelProbe, SinkVerdict,
+    AgentError, AgentEventSink, AgentOutcome, AgentRunner, AgentTask, AgentTermination,
+    CancelProbe, SinkVerdict,
 };
 use nova_responses::protocol::ProtocolLimits;
-use nova_responses::{ResponseItem, ResponseStatus, Usage};
+use nova_responses::{IncompleteReason, ResponseItem, Usage};
 
 use crate::completions::{
     CompletionsRequest, CompletionsToolChoice, FinishReason, ToolSpec,
@@ -137,7 +138,7 @@ impl AgentRunner for MockAgentRunner {
                     return Ok(AgentOutcome {
                         items: conversation[base_len..].to_vec(),
                         usage,
-                        status: ResponseStatus::Completed,
+                        termination: AgentTermination::Completed,
                     });
                 }
 
@@ -147,7 +148,11 @@ impl AgentRunner for MockAgentRunner {
                     return Ok(AgentOutcome {
                         items: conversation[base_len..].to_vec(),
                         usage,
-                        status: ResponseStatus::Incomplete,
+                        // Truncation is one of the two official incomplete
+                        // reasons, so this is where `incomplete` belongs.
+                        termination: AgentTermination::Incomplete(
+                            IncompleteReason::MaxOutputTokens,
+                        ),
                     });
                 }
 
@@ -157,7 +162,13 @@ impl AgentRunner for MockAgentRunner {
                         return Ok(AgentOutcome {
                             items: conversation[base_len..].to_vec(),
                             usage,
-                            status: ResponseStatus::Incomplete,
+                            // Running out of rounds is a caller-side budget, not
+                            // one of the two official incomplete reasons — those
+                            // are both about output being cut off. So the turn
+                            // completes with what it has. `outcome.items` is
+                            // still dropped: those calls will never be executed
+                            // and would leave dangling calls in the context.
+                            termination: AgentTermination::Completed,
                         });
                     }
                     tool_rounds += 1;

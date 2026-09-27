@@ -18,7 +18,7 @@ use nova_agent_runtime::{
     AgentEventSink, AgentRuntime, AgentRuntimeConfig, AgentRuntimeDeps, Executed,
 };
 use mock_agentd::completions::{
-    CompletionsMessage, CompletionsOutcome, CompletionsRequest, ToolCall,
+    CompletionsMessage, CompletionsOutcome, CompletionsRequest, FinishReason, ToolCall,
 };
 use mock_agentd::{
     EchoScheduler, Match, MockAgentRunner, NoopToolExecutor, Scheduler, SchedulerError, Script,
@@ -27,9 +27,9 @@ use mock_agentd::{
 use nova_responses::protocol::{ContentPart, ResponseItem, Role};
 use nova_responses::ports::{ResponseClaimSource, ResponseEventLog, ResponseIntake};
 use nova_responses::{
-    Clock, ContextAnchor, Conversation, ConversationId, EventBody, IdempotencyKey, ModelParams,
-    NodeTag, ResolvedContext, ResponseEventKind, ResponseId, ResponseRecord, ResponseStatus,
-    TenantId, TurnSpec, Usage,
+    Clock, ContextAnchor, Conversation, ConversationId, EventBody, IdempotencyKey,
+    IncompleteDetails, IncompleteReason, ModelParams, NodeTag, ResolvedContext, ResponseEventKind,
+    ResponseId, ResponseRecord, ResponseStatus, TenantId, TurnSpec, Usage,
 };
 use tokio::sync::Notify;
 
@@ -512,10 +512,65 @@ async fn a_model_that_keeps_calling_tools_hits_the_round_ceiling() {
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
     let rec = ResponseIntake::get(world.ledger.as_ref(), &id).await.expect("get").expect("present");
-    assert_eq!(rec.status, ResponseStatus::Incomplete);
+    // Exhausting the round budget is `completed`, not `incomplete`. The two
+    // official incomplete reasons are `max_output_tokens` and `content_filter`
+    // — both about output being cut off — and a caller-side step ceiling is
+    // neither. This assertion previously read `Incomplete`, which made a
+    // budget overrun indistinguishable from a truncated answer.
+    assert_eq!(rec.status, ResponseStatus::Completed);
+    assert!(
+        rec.incomplete_details.is_none(),
+        "a completed turn must carry no incomplete reason"
+    );
 
     let snap = snapshot(&world, &conv).await;
     assert_eq!(output_of(&snap).len(), 6);
+}
+
+#[tokio::test]
+async fn a_truncated_answer_records_the_official_reason() {
+    // The counterpart to the case above: this one really is `incomplete`, and
+    // the reason must survive to the record so a reader does not have to guess
+    // why the answer stops mid-sentence.
+    let world = MemWorld::new();
+    let (id, _conv) = queue(&world, "write forever", true).await;
+
+    let scheduler = Arc::new(TruncatedAnswer);
+    let tools = Arc::new(MapTools::default());
+    let e = agent_with(&world, scheduler, tools, AgentRuntimeConfig::default());
+
+    assert_eq!(e.run_once(2_000).await, Executed::Completed);
+
+    let rec = ResponseIntake::get(world.ledger.as_ref(), &id).await.expect("get").expect("present");
+    assert_eq!(rec.status, ResponseStatus::Incomplete);
+    assert_eq!(
+        rec.incomplete_details,
+        Some(IncompleteDetails::new(IncompleteReason::MaxOutputTokens)),
+        "status and reason are written from one value, so both must be present"
+    );
+}
+
+/// Streams a little text and stops because the output budget ran out.
+struct TruncatedAnswer;
+
+#[async_trait::async_trait]
+impl Scheduler for TruncatedAnswer {
+    fn name(&self) -> &str {
+        "truncated"
+    }
+
+    async fn schedule(
+        &self,
+        _request: &CompletionsRequest,
+        sink: &mut dyn AgentEventSink,
+    ) -> Result<CompletionsOutcome, SchedulerError> {
+        sink.text_delta("half an ans").await?;
+        Ok(CompletionsOutcome {
+            items: vec![ResponseItem::assistant_text("half an ans")],
+            finish: FinishReason::Length,
+            usage: Usage::new(3, 3),
+        })
+    }
 }
 
 struct StreamingToolThenAnswer;

@@ -17,7 +17,7 @@ use nova_responses::ports::{
 };
 use nova_responses::{
     canonical_items, AgentId, Attempt, IdempotencyKey, IntegrityTag, ResponseId, ResponseItem,
-    ResponseRecord, ResponseStatus, TenantId, Usage,
+    ResponseRecord, ResponseStatus, TenantId, Terminal, Usage,
 };
 
 use crate::store::MemStore;
@@ -253,17 +253,14 @@ impl ResponseClaimSource for MemResponseLedger {
         &self,
         response_id: &ResponseId,
         expected_attempt: Attempt,
-        status: ResponseStatus,
+        terminal: Terminal,
         usage: Usage,
         now_ms: u64,
     ) -> Result<(), LedgerError> {
         self.guard_writable()?;
-        if !status.is_terminal() {
-            return Err(LedgerError::InvalidTransition(format!(
-                "{} is not terminal",
-                status.as_str()
-            )));
-        }
+        // No "is this status terminal" guard: every `Terminal` is, by
+        // construction. The check it replaced could only ever fire on a
+        // programming error, and now that error does not compile.
         let mut g = self.store.lock();
         let Some(rec) = g.records.get_mut(response_id) else {
             return Err(LedgerError::NotFound);
@@ -271,7 +268,9 @@ impl ResponseClaimSource for MemResponseLedger {
         if rec.attempt != expected_attempt || rec.status != ResponseStatus::InProgress {
             return Err(LedgerError::StaleAttempt);
         }
-        rec.status = status;
+        rec.status = terminal.status();
+        // Written from the same value as the status, so the pair cannot drift.
+        rec.incomplete_details = terminal.incomplete_details();
         rec.owner = None;
         rec.usage = usage;
         rec.completed_at_ms = Some(now_ms);

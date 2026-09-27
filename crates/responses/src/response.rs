@@ -123,6 +123,88 @@ impl ResponseStatus {
     }
 }
 
+/// Why a response ended [`ResponseStatus::Incomplete`].
+///
+/// The set is closed at two values, and **neither is about tool calls**: a turn
+/// that stops so the caller can run a function is `completed`, carrying a
+/// `function_call` item in its output. Reading `incomplete` as "the model wants
+/// something" is therefore a category error — it means the output was cut off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum IncompleteReason {
+    /// The output budget ran out mid-answer.
+    MaxOutputTokens,
+    /// A content filter withheld the output.
+    ContentFilter,
+}
+
+impl IncompleteReason {
+    pub fn as_str(&self) -> &'static str {
+        self.into()
+    }
+}
+
+/// The reason envelope for an incomplete response.
+///
+/// A struct wrapping a single field because that is the protocol shape, and
+/// because it leaves room for the reason set to grow without every caller
+/// having to change how it reads the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncompleteDetails {
+    pub reason: IncompleteReason,
+}
+
+impl IncompleteDetails {
+    pub fn new(reason: IncompleteReason) -> Self {
+        Self { reason }
+    }
+}
+
+/// A terminal transition: the status, and the official reason when that status
+/// is `incomplete`.
+///
+/// One type rather than a `(ResponseStatus, Option<IncompleteDetails>)` pair,
+/// so "incomplete without a reason" and "completed with one" are both
+/// unrepresentable. Terminal transitions flow through this, which is what lets
+/// a caller branch exhaustively instead of falling back on a catch-all arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Terminal {
+    /// The turn produced its output. Includes a turn that stopped so its caller
+    /// can run the function calls it requested: those calls **are** the output.
+    Completed,
+    /// The output was cut short, for one of the two official reasons.
+    Incomplete { reason: IncompleteReason },
+    /// The turn or its upstream broke.
+    Failed,
+    /// Cancelled by the caller or reclaimed by the sweeper.
+    Cancelled,
+}
+
+impl Terminal {
+    pub fn incomplete(reason: IncompleteReason) -> Self {
+        Self::Incomplete { reason }
+    }
+
+    pub fn status(self) -> ResponseStatus {
+        match self {
+            Self::Completed => ResponseStatus::Completed,
+            Self::Incomplete { .. } => ResponseStatus::Incomplete,
+            Self::Failed => ResponseStatus::Failed,
+            Self::Cancelled => ResponseStatus::Cancelled,
+        }
+    }
+
+    /// The reason envelope to persist, present exactly for `incomplete`.
+    pub fn incomplete_details(self) -> Option<IncompleteDetails> {
+        match self {
+            Self::Incomplete { reason } => Some(IncompleteDetails::new(reason)),
+            _ => None,
+        }
+    }
+}
+
 /// Where a response inherits its context from (D30).
 ///
 /// The three variants replace D24's materialised snapshot: history is read from a
@@ -264,6 +346,13 @@ pub struct ResponseRecord {
     #[serde(default)]
     pub usage: Usage,
 
+    /// Why the turn ended `incomplete`. Present exactly when [`Self::status`] is
+    /// [`ResponseStatus::Incomplete`], because both are written from one
+    /// [`Terminal`] value — the same reason `integrity` keeps its algorithm and
+    /// tag together rather than as two fields that could disagree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_details: Option<IncompleteDetails>,
+
     /// Reasoning / thinking text streamed by a reasoning model this turn,
     /// concatenated into one string. Render-only, never fed back as context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -317,6 +406,7 @@ impl ResponseRecord {
             exec_context: None,
             status: ResponseStatus::Queued,
             usage: Usage::default(),
+            incomplete_details: None,
             reasoning: None,
             created_at_ms: now_ms,
             completed_at_ms: None,
@@ -369,6 +459,59 @@ mod tests {
 
     fn tag(s: &str) -> NodeTag {
         NodeTag::parse(s).unwrap()
+    }
+
+    #[test]
+    fn a_terminal_carries_a_reason_exactly_when_it_is_incomplete() {
+        // The invariant the type exists for: status and reason are one fact, so
+        // "incomplete with no reason" and "completed with one" cannot be built.
+        for terminal in [
+            Terminal::Completed,
+            Terminal::incomplete(IncompleteReason::MaxOutputTokens),
+            Terminal::incomplete(IncompleteReason::ContentFilter),
+            Terminal::Failed,
+            Terminal::Cancelled,
+        ] {
+            assert_eq!(
+                terminal.incomplete_details().is_some(),
+                terminal.status() == ResponseStatus::Incomplete,
+                "status and reason disagree for {terminal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_terminal_maps_to_a_terminal_status() {
+        for terminal in [
+            Terminal::Completed,
+            Terminal::incomplete(IncompleteReason::ContentFilter),
+            Terminal::Failed,
+            Terminal::Cancelled,
+        ] {
+            assert!(
+                terminal.status().is_terminal(),
+                "{terminal:?} must not map to a live status"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_call_round_is_completed_not_incomplete() {
+        // Officially the two incomplete reasons are about truncation only, so a
+        // turn stopping for its caller to run functions is a completed turn.
+        assert_eq!(Terminal::Completed.status(), ResponseStatus::Completed);
+        assert!(Terminal::Completed.incomplete_details().is_none());
+    }
+
+    #[test]
+    fn incomplete_reason_wire_names_match_the_official_spelling() {
+        assert_eq!(IncompleteReason::MaxOutputTokens.as_str(), "max_output_tokens");
+        assert_eq!(IncompleteReason::ContentFilter.as_str(), "content_filter");
+        assert_eq!(
+            serde_json::to_value(IncompleteDetails::new(IncompleteReason::MaxOutputTokens))
+                .expect("serialises"),
+            serde_json::json!({"reason": "max_output_tokens"})
+        );
     }
 
     #[test]
@@ -519,5 +662,4 @@ mod tests {
         let bare = serde_json::to_value(record(true, "t1")).unwrap();
         assert!(bare.get("exec_context").is_none(), "{bare}");
     }
-
 }

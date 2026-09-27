@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::response::{ResponseRecord, ResponseStatus};
+use crate::response::{IncompleteDetails, ResponseRecord, ResponseStatus};
 use crate::usage::Usage;
 
 use super::item::ResponseItem;
@@ -47,6 +47,10 @@ pub struct ResponseObject {
     /// Unix **seconds**, as upstream reports it.
     pub created_at: u64,
     pub status: ResponseStatus,
+    /// Why the turn ended `incomplete`; absent for every other status. Rendered
+    /// from the record, which holds status and reason as one fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_details: Option<IncompleteDetails>,
     pub model: String,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -97,6 +101,7 @@ impl ResponseObject {
             object: ObjectKind::Response,
             created_at: record.created_at_ms / 1000,
             status: record.status,
+            incomplete_details: record.incomplete_details,
             model: params.model.clone(),
             previous_response_id: record.previous_response_id().map(|id| id.to_string()),
             conversation: record.conversation_id().map(|id| ConversationRef::Object {
@@ -130,6 +135,9 @@ impl ResponseObject {
             object: ObjectKind::Response,
             created_at: 0,
             status,
+            // The reap path has no record in hand, so it has no reason to
+            // report either; a subscriber that needs one issues a `GET`.
+            incomplete_details: None,
             model: String::new(),
             previous_response_id: None,
             conversation: None,

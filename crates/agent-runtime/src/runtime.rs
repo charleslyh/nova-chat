@@ -18,12 +18,12 @@ use nova_responses::ports::{
     ResponseEventLog, StoreError,
 };
 use nova_responses::protocol::ResponseObject;
-use nova_responses::{AgentId, AppendEvent, Attempt, Clock, ContextAnchor, ConversationId, ResolvedContext, ResponseEventKind, ResponseId, ResponseItem, ResponseRecord, ResponseStatus, TenantId, TurnCommit, Usage};
+use nova_responses::{AgentId, AppendEvent, Attempt, Clock, ContextAnchor, ConversationId, ResolvedContext, ResponseEventKind, ResponseId, ResponseItem, ResponseRecord, ResponseStatus, TenantId, Terminal, TurnCommit, Usage};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use crate::runner::{AgentError, AgentRunner, AgentTask, CancelProbe};
+use crate::runner::{AgentError, AgentRunner, AgentTask, AgentTermination, CancelProbe};
 use crate::sink::EventSink;
 
 /// Events per read while replaying a bare response's stream.
@@ -52,7 +52,7 @@ struct TerminalOutput {
     produced: Vec<ResponseItem>,
     reasoning: String,
     usage: Usage,
-    status: ResponseStatus,
+    termination: AgentTermination,
 }
 
 /// Ports the orchestrator needs.
@@ -366,7 +366,7 @@ impl AgentRuntime {
                 produced: outcome.items,
                 reasoning: sink.reasoning().to_string(),
                 usage: outcome.usage,
-                status: outcome.status,
+                termination: outcome.termination,
             },
             now_ms,
         )
@@ -385,9 +385,13 @@ impl AgentRuntime {
             produced,
             reasoning,
             usage,
-            status,
+            termination,
         } = output;
         let id = &record.response_id;
+        // Status and reason travel as one value from here down, so the record
+        // cannot end up saying `incomplete` with nothing to explain it.
+        let terminal = termination.terminal();
+        let status = terminal.status();
 
         debug!(
             response = %id,
@@ -398,7 +402,7 @@ impl AgentRuntime {
         if let Err(e) = self
             .deps
             .ledger
-            .complete(id, attempt, status, usage, now_ms)
+            .complete(id, attempt, terminal, usage, now_ms)
             .await
         {
             warn!(response = %id, error = %e, "complete failed");
@@ -431,9 +435,12 @@ impl AgentRuntime {
             return Executed::Failed;
         }
 
-        let kind = match status {
-            ResponseStatus::Incomplete => ResponseEventKind::Incomplete,
-            _ => ResponseEventKind::Completed,
+        // Exhaustive over what a runner can report, so a new termination has to
+        // be classified here rather than defaulting to "completed" — which is
+        // how a failure once came out looking like success.
+        let kind = match termination {
+            AgentTermination::Completed => ResponseEventKind::Completed,
+            AgentTermination::Incomplete(_) => ResponseEventKind::Incomplete,
         };
         // Re-read the record: `ledger.complete` has written the terminal status and
         // usage, and the terminal event must carry them (the claimed record still says
@@ -476,7 +483,7 @@ impl AgentRuntime {
         if let Err(e) = self
             .deps
             .ledger
-            .complete(id, attempt, ResponseStatus::Failed, usage, now_ms)
+            .complete(id, attempt, Terminal::Failed, usage, now_ms)
             .await
         {
             warn!(response = %id, error = %e, "could not record failure");

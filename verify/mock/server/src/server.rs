@@ -43,12 +43,12 @@ pub async fn dispatch(world: &MemWorld, req: Request) -> Response {
         Request::LedgerComplete {
             response_id,
             expected_attempt,
-            status,
+            terminal,
             usage,
             now_ms,
         } => match world
             .ledger
-            .complete(&response_id, expected_attempt, status, usage, now_ms)
+            .complete(&response_id, expected_attempt, terminal, usage, now_ms)
             .await
         {
             Ok(()) => Response::Complete,

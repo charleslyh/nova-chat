@@ -11,7 +11,9 @@
 //! into every provider adapter.
 
 use async_trait::async_trait;
-use nova_responses::{ModelParams, RequestProvenance, ResponseItem, ResponseStatus, Usage};
+use nova_responses::{
+    IncompleteReason, ModelParams, RequestProvenance, ResponseItem, ResponseStatus, Terminal, Usage,
+};
 use serde_json::Value;
 
 /// One agent execution task, assembled by the orchestrator after a claim.
@@ -33,14 +35,46 @@ pub struct AgentTask {
     pub max_tool_rounds: usize,
 }
 
+/// How a run ended, as far as a runner can report it.
+///
+/// Only two cases, and that is the point. A failure is [`AgentError::Failed`]
+/// and a superseded attempt is [`AgentError::Superseded`], so neither can be
+/// smuggled in as a status here.
+///
+/// This replaces a bare `ResponseStatus` whose doc comment asked for the same
+/// discipline but could not enforce it: the orchestrator folded every
+/// unexpected value into `completed`, so a runner reporting `failed` was
+/// silently reported as success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentTermination {
+    /// The turn produced its output — including a turn that stopped so its
+    /// caller can run the function calls it requested.
+    Completed,
+    /// The output was cut short, for one of the two official reasons.
+    Incomplete(IncompleteReason),
+}
+
+impl AgentTermination {
+    /// The protocol-level terminal transition to record.
+    pub fn terminal(self) -> Terminal {
+        match self {
+            Self::Completed => Terminal::Completed,
+            Self::Incomplete(reason) => Terminal::incomplete(reason),
+        }
+    }
+
+    pub fn status(self) -> ResponseStatus {
+        self.terminal().status()
+    }
+}
+
 /// The final product of one agent execution.
 #[derive(Debug, Clone)]
 pub struct AgentOutcome {
     /// Everything produced this turn (tool call + output + answer), in order.
     pub items: Vec<ResponseItem>,
     pub usage: Usage,
-    /// `Completed` or `Incomplete`.
-    pub status: ResponseStatus,
+    pub termination: AgentTermination,
 }
 
 /// Why an agent run stopped.

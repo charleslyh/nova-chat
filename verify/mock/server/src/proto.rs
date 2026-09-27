@@ -16,7 +16,7 @@ use std::time::Duration;
 use nova_responses::{
     AgentId, AppendEvent, Attempt, Conversation, ConversationEvent, ConversationEventKind,
     ConversationId, IdempotencyKey, ResolvedContext, ResponseEvent, ResponseEventKind, ResponseId,
-    ResponseRecord, ResponseStatus, TenantId, TurnCommit, Usage,
+    ResponseRecord, ResponseStatus, TenantId, Terminal, TurnCommit, Usage,
 };
 use nova_responses::ports::{AbortedClaim, ClaimedResponse, ConversationError, CreateOutcome, EventLogError, LedgerError};
 use nova_responses::protocol::MetadataValue;
@@ -126,7 +126,8 @@ pub enum Request {
     LedgerComplete {
         response_id: ResponseId,
         expected_attempt: Attempt,
-        status: ResponseStatus,
+        /// Status and incomplete reason as one value, matching the port.
+        terminal: Terminal,
         usage: Usage,
         now_ms: u64,
     },

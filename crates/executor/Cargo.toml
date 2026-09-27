@@ -1,0 +1,24 @@
+[package]
+name = "nova-executor"
+version.workspace = true
+edition.workspace = true
+description = "AgentRunner implementation: exactly one model turn against an OpenAI-compatible endpoint"
+
+[dependencies]
+nova-agent-runtime = { workspace = true }
+nova-responses = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Chat-completions wire types and HTTP plumbing.
+async-openai = { workspace = true }
+# The streaming turn is expressed as a generator over the upstream stream.
+async-stream = { workspace = true }
+# Races the model stream against the cancellation probe.
+tokio = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/agent-runtime",
+    "crates/executor",
     "crates/responses",
     "gateway",
     "verify/mock/server",
@@ -19,6 +20,7 @@ license = "MIT"
 
 [workspace.dependencies]
 nova-responses = { path = "crates/responses" }
+nova-executor = { path = "crates/executor" }
 mock-server = { path = "verify/mock/server" }
 mock-client = { path = "verify/mock/client" }
 mock-agentd = { path = "verify/mock/agentd" }
@@ -53,3 +55,11 @@ url = "2"
 hex = "0.4"
 # Enum-to-string derivation so wire names have one source of truth.
 strum = { version = "0.26", features = ["derive"] }
+# Chat-completions wire client for the executor. The only git dependency in
+# this workspace, and a deliberate one: hand-rolling the request/response types
+# would mean owning the optionality of every provider-variant field, and
+# getting that wrong surfaces as a deserialisation failure against a live
+# model rather than at compile time. CI therefore needs access to git.woa.com.
+async-openai = { git = "https://git.woa.com/yuanbao-multimodal/async-openai.git", rev = "78d5540", features = ["chat-completion"] }
+# Stream construction for the executor's streaming turn.
+async-stream = "0.3"

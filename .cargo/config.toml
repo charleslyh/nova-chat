@@ -1,0 +1,11 @@
+# Fetch git dependencies through the git CLI.
+#
+# Needed since the executor crate took on `async-openai` from an internal host:
+# libgit2 (what cargo uses by default) fails TLS against git.woa.com, while the
+# git CLI works with the environment's credential setup. Without this, a fresh
+# checkout cannot resolve the dependency at all.
+#
+# The wider consequence is deliberate and recorded with the dependency in
+# Cargo.toml: this workspace's CI now needs access to that host.
+[net]
+git-fetch-with-cli = true

@@ -1214,3 +1214,23 @@ D24 下创建时要 `ledger.create` + `context.put` 同事务（INV-34），因�
 
 reap 的「失联判定」确属任务管控，可由宿主领取侧实现自含；但善后（Failed 终态事件、轮次归档 D30、锁释放 D28）是 responses 领域生命周期，宿主任务系统做不了。拆分后 sweeper 已只依赖 `ResponseClaimSource`——注入缝已打开（宿主 reconciler 在后端层回收时，本地 reap 空转无害），契约级迁移待下游联调时再评估。
 
+
+---
+
+## D32 终态四分：`Terminal` 收口状态与 incomplete 原因
+
+| | |
+|---|---|
+| **需求** | `ResponseStatus::Incomplete` 被三种互不相干的情形共用——「模型要调工具」「轮次预算用尽」「provider 故障」。故障因此与截断不可区分，上游 nova 的前端把 `incomplete` 一律显示为「已取消」，于是一次真实的模型服务故障，用户看到的是自己取消了请求。同时官方协议的 `incomplete_details` 在本仓 0 命中，截断原因根本无处安放。 |
+| **结论** | ① **新增 `IncompleteReason` / `IncompleteDetails`**，取值为官方仅有的两个：`max_output_tokens` / `content_filter`，二者都只描述「输出被截断」。② **新增 `Terminal` 枚举**（`Completed` / `Incomplete{reason}` / `Failed` / `Cancelled`）并取代 `ResponseClaimSource::complete` 的裸 `status` 参数——状态与原因由同一个值写出，「incomplete 没有原因」和「completed 带着原因」都构造不出来，与 `IntegrityTag` 把算法和摘要绑在一个 `Option` 里是同一条理由。③ **`ResponseRecord` 增 `incomplete_details`**，`ResponseObject` 随之暴露；终态事件本就重读 record，故出站对象自动带上。④ **`AgentOutcome.status` 改为 `AgentTermination`**（只有 `Completed` / `Incomplete(reason)`）：runner 在类型上无法报告 `Failed`——那是 `AgentError::Failed`——于是编排器里 `_ => Completed` 的兜底分支被穷尽匹配取代。那个兜底正是「runner 报 failed 却被静默当成成功」的通道。⑤ **函数调用轮与轮次上限一律 `completed`**：待执行的调用是本轮的产出，步数预算是调用方的账，两者都不属于官方的两个截断原因。 |
+| **代价** | `ResponseClaimSource::complete` 签名变更，四个实现与 mem-server 的 RPC 协议同步改；L0 中「非终态 status 被拒」用例删除——该保证已前移到类型层，运行时不再可观测；`verify/mock/agentd` 的轮次上限用例由断言 `Incomplete` 改为 `Completed`。下游 tuvvi 自行适配（已与用户确认）。 |
+| **SUPERSEDES** | 无（`Incomplete` 的三义超载从无 ADR，是实现漂移） |
+| **RESTATES** | INV-48（输出不由事件流回放派生）、INV-51（失败仍记账）、D30 归档语义均原样保留 |
+
+### 为何 `AgentTermination` 不含 `Failed`
+
+`AgentOutcome.status` 原有一行文档写着「只能是 Completed 或 Incomplete」，但类型是完整的六值枚举，而编排器用 `_ => Completed` 兜底。也就是说这条纪律既没有编译期约束，也没有运行时检查，违反它的唯一表现是「失败被当成成功提交」。把可表达的取值收窄到两个之后，这条文档变成了类型，兜底分支也随之消失。
+
+### 顺带移除的 `PersistFailedTurnRunner`（在 nova 侧）
+
+nova 的 agentd 包了一层 runner，把 `AgentError::Failed` 改写成空的 `Incomplete` 产出。它的注释自述理由是「上游编排器对 Failed 会跳过 `append_turn`，用户的提问会丢」。该前提已不成立：编排器的失败路径会归档输入连同已产出内容（含用流式增量重建的半截消息）。于是这层的唯一剩余效果，就是把故障上报成截断——正是上面那条「用户看到自己取消了请求」的直接来源。已随本次改动删除，故障如实传播。

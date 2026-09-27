@@ -15,8 +15,8 @@ use nova_responses::protocol::{CreateResponseRequest, MetadataValue, ProtocolLim
 use nova_responses::{
     canonical_items, AgentId, AppendEvent, Attempt, ContextAnchor, Conversation,
     ConversationEventKind, ConversationId, EventBody, IdempotencyKey, ModelParams, NodeTag,
-    ResponseEventKind, ResponseId, ResponseRecord, ResponseStatus, TenantId, TurnCommit, TurnSpec,
-    Usage,
+    IncompleteDetails, IncompleteReason, ResponseEventKind, ResponseId, ResponseRecord,
+    ResponseStatus, TenantId, Terminal, TurnCommit, TurnSpec, Usage,
 };
 use nova_responses::ports::{
     ContentIntegrity, ConversationError, ConversationStore, CreateOutcome, EventLogError,
@@ -281,7 +281,7 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
         .complete(
             &claimed_id,
             claimed.record.attempt,
-            ResponseStatus::Completed,
+            Terminal::Completed,
             Usage::new(3, 4),
             3_000,
         )
@@ -295,27 +295,17 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
         .complete(
             &claimed_id,
             claimed.record.attempt,
-            ResponseStatus::Completed,
+            Terminal::Completed,
             Usage::default(),
             3_100,
         )
         .await
         .is_err());
 
-    // A non-terminal target status is a programming error, not a transition.
-    assert!(matches!(
-        ports
-            .claims
-            .complete(
-                &claimed_id,
-                claimed.record.attempt,
-                ResponseStatus::InProgress,
-                Usage::default(),
-                3_200,
-            )
-            .await,
-        Err(LedgerError::InvalidTransition(_))
-    ));
+    // There is no longer a case here for "a non-terminal target status is
+    // rejected": `complete` takes a `Terminal`, so naming a live status does not
+    // compile. The requirement still holds — it is simply enforced earlier than
+    // this suite can observe.
 
     let fetched = ports
         .intake
@@ -325,6 +315,54 @@ pub async fn assert_ledger_conformance(ports: &PortSet) {
         .expect("present");
     assert_eq!(fetched.status, ResponseStatus::Completed);
     assert_eq!(fetched.usage.total_tokens(), 7);
+    assert!(
+        fetched.incomplete_details.is_none(),
+        "a completed turn must carry no incomplete reason"
+    );
+
+    // An incomplete turn must persist *why*. Without this, a reader cannot tell a
+    // truncated answer from a filtered one, and a store that drops the field
+    // would still pass every other case in this suite.
+    let truncated_id = ports.new_id();
+    ports
+        .intake
+        .create(
+            record(&truncated_id, None, &tenant, true, ResponseStatus::Queued),
+            fresh_key(),
+            3_300,
+        )
+        .await
+        .expect("create truncated");
+    let truncated = ports
+        .claims
+        .claim(AgentId::new(), 3_400, Duration::from_millis(30_000))
+        .await
+        .expect("claim truncated")
+        .expect("a queued response to claim");
+    ports
+        .claims
+        .complete(
+            &truncated.record.response_id,
+            truncated.record.attempt,
+            Terminal::incomplete(IncompleteReason::MaxOutputTokens),
+            Usage::new(1, 1),
+            3_500,
+        )
+        .await
+        .expect("complete truncated");
+
+    let fetched = ports
+        .intake
+        .get(&truncated.record.response_id)
+        .await
+        .expect("get truncated")
+        .expect("present");
+    assert_eq!(fetched.status, ResponseStatus::Incomplete);
+    assert_eq!(
+        fetched.incomplete_details,
+        Some(IncompleteDetails::new(IncompleteReason::MaxOutputTokens)),
+        "status and reason are one fact, so a stored `incomplete` carries its reason"
+    );
 }
 
 /// Cancellation contract.
@@ -812,7 +850,7 @@ pub async fn assert_global_claim(ports: &PortSet) {
             .complete(
                 &c.record.response_id,
                 c.record.attempt,
-                ResponseStatus::Completed,
+                Terminal::Completed,
                 Usage::default(),
                 1_000,
             )
@@ -878,7 +916,7 @@ pub async fn assert_global_claim(ports: &PortSet) {
             .complete(
                 &c.record.response_id,
                 c.record.attempt,
-                ResponseStatus::Completed,
+                Terminal::Completed,
                 Usage::default(),
                 2_200,
             )

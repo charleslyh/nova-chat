@@ -26,6 +26,7 @@
 | 角色（Role） | Role | `user` / `assistant` / `system` / `developer` |
 | 条目状态 | Item Status | `in_progress` / `completed` / `incomplete` |
 | 响应状态 | Response Status | `queued` / `in_progress` / `completed` / `failed` / `incomplete` / `cancelled` |
+| 未完成原因 | `incomplete_details.reason` | `max_output_tokens` / `content_filter`（仅 `incomplete` 携带，见下） |
 | 上一响应 | `previous_response_id` | 串联多轮上下文 |
 | 用量 | Usage | `input_tokens` / `output_tokens` / `total_tokens` |
 | 事件 | Streaming Event | `response.created` / `response.output_text.delta` / `response.output_item.added` / … |
@@ -168,6 +169,20 @@
 ## 6. 事件与续订
 
 事件名：`response.created` / `response.in_progress` / `response.output_text.delta` / `response.output_item.added` / `response.output_item.done` / `response.function_call_arguments.delta` / `response.function_call_arguments.done` / `response.completed` / `response.failed` / `response.incomplete`。
+
+### 终态的四种含义（D32）
+
+`incomplete` **只表示输出被截断**，原因取官方仅有的两个值，并随 `incomplete_details.reason` 落库与回显：
+
+| 情形 | 终态 | 说明 |
+| --- | --- | --- |
+| 模型请求调用函数 | `completed` | 待执行的调用就是本轮产出；调用方执行后带 `previous_response_id` 续轮 |
+| 模型给出最终答复 | `completed` | — |
+| 调用方轮次预算用尽 | `completed` | 步数是调用方的账，不是官方的截断原因 |
+| 输出超预算 / 被内容过滤 | `incomplete` + `reason` | `max_output_tokens` / `content_filter` |
+| 上游或执行故障 | `failed` | 如实上报，不折叠成其它终态 |
+
+状态与原因由同一个 `Terminal` 值写出，因此不存在「`incomplete` 没有原因」或「`completed` 带着原因」的记录。
 
 流式序列与上游一致，分文本回答与工具调用两类：
 

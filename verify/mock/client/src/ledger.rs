@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nova_responses::{AgentId, Attempt, IdempotencyKey, ResponseId, ResponseRecord, ResponseStatus, TenantId, Usage};
+use nova_responses::{AgentId, Attempt, IdempotencyKey, ResponseId, ResponseRecord, TenantId, Terminal, Usage};
 use nova_responses::ports::{
     AbortedClaim, ClaimedResponse, CreateOutcome, LedgerError, ResponseClaimSource,
     ResponseIntake, StoreError,
@@ -193,7 +193,7 @@ impl ResponseClaimSource for MemLedgerClient {
         &self,
         response_id: &ResponseId,
         expected_attempt: Attempt,
-        status: ResponseStatus,
+        terminal: Terminal,
         usage: Usage,
         now_ms: u64,
     ) -> Result<(), LedgerError> {
@@ -205,7 +205,7 @@ impl ResponseClaimSource for MemLedgerClient {
             Request::LedgerComplete {
                 response_id: response_id.clone(),
                 expected_attempt,
-                status,
+                terminal,
                 usage,
                 now_ms,
             },

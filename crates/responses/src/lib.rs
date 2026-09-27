@@ -48,7 +48,8 @@ pub use identity::{AgentId, Attempt, IdError, IdempotencyKey, NodeTag, TenantId}
 pub use integrity_hmac::{HmacSha256Integrity, ALG as INTEGRITY_ALG, KEY_ENV as INTEGRITY_KEY_ENV};
 pub use provenance::RequestProvenance;
 pub use response::{
-    ContextAnchor, IntegrityTag, ModelParams, ResponseId, ResponseRecord, ResponseStatus, TurnSpec,
+    ContextAnchor, IncompleteDetails, IncompleteReason, IntegrityTag, ModelParams, ResponseId,
+    ResponseRecord, ResponseStatus, Terminal, TurnSpec,
 };
 pub use usage::Usage;
 

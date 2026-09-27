@@ -1,0 +1,738 @@
+//! The chat-completions HTTP transport.
+//!
+//! Ported from the retiring in-process runner, where it earned several scars
+//! that are preserved verbatim below and individually commented:
+//! cumulative-snapshot normalisation, tool-chunk index merging, refusal
+//! precedence in finish-reason mapping, and the trailing usage drain.
+//!
+//! Three things changed in the move:
+//!
+//! - **`let`-chains rewritten** as `let ... else` / filtered `if let`, because
+//!   this workspace is on edition 2021. The rewrites are semantically exact;
+//!   where that mattered (the usage drain) it is called out inline.
+//! - **Logs redacted.** The original wrote whole request bodies and whole
+//!   response texts at `info!`, which put every user message into the log at
+//!   normal verbosity. Bodies are never logged now; text is capped and sits at
+//!   `debug!`.
+//! - **The API key cannot be printed.** It is wrapped in a type whose `Debug`
+//!   is opaque, so adding `#[derive(Debug)]` upstream of it cannot leak it.
+
+use std::collections::HashMap;
+use std::fmt;
+
+use async_openai::config::OpenAIConfig;
+use async_openai::types::chat::{
+    ChatCompletionMessageToolCall as WireMessageToolCall,
+    ChatCompletionMessageToolCallChunk as WireToolCallChunk,
+    ChatCompletionMessageToolCalls as WireMessageToolCalls,
+    ChatCompletionRequestAssistantMessage as WireAssistantMessage,
+    ChatCompletionRequestAssistantMessageContent as WireAssistantContent,
+    ChatCompletionRequestMessage as WireMessage,
+    ChatCompletionRequestSystemMessage as WireSystemMessage,
+    ChatCompletionRequestSystemMessageContent as WireSystemContent,
+    ChatCompletionRequestToolMessage as WireToolMessage,
+    ChatCompletionRequestToolMessageContent as WireToolContent,
+    ChatCompletionRequestUserMessage as WireUserMessage,
+    ChatCompletionRequestUserMessageContent as WireUserContent, ChatCompletionStreamOptions,
+    ChatCompletionTool as WireTool, ChatCompletionTools as WireTools, CompletionUsage,
+    CreateChatCompletionRequest, FinishReason as WireFinishReason, FunctionCall, FunctionObject,
+    ReasoningEffort,
+};
+use async_openai::Client;
+use async_trait::async_trait;
+use futures::StreamExt;
+use serde_json::Value;
+
+use crate::wire::{
+    ChatCompletion, ChunkStream, FinishReason, ModelError, ModelUsage, RequestMessage,
+    ResponseChunk, ToolCallRequest, ToolManifest,
+};
+
+/// Cap on model text reaching a log line. A trace records what happened, not
+/// what was said.
+const LOG_TEXT_LIMIT: usize = 256;
+
+/// An API key that cannot be printed by accident.
+#[derive(Clone)]
+pub struct ApiKey(String);
+
+impl ApiKey {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Deliberately opaque: a derived Debug anywhere upstream must not be
+        // able to put a credential in a log line.
+        f.write_str("ApiKey(***)")
+    }
+}
+
+/// Where a model lives and how to address it.
+#[derive(Clone, Debug)]
+pub struct ModelEndpoint {
+    pub api_key: ApiKey,
+    pub base_url: String,
+    /// The wire model name sent upstream.
+    pub api_model: String,
+    /// Provider-specific request fields, passed through.
+    pub extensions: Value,
+}
+
+impl ModelEndpoint {
+    pub fn new(api_key: ApiKey, base_url: impl Into<String>, api_model: impl Into<String>) -> Self {
+        Self {
+            api_key,
+            base_url: base_url.into(),
+            api_model: api_model.into(),
+            extensions: Value::Object(Default::default()),
+        }
+    }
+
+    pub fn with_extensions(mut self, extensions: Value) -> Self {
+        self.extensions = extensions;
+        self
+    }
+}
+
+/// Chat-completions transport over an OpenAI-compatible endpoint.
+pub struct HttpChatCompletion {
+    client: Client<OpenAIConfig>,
+    api_model: String,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl HttpChatCompletion {
+    pub fn new(endpoint: ModelEndpoint) -> Self {
+        let config = OpenAIConfig::new()
+            .with_api_key(endpoint.api_key.expose())
+            .with_api_base(endpoint.base_url);
+        Self {
+            client: Client::with_config(config),
+            api_model: endpoint.api_model,
+            reasoning_effort: reasoning_effort(&endpoint.extensions),
+        }
+    }
+
+    fn request(
+        &self,
+        messages: &[RequestMessage],
+        tools: &[ToolManifest],
+        stream: bool,
+    ) -> CreateChatCompletionRequest {
+        CreateChatCompletionRequest {
+            model: self.api_model.clone(),
+            messages: to_wire_messages(messages),
+            tools: map_tools(tools),
+            stream: Some(stream),
+            stream_options: stream.then_some(ChatCompletionStreamOptions {
+                include_usage: Some(true),
+                include_obfuscation: None,
+            }),
+            reasoning_effort: self.reasoning_effort.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+#[async_trait]
+impl ChatCompletion for HttpChatCompletion {
+    async fn completion(
+        &self,
+        messages: &[RequestMessage],
+        tools: &[ToolManifest],
+        stream: bool,
+    ) -> Result<ChunkStream, ModelError> {
+        let request = self.request(messages, tools, stream);
+        // Shape only. The body carries the whole conversation, so it is never
+        // logged; when a wire-level dump is genuinely needed it belongs behind
+        // a deliberate, short-lived local change, not in normal operation.
+        tracing::debug!(
+            model = %self.api_model,
+            messages = messages.len(),
+            tools = tools.len(),
+            stream,
+            "[llm] request"
+        );
+        if !stream {
+            return self.blocking_turn(request).await;
+        }
+        self.streaming_turn(request).await
+    }
+}
+
+impl HttpChatCompletion {
+    async fn blocking_turn(
+        &self,
+        request: CreateChatCompletionRequest,
+    ) -> Result<ChunkStream, ModelError> {
+        let response = self
+            .client
+            .chat()
+            .create(request)
+            .await
+            .map_err(provider_error)?;
+        let choice = response
+            .choices
+            .first()
+            .ok_or_else(|| ModelError::new("model returned no choices"))?;
+
+        let mut chunks = Vec::new();
+        if let Some(reasoning) = extract_reasoning(&response, "message") {
+            chunks.push(Ok(ResponseChunk::Think(reasoning)));
+            chunks.push(Ok(ResponseChunk::ThinkDone));
+        }
+        if let Some(content) = choice
+            .message
+            .content
+            .as_deref()
+            .filter(|content| !content.is_empty())
+        {
+            chunks.push(Ok(ResponseChunk::TextBlock(content.to_string())));
+            chunks.push(Ok(ResponseChunk::TextDone));
+        }
+        if let Some(tool_calls) = &choice.message.tool_calls {
+            for call in tool_calls_from_message(tool_calls) {
+                chunks.push(Ok(ResponseChunk::ToolCall(call)));
+            }
+        }
+        let reason = finish_reason(
+            choice.finish_reason.as_ref(),
+            choice.message.refusal.clone().unwrap_or_default(),
+        );
+        tracing::debug!(
+            finish_reason = ?reason,
+            chars = choice.message.content.as_deref().unwrap_or_default().len(),
+            "[llm] response (non-stream)"
+        );
+        chunks.push(Ok(ResponseChunk::Done {
+            reason,
+            usage: response.usage.as_ref().map(map_usage),
+        }));
+        Ok(Box::pin(futures::stream::iter(chunks)))
+    }
+
+    async fn streaming_turn(
+        &self,
+        request: CreateChatCompletionRequest,
+    ) -> Result<ChunkStream, ModelError> {
+        let mut upstream = self
+            .client
+            .chat()
+            .create_stream(request)
+            .await
+            .map_err(provider_error)?;
+        let output = async_stream::stream! {
+            let mut calls: HashMap<u32, (String, String, String)> = HashMap::new();
+            let mut refusal = String::new();
+            let mut usage = None;
+            let mut saw_reasoning = false;
+            let mut saw_text = false;
+            let mut acc_text = String::new();
+
+            while let Some(item) = upstream.next().await {
+                let response = match item {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::warn!(
+                            chars = acc_text.len(),
+                            preview = %redact(&acc_text),
+                            "[llm] stream failed mid-way"
+                        );
+                        yield Err(provider_error(error));
+                        return;
+                    }
+                };
+                let reasoning = extract_reasoning(&response, "delta");
+                if let Some(chunk_usage) = response.usage {
+                    usage = Some(chunk_usage);
+                }
+                let Some(choice) = response.choices.first() else {
+                    continue;
+                };
+                if let Some(reasoning) = reasoning {
+                    saw_reasoning = true;
+                    yield Ok(ResponseChunk::Think(reasoning));
+                }
+                if let Some(content) = choice.delta.content.as_deref().filter(|text| !text.is_empty()) {
+                    let delta = normalize_text_delta(&acc_text, content);
+                    if !delta.is_empty() {
+                        saw_text = true;
+                        acc_text.push_str(delta);
+                        yield Ok(ResponseChunk::TextBlock(delta.to_string()));
+                    }
+                }
+                if let Some(part) = choice.delta.refusal.as_deref() {
+                    refusal.push_str(part);
+                }
+                if let Some(tool_calls) = &choice.delta.tool_calls {
+                    for call in tool_calls {
+                        merge_tool_chunk(&mut calls, call);
+                    }
+                }
+
+                if let Some(reason) = choice.finish_reason.as_ref() {
+                    // With `include_usage`, totals arrive in a chunk AFTER the
+                    // one carrying finish_reason. Drain for them, stopping at
+                    // the first chunk that is not a usage carrier — the exact
+                    // semantics of the `let`-chain this replaces.
+                    loop {
+                        let Some(extra) = upstream.next().await else { break };
+                        let Ok(extra) = extra else { break };
+                        let Some(extra_usage) = extra.usage else { break };
+                        usage = Some(extra_usage);
+                    }
+                    if saw_reasoning {
+                        yield Ok(ResponseChunk::ThinkDone);
+                    }
+                    if saw_text {
+                        yield Ok(ResponseChunk::TextDone);
+                    }
+                    for call in finalize_calls(calls) {
+                        yield Ok(ResponseChunk::ToolCall(call));
+                    }
+                    let reason = finish_reason(Some(reason), refusal);
+                    tracing::debug!(
+                        finish_reason = ?reason,
+                        chars = acc_text.len(),
+                        preview = %redact(&acc_text),
+                        "[llm] response (stream)"
+                    );
+                    yield Ok(ResponseChunk::Done {
+                        reason,
+                        usage: usage.as_ref().map(map_usage),
+                    });
+                    return;
+                }
+            }
+
+            // The stream ended without a finish_reason. Still a complete round
+            // from our side: emit what was collected and call it a stop.
+            if saw_reasoning {
+                yield Ok(ResponseChunk::ThinkDone);
+            }
+            if saw_text {
+                yield Ok(ResponseChunk::TextDone);
+            }
+            for call in finalize_calls(calls) {
+                yield Ok(ResponseChunk::ToolCall(call));
+            }
+            tracing::debug!(
+                chars = acc_text.len(),
+                preview = %redact(&acc_text),
+                "[llm] response (stream, no finish_reason)"
+            );
+            yield Ok(ResponseChunk::Done {
+                reason: finish_reason(None, refusal),
+                usage: usage.as_ref().map(map_usage),
+            });
+        };
+        Ok(Box::pin(output))
+    }
+}
+
+/// OpenAI-compatible endpoints normally stream text deltas, but some provider
+/// nodes intermittently stream the complete text generated so far. Convert
+/// those cumulative snapshots into deltas before forwarding them; otherwise
+/// every prefix is appended again and the response grows quadratically.
+fn normalize_text_delta<'a>(accumulated: &str, incoming: &'a str) -> &'a str {
+    incoming.strip_prefix(accumulated).unwrap_or(incoming)
+}
+
+/// Tool calls arrive as indexed fragments; only the assembled set is stable, so
+/// they are sorted by call id before being emitted.
+fn finalize_calls(calls: HashMap<u32, (String, String, String)>) -> Vec<ToolCallRequest> {
+    let mut finalized: Vec<_> = calls
+        .into_values()
+        .map(|(call_id, name, arguments)| ToolCallRequest {
+            call_id,
+            name,
+            arguments: parse_arguments(&arguments),
+        })
+        .filter(|call| !call.name.is_empty())
+        .collect();
+    finalized.sort_by(|left, right| left.call_id.cmp(&right.call_id));
+    finalized
+}
+
+fn redact(text: &str) -> String {
+    if text.len() <= LOG_TEXT_LIMIT {
+        return text.to_string();
+    }
+    // Char boundary, not byte boundary: the text is routinely non-ASCII.
+    let cut = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= LOG_TEXT_LIMIT)
+        .last()
+        .unwrap_or(0);
+    format!("{}…[+{} bytes]", &text[..cut], text.len() - cut)
+}
+
+fn to_wire_messages(messages: &[RequestMessage]) -> Vec<WireMessage> {
+    messages
+        .iter()
+        .map(|message| match message {
+            RequestMessage::System { content } => WireMessage::System(WireSystemMessage {
+                content: WireSystemContent::Text(content.clone()),
+                name: None,
+            }),
+            RequestMessage::User { content } => WireMessage::User(WireUserMessage {
+                content: WireUserContent::Text(content.clone()),
+                name: None,
+            }),
+            RequestMessage::Assistant {
+                content,
+                tool_calls,
+            } => WireMessage::Assistant(WireAssistantMessage {
+                // A tool-call-only assistant turn must send no content field
+                // at all; an empty string is rejected by some providers.
+                content: if content.is_empty() && tool_calls.is_some() {
+                    None
+                } else {
+                    Some(WireAssistantContent::Text(content.clone()))
+                },
+                tool_calls: tool_calls.as_ref().map(|calls| {
+                    calls
+                        .iter()
+                        .map(|call| {
+                            WireMessageToolCalls::Function(WireMessageToolCall {
+                                id: call.call_id.clone(),
+                                function: FunctionCall {
+                                    name: call.name.clone(),
+                                    arguments: serialize_arguments(&call.arguments),
+                                },
+                            })
+                        })
+                        .collect()
+                }),
+                ..Default::default()
+            }),
+            RequestMessage::Tool { content, call_id } => WireMessage::Tool(WireToolMessage {
+                content: WireToolContent::Text(content.clone()),
+                tool_call_id: call_id.clone(),
+            }),
+        })
+        .collect()
+}
+
+fn map_tools(tools: &[ToolManifest]) -> Option<Vec<WireTools>> {
+    (!tools.is_empty()).then(|| {
+        tools
+            .iter()
+            .map(|tool| {
+                WireTools::Function(WireTool {
+                    function: FunctionObject {
+                        name: tool.name.clone(),
+                        description: Some(tool.description.clone()),
+                        // Already a Value: no re-parse, so a schema can no
+                        // longer be silently dropped on the way out.
+                        parameters: Some(tool.parameters.clone()),
+                        strict: None,
+                    },
+                })
+            })
+            .collect()
+    })
+}
+
+fn tool_calls_from_message(calls: &[WireMessageToolCalls]) -> Vec<ToolCallRequest> {
+    let mut calls: Vec<_> = calls
+        .iter()
+        .filter_map(|call| match call {
+            WireMessageToolCalls::Function(call) if !call.function.name.is_empty() => {
+                Some(ToolCallRequest {
+                    call_id: call.id.clone(),
+                    name: call.function.name.clone(),
+                    arguments: parse_arguments(&call.function.arguments),
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    calls.sort_by(|left, right| left.call_id.cmp(&right.call_id));
+    calls
+}
+
+/// Fragments of one call arrive across chunks keyed by `index`: the id and name
+/// appear once, the arguments accumulate.
+fn merge_tool_chunk(calls: &mut HashMap<u32, (String, String, String)>, chunk: &WireToolCallChunk) {
+    let entry = calls.entry(chunk.index).or_insert_with(|| {
+        (
+            chunk.id.clone().unwrap_or_default(),
+            chunk
+                .function
+                .as_ref()
+                .and_then(|function| function.name.clone())
+                .unwrap_or_default(),
+            String::new(),
+        )
+    });
+    if let Some(id) = chunk.id.as_deref().filter(|id| !id.is_empty()) {
+        entry.0 = id.to_string();
+    }
+    if let Some(function) = &chunk.function {
+        if let Some(name) = function.name.as_deref().filter(|name| !name.is_empty()) {
+            entry.1 = name.to_string();
+        }
+        if let Some(arguments) = &function.arguments {
+            entry.2.push_str(arguments);
+        }
+    }
+}
+
+/// Refusal wording wins over the wire reason: a provider that both filtered the
+/// output and reported `stop` has still refused.
+fn finish_reason(reason: Option<&WireFinishReason>, refusal: String) -> FinishReason {
+    if !refusal.is_empty() {
+        return FinishReason::Refusal {
+            reason: Some(refusal),
+        };
+    }
+    match reason {
+        Some(WireFinishReason::Length) => FinishReason::Length,
+        Some(WireFinishReason::ContentFilter) => FinishReason::Refusal { reason: None },
+        // Includes `tool_calls`: the requested calls are already expressed as
+        // ToolCall chunks, so nothing about the reason needs to say so.
+        _ => FinishReason::Stop,
+    }
+}
+
+fn map_usage(usage: &CompletionUsage) -> ModelUsage {
+    ModelUsage {
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+        cached_tokens: 0,
+        reasoning_tokens: 0,
+    }
+}
+
+/// Reasoning text is not part of the typed wire schema, so it is dug out of the
+/// serialised form: `choices[0].{message|delta}.reasoning_content`.
+fn extract_reasoning(value: &impl serde::Serialize, container: &str) -> Option<String> {
+    serde_json::to_value(value)
+        .ok()?
+        .get("choices")?
+        .as_array()?
+        .first()?
+        .get(container)?
+        .get("reasoning_content")?
+        .as_str()
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_arguments(arguments: &str) -> Value {
+    let arguments = arguments.trim();
+    if arguments.is_empty() {
+        Value::Object(Default::default())
+    } else {
+        // A model that emits malformed JSON still made a call; keep the raw
+        // text so the tool can reject it with a useful message.
+        serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
+    }
+}
+
+fn serialize_arguments(arguments: &Value) -> String {
+    match arguments {
+        Value::String(arguments) => arguments.clone(),
+        Value::Null => "{}".to_string(),
+        arguments => serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string()),
+    }
+}
+
+fn reasoning_effort(extensions: &Value) -> Option<ReasoningEffort> {
+    match extensions
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "minimal" => Some(ReasoningEffort::Minimal),
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        "xhigh" | "x-high" => Some(ReasoningEffort::Xhigh),
+        _ => None,
+    }
+}
+
+fn provider_error(error: impl fmt::Display) -> ModelError {
+    ModelError::new(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_regular_stream_deltas() {
+        assert_eq!(normalize_text_delta("你好！", "我是 Nova"), "我是 Nova");
+    }
+
+    #[test]
+    fn converts_cumulative_stream_snapshots_to_deltas() {
+        assert_eq!(
+            normalize_text_delta("你好！", "你好！我是 Nova"),
+            "我是 Nova"
+        );
+        assert_eq!(
+            normalize_text_delta("你好！我是 Nova", "你好！我是 Nova"),
+            ""
+        );
+    }
+
+    #[test]
+    fn refusal_wording_outranks_the_wire_reason() {
+        let reason = finish_reason(Some(&WireFinishReason::Stop), "declined".to_string());
+        assert_eq!(
+            reason,
+            FinishReason::Refusal {
+                reason: Some("declined".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn content_filter_is_a_refusal_without_wording() {
+        assert_eq!(
+            finish_reason(Some(&WireFinishReason::ContentFilter), String::new()),
+            FinishReason::Refusal { reason: None }
+        );
+    }
+
+    #[test]
+    fn tool_calls_reason_is_a_plain_stop() {
+        // The calls themselves carry that information; see `FinishReason`.
+        assert_eq!(
+            finish_reason(Some(&WireFinishReason::ToolCalls), String::new()),
+            FinishReason::Stop
+        );
+    }
+
+    #[test]
+    fn length_maps_to_its_own_reason() {
+        assert_eq!(
+            finish_reason(Some(&WireFinishReason::Length), String::new()),
+            FinishReason::Length
+        );
+    }
+
+    #[test]
+    fn unparseable_arguments_survive_as_raw_text() {
+        assert_eq!(parse_arguments("  "), Value::Object(Default::default()));
+        assert_eq!(
+            parse_arguments("{not json"),
+            Value::String("{not json".to_string())
+        );
+        assert_eq!(parse_arguments(r#"{"a":1}"#), serde_json::json!({"a": 1}));
+    }
+
+    #[test]
+    fn redaction_caps_text_and_never_splits_a_character() {
+        let long = "中".repeat(400);
+        let out = redact(&long);
+        assert!(out.contains('…'), "long text must be elided");
+        assert!(out.len() < long.len());
+        // Would panic on a byte-boundary slice of multi-byte characters.
+        assert!(out.starts_with('中'));
+
+        let short = "短文本";
+        assert_eq!(redact(short), short);
+    }
+
+    #[test]
+    fn api_key_debug_is_opaque() {
+        let key = ApiKey::new("sk-secret-value");
+        assert_eq!(format!("{key:?}"), "ApiKey(***)");
+        assert!(!format!("{key:?}").contains("secret"));
+    }
+
+    #[test]
+    fn tool_schemas_pass_through_without_a_reparse() {
+        let schema = serde_json::json!({"type": "object", "properties": {"a": {"type": "string"}}});
+        let tools = vec![ToolManifest {
+            name: "t".into(),
+            description: "d".into(),
+            parameters: schema.clone(),
+        }];
+        let mapped = map_tools(&tools).expect("tools present");
+        match &mapped[0] {
+            WireTools::Function(tool) => {
+                assert_eq!(tool.function.parameters.as_ref(), Some(&schema));
+            }
+            other => panic!("only function tools are declarable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_tools_declares_no_tools_field() {
+        assert!(map_tools(&[]).is_none());
+    }
+
+    #[test]
+    fn tool_call_fragments_merge_by_index() {
+        let mut calls = HashMap::new();
+        merge_tool_chunk(
+            &mut calls,
+            &WireToolCallChunk {
+                index: 0,
+                id: Some("call_1".into()),
+                r#type: None,
+                function: Some(async_openai::types::chat::FunctionCallStream {
+                    name: Some("draw".into()),
+                    arguments: Some("{\"x\":".into()),
+                }),
+            },
+        );
+        merge_tool_chunk(
+            &mut calls,
+            &WireToolCallChunk {
+                index: 0,
+                id: None,
+                r#type: None,
+                function: Some(async_openai::types::chat::FunctionCallStream {
+                    name: None,
+                    arguments: Some("1}".into()),
+                }),
+            },
+        );
+        let finalized = finalize_calls(calls);
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].call_id, "call_1");
+        assert_eq!(finalized[0].name, "draw");
+        assert_eq!(finalized[0].arguments, serde_json::json!({"x": 1}));
+    }
+
+    #[test]
+    fn nameless_calls_are_dropped() {
+        let mut calls = HashMap::new();
+        calls.insert(0, ("call_1".to_string(), String::new(), "{}".to_string()));
+        assert!(finalize_calls(calls).is_empty());
+    }
+
+    #[test]
+    fn assistant_tool_call_turn_sends_no_content_field() {
+        let wire = to_wire_messages(&[RequestMessage::Assistant {
+            content: String::new(),
+            tool_calls: Some(vec![ToolCallRequest {
+                call_id: "c1".into(),
+                name: "t".into(),
+                arguments: serde_json::json!({}),
+            }]),
+        }]);
+        match &wire[0] {
+            WireMessage::Assistant(message) => assert!(message.content.is_none()),
+            other => panic!("expected an assistant message, got {other:?}"),
+        }
+    }
+}
