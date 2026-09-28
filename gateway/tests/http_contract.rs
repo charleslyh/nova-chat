@@ -848,6 +848,45 @@ async fn a_cancelled_conversation_turn_archives_its_input() {
 }
 
 #[tokio::test]
+async fn conversation_items_list_in_the_official_shape() {
+    // Upstream's `GET /v1/conversations/{id}/items` (D35): a page with stable ids,
+    // `first_id` / `last_id` / `has_more`, newest first by default.
+    let h = start().await;
+    let (_, conv) = h.post("/v1/conversations", json!({})).await;
+    let conv_id = conv["id"].as_str().unwrap().to_string();
+    let (status, body) = h
+        .post(
+            "/v1/responses",
+            json!({ "model": "m", "input": "keep me", "conversation": conv_id, "background": true }),
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::ACCEPTED);
+    let id = body["id"].as_str().unwrap().to_string();
+    let _ = h.post(&format!("/v1/responses/{id}/cancel"), Value::Null).await;
+
+    let (status, page) = h
+        .get(&format!("/v1/conversations/{conv_id}/items?order=asc&limit=1"))
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{page}");
+    assert_eq!(page["object"], "list");
+    assert_eq!(page["data"].as_array().unwrap().len(), 1);
+    assert!(page["data"][0]["id"].is_string(), "every item carries an id: {page}");
+    assert!(page.to_string().contains("keep me"), "{page}");
+    assert_eq!(page["first_id"], page["data"][0]["id"]);
+
+    let (status, _) = h
+        .get(&format!("/v1/conversations/{conv_id}/items?limit=0"))
+        .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    let (status, _) = h
+        .get(&format!("/v1/conversations/{conv_id}/items?after=item_999"))
+        .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    let (status, _) = h.get("/v1/conversations/conv_missing/items").await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn a_cancelled_store_false_turn_is_not_archived() {
     // `store=false` keeps its existing semantics on every terminal path: a cancelled
     // ephemeral turn must not land in the conversation snapshot.

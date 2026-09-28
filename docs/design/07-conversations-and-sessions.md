@@ -199,7 +199,7 @@ sequenceDiagram
 | `GET /v1/conversations/{id}/events` | SSE 订阅：回放 + 实时 |
 | `POST /v1/conversations/{id}/events` | 业务事件，与轮次事件同序号空间严格保序 |
 
-**不实现官方 `items` 子资源**（`GET/POST/DELETE /conversations/{id}/items`）：主快照是服务端维护的物化状态，不暴露条目级增删。读历史走 transcript（一次取全，不强制分页）。**没有自研的「发起轮次」端点**：轮次一律经标准 `POST /v1/responses { conversation }`。
+**官方 `items` 子资源只实现读**（`GET /conversations/{id}/items`，D35）：分页读主快照，条目按位置派生稳定 id；`POST/DELETE` 仍不实现——主快照是服务端维护的物化状态，不暴露条目级增删。transcript 保留（一次取全，不强制分页）。**没有自研的「发起轮次」端点**：轮次一律经标准 `POST /v1/responses { conversation }`。
 
 ---
 
@@ -227,7 +227,7 @@ sequenceDiagram
 | D24 物化快照 | **条款推翻（D30）**：快照从「每 response 一份」改为「会话一份 + 每轮 delta」 |
 | D28 吸收 session | **保留并扩展**：conversation 单实体 + 锁 + 事件流不变，D30 再加主快照 |
 | D25 执行独立 | 终态释放与推进落在独立执行进程 `settle`，账本在 reap 时把关联随终态交出 |
-| D22 封闭子集 | `conversation` 从拒绝清单移入子集；`items` 子资源仍不在子集内 |
+| D22 封闭子集 | `conversation` 从拒绝清单移入子集；`items` 子资源的读侧自 D35 起进入子集，增删仍不在 |
 
 ---
 

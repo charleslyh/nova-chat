@@ -42,7 +42,7 @@ flowchart TB
 | `ResponseEventLog` | per-response 有界缓冲、`starting_after` 读取、终态关闭、**TTL 内回放重建 response 对象**（D30） | **无 Gap / 无 read_from / 无冷层** |
 | `ResponseIntake`（发起侧） | create / cancel / delete / get / delete_by_tenant：gateway 与能力层的记录簿 | **无准入**（过载/降级属任务管控，宿主自决） |
 | `ResponseClaimSource`（领取侧） | 原子领取（全局 claim）、心跳收口（reap）、终态漏斗、部分用量 | **无会话锁 / 无 Busy 结果** |
-| `ConversationStore` | 会话 CRUD、链尾指针、轮次锁、事件流，**持久物化主快照**（`read_snapshot` / `append_turn`，D30） | 官方 `items` 子资源不暴露；快照不逐条增删 |
+| `ConversationStore` | 会话 CRUD、链尾指针、轮次锁、事件流，**持久物化主快照**（`read_snapshot` / `append_turn`，D30） | 官方 `items` 只读（D35，网关层从快照派生）；快照不逐条增删 |
 | `ContentIntegrity` | 签名 / 常数时间校验 | 仅防篡改，非不可否认性 |
 | `MetricsSink` | 指标上报 | — |
 

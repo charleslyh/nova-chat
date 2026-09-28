@@ -3,7 +3,8 @@
 //! Two surfaces, deliberately kept in separate namespaces:
 //!
 //! - `/v1/responses` and `/v1/conversations` are **upstream's**, matched
-//!   endpoint for endpoint so an official SDK can drive them unmodified. Note
+//!   endpoint for endpoint so an official SDK can drive them unmodified —
+//!   including the read side of `/v1/conversations/{id}/items` (D35). Note
 //!   that `/v1/conversations/{id}` handles both `GET` and `POST`, because
 //!   upstream models the metadata update as a POST to the same path rather than
 //!   a PATCH.
@@ -62,6 +63,8 @@ pub fn router(state: AppState) -> Router {
             "/v1/conversations/{id}/transcript",
             get(conversations::transcript),
         )
+        // Upstream's items list (read only, D35).
+        .route("/v1/conversations/{id}/items", get(conversations::items))
         // Operations.
         .route("/v1/tenants/{tenant}/purge", post(admin::purge_tenant))
         .layer(CorsLayer::permissive())

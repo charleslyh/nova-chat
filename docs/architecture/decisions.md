@@ -1076,7 +1076,7 @@ conversation（D27）回答「上下文从哪来」，是官方协议；session 
 | | |
 |---|---|
 | **需求** | 官方 conversation 兼容（`spec.md` FR-40/41） |
-| **结论** | ① conversation 只存 `{ id, tenant, last_response_id, metadata }`，**不存任何条目**。② `POST /v1/responses { conversation }` 把它解析为链尾 `ResponseId`，再走既有 `resolve_chain`（D24 零改动）——conversation 不是第二种上下文来源，只是第二种指定锚点的方式。③ 终态时 `advance(conv, resp)` 更新指针，**后写胜出**（无 CAS），且只推进**提交了输出**的轮次。④ 官方 `items` 子资源不实现：容器无条目可增删，读历史走 session 的 transcript。⑤ 只实现官方 4 个 CRUD 端点。 |
+| **结论** | ① conversation 只存 `{ id, tenant, last_response_id, metadata }`，**不存任何条目**。② `POST /v1/responses { conversation }` 把它解析为链尾 `ResponseId`，再走既有 `resolve_chain`（D24 零改动）——conversation 不是第二种上下文来源，只是第二种指定锚点的方式。③ 终态时 `advance(conv, resp)` 更新指针，**后写胜出**（无 CAS），且只推进**提交了输出**的轮次。④ 官方 `items` 子资源不实现：容器无条目可增删，读历史走 session 的 transcript（**读侧已由 D35 推翻**：D30 之后会话有主快照）。⑤ 只实现官方 4 个 CRUD 端点。 |
 | **代价** | 裸用 conversation（无 session）时并发轮次无锁，指针后写胜出（与官方一致） |
 
 ### 为何能退化成指针
@@ -1107,7 +1107,7 @@ conversation 退化为指针后，`resolve_chain` 仍是上下文装配的唯一
 | 方案 | 否决理由 |
 |---|---|
 | conversation 存条目 | 同一段对话两份副本，必然分叉，且与 D24 物化快照重复 |
-| 实现官方 `items` 子资源 | 容器无条目可增删；分页/排序/`include`/删除语义全在此，成本高、收益零 |
+| 实现官方 `items` 子资源 | 容器无条目可增删；分页/排序/`include`/删除语义全在此，成本高、收益零（D30 后前提改变，读侧见 D35） |
 | advance 加 CAS | 官方 SDK 收到不存在的 409 |
 | 只有 conversation 没有 session | 多端同步无承载；且官方无会话概念 |
 
@@ -1254,3 +1254,12 @@ nova 的 agentd 包了一层 runner，把 `AgentError::Failed` 改写成空的 `
 | **需求** | 委派（agent-as-tool）在 `Runner::drive` 内递归，天然复用父 Runner 的 hooks 实例。nova 宿主的 `ChainTimeline` 在该实例上数「每链恰好一对 accepted/done」（B-11），于是子链的 accepted 和父链的 done 被当作重复拒绝——委派链的时间线记录整个不落库。e2e V3（委派用例）首次走真实链路即暴露。 |
 | **结论** | ① `Hooks` 增 `nested() -> Option<Arc<dyn Hooks>>`，默认 `None`（沿用自身）——子链是否拥有自己的观察者是**宿主的决策**，库不预设。② `DriveParams` 携带本链的 hooks，委派处取 `self.hooks.nested()` 传入。③ 宿主 `ChainTimeline::nested()` 返回 `None`：**子链不写 nova 的时间线与回合记录**。子链的工作经父链的 `agent` 调用抵达消息流（实时合成帧供面板渲染；调用的结构化输出携带子链 response_id 供刷新后重订阅），再写一份属于父会话的记录只会让一次提问显示成多个回合、每个都「调用」了下一层实际调用的工具。 |
 | **代价** | `Hooks` 公开面新增一个方法（B-3 快照放行，本记录即流程闸要求的决策记录）；`drive`/`finish`/`cancelled` 签名多一个 hooks 参数。默认行为不变：不覆写 `nested()` 的宿主与改动前逐字节等价。宿主侧的配套：`timeline::content_from_items` 跳过 `nested` 标记的 items（吸收进来的子链工作不是父链自己的调用）。 |
+
+## D35 官方 `items` 只读：从主快照派生，位置即 id
+
+| | |
+|---|---|
+| **需求** | 宿主（nova）刷新恢复要读**标准**会话条目，而不是私有的 turn 记录与进程内 partial：`function_call` / `function_call_output` / `message` / `reasoning` 都是官方 `ConversationItem`，`GET /v1/conversations/{id}/items` 就是它们的官方读法。D27④ 与 D30 当时判定"不实现 items"，理由是容器无条目可增删——D30 之后会话**有**持久主快照，读侧的前提已经不成立。 |
+| **结论** | ① 只实现 `GET …/items`：`after` / `limit`（1..=100，默认 20）/ `order`（`asc`/`desc`，默认 `desc`）/ `include`（接受但不改变输出），返回 `{object:"list", data, first_id, last_id, has_more}`。② **完全在网关层派生**：读 `read_snapshot`，不新增端口方法、不改存储形状、不做数据迁移。③ **id 规则**：条目带原生 id 且在快照中首次出现则沿用；否则为 `item_{位置}`。快照只追加、从不重排或删除（D30），所以位置 id 在会话增长后保持不变，游标跨轮有效。④ 存储里挂在条目上的 reasoning 渲染为官方 `reasoning` 条目（`summary: [{type:"summary_text"}]`），位于其所属条目之前，并占一个位置。⑤ 未知 `after` 返回 `400`（不静默从头返回，否则调用方会拿到重复条目）；会话不存在或不属于该租户仍是 `404`（SEC-2）。⑥ `POST/DELETE …/items` 仍不实现：条目级改写会让已提交的上下文与账本各说各话。transcript 保留，二者读同一份快照。 |
+| **代价** | 派生 id 不是存储层的真实主键：若将来快照允许删除或重排，位置 id 会漂移——届时必须改为写入时铸造 id（D30 的 `append_turn`）。每次分页都读取完整快照再切片，长会话是 O(n)；与 transcript 同量级，可接受。 |
+| **否决** | 在 `append_turn` 铸造 id：要改三个存储实现并迁移已有 Mongo 快照，而读侧用位置就能给出同样稳定的 id。新增 `list_items(after, limit)` 端口方法：快照本就整份读取，下推分页收益小，却让每个存储接入方多实现一个方法。 |

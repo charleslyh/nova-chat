@@ -69,7 +69,7 @@
 | `context_management` | `400 unsupported_parameter` | 自行控制链长；超限会明确报错 |
 | `prompt` | `400 unsupported_parameter` | 直接传 `instructions` 与 `input` |
 
-> `conversation` 自本版起**不再是拒绝项**（D27）：它作为会话容器被接受，服务端读其持久主快照续接历史（D30）。`conversation` 的 `items` **子资源**（`GET/POST/DELETE /v1/conversations/{id}/items`）仍不在子集内——主快照是服务端维护的物化状态，不暴露条目级增删，读历史走自研的 transcript（见 §9）。
+> `conversation` 自本版起**不再是拒绝项**（D27）：它作为会话容器被接受，服务端读其持久主快照续接历史（D30）。`conversation` 的 `items` **子资源**只实现**读**（`GET /v1/conversations/{id}/items`，D35）：条目来自主快照，按位置派生稳定 id，`after`/`limit`/`order` 语义与官方一致；增删（`POST/DELETE`）仍不在子集内——主快照是服务端维护的物化状态，不暴露条目级改写。transcript（见 §9）保留为一次取全量的便捷形状。
 
 其余未列出的上游参数返回 `400 invalid_request`，错误信息**指明字段名**。
 
@@ -254,7 +254,7 @@ conversation 是**唯一**的会话资源（D28 吸收自研 session 后，D30 �
 | `DELETE /v1/conversations/{id}` | 删容器；**不级联**删响应记录 |
 
 - `metadata` 上限与 responses 一致：≤ 16 项，键 ≤ 64B，值 ≤ 512B。
-- **不实现官方 `items` 子资源**：会话持有服务端维护的持久主快照（D30），不暴露条目级增删；读历史走 transcript。
+- **官方 `items` 子资源只读**（D35）：`GET …/items` 分页读主快照；不暴露条目级增删（D30 主快照只追加）。
 - 创建响应时携带 `conversation`，服务端读会话主快照续接历史——**与 `previous_response_id` 互斥**。
 
 ### 9.2 自研子资源（非官方协议）

@@ -3,8 +3,9 @@
 //! 这里是**接入层**：协议解析、租户鉴权、HTTP 翻译、`object` 字段渲染。业务编排委托给
 //! 能力层，本文件不直接操作端口（除 SSE：流本身就是传输）。
 //!
-//! 官方的 `items` 子资源没有实现：容器只是指向响应链尾的指针，没有属于自己的条目可增删。
-//! 读历史走 transcript，一次返回全部。
+//! 官方 `items` 子资源只实现**读**（`GET …/items`，D35）：条目来自会话物化快照，按位置派生
+//! 稳定 id，分页语义与官方一致。增删（`POST/DELETE …/items`）仍不实现——快照只追加，条目
+//! 级改写会让已提交的上下文与账本各说各话。transcript 保留为一次取全量的便捷形状。
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -394,6 +395,162 @@ fn transcript_object(id: &ConversationId, context: &ResolvedContext) -> Transcri
     }
 }
 
+/// Query of `GET /v1/conversations/{id}/items` (official shape).
+#[derive(Debug, Deserialize)]
+pub struct ItemsQuery {
+    /// Page after this item id, in the requested order.
+    #[serde(default)]
+    pub after: Option<String>,
+    /// 1..=100, default 20.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// `asc` or `desc` (default `desc`, as upstream).
+    #[serde(default)]
+    pub order: Option<String>,
+    /// Accepted for compatibility; every field this service stores is already
+    /// in the item, so it changes nothing.
+    #[serde(default)]
+    pub include: Option<Value>,
+}
+
+const ITEMS_DEFAULT_LIMIT: usize = 20;
+const ITEMS_MAX_LIMIT: usize = 100;
+
+/// The official list page.
+#[derive(Debug, Serialize)]
+struct ItemsPage {
+    object: &'static str,
+    data: Vec<Value>,
+    first_id: Option<String>,
+    last_id: Option<String>,
+    has_more: bool,
+}
+
+/// GET /v1/conversations/{id}/items — the conversation's items, paged (D35).
+pub async fn items(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ItemsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let tenant = match tenant_or_reject(&state, &headers) {
+        Ok(t) => t,
+        Err(resp) => return *resp,
+    };
+    let id = match parse_id(&id) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let limit = match q.limit {
+        None => ITEMS_DEFAULT_LIMIT,
+        Some(n) if (1..=ITEMS_MAX_LIMIT as i64).contains(&n) => n as usize,
+        Some(n) => {
+            return bad_request(
+                "invalid_request",
+                format!("limit must be between 1 and {ITEMS_MAX_LIMIT}, got {n}"),
+            )
+        }
+    };
+    let descending = match q.order.as_deref() {
+        None | Some("desc") => true,
+        Some("asc") => false,
+        Some(other) => {
+            return bad_request(
+                "invalid_request",
+                format!("order must be `asc` or `desc`, got `{other}`"),
+            )
+        }
+    };
+
+    match state.conversations.read_snapshot(&tenant, &id).await {
+        Ok(context) => {
+            match items_page(&context, q.after.as_deref(), limit, descending) {
+                Some(page) => Json(page).into_response(),
+                // An unknown cursor is a client error, not an empty page: a page
+                // that silently restarts would duplicate what the caller has.
+                None => bad_request("invalid_request", "`after` is not an item of this conversation"),
+            }
+        }
+        Err(e) => map_conversation_error(&e),
+    }
+}
+
+/// History → official items, each with a STABLE id.
+///
+/// The snapshot is append-only and most stored items carry no id (only an
+/// assistant message gets one, and a multi-round chain can repeat it). An item
+/// keeps its native id when it is the first occurrence; otherwise its id is
+/// derived from its position (`item_{n}`). Position is stable because the
+/// snapshot never reorders or drops entries, so a cursor stays valid across
+/// later turns.
+///
+/// Reasoning, stored beside the item it preceded, is rendered as the official
+/// `reasoning` item (`summary_text`) right before it.
+fn conversation_items(context: &ResolvedContext) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(context.item_count());
+    let mut position = 0usize;
+    let mut next_id = |native: Option<&str>, seen: &mut std::collections::HashSet<String>| {
+        let id = match native {
+            Some(n) if !n.is_empty() && !seen.contains(n) => n.to_owned(),
+            _ => format!("item_{position}"),
+        };
+        position += 1;
+        seen.insert(id.clone());
+        id
+    };
+    for entry in &context.entries {
+        if let Some(text) = &entry.reasoning {
+            let id = next_id(None, &mut seen);
+            out.push(serde_json::json!({
+                "type": "reasoning",
+                "id": id,
+                "summary": [{ "type": "summary_text", "text": text }],
+            }));
+        }
+        let native = match &entry.item {
+            ResponseItem::Message { id, .. }
+            | ResponseItem::FunctionCall { id, .. }
+            | ResponseItem::FunctionCallOutput { id, .. }
+            | ResponseItem::CustomToolCall { id, .. } => id.clone(),
+        };
+        let id = next_id(native.as_deref(), &mut seen);
+        let mut value = serde_json::to_value(&entry.item).unwrap_or(Value::Null);
+        if let Value::Object(map) = &mut value {
+            map.insert("id".into(), Value::String(id));
+        }
+        out.push(value);
+    }
+    out
+}
+
+/// One page, or `None` when `after` names no item of this conversation.
+fn items_page(
+    context: &ResolvedContext,
+    after: Option<&str>,
+    limit: usize,
+    descending: bool,
+) -> Option<ItemsPage> {
+    let mut all = conversation_items(context);
+    if descending {
+        all.reverse();
+    }
+    let start = match after {
+        None => 0,
+        Some(cursor) => all.iter().position(|item| item["id"] == cursor)? + 1,
+    };
+    let rest = &all[start.min(all.len())..];
+    let data: Vec<Value> = rest.iter().take(limit).cloned().collect();
+    let id_of = |v: &Value| v["id"].as_str().map(str::to_owned);
+    Some(ItemsPage {
+        object: "list",
+        first_id: data.first().and_then(id_of),
+        last_id: data.last().and_then(id_of),
+        has_more: rest.len() > data.len(),
+        data,
+    })
+}
+
 fn draining() -> Response {
     crate::error::api_error(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -406,6 +563,73 @@ fn draining() -> Response {
 mod tests {
     use super::*;
     use nova_responses::ContextEntry;
+
+    fn history() -> ResolvedContext {
+        ResolvedContext::new(
+            vec![
+                ContextEntry::new(ResponseItem::user_text("q1")),
+                ContextEntry::with_reasoning(
+                    ResponseItem::assistant_text("a1"),
+                    Some("thinking".into()),
+                ),
+                ContextEntry::new(ResponseItem::user_text("q2")),
+                ContextEntry::new(ResponseItem::assistant_text("a2")),
+            ],
+            2,
+        )
+    }
+
+    fn ids(page: &ItemsPage) -> Vec<String> {
+        page.data.iter().map(|v| v["id"].as_str().unwrap().to_owned()).collect()
+    }
+
+    #[test]
+    fn every_item_gets_a_unique_id_and_reasoning_is_an_official_item() {
+        let items = conversation_items(&history());
+        // Four items plus the reasoning block before `a1`.
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[1]["type"], "reasoning");
+        assert_eq!(items[1]["summary"][0]["type"], "summary_text");
+        assert_eq!(items[1]["summary"][0]["text"], "thinking");
+        let unique: std::collections::HashSet<_> =
+            items.iter().map(|v| v["id"].as_str().unwrap().to_owned()).collect();
+        assert_eq!(unique.len(), items.len(), "ids must be unique: {items:?}");
+    }
+
+    #[test]
+    fn ids_survive_later_turns() {
+        // A cursor handed out on page one must still point at the same item after
+        // the conversation grows — the snapshot only appends.
+        let before = conversation_items(&history());
+        let mut grown = history();
+        grown.entries.push(ContextEntry::new(ResponseItem::user_text("q3")));
+        let after = conversation_items(&grown);
+        for (old, new) in before.iter().zip(&after) {
+            assert_eq!(old["id"], new["id"]);
+        }
+    }
+
+    #[test]
+    fn a_page_is_ordered_bounded_and_resumable() {
+        let context = history();
+        let first = items_page(&context, None, 2, false).unwrap();
+        assert!(first.has_more);
+        assert_eq!(first.data[0]["content"][0]["text"], "q1");
+        let second = items_page(&context, first.last_id.as_deref(), 10, false).unwrap();
+        assert!(!second.has_more);
+        let mut all = ids(&first);
+        all.extend(ids(&second));
+        assert_eq!(all.len(), 5, "pages must neither overlap nor skip");
+
+        // Default order is newest first.
+        let newest = items_page(&context, None, 1, true).unwrap();
+        assert_eq!(newest.data[0]["content"][0]["text"], "a2");
+    }
+
+    #[test]
+    fn an_unknown_cursor_is_refused_not_restarted() {
+        assert!(items_page(&history(), Some("item_999"), 5, false).is_none());
+    }
 
     #[test]
     fn a_transcript_keeps_every_item_even_when_only_some_have_reasoning() {
