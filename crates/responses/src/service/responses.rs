@@ -571,7 +571,9 @@ impl ResponsesService {
             .event_log
             .append(AppendEvent::lifecycle(
                 response_id.clone(),
-                crate::events::ResponseEventKind::Failed,
+                // The event carries the state the object carries: cancelled is
+                // cancelled, not a borrowed failure event.
+                crate::events::ResponseEventKind::Cancelled,
                 response.clone(),
             ))
             .await

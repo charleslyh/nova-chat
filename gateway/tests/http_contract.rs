@@ -788,7 +788,7 @@ async fn delete_removes_content_and_breaks_further_chaining() {
 }
 
 #[tokio::test]
-async fn cancel_moves_to_terminal_and_emits_a_failure_event() {
+async fn cancel_moves_to_terminal_and_emits_a_cancelled_event() {
     let h = start().await;
     let (_, body) = h
         .post(
@@ -803,9 +803,10 @@ async fn cancel_moves_to_terminal_and_emits_a_failure_event() {
     assert_eq!(cancelled["status"], "cancelled");
 
     let text = h.sse_text(&format!("/v1/responses/{id}?stream=true")).await;
-    assert!(text.contains("event: response.failed"), "got: {text}");
-    // The cancellation itself is reported by the cancel endpoint's status
-    // (`cancelled`), not as a free-text payload on the stream event.
+    // A cancel is its own outcome, not a failure: the terminal event names it
+    // (`response.cancelled`) so a client can tell "the user stopped this" from
+    // "this broke" — the two are different answers to different questions.
+    assert!(text.contains("event: response.cancelled"), "got: {text}");
 }
 
 #[tokio::test]

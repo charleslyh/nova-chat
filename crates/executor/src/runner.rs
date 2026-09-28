@@ -115,7 +115,7 @@ impl AgentRunner for SingleTurnExecutor {
         let tools = declared_tools(task);
         let provider = (self.provider)(endpoint);
 
-        tracing::debug!(
+        tracing::info!(
             target: "agent_trace",
             phase = "exec.model_request",
             response_id = %task.provenance.response_id,
@@ -145,7 +145,7 @@ impl AgentRunner for SingleTurnExecutor {
 
             if first_chunk {
                 first_chunk = false;
-                tracing::debug!(
+                tracing::info!(
                     target: "agent_trace",
                     phase = "exec.first_chunk",
                     response_id = %task.provenance.response_id,
@@ -204,7 +204,7 @@ impl AgentRunner for SingleTurnExecutor {
             return Err(failed("model produced no output items", state.usage));
         }
 
-        tracing::debug!(
+        tracing::info!(
             target: "agent_trace",
             phase = "exec.settled",
             response_id = %task.provenance.response_id,

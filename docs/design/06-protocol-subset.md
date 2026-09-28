@@ -168,7 +168,9 @@
 
 ## 6. 事件与续订
 
-事件名：`response.created` / `response.in_progress` / `response.output_text.delta` / `response.output_item.added` / `response.output_item.done` / `response.function_call_arguments.delta` / `response.function_call_arguments.done` / `response.completed` / `response.failed` / `response.incomplete`。
+事件名：`response.created` / `response.in_progress` / `response.output_text.delta` / `response.output_item.added` / `response.output_item.done` / `response.function_call_arguments.delta` / `response.function_call_arguments.done` / `response.completed` / `response.failed` / `response.incomplete` / `response.cancelled`。
+
+`response.cancelled` 是取消的**专属**终态事件（D33）：此前取消借用 `response.failed` 发送，事件与它携带的 `status: cancelled` 对象自相矛盾，下游按事件名分类就把用户自己的取消一路上报为「失败」。
 
 ### 终态的四种含义（D32）
 

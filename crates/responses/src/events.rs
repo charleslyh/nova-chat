@@ -73,6 +73,11 @@ pub enum ResponseEventKind {
     Failed,
     #[strum(serialize = "response.incomplete")]
     Incomplete,
+    /// A cancellation is a terminal state of its own (B-12): sharing the
+    /// failure event is what once made a user's own cancel read as an error
+    /// all the way up the chain.
+    #[strum(serialize = "response.cancelled")]
+    Cancelled,
 }
 
 impl ResponseEventKind {
@@ -91,7 +96,10 @@ impl ResponseEventKind {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            ResponseEventKind::Completed | ResponseEventKind::Failed | ResponseEventKind::Incomplete
+            ResponseEventKind::Completed
+                | ResponseEventKind::Failed
+                | ResponseEventKind::Incomplete
+                | ResponseEventKind::Cancelled
         )
     }
 
@@ -572,17 +580,19 @@ mod tests {
             ResponseEventKind::Completed,
             ResponseEventKind::Failed,
             ResponseEventKind::Incomplete,
+            ResponseEventKind::Cancelled,
         ] {
             assert!(!kind.coalescible(), "{kind:?} must not be coalescible");
         }
     }
 
     #[test]
-    fn terminal_set_is_exactly_the_three_end_states() {
+    fn terminal_set_is_exactly_the_terminal_states() {
         for kind in [
             ResponseEventKind::Completed,
             ResponseEventKind::Failed,
             ResponseEventKind::Incomplete,
+            ResponseEventKind::Cancelled,
         ] {
             assert!(kind.is_terminal(), "{kind:?}");
         }

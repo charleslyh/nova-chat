@@ -1234,3 +1234,23 @@ reap 的「失联判定」确属任务管控，可由宿主领取侧实现自含
 ### 顺带移除的 `PersistFailedTurnRunner`（在 nova 侧）
 
 nova 的 agentd 包了一层 runner，把 `AgentError::Failed` 改写成空的 `Incomplete` 产出。它的注释自述理由是「上游编排器对 Failed 会跳过 `append_turn`，用户的提问会丢」。该前提已不成立：编排器的失败路径会归档输入连同已产出内容（含用流式增量重建的半截消息）。于是这层的唯一剩余效果，就是把故障上报成截断——正是上面那条「用户看到自己取消了请求」的直接来源。已随本次改动删除，故障如实传播。
+
+---
+
+## D33 取消是取消：`response.cancelled` 事件入协议子集
+
+| | |
+|---|---|
+| **需求** | `Service::cancel` 把账本状态写成 `cancelled`，终态事件却发 `response.failed`——事件层没有 `Cancelled` 变体，取消只能「借用」失败事件。下游 nova-agents 按事件名分类终态，用户自己的取消被链驱动如实归类为 `Failed`，一路上报为「失败」。这正是 B-12（终态不折叠）要拦的事故形态，只是折叠点在事件层而非状态层。 |
+| **结论** | ① `ResponseEventKind` 增 `Cancelled`（`response.cancelled`），进 `is_terminal` 终态集、不参与 coalesce——与 `Completed`/`Failed`/`Incomplete` 同权。② `Service::cancel` 的终态事件改发 `Cancelled`：事件与它携带的对象（`status: cancelled`）从此说同一件事。③ 这是 B-3 公开面快照放行的一次库侧联动：`nova-agents` 的 `TurnStatus`/`TurnOutcome` 增 `Cancelled`，`Hooks` 增 `nested()`（子链获得自己的观察者，见下），二者都在各自仓的 B-3 快照留痕。 |
+| **代价** | 事件消费方需要认识 `response.cancelled`（nova-agents 已同步；前端 chat.ts 的帧归约本就处理 cancelled 状态，事件名是新增识别）。终态事件集合从三个变四个，`terminal_set` 断言随之更新。 |
+
+---
+
+## D34 子链是链：`Hooks::nested()` 给委派自己的观察者
+
+| | |
+|---|---|
+| **需求** | 委派（agent-as-tool）在 `Runner::drive` 内递归，天然复用父 Runner 的 hooks 实例。nova 宿主的 `ChainTimeline` 在该实例上数「每链恰好一对 accepted/done」（B-11），于是子链的 accepted 和父链的 done 被当作重复拒绝——委派链的时间线记录整个不落库。e2e V3（委派用例）首次走真实链路即暴露。 |
+| **结论** | ① `Hooks` 增 `nested() -> Option<Arc<dyn Hooks>>`，默认 `None`（沿用自身）——子链是否拥有自己的观察者是**宿主的决策**，库不预设。② `DriveParams` 携带本链的 hooks，委派处取 `self.hooks.nested()` 传入。③ 宿主 `ChainTimeline::nested()` 返回 `None`：**子链不写 nova 的时间线与回合记录**。子链的工作经父链的 `agent` 调用抵达消息流（实时合成帧供面板渲染；调用的结构化输出携带子链 response_id 供刷新后重订阅），再写一份属于父会话的记录只会让一次提问显示成多个回合、每个都「调用」了下一层实际调用的工具。 |
+| **代价** | `Hooks` 公开面新增一个方法（B-3 快照放行，本记录即流程闸要求的决策记录）；`drive`/`finish`/`cancelled` 签名多一个 hooks 参数。默认行为不变：不覆写 `nested()` 的宿主与改动前逐字节等价。宿主侧的配套：`timeline::content_from_items` 跳过 `nested` 标记的 items（吸收进来的子链工作不是父链自己的调用）。 |

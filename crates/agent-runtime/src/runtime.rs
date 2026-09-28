@@ -241,7 +241,7 @@ impl AgentRuntime {
         let id = record.response_id.clone();
         let attempt = record.attempt;
         let started = std::time::Instant::now();
-        debug!(
+        info!(
             response = %id,
             attempt = ?attempt,
             "serving a claimed response"
@@ -393,7 +393,7 @@ impl AgentRuntime {
         let terminal = termination.terminal();
         let status = terminal.status();
 
-        debug!(
+        info!(
             response = %id,
             attempt = ?attempt,
             status = ?status,
