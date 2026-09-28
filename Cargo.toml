@@ -60,6 +60,9 @@ strum = { version = "0.26", features = ["derive"] }
 # would mean owning the optionality of every provider-variant field, and
 # getting that wrong surfaces as a deserialisation failure against a live
 # model rather than at compile time. CI therefore needs access to git.woa.com.
-async-openai = { git = "https://git.woa.com/yuanbao-multimodal/async-openai.git", rev = "78d5540", features = ["chat-completion"] }
+# …pinned to a rev that carries `reasoning_content`: a provider that streams the
+# chain of thought in its own field (hy4) is invisible to the typed schema
+# without it, and no upstream release has the field.
+async-openai = { git = "https://git.woa.com/yuanbao-multimodal/async-openai.git", rev = "2f28c7c3826963f60a58ec0e32c64da6450b3088", features = ["chat-completion"] }
 # Stream construction for the executor's streaming turn.
 async-stream = "0.3"

@@ -12,6 +12,7 @@
 //! - [`context`] — protocol items → completion messages.
 //! - [`outcome`] — how a round ends, in protocol terms (the four-state split).
 //! - [`runner`] — the port implementation: exactly one round.
+//! - [`think`] — splitting a chain of thought a provider inlined in the body.
 //! - [`transport`] — the chat-completions wire client.
 //! - [`wire`] — the vocabulary the transport and the runner share.
 //!
@@ -29,6 +30,7 @@ pub mod catalog;
 pub mod context;
 pub mod outcome;
 pub mod runner;
+pub(crate) mod think;
 pub mod transport;
 pub mod wire;
 

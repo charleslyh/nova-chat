@@ -22,3 +22,6 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# Wire-level tests stand up the upstream endpoint rather than a model.
+axum = { workspace = true }
+tokio = { workspace = true, features = ["net"] }

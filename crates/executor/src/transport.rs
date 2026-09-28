@@ -43,6 +43,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::Value;
 
+use crate::think::{Split, ThinkSplitter};
 use crate::wire::{
     ChatCompletion, ChunkStream, FinishReason, ModelError, ModelUsage, RequestMessage,
     ResponseChunk, ToolCallRequest, ToolManifest,
@@ -184,7 +185,10 @@ impl HttpChatCompletion {
             .ok_or_else(|| ModelError::new("model returned no choices"))?;
 
         let mut chunks = Vec::new();
+        let mut splitter = ThinkSplitter::new(self.reasoning_effort.is_some());
         if let Some(reasoning) = extract_reasoning(&response, "message") {
+            // The provider carries the CoT in its own field: nothing to split.
+            splitter.disable();
             chunks.push(Ok(ResponseChunk::Think(reasoning)));
             chunks.push(Ok(ResponseChunk::ThinkDone));
         }
@@ -194,7 +198,21 @@ impl HttpChatCompletion {
             .as_deref()
             .filter(|content| !content.is_empty())
         {
-            chunks.push(Ok(ResponseChunk::TextBlock(content.to_string())));
+            let mut parts = splitter.push(content);
+            parts.extend(splitter.finish());
+            let mut thought = false;
+            for part in parts {
+                match part {
+                    Split::Think(text) => {
+                        thought = true;
+                        chunks.push(Ok(ResponseChunk::Think(text)));
+                    }
+                    Split::Text(text) => chunks.push(Ok(ResponseChunk::TextBlock(text))),
+                }
+            }
+            if thought {
+                chunks.push(Ok(ResponseChunk::ThinkDone));
+            }
             chunks.push(Ok(ResponseChunk::TextDone));
         }
         if let Some(tool_calls) = &choice.message.tool_calls {
@@ -228,6 +246,9 @@ impl HttpChatCompletion {
             .create_stream(request)
             .await
             .map_err(provider_error)?;
+        // Whether this turn asked the model to think: only such a turn can be
+        // receiving an INLINED CoT, so only such a turn holds its body.
+        let thinking = self.reasoning_effort.is_some();
         let output = async_stream::stream! {
             let mut calls: HashMap<u32, (String, String, String)> = HashMap::new();
             let mut refusal = String::new();
@@ -235,6 +256,7 @@ impl HttpChatCompletion {
             let mut saw_reasoning = false;
             let mut saw_text = false;
             let mut acc_text = String::new();
+            let mut splitter = ThinkSplitter::new(thinking);
 
             while let Some(item) = upstream.next().await {
                 let response = match item {
@@ -257,15 +279,33 @@ impl HttpChatCompletion {
                     continue;
                 };
                 if let Some(reasoning) = reasoning {
+                    // The provider carries the CoT in its own field: stop
+                    // splitting and give back whatever body is being held.
+                    for part in splitter.disable() {
+                        if let Split::Text(text) = part {
+                            saw_text = true;
+                            yield Ok(ResponseChunk::TextBlock(text));
+                        }
+                    }
                     saw_reasoning = true;
                     yield Ok(ResponseChunk::Think(reasoning));
                 }
                 if let Some(content) = choice.delta.content.as_deref().filter(|text| !text.is_empty()) {
                     let delta = normalize_text_delta(&acc_text, content);
                     if !delta.is_empty() {
-                        saw_text = true;
                         acc_text.push_str(delta);
-                        yield Ok(ResponseChunk::TextBlock(delta.to_string()));
+                        for part in splitter.push(delta) {
+                            match part {
+                                Split::Think(text) => {
+                                    saw_reasoning = true;
+                                    yield Ok(ResponseChunk::Think(text));
+                                }
+                                Split::Text(text) => {
+                                    saw_text = true;
+                                    yield Ok(ResponseChunk::TextBlock(text));
+                                }
+                            }
+                        }
                     }
                 }
                 if let Some(part) = choice.delta.refusal.as_deref() {
@@ -287,6 +327,12 @@ impl HttpChatCompletion {
                         let Ok(extra) = extra else { break };
                         let Some(extra_usage) = extra.usage else { break };
                         usage = Some(extra_usage);
+                    }
+                    for part in splitter.finish() {
+                        if let Split::Text(text) = part {
+                            saw_text = true;
+                            yield Ok(ResponseChunk::TextBlock(text));
+                        }
                     }
                     if saw_reasoning {
                         yield Ok(ResponseChunk::ThinkDone);
@@ -314,6 +360,12 @@ impl HttpChatCompletion {
 
             // The stream ended without a finish_reason. Still a complete round
             // from our side: emit what was collected and call it a stop.
+            for part in splitter.finish() {
+                if let Split::Text(text) = part {
+                    saw_text = true;
+                    yield Ok(ResponseChunk::TextBlock(text));
+                }
+            }
             if saw_reasoning {
                 yield Ok(ResponseChunk::ThinkDone);
             }
@@ -734,5 +786,113 @@ mod tests {
             WireMessage::Assistant(message) => assert!(message.content.is_none()),
             other => panic!("expected an assistant message, got {other:?}"),
         }
+    }
+
+    /// Serve `deltas` as the upstream endpoint's SSE stream, then a stop frame.
+    /// Returns the base URL a transport is built against.
+    async fn serve_deltas(deltas: Vec<Value>) -> String {
+        use axum::response::sse::Event;
+
+        let mut frames: Vec<Result<Event, std::convert::Infallible>> = deltas
+            .into_iter()
+            .map(|delta| {
+                Ok(Event::default().data(
+                    serde_json::json!({
+                        "id": "chatcmpl-test",
+                        "object": "chat.completion.chunk",
+                        "created": 0,
+                        "model": "test-model",
+                        "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
+                    })
+                    .to_string(),
+                ))
+            })
+            .collect();
+        frames.push(Ok(Event::default().data(
+            serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "test-model",
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            })
+            .to_string(),
+        )));
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |_body: String| async move {
+                axum::response::Sse::new(futures::stream::iter(frames))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/v1")
+    }
+
+    /// What a caller of one turn ends up with: the reasoning and the reply.
+    async fn one_turn(base_url: &str, extensions: Value) -> (String, String) {
+        let completion = HttpChatCompletion::new(
+            ModelEndpoint::new(ApiKey::new("key"), base_url, "test-model")
+                .with_extensions(extensions),
+        );
+        let messages = vec![RequestMessage::User {
+            content: "hi".to_string(),
+        }];
+        let mut stream = completion.completion(&messages, &[], true).await.unwrap();
+        let mut thinking = String::new();
+        let mut body = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk.unwrap() {
+                ResponseChunk::Think(part) => thinking.push_str(&part),
+                ResponseChunk::TextBlock(part) => body.push_str(&part),
+                _ => {}
+            }
+        }
+        (thinking, body)
+    }
+
+    /// Over the wire, in the exact shape Hy3 sends: the CoT inlined in
+    /// `content`, `reasoning_content` permanently null. It must reach the caller
+    /// as reasoning and the reply as body, or the UI cannot tell them apart.
+    #[tokio::test]
+    async fn a_streamed_reply_with_inline_thinking_splits_over_the_wire() {
+        let base_url = serve_deltas(vec![
+            serde_json::json!({ "content": "ponder", "reasoning_content": null }),
+            serde_json::json!({ "content": " more", "reasoning_content": null }),
+            serde_json::json!({ "content": "</think>", "reasoning_content": null }),
+            serde_json::json!({ "content": "Hi there!", "reasoning_content": null }),
+        ])
+        .await;
+        let (thinking, body) =
+            one_turn(&base_url, serde_json::json!({ "reasoning_effort": "high" })).await;
+        assert_eq!(thinking, "ponder more");
+        assert_eq!(body, "Hi there!");
+    }
+
+    /// A provider carrying the CoT in its own field needs no splitting — and
+    /// that field only exists in the typed schema at all because the dependency
+    /// is pinned to a rev that carries it.
+    #[tokio::test]
+    async fn a_streamed_reasoning_field_becomes_thinking() {
+        let base_url = serve_deltas(vec![
+            serde_json::json!({ "reasoning_content": "ponder" }),
+            serde_json::json!({ "content": "Hi!", "reasoning_content": null }),
+        ])
+        .await;
+        let (thinking, body) = one_turn(&base_url, serde_json::json!({})).await;
+        assert_eq!(thinking, "ponder");
+        assert_eq!(body, "Hi!");
+    }
+
+    /// A turn that never asked the model to think cannot be holding its body
+    /// back: there is no marker coming, so the whole reply streams through.
+    #[tokio::test]
+    async fn a_turn_that_did_not_ask_to_think_streams_its_whole_body() {
+        let base_url =
+            serve_deltas(vec![serde_json::json!({ "content": "Just the answer." })]).await;
+        let (thinking, body) = one_turn(&base_url, serde_json::json!({})).await;
+        assert_eq!(thinking, "");
+        assert_eq!(body, "Just the answer.");
     }
 }
