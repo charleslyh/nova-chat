@@ -15,6 +15,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 # Chat-completions wire types and HTTP plumbing.
 async-openai = { workspace = true }
+# Same reqwest the client above rides, so a per-round client shares one pool.
+openai-reqwest = { workspace = true }
 # The streaming turn is expressed as a generator over the upstream stream.
 async-stream = { workspace = true }
 # Races the model stream against the cancellation probe.

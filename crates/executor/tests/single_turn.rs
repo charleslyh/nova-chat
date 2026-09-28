@@ -17,6 +17,7 @@ use nova_agent_runtime::{
 use nova_executor::{
     ChatCompletion, ChunkStream, FinishReason, ModelCatalog, ModelEntry, ModelError, ModelUsage,
     RequestMessage, ResponseChunk, SingleTurnExecutor, ToolCallRequest, ToolManifest,
+    TransportOverrides,
 };
 use nova_responses::{
     IncompleteReason, ItemStatus, ModelParams, NodeTag, RequestProvenance, ResponseId,
@@ -30,6 +31,8 @@ struct ScriptedModel {
     chunks: Vec<ResponseChunk>,
     seen: Arc<Mutex<Vec<RequestMessage>>>,
     seen_tools: Arc<Mutex<Vec<ToolManifest>>>,
+    /// What this round was asked to carry to the upstream.
+    seen_transport: Arc<Mutex<TransportOverrides>>,
 }
 
 impl ScriptedModel {
@@ -38,6 +41,7 @@ impl ScriptedModel {
             chunks,
             seen: Arc::new(Mutex::new(Vec::new())),
             seen_tools: Arc::new(Mutex::new(Vec::new())),
+            seen_transport: Arc::new(Mutex::new(TransportOverrides::new())),
         }
     }
 }
@@ -49,7 +53,9 @@ impl ChatCompletion for ScriptedModel {
         messages: &[RequestMessage],
         tools: &[ToolManifest],
         _stream: bool,
+        transport: &TransportOverrides,
     ) -> Result<ChunkStream, ModelError> {
+        *self.seen_transport.lock().expect("lock") = transport.clone();
         *self.seen.lock().expect("lock") = messages.to_vec();
         *self.seen_tools.lock().expect("lock") = tools.to_vec();
         let chunks: Vec<_> = self.chunks.iter().cloned().map(Ok).collect();
@@ -68,6 +74,7 @@ impl ChatCompletion for BrokenModel {
         _messages: &[RequestMessage],
         _tools: &[ToolManifest],
         _stream: bool,
+        _transport: &TransportOverrides,
     ) -> Result<ChunkStream, ModelError> {
         Err(ModelError::new("connection refused"))
     }
@@ -175,12 +182,20 @@ fn catalog() -> ModelCatalog {
 }
 
 fn task(items: Vec<ResponseItem>, tools: Vec<nova_responses::protocol::Tool>) -> AgentTask {
+    task_with_context(items, tools, None)
+}
+
+fn task_with_context(
+    items: Vec<ResponseItem>,
+    tools: Vec<nova_responses::protocol::Tool>,
+    exec_context: Option<serde_json::Value>,
+) -> AgentTask {
     let mut params = ModelParams::new("house");
     params.tools = tools;
     params.instructions = Some("be brief".to_string());
     AgentTask {
         params,
-        exec_context: None,
+        exec_context,
         items,
         provenance: RequestProvenance {
             response_id: ResponseId::new(NodeTag::parse("test").expect("valid tag")),
@@ -783,4 +798,63 @@ async fn text_and_calls_in_one_round_are_both_output_answer_first() {
         outcome.items[1],
         ResponseItem::FunctionCall { .. }
     ));
+}
+
+/// A proxied upstream needs values the endpoint declaration cannot express. The
+/// host stamps them on the record; the runner's job is only to carry them
+/// through — what they MEAN is none of this crate's business.
+#[tokio::test]
+async fn a_round_carries_the_host_stamped_headers() {
+    let model = Arc::new(ScriptedModel::new(vec![
+        ResponseChunk::TextBlock("hi".into()),
+        ResponseChunk::TextDone,
+        done(FinishReason::Stop),
+    ]));
+    let transport = model.seen_transport.clone();
+    let (mut sink, _log) = RecordingSink::new(SinkVerdict::Continue);
+
+    let task = task_with_context(
+        vec![ResponseItem::user_text("hi")],
+        vec![],
+        Some(serde_json::json!({
+            "llm_transport": { "headers": { "x-litellm-customer-id": "alice" } }
+        })),
+    );
+    executor(model)
+        .run(&task, &mut sink, &NeverCancel)
+        .await
+        .expect("completes");
+
+    assert_eq!(
+        transport
+            .lock()
+            .expect("lock")
+            .headers()
+            .collect::<Vec<_>>(),
+        vec![("x-litellm-customer-id", "alice")]
+    );
+}
+
+/// The common case: a round on an internal endpoint carries nothing, and must
+/// not invent headers of its own.
+#[tokio::test]
+async fn a_round_without_a_stamp_carries_nothing() {
+    let model = Arc::new(ScriptedModel::new(vec![
+        ResponseChunk::TextBlock("hi".into()),
+        ResponseChunk::TextDone,
+        done(FinishReason::Stop),
+    ]));
+    let transport = model.seen_transport.clone();
+    let (mut sink, _log) = RecordingSink::new(SinkVerdict::Continue);
+
+    executor(model)
+        .run(
+            &task(vec![ResponseItem::user_text("hi")], vec![]),
+            &mut sink,
+            &NeverCancel,
+        )
+        .await
+        .expect("completes");
+
+    assert!(transport.lock().expect("lock").is_empty());
 }

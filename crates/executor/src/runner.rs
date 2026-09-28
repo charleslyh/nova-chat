@@ -38,6 +38,7 @@ use nova_responses::{ContentPart, ItemStatus, ResponseItem, Role, Usage};
 use crate::catalog::ModelCatalog;
 use crate::context::messages_for_task;
 use crate::outcome::Termination;
+use crate::passthrough::overrides_from_exec_context;
 use crate::transport::{HttpChatCompletion, ModelEndpoint};
 use crate::wire::{ChatCompletion, ModelUsage, ResponseChunk, ToolCallRequest, ToolManifest};
 
@@ -114,6 +115,9 @@ impl AgentRunner for SingleTurnExecutor {
         let messages = messages_for_task(task).map_err(|error| failed(error, Usage::default()))?;
         let tools = declared_tools(task);
         let provider = (self.provider)(endpoint);
+        // What the host stamped for this round: headers a proxied upstream
+        // needs and the endpoint declaration cannot express.
+        let transport = overrides_from_exec_context(task.exec_context.as_ref());
 
         tracing::info!(
             target: "agent_trace",
@@ -124,7 +128,7 @@ impl AgentRunner for SingleTurnExecutor {
         );
 
         let mut stream = provider
-            .completion(&messages, &tools, true)
+            .completion(&messages, &tools, true, &transport)
             .await
             .map_err(|error| failed(error, Usage::default()))?;
 

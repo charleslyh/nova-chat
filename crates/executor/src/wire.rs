@@ -128,6 +128,43 @@ pub enum ResponseChunk {
     },
 }
 
+/// What one round must carry to the upstream beyond its static endpoint config.
+///
+/// A proxied model needs an accounting id (and sometimes a caller-chosen key)
+/// that no endpoint declaration can express, so the host stamps it per round
+/// and this crate rides it along. Deliberately opaque: the transport does not
+/// know what a billing id or a credential MEANS, only that this round asked
+/// for a set of headers.
+///
+/// Values are never logged — the host may put a credential in one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TransportOverrides {
+    headers: std::collections::BTreeMap<String, String>,
+}
+
+impl TransportOverrides {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.headers.is_empty()
+    }
+
+    /// Stamp one header, replacing any value already held under `name`.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(name.into(), value.into());
+        self
+    }
+
+    /// The stamped headers, in name order.
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+}
+
 /// A streaming completion provider.
 ///
 /// Kept as a trait for one reason: tests script a chunk sequence instead of
@@ -135,11 +172,14 @@ pub enum ResponseChunk {
 /// is therefore testable without a model.
 #[async_trait]
 pub trait ChatCompletion: Send + Sync {
+    /// Perform one round. `transport` carries this round's host-stamped
+    /// headers; a round talking to an internal endpoint passes an empty set.
     async fn completion(
         &self,
         messages: &[RequestMessage],
         tools: &[ToolManifest],
         stream: bool,
+        transport: &TransportOverrides,
     ) -> Result<ChunkStream, ModelError>;
 }
 

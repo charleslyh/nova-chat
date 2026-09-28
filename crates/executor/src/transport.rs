@@ -17,6 +17,7 @@
 //! - **The API key cannot be printed.** It is wrapped in a type whose `Debug`
 //!   is opaque, so adding `#[derive(Debug)]` upstream of it cannot leak it.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -46,7 +47,7 @@ use serde_json::Value;
 use crate::think::{Split, ThinkSplitter};
 use crate::wire::{
     ChatCompletion, ChunkStream, FinishReason, ModelError, ModelUsage, RequestMessage,
-    ResponseChunk, ToolCallRequest, ToolManifest,
+    ResponseChunk, ToolCallRequest, ToolManifest, TransportOverrides,
 };
 
 /// Cap on model text reaching a log line. A trace records what happened, not
@@ -105,6 +106,13 @@ impl ModelEndpoint {
 /// Chat-completions transport over an OpenAI-compatible endpoint.
 pub struct HttpChatCompletion {
     client: Client<OpenAIConfig>,
+    /// The config `client` was built from, so a round carrying passthrough
+    /// headers can derive a variant without re-reading anything.
+    config: OpenAIConfig,
+    /// Shared connection pool. A round's own client MUST be built with it
+    /// (`Client::build`) rather than `Client::with_config`, which spins up a
+    /// fresh pool and drops keep-alive on every request.
+    http: openai_reqwest::Client,
     api_model: String,
     reasoning_effort: Option<ReasoningEffort>,
 }
@@ -114,11 +122,51 @@ impl HttpChatCompletion {
         let config = OpenAIConfig::new()
             .with_api_key(endpoint.api_key.expose())
             .with_api_base(endpoint.base_url);
+        let http = openai_reqwest::Client::new();
         Self {
-            client: Client::with_config(config),
+            client: Client::build(http.clone(), config.clone()),
+            config,
+            http,
             api_model: endpoint.api_model,
             reasoning_effort: reasoning_effort(&endpoint.extensions),
         }
+    }
+
+    /// The client for one round: the shared one when the round carries nothing
+    /// to pass through, else a variant carrying its headers. The variant reuses
+    /// `http`, so building it costs a clone and keeps the connection pool.
+    ///
+    /// Headers are applied as `custom_headers`, which `OpenAIConfig::headers()`
+    /// merges LAST — that precedence is what lets a round override
+    /// `authorization`. `passthrough_headers_reach_the_wire` pins it, so a
+    /// dependency bump cannot silently downgrade us to the static key.
+    fn client_for(&self, transport: &TransportOverrides) -> Cow<'_, Client<OpenAIConfig>> {
+        if transport.is_empty() {
+            return Cow::Borrowed(&self.client);
+        }
+        let mut config = self.config.clone();
+        for (name, value) in transport.headers() {
+            // Names and values are validated where the override is read, but a
+            // header that is legal JSON can still be illegal on the wire. Drop
+            // that one entry rather than fail the round; the upstream deciding
+            // it is missing is the better error. The name is owned because
+            // `IntoHeaderName` for `&str` demands `'static`.
+            let applied = openai_reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|error| error.to_string())
+                .and_then(|name| {
+                    config
+                        .clone()
+                        .with_header(name, value)
+                        .map_err(|error| error.to_string())
+                });
+            match applied {
+                Ok(next) => config = next,
+                Err(error) => {
+                    tracing::warn!(header = %name, error = %error, "dropping an invalid passthrough header")
+                }
+            }
+        }
+        Cow::Owned(Client::build(self.http.clone(), config))
     }
 
     fn request(
@@ -149,7 +197,9 @@ impl ChatCompletion for HttpChatCompletion {
         messages: &[RequestMessage],
         tools: &[ToolManifest],
         stream: bool,
+        transport: &TransportOverrides,
     ) -> Result<ChunkStream, ModelError> {
+        let client = self.client_for(transport);
         let request = self.request(messages, tools, stream);
         // Shape only. The body carries the whole conversation, so it is never
         // logged; when a wire-level dump is genuinely needed it belongs behind
@@ -162,9 +212,9 @@ impl ChatCompletion for HttpChatCompletion {
             "[llm] request"
         );
         if !stream {
-            return self.blocking_turn(request).await;
+            return self.blocking_turn(request, &client).await;
         }
-        self.streaming_turn(request).await
+        self.streaming_turn(request, &client).await
     }
 }
 
@@ -172,9 +222,9 @@ impl HttpChatCompletion {
     async fn blocking_turn(
         &self,
         request: CreateChatCompletionRequest,
+        client: &Client<OpenAIConfig>,
     ) -> Result<ChunkStream, ModelError> {
-        let response = self
-            .client
+        let response = client
             .chat()
             .create(request)
             .await
@@ -239,9 +289,9 @@ impl HttpChatCompletion {
     async fn streaming_turn(
         &self,
         request: CreateChatCompletionRequest,
+        client: &Client<OpenAIConfig>,
     ) -> Result<ChunkStream, ModelError> {
-        let mut upstream = self
-            .client
+        let mut upstream = client
             .chat()
             .create_stream(request)
             .await
@@ -831,7 +881,11 @@ mod tests {
     }
 
     /// What a caller of one turn ends up with: the reasoning and the reply.
-    async fn one_turn(base_url: &str, extensions: Value) -> (String, String) {
+    async fn one_turn(
+        base_url: &str,
+        extensions: Value,
+        transport: TransportOverrides,
+    ) -> (String, String) {
         let completion = HttpChatCompletion::new(
             ModelEndpoint::new(ApiKey::new("key"), base_url, "test-model")
                 .with_extensions(extensions),
@@ -839,7 +893,10 @@ mod tests {
         let messages = vec![RequestMessage::User {
             content: "hi".to_string(),
         }];
-        let mut stream = completion.completion(&messages, &[], true).await.unwrap();
+        let mut stream = completion
+            .completion(&messages, &[], true, &transport)
+            .await
+            .unwrap();
         let mut thinking = String::new();
         let mut body = String::new();
         while let Some(chunk) = stream.next().await {
@@ -864,8 +921,12 @@ mod tests {
             serde_json::json!({ "content": "Hi there!", "reasoning_content": null }),
         ])
         .await;
-        let (thinking, body) =
-            one_turn(&base_url, serde_json::json!({ "reasoning_effort": "high" })).await;
+        let (thinking, body) = one_turn(
+            &base_url,
+            serde_json::json!({ "reasoning_effort": "high" }),
+            TransportOverrides::new(),
+        )
+        .await;
         assert_eq!(thinking, "ponder more");
         assert_eq!(body, "Hi there!");
     }
@@ -880,9 +941,76 @@ mod tests {
             serde_json::json!({ "content": "Hi!", "reasoning_content": null }),
         ])
         .await;
-        let (thinking, body) = one_turn(&base_url, serde_json::json!({})).await;
+        let (thinking, body) =
+            one_turn(&base_url, serde_json::json!({}), TransportOverrides::new()).await;
         assert_eq!(thinking, "ponder");
         assert_eq!(body, "Hi!");
+    }
+
+    /// A proxied upstream needs an accounting id the endpoint declaration
+    /// cannot express, and sometimes a caller-chosen key. Both must ride along
+    /// — and the key must WIN over the endpoint's own, which is the whole point
+    /// of stamping it per round.
+    #[tokio::test]
+    async fn passthrough_headers_reach_the_wire() {
+        use axum::body::Body as WireBody;
+        use axum::http::Request;
+        use axum::response::sse::Event;
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |request: Request<WireBody>| {
+                let sink = sink.clone();
+                async move {
+                    for name in ["x-litellm-customer-id", "authorization"] {
+                        if let Some(value) = request.headers().get(name) {
+                            sink.lock().expect("lock").push((
+                                name.to_string(),
+                                value.to_str().unwrap_or_default().to_string(),
+                            ));
+                        }
+                    }
+                    axum::response::Sse::new(futures::stream::iter(vec![Ok::<
+                        Event,
+                        std::convert::Infallible,
+                    >(
+                        Event::default().data(
+                            serde_json::json!({
+                                "id": "chatcmpl-test",
+                                "object": "chat.completion.chunk",
+                                "created": 0,
+                                "model": "test-model",
+                                "choices": [{ "index": 0, "delta": { "content": "hi" }, "finish_reason": "stop" }],
+                            })
+                            .to_string(),
+                        ),
+                    )]))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base_url = format!("http://{addr}/v1");
+
+        let transport = TransportOverrides::new()
+            .with_header("x-litellm-customer-id", "alice")
+            .with_header("authorization", "Bearer sk-caller");
+        let (_thinking, body) = one_turn(&base_url, serde_json::json!({}), transport).await;
+
+        assert_eq!(body, "hi");
+        let seen = seen.lock().expect("lock").clone();
+        assert!(
+            seen.contains(&("x-litellm-customer-id".to_string(), "alice".to_string())),
+            "the accounting id must ride along: {seen:?}"
+        );
+        assert!(
+            seen.contains(&("authorization".to_string(), "Bearer sk-caller".to_string())),
+            "a per-round key must win over the endpoint's own: {seen:?}"
+        );
     }
 
     /// A turn that never asked the model to think cannot be holding its body
@@ -891,7 +1019,8 @@ mod tests {
     async fn a_turn_that_did_not_ask_to_think_streams_its_whole_body() {
         let base_url =
             serve_deltas(vec![serde_json::json!({ "content": "Just the answer." })]).await;
-        let (thinking, body) = one_turn(&base_url, serde_json::json!({})).await;
+        let (thinking, body) =
+            one_turn(&base_url, serde_json::json!({}), TransportOverrides::new()).await;
         assert_eq!(thinking, "");
         assert_eq!(body, "Just the answer.");
     }

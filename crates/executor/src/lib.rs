@@ -29,6 +29,7 @@
 pub mod catalog;
 pub mod context;
 pub mod outcome;
+pub mod passthrough;
 pub mod runner;
 pub(crate) mod think;
 pub mod transport;
@@ -40,5 +41,5 @@ pub use runner::{EnvReader, ProviderFactory, SingleTurnExecutor};
 pub use transport::{ApiKey, HttpChatCompletion, ModelEndpoint};
 pub use wire::{
     ChatCompletion, ChunkStream, FinishReason, ModelError, ModelUsage, RequestMessage,
-    ResponseChunk, ToolCallRequest, ToolManifest,
+    ResponseChunk, ToolCallRequest, ToolManifest, TransportOverrides,
 };

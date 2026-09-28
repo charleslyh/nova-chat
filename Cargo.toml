@@ -44,6 +44,11 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# The chat-completions client rides reqwest 0.13 (async-openai 0.42), and the
+# executor names that client type so a round carrying passthrough headers can
+# build its own client on the SAME connection pool. Aliased because the
+# gateway's own HTTP work is still on 0.12.
+openai-reqwest = { package = "reqwest", version = "0.13", default-features = false, features = ["json", "stream"] }
 # Content integrity (D20 ⑧ / INV-44): canonicalisation + tamper detection.
 hmac = "0.12"
 sha2 = "0.10"
