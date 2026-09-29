@@ -117,6 +117,8 @@ D24 为了「删除中间环节后对话仍能继续」选择了每环物化全�
 
 **禁止静默截断**（INV-41）。上限在**创建时 `resolve_context` 校验**：超限即拒绝创建，读取时快照已是合规尺寸。1 MiB 上限之所以有效，依赖「图片文件仅接受引用」这一协议约束（见 [06](./06-protocol-subset.md) §3.1）。
 
+这里约束的是持久对话真相源：会话快照和 response 输入不会被裁掉。执行端把合规快照交给 completion 前，还会按该 completion 的 `window_size` 建立一份进程内模型视图；模型视图可依次清理旧工具结果、裁剪旧轮次、生成摘要，但不会回写会话快照。压缩结果只在有界 LRU 中沿 `previous_response_id` 或 conversation 锚点复用。
+
 ---
 
 ## 4. `instructions` 不参与快照

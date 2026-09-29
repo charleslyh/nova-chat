@@ -34,24 +34,33 @@ use crate::wire::{ModelError, RequestMessage, ToolCallRequest};
 pub fn messages_for_task(task: &AgentTask) -> Result<Vec<RequestMessage>, ModelError> {
     let mut messages = Vec::new();
     push_system(&mut messages, task.params.instructions.as_deref());
-    messages.extend(items_to_messages(&task.items)?);
+    append_items(&mut messages, &task.items)?;
     if messages.is_empty() {
         return Err(ModelError::new("response context contains no messages"));
     }
     Ok(messages)
 }
 
-fn push_system(messages: &mut Vec<RequestMessage>, value: Option<&str>) {
-    if let Some(content) = value.map(str::trim).filter(|value| !value.is_empty()) {
-        messages.push(RequestMessage::System {
-            content: content.to_string(),
-        });
-    }
+pub(crate) fn with_instructions(
+    instructions: Option<&str>,
+    mut conversation: Vec<RequestMessage>,
+) -> Vec<RequestMessage> {
+    let mut messages = Vec::new();
+    push_system(&mut messages, instructions);
+    messages.append(&mut conversation);
+    messages
 }
 
-fn items_to_messages(items: &[ResponseItem]) -> Result<Vec<RequestMessage>, ModelError> {
-    let mut messages: Vec<RequestMessage> = Vec::with_capacity(items.len());
-    let mut known_calls = HashSet::new();
+/// Append protocol items onto an existing completion transcript.
+///
+/// Tool outputs must still follow their call. Calls already present on
+/// `messages` count, so a later turn can attach an output to a call that
+/// survived in a cached prefix.
+pub(crate) fn append_items(
+    messages: &mut Vec<RequestMessage>,
+    items: &[ResponseItem],
+) -> Result<(), ModelError> {
+    let mut known_calls = known_call_ids(messages);
 
     for item in items {
         match item {
@@ -113,6 +122,34 @@ fn items_to_messages(items: &[ResponseItem]) -> Result<Vec<RequestMessage>, Mode
         }
     }
 
+    Ok(())
+}
+
+fn push_system(messages: &mut Vec<RequestMessage>, value: Option<&str>) {
+    if let Some(content) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        messages.push(RequestMessage::System {
+            content: content.to_string(),
+        });
+    }
+}
+
+fn known_call_ids(messages: &[RequestMessage]) -> HashSet<String> {
+    let mut known = HashSet::new();
+    for message in messages {
+        if let RequestMessage::Assistant {
+            tool_calls: Some(calls),
+            ..
+        } = message
+        {
+            known.extend(calls.iter().map(|call| call.call_id.clone()));
+        }
+    }
+    known
+}
+
+pub(crate) fn items_to_messages(items: &[ResponseItem]) -> Result<Vec<RequestMessage>, ModelError> {
+    let mut messages = Vec::with_capacity(items.len());
+    append_items(&mut messages, items)?;
     Ok(messages)
 }
 

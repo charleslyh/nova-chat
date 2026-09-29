@@ -27,6 +27,7 @@
 //!   replaceable by an off-the-shelf model service.
 
 pub mod catalog;
+pub mod compact;
 pub mod context;
 pub mod outcome;
 pub mod passthrough;

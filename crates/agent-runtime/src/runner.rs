@@ -12,7 +12,8 @@
 
 use async_trait::async_trait;
 use nova_responses::{
-    IncompleteReason, ModelParams, RequestProvenance, ResponseItem, ResponseStatus, Terminal, Usage,
+    ConversationId, IncompleteReason, ModelParams, RequestProvenance, ResponseId, ResponseItem,
+    ResponseStatus, Terminal, Usage,
 };
 use serde_json::Value;
 
@@ -31,6 +32,16 @@ pub struct AgentTask {
     pub exec_context: Option<Value>,
     /// Initial conversation (`snapshot items + this turn's input`, D30).
     pub items: Vec<ResponseItem>,
+    /// How many leading `items` were inherited from the snapshot. The tail is
+    /// this turn's own input. The completion tier uses the split to reuse a
+    /// compressed prefix stored under `previous_response_id`.
+    pub inherited_len: usize,
+    /// The response this turn continues, when the anchor is a previous response.
+    /// A conversation anchor leaves this empty and uses `conversation_id`.
+    pub previous_response_id: Option<ResponseId>,
+    /// Conversation anchor for the normal Nova Agent path. The completion tier
+    /// uses it to reuse the process-local compressed prefix across turns.
+    pub conversation_id: Option<ConversationId>,
     pub provenance: RequestProvenance,
     pub max_tool_rounds: usize,
 }

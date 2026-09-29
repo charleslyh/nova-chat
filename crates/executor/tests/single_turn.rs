@@ -178,6 +178,7 @@ fn catalog() -> ModelCatalog {
         api_model: "upstream".to_string(),
         api_key_env: None,
         extensions: serde_json::Value::Null,
+        window_size: None,
     }])
 }
 
@@ -197,6 +198,9 @@ fn task_with_context(
         params,
         exec_context,
         items,
+        inherited_len: 0,
+        previous_response_id: None,
+        conversation_id: None,
         provenance: RequestProvenance {
             response_id: ResponseId::new(NodeTag::parse("test").expect("valid tag")),
             attempt: nova_responses::Attempt::UNCLAIMED.next(),

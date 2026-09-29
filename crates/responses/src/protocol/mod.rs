@@ -68,7 +68,7 @@ pub const UPSTREAM_SPEC_REVISION: &str = "2025-08-07";
 pub const EXPLICITLY_UNSUPPORTED_FIELDS: &[(&str, &str)] = &[
     (
         "context_management",
-        "server-side context compaction is not supported; manage history length via previous_response_id chains",
+        "per-request context-management controls are not supported; model-tier compaction is automatic when the configured context window requires it",
     ),
     (
         "prompt",

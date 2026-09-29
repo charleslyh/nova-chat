@@ -53,6 +53,10 @@ pub struct ModelEntry {
     /// Provider-specific request fields, passed through untouched.
     #[serde(default)]
     pub extensions: Value,
+    /// Context window in tokens. Compaction starts at `window_size - 20_000`.
+    /// Absent means this model is not compacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_size: Option<u64>,
 }
 
 /// The configured models, keyed by catalog id.
@@ -63,6 +67,15 @@ pub struct ModelCatalog {
 
 impl ModelCatalog {
     pub fn new(entries: impl IntoIterator<Item = ModelEntry>) -> Self {
+        let entries: Vec<_> = entries.into_iter().collect();
+        for entry in &entries {
+            if entry.window_size.is_some() && tokenizer_for_completion(&entry.id).is_none() {
+                tracing::warn!(
+                    model = %entry.id,
+                    "completion uses conservative context token estimation"
+                );
+            }
+        }
         Self {
             entries: entries
                 .into_iter()
@@ -73,6 +86,23 @@ impl ModelCatalog {
 
     pub fn get(&self, model: &str) -> Option<&ModelEntry> {
         self.entries.get(model)
+    }
+
+    /// The context window for `model`, when the entry declares one.
+    pub fn window_tokens(&self, model: &str) -> Option<usize> {
+        self.entries
+            .get(model)?
+            .window_size
+            .map(|tokens| tokens as usize)
+    }
+
+    /// Select context accounting from the stable completion identity.
+    ///
+    /// Upstream wire names are deliberately not inspected: deployments may
+    /// alias those names without changing the model family or tokenizer.
+    pub fn tokenizer(&self, model: &str) -> Option<&'static str> {
+        let entry = self.entries.get(model)?;
+        tokenizer_for_completion(&entry.id)
     }
 
     /// Resolve a request's `model` into a usable endpoint.
@@ -93,6 +123,13 @@ impl ModelCatalog {
             ModelEndpoint::new(api_key, entry.base_url.clone(), entry.api_model.clone())
                 .with_extensions(entry.extensions.clone()),
         )
+    }
+}
+
+fn tokenizer_for_completion(completion_id: &str) -> Option<&'static str> {
+    match completion_id {
+        "hunyuan-3" => Some("hy3"),
+        _ => None,
     }
 }
 
@@ -136,6 +173,7 @@ mod tests {
             api_model: "upstream-name".to_string(),
             api_key_env: api_key_env.map(str::to_string),
             extensions: Value::Null,
+            window_size: None,
         }
     }
 
@@ -212,6 +250,28 @@ mod tests {
         // Asserted through Debug because the key type refuses to reveal itself,
         // which is the point.
         assert_eq!(format!("{:?}", endpoint.api_key), "ApiKey(***)");
+    }
+
+    #[test]
+    fn window_size_is_read_from_the_entry() {
+        let mut model = entry("hy3", None);
+        assert_eq!(
+            ModelCatalog::new([model.clone()]).window_tokens("hy3"),
+            None
+        );
+        model.window_size = Some(262_144);
+        assert_eq!(
+            ModelCatalog::new([model]).window_tokens("hy3"),
+            Some(262_144)
+        );
+    }
+
+    #[test]
+    fn tokenizer_is_selected_from_the_completion_identity() {
+        let catalog =
+            ModelCatalog::new([entry("hunyuan-3", None), entry("hunyuan-4-preview", None)]);
+        assert_eq!(catalog.tokenizer("hunyuan-3"), Some("hy3"));
+        assert_eq!(catalog.tokenizer("hunyuan-4-preview"), None);
     }
 
     #[test]

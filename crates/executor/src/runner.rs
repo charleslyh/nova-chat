@@ -36,7 +36,7 @@ use nova_agent_runtime::{
 use nova_responses::{ContentPart, ItemStatus, ResponseItem, Role, Usage};
 
 use crate::catalog::ModelCatalog;
-use crate::context::messages_for_task;
+use crate::compact::{prepare_messages, ContextCache, ModelSummarizer};
 use crate::outcome::Termination;
 use crate::passthrough::overrides_from_exec_context;
 use crate::transport::{HttpChatCompletion, ModelEndpoint};
@@ -57,6 +57,8 @@ pub struct SingleTurnExecutor {
     catalog: ModelCatalog,
     provider: ProviderFactory,
     env: EnvReader,
+    /// Compressed completion context from earlier responses, keyed by response id.
+    context_cache: ContextCache,
 }
 
 impl SingleTurnExecutor {
@@ -65,6 +67,7 @@ impl SingleTurnExecutor {
             catalog,
             provider: Arc::new(|endpoint| Arc::new(HttpChatCompletion::new(endpoint))),
             env: Arc::new(|name| std::env::var(name).ok()),
+            context_cache: ContextCache::new(),
         }
     }
 
@@ -112,12 +115,24 @@ impl AgentRunner for SingleTurnExecutor {
             .catalog
             .resolve(&task.params.model, &|name| (self.env)(name))
             .map_err(|error| failed(error, Usage::default()))?;
-        let messages = messages_for_task(task).map_err(|error| failed(error, Usage::default()))?;
         let tools = declared_tools(task);
         let provider = (self.provider)(endpoint);
         // What the host stamped for this round: headers a proxied upstream
         // needs and the endpoint declaration cannot express.
         let transport = overrides_from_exec_context(task.exec_context.as_ref());
+        let summarizer = ModelSummarizer::new(provider.as_ref(), &transport);
+        let window = self.catalog.window_tokens(&task.params.model);
+        let tokenizer = self.catalog.tokenizer(&task.params.model);
+        let messages = prepare_messages(
+            &self.context_cache,
+            task,
+            window,
+            tokenizer,
+            &tools,
+            &summarizer,
+        )
+        .await
+        .map_err(|error| failed(error, Usage::default()))?;
 
         tracing::info!(
             target: "agent_trace",

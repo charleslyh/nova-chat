@@ -13,6 +13,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokenizers = { workspace = true }
 # Chat-completions wire types and HTTP plumbing.
 async-openai = { workspace = true }
 # Same reqwest the client above rides, so a per-round client shares one pool.

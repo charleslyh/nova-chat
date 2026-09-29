@@ -288,6 +288,9 @@ impl AgentRuntime {
                     .await;
             }
         };
+        let inherited_len = snapshot.item_count();
+        let previous_response_id = record.previous_response_id().cloned();
+        let conversation_id = record.conversation_id().cloned();
         let mut items: Vec<ResponseItem> = snapshot.into_items();
         items.extend(record.spec.input_items.clone());
 
@@ -295,6 +298,9 @@ impl AgentRuntime {
             params: record.spec.params.clone(),
             exec_context: record.exec_context.clone(),
             items,
+            inherited_len,
+            previous_response_id,
+            conversation_id,
             provenance,
             max_tool_rounds: self.cfg.max_tool_rounds,
         };
