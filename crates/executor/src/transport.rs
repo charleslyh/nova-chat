@@ -169,6 +169,14 @@ impl HttpChatCompletion {
         Cow::Owned(Client::build(self.http.clone(), config))
     }
 
+    /// Whether this turn asks the model to think. `none` is a level of the enum,
+    /// not an absent one: such a turn is sent a request that says "do not
+    /// think", so no CoT is coming and its body must not be held back for a
+    /// think marker that never arrives.
+    fn thinks(&self) -> bool {
+        !matches!(self.reasoning_effort, None | Some(ReasoningEffort::None))
+    }
+
     fn request(
         &self,
         messages: &[RequestMessage],
@@ -235,7 +243,7 @@ impl HttpChatCompletion {
             .ok_or_else(|| ModelError::new("model returned no choices"))?;
 
         let mut chunks = Vec::new();
-        let mut splitter = ThinkSplitter::new(self.reasoning_effort.is_some());
+        let mut splitter = ThinkSplitter::new(self.thinks());
         if let Some(reasoning) = extract_reasoning(&response, "message") {
             // The provider carries the CoT in its own field: nothing to split.
             splitter.disable();
@@ -298,7 +306,7 @@ impl HttpChatCompletion {
             .map_err(provider_error)?;
         // Whether this turn asked the model to think: only such a turn can be
         // receiving an INLINED CoT, so only such a turn holds its body.
-        let thinking = self.reasoning_effort.is_some();
+        let thinking = self.thinks();
         let output = async_stream::stream! {
             let mut calls: HashMap<u32, (String, String, String)> = HashMap::new();
             let mut refusal = String::new();
@@ -650,20 +658,24 @@ fn serialize_arguments(arguments: &Value) -> String {
     }
 }
 
+/// The `reasoning_effort` a configured endpoint names: the protocol's own enum,
+/// or `None` when it names none — no field on the wire, which is not the same
+/// thing as `none`.
 fn reasoning_effort(extensions: &Value) -> Option<ReasoningEffort> {
     match extensions
         .get("reasoning_effort")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
+        .and_then(Value::as_str)?
         .trim()
         .to_ascii_lowercase()
         .as_str()
     {
+        "none" => Some(ReasoningEffort::None),
         "minimal" => Some(ReasoningEffort::Minimal),
         "low" => Some(ReasoningEffort::Low),
         "medium" => Some(ReasoningEffort::Medium),
         "high" => Some(ReasoningEffort::High),
-        "xhigh" | "x-high" => Some(ReasoningEffort::Xhigh),
+        "xhigh" => Some(ReasoningEffort::Xhigh),
+        "max" => Some(ReasoningEffort::Max),
         _ => None,
     }
 }
@@ -675,6 +687,47 @@ fn provider_error(error: impl fmt::Display) -> ModelError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every level of the protocol's enum reaches the wire, and `none` travels
+    /// as its own value rather than as an absent field — otherwise a caller
+    /// asking for "do not think" gets whatever the upstream defaults to.
+    #[test]
+    fn the_configured_reasoning_effort_is_the_protocols_enum() {
+        let level =
+            |value: &str| reasoning_effort(&serde_json::json!({ "reasoning_effort": value }));
+        for (value, expected) in [
+            ("none", ReasoningEffort::None),
+            ("minimal", ReasoningEffort::Minimal),
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::High),
+            ("xhigh", ReasoningEffort::Xhigh),
+            ("max", ReasoningEffort::Max),
+        ] {
+            assert_eq!(level(value), Some(expected.clone()), "{value}");
+        }
+        assert_eq!(level(" HIGH "), Some(ReasoningEffort::High));
+        // No field at all: the request stays silent about thinking.
+        assert_eq!(reasoning_effort(&serde_json::json!({})), None);
+        // Outside the enum: not a level the protocol defines.
+        assert_eq!(level("x-high"), None);
+    }
+
+    /// A turn told not to think gets no CoT, so inline think-marker splitting
+    /// stays off for it — as it does for a turn naming no level at all.
+    #[test]
+    fn none_asks_the_model_not_to_think() {
+        let thinks = |extensions: Value| {
+            HttpChatCompletion::new(
+                ModelEndpoint::new(ApiKey::new("k"), "http://h/v1", "m")
+                    .with_extensions(extensions),
+            )
+            .thinks()
+        };
+        assert!(thinks(serde_json::json!({ "reasoning_effort": "high" })));
+        assert!(!thinks(serde_json::json!({ "reasoning_effort": "none" })));
+        assert!(!thinks(serde_json::json!({})));
+    }
 
     #[test]
     fn preserves_regular_stream_deltas() {
