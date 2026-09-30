@@ -251,7 +251,6 @@ fn task_with_context(
             attempt: nova_responses::Attempt::UNCLAIMED.next(),
             exec_deadline_ms: u64::MAX,
         },
-        max_tool_rounds: 8,
     }
 }
 

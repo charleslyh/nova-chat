@@ -22,7 +22,7 @@ use mock_agentd::completions::{
 };
 use mock_agentd::{
     EchoScheduler, Match, MockAgentRunner, NoopToolExecutor, Scheduler, SchedulerError, Script,
-    ScriptedScheduler, ToolError, ToolExecutor,
+    ScriptedScheduler, ToolError, ToolExecutor, MAX_TOOL_ROUNDS,
 };
 use nova_responses::protocol::{ContentPart, ResponseItem, Role};
 use nova_responses::ports::{ResponseClaimSource, ResponseEventLog, ResponseIntake};
@@ -522,11 +522,9 @@ async fn a_model_that_keeps_calling_tools_hits_the_round_ceiling() {
 
     let scheduler = Arc::new(AlwaysToolCall);
     let tools = Arc::new(MapTools::default().with("ping", "pong"));
-    let cfg = AgentRuntimeConfig {
-        max_tool_rounds: 3,
-        ..AgentRuntimeConfig::default()
-    };
-    let e = agent_with(&world, scheduler, tools, cfg);
+    // The round ceiling is the runner's own (MockAgentRunner::MAX_TOOL_ROUNDS),
+    // not the orchestrator's: a runner that is done looping decides that.
+    let e = agent_with(&world, scheduler, tools, AgentRuntimeConfig::default());
 
     assert_eq!(e.run_once(2_000).await, Executed::Completed);
 
@@ -543,7 +541,8 @@ async fn a_model_that_keeps_calling_tools_hits_the_round_ceiling() {
     );
 
     let snap = snapshot(&world, &conv).await;
-    assert_eq!(output_of(&snap).len(), 6);
+    // One tool call plus its output per round, up to the runner's own ceiling.
+    assert_eq!(output_of(&snap).len(), MAX_TOOL_ROUNDS * 2);
 }
 
 #[tokio::test]

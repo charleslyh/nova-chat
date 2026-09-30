@@ -10,7 +10,7 @@ pub mod mock_runner;
 pub mod scheduler;
 pub mod tool;
 
-pub use mock_runner::MockAgentRunner;
+pub use mock_runner::{MockAgentRunner, MAX_TOOL_ROUNDS};
 pub use scheduler::{
     EchoScheduler, HttpChatCompletionsScheduler, Match, Script, ScriptRule, Scheduler,
     SchedulerError, ScriptedScheduler,

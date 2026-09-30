@@ -81,8 +81,6 @@ pub struct AgentRuntimeDeps {
 pub struct AgentRuntimeConfig {
     pub exec_ttl: Duration,
     pub retain_after_terminal: Duration,
-    /// Hard ceiling on tool-calling rounds per response.
-    pub max_tool_rounds: usize,
     /// Interval between keep-alive heartbeats sent while the (possibly long) ReAct
     /// loop runs.
     pub heartbeat_interval: Duration,
@@ -97,7 +95,6 @@ impl Default for AgentRuntimeConfig {
         Self {
             exec_ttl: Duration::from_secs(300),
             retain_after_terminal: Duration::from_secs(60),
-            max_tool_rounds: 20,
             heartbeat_interval: Duration::from_secs(30),
             cancel_poll_interval: Duration::from_millis(250),
         }
@@ -302,7 +299,6 @@ impl AgentRuntime {
             previous_response_id,
             conversation_id,
             provenance,
-            max_tool_rounds: self.cfg.max_tool_rounds,
         };
 
         let mut sink = EventSink::new(self.deps.event_log.clone(), id.clone(), attempt);
@@ -318,7 +314,6 @@ impl AgentRuntime {
             response = %id,
             runner = self.deps.runner.name(),
             items = task.items.len(),
-            max_tool_rounds = task.max_tool_rounds,
             "handing the task to the runner"
         );
         let outcome = match self.deps.runner.run(&task, &mut sink, &cancel).await {

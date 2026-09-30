@@ -650,7 +650,6 @@ mod tests {
                 attempt: Attempt::UNCLAIMED.next(),
                 exec_deadline_ms: u64::MAX,
             },
-            max_tool_rounds: 1,
         }
     }
 

@@ -43,7 +43,6 @@ pub struct AgentTask {
     /// uses it to reuse the process-local compressed prefix across turns.
     pub conversation_id: Option<ConversationId>,
     pub provenance: RequestProvenance,
-    pub max_tool_rounds: usize,
 }
 
 /// How a run ended, as far as a runner can report it.

@@ -20,6 +20,15 @@ use crate::completions::{
 use crate::scheduler::{validate_outcome, Scheduler, SchedulerError};
 use crate::tool::ToolExecutor;
 
+/// How many tool-calling rounds this ReAct double will run before it stops and
+/// completes with what it has.
+///
+/// The ceiling lives here rather than on `AgentTask` because it belongs to the
+/// runner that actually loops: the production runner is single-turn and cannot
+/// spend more than one, and the chain's turn budget is enforced one tier up, in
+/// nova-agents. A budget on the task would be a second owner of that rule.
+pub const MAX_TOOL_ROUNDS: usize = 20;
+
 /// Runs a task to a terminal state using completions + tool execution.
 pub struct MockAgentRunner {
     scheduler: Arc<dyn Scheduler>,
@@ -157,7 +166,7 @@ impl AgentRunner for MockAgentRunner {
                 }
 
                 FinishReason::ToolCalls => {
-                    if tool_rounds >= task.max_tool_rounds {
+                    if tool_rounds >= MAX_TOOL_ROUNDS {
                         usage = usage.accumulate(outcome.usage);
                         return Ok(AgentOutcome {
                             items: conversation[base_len..].to_vec(),
