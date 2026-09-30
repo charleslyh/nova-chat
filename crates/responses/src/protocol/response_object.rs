@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::response::{IncompleteDetails, ResponseRecord, ResponseStatus};
+use crate::response::{IncompleteDetails, ResponseError, ResponseRecord, ResponseStatus};
 use crate::usage::Usage;
 
 use super::item::ResponseItem;
@@ -51,6 +51,11 @@ pub struct ResponseObject {
     /// from the record, which holds status and reason as one fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incomplete_details: Option<IncompleteDetails>,
+    /// Why the turn failed; absent for every other status. Without this field a
+    /// subscriber seeing `status: "failed"` has nothing to report but a
+    /// placeholder, which is how a chain could not name a fault it had caught.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ResponseError>,
     pub model: String,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,6 +107,7 @@ impl ResponseObject {
             created_at: record.created_at_ms / 1000,
             status: record.status,
             incomplete_details: record.incomplete_details,
+            error: record.error.clone(),
             model: params.model.clone(),
             previous_response_id: record.previous_response_id().map(|id| id.to_string()),
             conversation: record.conversation_id().map(|id| ConversationRef::Object {
@@ -138,6 +144,7 @@ impl ResponseObject {
             // The reap path has no record in hand, so it has no reason to
             // report either; a subscriber that needs one issues a `GET`.
             incomplete_details: None,
+            error: None,
             model: String::new(),
             previous_response_id: None,
             conversation: None,
@@ -206,6 +213,23 @@ mod tests {
         assert_eq!(json["tool_choice"], "auto");
         assert!(json["conversation"]["id"].as_str().unwrap().starts_with("conv_"));
         assert_eq!(json["usage"]["total_tokens"], 0);
+    }
+
+    #[test]
+    fn a_failed_record_renders_its_reason_and_any_other_status_does_not() {
+        // The wire half of the same gap: a subscriber that sees `failed` needs
+        // the wording on the object, not only on the record it cannot read.
+        let mut r = record();
+        r.status = ResponseStatus::Failed;
+        r.error = Some(ResponseError { message: "boom".into() });
+        let json = serde_json::to_value(ResponseObject::without_output(&r)).unwrap();
+        assert_eq!(json["error"]["message"], "boom");
+
+        let live = serde_json::to_value(ResponseObject::without_output(&record())).unwrap();
+        assert!(
+            live.get("error").is_none(),
+            "no reason is omitted rather than rendered as null: {live}"
+        );
     }
 
     #[test]

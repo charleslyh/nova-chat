@@ -603,7 +603,7 @@ async fn exec(ctx: &mut Ctx, trace: &mut Trace, sc: &str, step: Step) -> Result<
             let terminal = if ok {
                 Terminal::Completed
             } else {
-                Terminal::Failed
+                Terminal::failed("scenario-step failure")
             };
             let status = terminal.status();
             let usage = Usage::new(input_tokens, output_tokens);

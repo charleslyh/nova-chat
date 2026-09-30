@@ -489,7 +489,7 @@ impl AgentRuntime {
         if let Err(e) = self
             .deps
             .ledger
-            .complete(id, attempt, Terminal::Failed, usage, now_ms)
+            .complete(id, attempt, Terminal::failed(reason), usage, now_ms)
             .await
         {
             warn!(response = %id, error = %e, "could not record failure");

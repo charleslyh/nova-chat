@@ -271,6 +271,7 @@ impl ResponseClaimSource for MemResponseLedger {
         rec.status = terminal.status();
         // Written from the same value as the status, so the pair cannot drift.
         rec.incomplete_details = terminal.incomplete_details();
+        rec.error = terminal.error();
         rec.owner = None;
         rec.usage = usage;
         rec.completed_at_ms = Some(now_ms);

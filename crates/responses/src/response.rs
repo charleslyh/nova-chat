@@ -161,6 +161,21 @@ impl IncompleteDetails {
     }
 }
 
+/// Why a turn ended [`ResponseStatus::Failed`].
+///
+/// A struct wrapping the message because that is the protocol shape, and because
+/// it leaves the envelope room to grow (`code`) without every reader changing
+/// how it reads the field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseError {
+    pub message: String,
+}
+
+/// Ceiling on a persisted failure message: a provider that dumps its whole
+/// response body into an error must not be able to bloat the record or the wire
+/// payload, and the head is what identifies the fault.
+const MAX_ERROR_MESSAGE_CHARS: usize = 512;
+
 /// A terminal transition: the status, and the official reason when that status
 /// is `incomplete`.
 ///
@@ -168,7 +183,7 @@ impl IncompleteDetails {
 /// so "incomplete without a reason" and "completed with one" are both
 /// unrepresentable. Terminal transitions flow through this, which is what lets
 /// a caller branch exhaustively instead of falling back on a catch-all arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Terminal {
     /// The turn produced its output. Includes a turn that stopped so its caller
@@ -176,8 +191,12 @@ pub enum Terminal {
     Completed,
     /// The output was cut short, for one of the two official reasons.
     Incomplete { reason: IncompleteReason },
-    /// The turn or its upstream broke.
-    Failed,
+    /// The turn or its upstream broke, carrying the reason it broke with.
+    ///
+    /// The reason is required: a failure that loses its wording is not a lesser
+    /// failure, it is an undiagnosable one — which is how a chain once reported
+    /// every fault as "upstream reported a failure without a message".
+    Failed { message: String },
     /// Cancelled by the caller or reclaimed by the sweeper.
     Cancelled,
 }
@@ -187,19 +206,36 @@ impl Terminal {
         Self::Incomplete { reason }
     }
 
-    pub fn status(self) -> ResponseStatus {
+    pub fn failed(message: impl std::fmt::Display) -> Self {
+        let message = message.to_string();
+        let message = match message.char_indices().nth(MAX_ERROR_MESSAGE_CHARS) {
+            Some((cut, _)) => format!("{}…", &message[..cut]),
+            None => message,
+        };
+        Self::Failed { message }
+    }
+
+    pub fn status(&self) -> ResponseStatus {
         match self {
             Self::Completed => ResponseStatus::Completed,
             Self::Incomplete { .. } => ResponseStatus::Incomplete,
-            Self::Failed => ResponseStatus::Failed,
+            Self::Failed { .. } => ResponseStatus::Failed,
             Self::Cancelled => ResponseStatus::Cancelled,
         }
     }
 
     /// The reason envelope to persist, present exactly for `incomplete`.
-    pub fn incomplete_details(self) -> Option<IncompleteDetails> {
+    pub fn incomplete_details(&self) -> Option<IncompleteDetails> {
         match self {
-            Self::Incomplete { reason } => Some(IncompleteDetails::new(reason)),
+            Self::Incomplete { reason } => Some(IncompleteDetails::new(*reason)),
+            _ => None,
+        }
+    }
+
+    /// The error envelope to persist, present exactly for `failed`.
+    pub fn error(&self) -> Option<ResponseError> {
+        match self {
+            Self::Failed { message } => Some(ResponseError { message: message.clone() }),
             _ => None,
         }
     }
@@ -353,6 +389,12 @@ pub struct ResponseRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incomplete_details: Option<IncompleteDetails>,
 
+    /// Why the turn ended `failed`. Present exactly when [`Self::status`] is
+    /// [`ResponseStatus::Failed`], for the same reason `incomplete_details`
+    /// trails its own status: both are written from one [`Terminal`] value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ResponseError>,
+
     /// Reasoning / thinking text streamed by a reasoning model this turn,
     /// concatenated into one string. Render-only, never fed back as context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -407,6 +449,7 @@ impl ResponseRecord {
             status: ResponseStatus::Queued,
             usage: Usage::default(),
             incomplete_details: None,
+            error: None,
             reasoning: None,
             created_at_ms: now_ms,
             completed_at_ms: None,
@@ -469,7 +512,7 @@ mod tests {
             Terminal::Completed,
             Terminal::incomplete(IncompleteReason::MaxOutputTokens),
             Terminal::incomplete(IncompleteReason::ContentFilter),
-            Terminal::Failed,
+            Terminal::failed("boom"),
             Terminal::Cancelled,
         ] {
             assert_eq!(
@@ -485,7 +528,7 @@ mod tests {
         for terminal in [
             Terminal::Completed,
             Terminal::incomplete(IncompleteReason::ContentFilter),
-            Terminal::Failed,
+            Terminal::failed("boom"),
             Terminal::Cancelled,
         ] {
             assert!(
@@ -493,6 +536,38 @@ mod tests {
                 "{terminal:?} must not map to a live status"
             );
         }
+    }
+
+    #[test]
+    fn a_failure_carries_its_reason_and_only_a_failure_carries_one() {
+        // What the chain could not see before: `chain.end` had no way to name
+        // the fault and fell back to a placeholder for every failure.
+        for terminal in [
+            Terminal::Completed,
+            Terminal::incomplete(IncompleteReason::ContentFilter),
+            Terminal::failed("model produced no output items"),
+            Terminal::Cancelled,
+        ] {
+            assert_eq!(
+                terminal.error().is_some(),
+                terminal.status() == ResponseStatus::Failed,
+                "status and error disagree for {terminal:?}"
+            );
+        }
+        assert_eq!(
+            Terminal::failed("model produced no output items").error(),
+            Some(ResponseError {
+                message: "model produced no output items".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_failure_reason_is_bounded_so_a_provider_dump_cannot_bloat_the_record() {
+        let terminal = Terminal::failed("x".repeat(10_000));
+        let message = terminal.error().unwrap().message;
+        assert!(message.len() <= MAX_ERROR_MESSAGE_CHARS + 4);
+        assert!(message.ends_with('…'));
     }
 
     #[test]

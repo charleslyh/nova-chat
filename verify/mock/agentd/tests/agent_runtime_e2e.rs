@@ -199,13 +199,32 @@ async fn a_scheduler_failure_terminates_the_response() {
     let rec = ResponseIntake::get(world.ledger.as_ref(), &id).await.expect("get").expect("present");
     assert_eq!(rec.status, ResponseStatus::Failed);
     assert!(rec.status.is_terminal());
+    // What the chain reads to name the fault. Without it the only thing a
+    // subscriber can say is that something failed.
+    let recorded = rec.error.as_ref().map(|e| e.message.clone()).unwrap_or_default();
+    assert!(
+        recorded.ends_with("provider returned 503"),
+        "a failure must record its reason, or the chain reports a placeholder: {recorded}"
+    );
 
     let events = world
         .event_log
         .read_after(&id, None, 64, Duration::from_millis(0))
         .await
         .expect("read");
-    assert!(events.iter().any(|ev| ev.kind().is_terminal()));
+    let terminal = events
+        .iter()
+        .find(|ev| ev.kind().is_terminal())
+        .expect("a terminal event");
+    let wired = terminal
+        .response_object()
+        .and_then(|o| o.error.as_ref())
+        .map(|e| e.message.clone())
+        .unwrap_or_default();
+    assert!(
+        wired.ends_with("provider returned 503"),
+        "the terminal frame must carry the reason across the wire: {wired}"
+    );
 }
 
 #[tokio::test]

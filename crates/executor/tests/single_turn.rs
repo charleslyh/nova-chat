@@ -6,6 +6,7 @@
 //! "this round only" rule, and both stop signals.
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -59,6 +60,50 @@ impl ChatCompletion for ScriptedModel {
         *self.seen.lock().expect("lock") = messages.to_vec();
         *self.seen_tools.lock().expect("lock") = tools.to_vec();
         let chunks: Vec<_> = self.chunks.iter().cloned().map(Ok).collect();
+        let stream: Pin<Box<dyn Stream<Item = _> + Send>> = Box::pin(futures::stream::iter(chunks));
+        Ok(stream)
+    }
+}
+
+/// Answers every call from its own script, so a round that is asked twice can
+/// answer differently the second time. Calls past the script stay silent, which
+/// is what a model that keeps producing nothing looks like.
+struct SequencedModel {
+    rounds: Vec<Vec<ResponseChunk>>,
+    calls: AtomicUsize,
+}
+
+impl SequencedModel {
+    fn new(rounds: Vec<Vec<ResponseChunk>>) -> Self {
+        Self {
+            rounds,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ChatCompletion for SequencedModel {
+    async fn completion(
+        &self,
+        _messages: &[RequestMessage],
+        _tools: &[ToolManifest],
+        _stream: bool,
+        _transport: &TransportOverrides,
+    ) -> Result<ChunkStream, ModelError> {
+        let index = self.calls.fetch_add(1, Ordering::SeqCst);
+        let chunks: Vec<_> = self
+            .rounds
+            .get(index)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(Ok)
+            .collect();
         let stream: Pin<Box<dyn Stream<Item = _> + Send>> = Box::pin(futures::stream::iter(chunks));
         Ok(stream)
     }
@@ -487,6 +532,63 @@ async fn an_empty_completed_round_is_a_failure_not_a_blank_answer() {
         .expect_err("a completed round with no output is a provider anomaly");
 
     assert!(matches!(error, AgentError::Failed { .. }));
+}
+
+#[tokio::test]
+async fn a_blank_round_is_asked_once_more_and_the_second_answer_is_kept() {
+    // What the chain could not survive before: one silent turn discarded the
+    // rounds of tool work behind it.
+    let model = Arc::new(SequencedModel::new(vec![
+        vec![done(FinishReason::Stop)],
+        vec![
+            ResponseChunk::TextBlock("answer".into()),
+            done(FinishReason::Stop),
+        ],
+    ]));
+    let (mut sink, _log) = RecordingSink::new(SinkVerdict::Continue);
+
+    let outcome = executor(model.clone())
+        .run(
+            &task(vec![ResponseItem::user_text("q")], vec![]),
+            &mut sink,
+            &NeverCancel,
+        )
+        .await
+        .expect("the second attempt answers");
+
+    assert_eq!(model.calls(), 2, "one retry, no more");
+    assert_eq!(outcome.items.len(), 1, "the answer is this round's output");
+    assert_eq!(
+        outcome.usage.input_tokens, 20,
+        "both attempts' tokens are owed, not just the last"
+    );
+}
+
+#[tokio::test]
+async fn a_round_that_stays_blank_is_failed_after_exactly_one_retry() {
+    let model = Arc::new(SequencedModel::new(vec![
+        vec![done(FinishReason::Stop)],
+        vec![done(FinishReason::Stop)],
+    ]));
+    let (mut sink, _log) = RecordingSink::new(SinkVerdict::Continue);
+
+    let error = executor(model.clone())
+        .run(
+            &task(vec![ResponseItem::user_text("q")], vec![]),
+            &mut sink,
+            &NeverCancel,
+        )
+        .await
+        .expect_err("a model that never answers is still a failure");
+
+    assert_eq!(model.calls(), 2, "the retry is bounded, not unbounded");
+    match error {
+        AgentError::Failed { message, usage } => {
+            assert!(message.contains("no output items"));
+            assert_eq!(usage.input_tokens, 20);
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
 }
 
 #[tokio::test]

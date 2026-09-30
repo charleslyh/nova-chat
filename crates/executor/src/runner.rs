@@ -40,7 +40,10 @@ use crate::compact::{prepare_messages, ContextCache, ModelSummarizer};
 use crate::outcome::Termination;
 use crate::passthrough::overrides_from_exec_context;
 use crate::transport::{HttpChatCompletion, ModelEndpoint};
-use crate::wire::{ChatCompletion, ModelUsage, ResponseChunk, ToolCallRequest, ToolManifest};
+use crate::wire::{
+    ChatCompletion, ModelUsage, RequestMessage, ResponseChunk, ToolCallRequest, ToolManifest,
+    TransportOverrides,
+};
 
 /// Builds a provider for a resolved endpoint.
 ///
@@ -83,6 +86,11 @@ impl SingleTurnExecutor {
         self
     }
 }
+
+/// How many times a round that finishes normally but produces nothing is asked
+/// again. Two, not unbounded: the point is to survive one silent turn, not to
+/// spend until the model talks.
+const EMPTY_ROUND_ATTEMPTS: usize = 2;
 
 /// Everything accumulated while reading one round's stream.
 #[derive(Default)]
@@ -142,105 +150,153 @@ impl AgentRunner for SingleTurnExecutor {
             tools = tools.len(),
         );
 
-        let mut stream = provider
-            .completion(&messages, &tools, true, &transport)
-            .await
-            .map_err(|error| failed(error, Usage::default()))?;
-
-        let mut state = RoundState::default();
-        let mut termination = None;
-        let mut first_chunk = true;
-
+        // One retry, and only for the one anomaly worth a second attempt: a
+        // round that finished normally yet produced nothing. A blank final answer
+        // used to fail a chain that had already done its tool work — eight
+        // productive rounds discarded for one silent turn. Bounded rather than
+        // open-ended because a model that is deterministically silent is unlikely
+        // to answer on the second ask; this buys one chance, not a guarantee.
+        let mut spent = Usage::default();
+        let mut attempt = 1;
         loop {
-            // `biased` so a fence that has already moved wins over a chunk that
-            // happens to be ready: the point is to stop spending promptly.
-            let next = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(AgentError::Superseded),
-                item = stream.next() => item,
-            };
-            let Some(item) = next else { break };
-            let chunk = item.map_err(|error| failed(error, state.usage))?;
+            let (state, termination) = stream_round(
+                provider.as_ref(),
+                &messages,
+                &tools,
+                &transport,
+                task,
+                sink,
+                cancel,
+            )
+            .await?;
 
-            if first_chunk {
-                first_chunk = false;
-                tracing::info!(
-                    target: "agent_trace",
-                    phase = "exec.first_chunk",
+            let items = round_items(&state, termination);
+            // A completed round with no output at all is a provider anomaly, not
+            // an empty answer: reporting it as success would render a blank
+            // reply. A truncated round legitimately may carry nothing, so only a
+            // `completed` round is retried and then failed.
+            let blank = items.is_empty() && termination == Termination::Completed;
+            if blank && attempt < EMPTY_ROUND_ATTEMPTS {
+                spent = accumulate(spent, state.usage);
+                attempt += 1;
+                tracing::warn!(
                     response_id = %task.provenance.response_id,
+                    attempt,
+                    "round completed with no output items; asking once more"
                 );
+                continue;
+            }
+            if blank {
+                let usage = accumulate(spent, state.usage);
+                return Err(failed("model produced no output items", usage));
             }
 
-            match chunk {
-                ResponseChunk::Think(text) => {
-                    guard(sink.reasoning_text_delta(&text).await)?;
-                }
-                ResponseChunk::TextBlock(text) => {
-                    if !state.message_open {
-                        open_message(sink, &item_id(task)).await?;
-                        state.message_open = true;
-                    }
-                    state.text.push_str(&text);
-                    guard(sink.text_delta(&text).await)?;
-                }
-                ResponseChunk::ThinkDone => {}
-                ResponseChunk::TextDone => {
-                    if state.message_open {
-                        close_message(sink, &item_id(task), &state.text).await?;
-                        state.message_open = false;
-                    }
-                }
-                ResponseChunk::ToolCall(call) => {
-                    let arguments = arguments_to_string(&call.arguments);
-                    guard(sink.tool_call(&call.call_id, &call.name, &arguments).await)?;
-                    state.calls.push(call);
-                }
-                ResponseChunk::Done { reason, usage } => {
-                    state.usage = map_usage(usage.as_ref());
-                    termination = Some(Termination::classify(&reason));
-                    break;
-                }
-            }
+            tracing::info!(
+                target: "agent_trace",
+                phase = "exec.settled",
+                response_id = %task.provenance.response_id,
+                status = termination.status().as_str(),
+                reason = termination
+                    .incomplete_reason()
+                    .map_or("", |reason| reason.as_str()),
+                calls = state.calls.len(),
+                chars = state.text.len(),
+            );
+
+            return Ok(AgentOutcome {
+                items,
+                usage: accumulate(spent, state.usage),
+                termination: termination.report(),
+            });
         }
-
-        // A stream that ended without `Done` still produced a round; treat the
-        // silence as a natural stop rather than inventing a failure.
-        let termination = termination.unwrap_or(Termination::Completed);
-
-        // `TextDone` is optional for adapters, so an item may still be open
-        // here. Closing it keeps the lifecycle well-formed without risking a
-        // second close of one already finished above.
-        if state.message_open {
-            close_message(sink, &item_id(task), &state.text).await?;
-            state.message_open = false;
-        }
-
-        let items = round_items(&state, termination);
-        if items.is_empty() && termination == Termination::Completed {
-            // A completed round with no output at all is a provider anomaly,
-            // not an empty answer: reporting it as success would render a blank
-            // reply. A truncated round legitimately may carry nothing.
-            return Err(failed("model produced no output items", state.usage));
-        }
-
-        tracing::info!(
-            target: "agent_trace",
-            phase = "exec.settled",
-            response_id = %task.provenance.response_id,
-            status = termination.status().as_str(),
-            reason = termination
-                .incomplete_reason()
-                .map_or("", |reason| reason.as_str()),
-            calls = state.calls.len(),
-            chars = state.text.len(),
-        );
-
-        Ok(AgentOutcome {
-            items,
-            usage: state.usage,
-            termination: termination.report(),
-        })
     }
+}
+
+/// One attempt at the round: open the stream, consume it, and close whatever
+/// item is still open. Its own function so a round that comes back blank can be
+/// asked again without re-deriving the context.
+async fn stream_round(
+    provider: &dyn ChatCompletion,
+    messages: &[RequestMessage],
+    tools: &[ToolManifest],
+    transport: &TransportOverrides,
+    task: &AgentTask,
+    sink: &mut dyn AgentEventSink,
+    cancel: &dyn CancelProbe,
+) -> Result<(RoundState, Termination), AgentError> {
+    let mut stream = provider
+        .completion(messages, tools, true, transport)
+        .await
+        .map_err(|error| failed(error, Usage::default()))?;
+
+    let mut state = RoundState::default();
+    let mut termination = None;
+    let mut first_chunk = true;
+
+    loop {
+        // `biased` so a fence that has already moved wins over a chunk that
+        // happens to be ready: the point is to stop spending promptly.
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(AgentError::Superseded),
+            item = stream.next() => item,
+        };
+        let Some(item) = next else { break };
+        let chunk = item.map_err(|error| failed(error, state.usage))?;
+
+        if first_chunk {
+            first_chunk = false;
+            tracing::info!(
+                target: "agent_trace",
+                phase = "exec.first_chunk",
+                response_id = %task.provenance.response_id,
+            );
+        }
+
+        match chunk {
+            ResponseChunk::Think(text) => {
+                guard(sink.reasoning_text_delta(&text).await)?;
+            }
+            ResponseChunk::TextBlock(text) => {
+                if !state.message_open {
+                    open_message(sink, &item_id(task)).await?;
+                    state.message_open = true;
+                }
+                state.text.push_str(&text);
+                guard(sink.text_delta(&text).await)?;
+            }
+            ResponseChunk::ThinkDone => {}
+            ResponseChunk::TextDone => {
+                if state.message_open {
+                    close_message(sink, &item_id(task), &state.text).await?;
+                    state.message_open = false;
+                }
+            }
+            ResponseChunk::ToolCall(call) => {
+                let arguments = arguments_to_string(&call.arguments);
+                guard(sink.tool_call(&call.call_id, &call.name, &arguments).await)?;
+                state.calls.push(call);
+            }
+            ResponseChunk::Done { reason, usage } => {
+                state.usage = map_usage(usage.as_ref());
+                termination = Some(Termination::classify(&reason));
+                break;
+            }
+        }
+    }
+
+    // A stream that ended without `Done` still produced a round; treat the
+    // silence as a natural stop rather than inventing a failure.
+    let termination = termination.unwrap_or(Termination::Completed);
+
+    // `TextDone` is optional for adapters, so an item may still be open here.
+    // Closing it keeps the lifecycle well-formed without risking a second close
+    // of one already finished above.
+    if state.message_open {
+        close_message(sink, &item_id(task), &state.text).await?;
+    }
+
+    Ok((state, termination))
 }
 
 /// This round's own output, in emission order: the answer, then the calls it
@@ -351,6 +407,15 @@ fn map_usage(usage: Option<&ModelUsage>) -> Usage {
     usage
         .map(|usage| Usage::new(usage.prompt_tokens as u64, usage.completion_tokens as u64))
         .unwrap_or_default()
+}
+
+/// Tokens spent across every attempt of one round: a round that was asked twice
+/// still owes what the first attempt burned.
+fn accumulate(spent: Usage, last: Usage) -> Usage {
+    Usage::new(
+        spent.input_tokens + last.input_tokens,
+        spent.output_tokens + last.output_tokens,
+    )
 }
 
 /// Arguments cross the protocol boundary as an opaque string, because
