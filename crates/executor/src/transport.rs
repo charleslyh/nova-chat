@@ -12,8 +12,9 @@
 //!   where that mattered (the usage drain) it is called out inline.
 //! - **Logs redacted.** The original wrote whole request bodies and whole
 //!   response texts at `info!`, which put every user message into the log at
-//!   normal verbosity. Bodies are never logged now; text is capped and sits at
-//!   `debug!`.
+//!   normal verbosity. That is deliberately restored for troubleshooting: the
+//!   `[llm]` request/response logs carry the full request body and the
+//!   complete accumulated result at `info!`, on by default.
 //! - **The API key cannot be printed.** It is wrapped in a type whose `Debug`
 //!   is opaque, so adding `#[derive(Debug)]` upstream of it cannot leak it.
 
@@ -53,6 +54,51 @@ use crate::wire::{
 /// Cap on model text reaching a log line. A trace records what happened, not
 /// what was said.
 const LOG_TEXT_LIMIT: usize = 256;
+
+/// Whether the `[llm]` request/response logs are on. They carry the full
+/// request body and the complete (accumulated) result at `info!`, so they are
+/// on by default; the check only skips serialisation when filtered out.
+/// Headers (and thus credentials) are never logged.
+fn wire_enabled() -> bool {
+    tracing::enabled!(tracing::Level::INFO)
+}
+
+fn to_json(value: &impl serde::Serialize) -> String {
+    serde_json::to_string(value).unwrap_or_else(|error| format!("<unserializable: {error}>"))
+}
+
+/// The accumulated outcome of one streamed round, dumped once at its end.
+#[allow(clippy::too_many_arguments)]
+fn log_stream_result(
+    model: &str,
+    outcome: &str,
+    finish_reason: Option<&WireFinishReason>,
+    content: &str,
+    reasoning: &str,
+    refusal: &str,
+    tool_calls: &[ToolCallRequest],
+    usage: Option<&CompletionUsage>,
+) {
+    if !wire_enabled() {
+        return;
+    }
+    let result = serde_json::json!({
+        "model": model,
+        "outcome": outcome,
+        "finish_reason": finish_reason,
+        "content": content,
+        "reasoning_content": reasoning,
+        "refusal": refusal,
+        "tool_calls": tool_calls,
+        "usage": usage,
+    });
+    tracing::info!(
+        finish_reason = ?finish_reason,
+        chars = content.len(),
+        result = %result,
+        "[llm] response (stream, accumulated)"
+    );
+}
 
 /// An API key that cannot be printed by accident.
 #[derive(Clone)]
@@ -209,16 +255,17 @@ impl ChatCompletion for HttpChatCompletion {
     ) -> Result<ChunkStream, ModelError> {
         let client = self.client_for(transport);
         let request = self.request(messages, tools, stream);
-        // Shape only. The body carries the whole conversation, so it is never
-        // logged; when a wire-level dump is genuinely needed it belongs behind
-        // a deliberate, short-lived local change, not in normal operation.
-        tracing::debug!(
-            model = %self.api_model,
-            messages = messages.len(),
-            tools = tools.len(),
-            stream,
-            "[llm] request"
-        );
+        if wire_enabled() {
+            tracing::info!(
+                model = %self.api_model,
+                messages = messages.len(),
+                tools = tools.len(),
+                stream,
+                passthrough_headers = transport.headers().count(),
+                body = %to_json(&request),
+                "[llm] request"
+            );
+        }
         if !stream {
             return self.blocking_turn(request, &client).await;
         }
@@ -236,7 +283,10 @@ impl HttpChatCompletion {
             .chat()
             .create(request)
             .await
-            .map_err(provider_error)?;
+            .map_err(|error| {
+                tracing::info!(error = %error, "[llm] request failed (non-stream)");
+                provider_error(error)
+            })?;
         let choice = response
             .choices
             .first()
@@ -282,11 +332,14 @@ impl HttpChatCompletion {
             choice.finish_reason.as_ref(),
             choice.message.refusal.clone().unwrap_or_default(),
         );
-        tracing::debug!(
-            finish_reason = ?reason,
-            chars = choice.message.content.as_deref().unwrap_or_default().len(),
-            "[llm] response (non-stream)"
-        );
+        if wire_enabled() {
+            tracing::info!(
+                finish_reason = ?reason,
+                chars = choice.message.content.as_deref().unwrap_or_default().len(),
+                body = %to_json(&response),
+                "[llm] response (non-stream)"
+            );
+        }
         chunks.push(Ok(ResponseChunk::Done {
             reason,
             usage: response.usage.as_ref().map(map_usage),
@@ -303,10 +356,14 @@ impl HttpChatCompletion {
             .chat()
             .create_stream(request)
             .await
-            .map_err(provider_error)?;
+            .map_err(|error| {
+                tracing::info!(error = %error, "[llm] request failed (stream)");
+                provider_error(error)
+            })?;
         // Whether this turn asked the model to think: only such a turn can be
         // receiving an INLINED CoT, so only such a turn holds its body.
         let thinking = self.thinks();
+        let model = self.api_model.clone();
         let output = async_stream::stream! {
             let mut calls: HashMap<u32, (String, String, String)> = HashMap::new();
             let mut refusal = String::new();
@@ -314,6 +371,8 @@ impl HttpChatCompletion {
             let mut saw_reasoning = false;
             let mut saw_text = false;
             let mut acc_text = String::new();
+            // Raw `reasoning_content` field, accumulated for the wire dump only.
+            let mut acc_reasoning = String::new();
             let mut splitter = ThinkSplitter::new(thinking);
 
             while let Some(item) = upstream.next().await {
@@ -325,6 +384,26 @@ impl HttpChatCompletion {
                             preview = %redact(&acc_text),
                             "[llm] stream failed mid-way"
                         );
+                        if wire_enabled() {
+                            let partial: Vec<_> = calls
+                                .values()
+                                .map(|(call_id, name, arguments)| ToolCallRequest {
+                                    call_id: call_id.clone(),
+                                    name: name.clone(),
+                                    arguments: Value::String(arguments.clone()),
+                                })
+                                .collect();
+                            log_stream_result(
+                                &model,
+                                &format!("error: {error}"),
+                                None,
+                                &acc_text,
+                                &acc_reasoning,
+                                &refusal,
+                                &partial,
+                                usage.as_ref(),
+                            );
+                        }
                         yield Err(provider_error(error));
                         return;
                     }
@@ -337,6 +416,7 @@ impl HttpChatCompletion {
                     continue;
                 };
                 if let Some(reasoning) = reasoning {
+                    acc_reasoning.push_str(&reasoning);
                     // The provider carries the CoT in its own field: stop
                     // splitting and give back whatever body is being held.
                     for part in splitter.disable() {
@@ -398,16 +478,21 @@ impl HttpChatCompletion {
                     if saw_text {
                         yield Ok(ResponseChunk::TextDone);
                     }
-                    for call in finalize_calls(calls) {
+                    let finalized = finalize_calls(calls);
+                    log_stream_result(
+                        &model,
+                        "finished",
+                        Some(reason),
+                        &acc_text,
+                        &acc_reasoning,
+                        &refusal,
+                        &finalized,
+                        usage.as_ref(),
+                    );
+                    for call in finalized {
                         yield Ok(ResponseChunk::ToolCall(call));
                     }
                     let reason = finish_reason(Some(reason), refusal);
-                    tracing::debug!(
-                        finish_reason = ?reason,
-                        chars = acc_text.len(),
-                        preview = %redact(&acc_text),
-                        "[llm] response (stream)"
-                    );
                     yield Ok(ResponseChunk::Done {
                         reason,
                         usage: usage.as_ref().map(map_usage),
@@ -430,14 +515,20 @@ impl HttpChatCompletion {
             if saw_text {
                 yield Ok(ResponseChunk::TextDone);
             }
-            for call in finalize_calls(calls) {
+            let finalized = finalize_calls(calls);
+            log_stream_result(
+                &model,
+                "ended without finish_reason",
+                None,
+                &acc_text,
+                &acc_reasoning,
+                &refusal,
+                &finalized,
+                usage.as_ref(),
+            );
+            for call in finalized {
                 yield Ok(ResponseChunk::ToolCall(call));
             }
-            tracing::debug!(
-                chars = acc_text.len(),
-                preview = %redact(&acc_text),
-                "[llm] response (stream, no finish_reason)"
-            );
             yield Ok(ResponseChunk::Done {
                 reason: finish_reason(None, refusal),
                 usage: usage.as_ref().map(map_usage),
