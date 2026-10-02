@@ -36,6 +36,10 @@ pub struct ToolManifest {
     pub description: String,
     /// JSON Schema object, passed through untouched.
     pub parameters: Value,
+    /// The caller's `strict` flag. Reaches the wire only when the endpoint
+    /// opts in, since constrained decoding is not safe for every tool format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 /// A tool call the model asked for.
@@ -60,6 +64,10 @@ pub enum RequestMessage {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<ToolCallRequest>>,
+        /// The thinking this turn was produced with. Interleaved-thinking models
+        /// expect it back on every assistant turn of the current tool loop.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
     },
     Tool {
         content: String,
@@ -94,6 +102,11 @@ pub enum FinishReason {
     /// calling it `Stop` once committed half-written tool arguments as a
     /// finished round.
     Interrupted,
+    /// The upstream said it stopped to call tools (`finish_reason:
+    /// "tool_calls"`) but no call survived its parser. Seen when the model's
+    /// tool-call markup is malformed: the server keeps the text before it and
+    /// drops the call.
+    MissingToolCalls,
 }
 
 /// Token accounting for one model round.

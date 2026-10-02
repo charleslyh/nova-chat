@@ -155,7 +155,8 @@ impl Conversation {
 pub struct TurnCommit {
     pub input_items: Vec<ResponseItem>,
     pub output_items: Vec<ResponseItem>,
-    /// Render-only, placed immediately before the output block.
+    /// Placed immediately before the output block; see [`crate::ContextEntry`]
+    /// for who reads it back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
     pub usage: Usage,

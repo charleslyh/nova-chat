@@ -72,6 +72,8 @@ impl ChatCompletion for ScriptedModel {
 struct SequencedModel {
     rounds: Vec<Vec<ResponseChunk>>,
     calls: AtomicUsize,
+    /// What each call was asked, in order.
+    seen: Mutex<Vec<Vec<RequestMessage>>>,
 }
 
 impl SequencedModel {
@@ -79,11 +81,16 @@ impl SequencedModel {
         Self {
             rounds,
             calls: AtomicUsize::new(0),
+            seen: Mutex::new(Vec::new()),
         }
     }
 
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    fn asked(&self, call: usize) -> Vec<RequestMessage> {
+        self.seen.lock().expect("lock")[call].clone()
     }
 }
 
@@ -91,11 +98,12 @@ impl SequencedModel {
 impl ChatCompletion for SequencedModel {
     async fn completion(
         &self,
-        _messages: &[RequestMessage],
+        messages: &[RequestMessage],
         _tools: &[ToolManifest],
         _stream: bool,
         _transport: &TransportOverrides,
     ) -> Result<ChunkStream, ModelError> {
+        self.seen.lock().expect("lock").push(messages.to_vec());
         let index = self.calls.fetch_add(1, Ordering::SeqCst);
         let chunks: Vec<_> = self
             .rounds
@@ -244,6 +252,7 @@ fn task_with_context(
         params,
         exec_context,
         items,
+        reasoning: Default::default(),
         inherited_len: 0,
         previous_response_id: None,
         conversation_id: None,
@@ -1233,4 +1242,235 @@ async fn a_round_without_a_stamp_carries_nothing() {
         .expect("completes");
 
     assert!(transport.lock().expect("lock").is_empty());
+}
+
+// --- reasoning replay & lost tool calls -------------------------------------
+
+fn a_tool() -> Vec<nova_responses::protocol::Tool> {
+    vec![nova_responses::protocol::Tool::Function {
+        name: "draw".to_string(),
+        description: Some("draws".to_string()),
+        parameters: serde_json::json!({ "type": "object" }),
+        strict: None,
+    }]
+}
+
+fn draw_call(call_id: &str) -> ResponseChunk {
+    ResponseChunk::ToolCall(ToolCallRequest {
+        call_id: call_id.into(),
+        name: "draw".into(),
+        arguments: serde_json::json!({ "what": "cat" }),
+    })
+}
+
+fn function_calls(items: &[ResponseItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| matches!(item, ResponseItem::FunctionCall { .. }))
+        .count()
+}
+
+#[tokio::test]
+async fn inherited_reasoning_is_replayed_on_its_assistant_turn() {
+    let model = Arc::new(SequencedModel::new(vec![vec![
+        ResponseChunk::TextBlock("done".into()),
+        done(FinishReason::Stop),
+    ]]));
+    let (mut sink, _log) = RecordingSink::new(SinkVerdict::Continue);
+    let mut task = task(
+        vec![
+            ResponseItem::user_text("draw a cat"),
+            ResponseItem::FunctionCall {
+                call_id: "c1".into(),
+                name: "draw".into(),
+                arguments: "{}".into(),
+                id: None,
+                status: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "c1".into(),
+                output: "ok".into(),
+                id: None,
+                status: None,
+            },
+        ],
+        a_tool(),
+    );
+    task.reasoning.insert(1, "I should draw".into());
+
+    executor(model.clone())
+        .run(&task, &mut sink, &NeverCancel)
+        .await
+        .expect("completes");
+
+    let asked = model.asked(0);
+    assert!(
+        asked.iter().any(|message| matches!(
+            message,
+            RequestMessage::Assistant { reasoning: Some(text), tool_calls: Some(_), .. }
+                if text == "I should draw"
+        )),
+        "the call's assistant turn carries its reasoning: {asked:?}"
+    );
+}
+
+/// The Hy3 incident shape: "我来帮你画。" streamed, `finish_reason` said
+/// tool_calls, no call parsed. The round is continued once, the announcement
+/// kept as said, and the recovered call ends up in the same round's output.
+#[tokio::test]
+async fn an_announced_but_lost_tool_call_is_recovered_by_one_continuation() {
+    let model = Arc::new(SequencedModel::new(vec![
+        vec![
+            ResponseChunk::Think("plan".into()),
+            ResponseChunk::TextBlock("我来帮你画。".into()),
+            ResponseChunk::TextDone,
+            done(FinishReason::MissingToolCalls),
+        ],
+        vec![draw_call("call_1"), done(FinishReason::Stop)],
+    ]));
+    let (mut sink, log) = RecordingSink::new(SinkVerdict::Continue);
+
+    let outcome = executor(model.clone())
+        .run(
+            &task(vec![ResponseItem::user_text("画只猫")], a_tool()),
+            &mut sink,
+            &NeverCancel,
+        )
+        .await
+        .expect("recovered");
+
+    assert_eq!(model.calls(), 2, "one continuation, no more");
+    assert_eq!(outcome.termination.status(), ResponseStatus::Completed);
+    assert_eq!(function_calls(&outcome.items), 1);
+    assert_eq!(log.lock().expect("lock").text, "我来帮你画。", "said once");
+
+    let followup = model.asked(1);
+    let n = followup.len();
+    assert!(matches!(
+        &followup[n - 2],
+        RequestMessage::Assistant { content, reasoning: Some(thought), .. }
+            if content == "我来帮你画。" && thought == "plan"
+    ));
+    assert!(matches!(&followup[n - 1], RequestMessage::User { .. }));
+}
+
+#[tokio::test]
+async fn leaked_tool_markup_is_treated_as_a_lost_call() {
+    let model = Arc::new(SequencedModel::new(vec![
+        vec![
+            ResponseChunk::TextBlock("好的<tool_calls><tool_call>draw".into()),
+            done(FinishReason::Stop),
+        ],
+        vec![draw_call("call_1"), done(FinishReason::Stop)],
+    ]));
+    let (mut sink, _log) = RecordingSink::new(SinkVerdict::Continue);
+
+    let outcome = executor(model.clone())
+        .run(
+            &task(vec![ResponseItem::user_text("q")], a_tool()),
+            &mut sink,
+            &NeverCancel,
+        )
+        .await
+        .expect("recovered");
+
+    assert_eq!(model.calls(), 2);
+    assert_eq!(function_calls(&outcome.items), 1);
+}
+
+#[tokio::test]
+async fn a_lost_call_with_nothing_shown_is_simply_asked_again() {
+    let model = Arc::new(SequencedModel::new(vec![
+        vec![done(FinishReason::MissingToolCalls)],
+        vec![draw_call("call_1"), done(FinishReason::Stop)],
+    ]));
+    let (mut sink, _log) = RecordingSink::new(SinkVerdict::Continue);
+
+    let outcome = executor(model.clone())
+        .run(
+            &task(vec![ResponseItem::user_text("q")], a_tool()),
+            &mut sink,
+            &NeverCancel,
+        )
+        .await
+        .expect("the retry calls");
+
+    assert_eq!(model.calls(), 2);
+    assert!(
+        !model
+            .asked(1)
+            .iter()
+            .any(|message| matches!(message, RequestMessage::Assistant { .. })),
+        "a plain retry asks the same question, with no continuation"
+    );
+    assert_eq!(function_calls(&outcome.items), 1);
+}
+
+#[tokio::test]
+async fn a_continuation_that_produces_nothing_leaves_the_answer_standing() {
+    let model = Arc::new(SequencedModel::new(vec![
+        vec![
+            ResponseChunk::TextBlock("我来帮你画。".into()),
+            done(FinishReason::MissingToolCalls),
+        ],
+        vec![done(FinishReason::Interrupted)],
+    ]));
+    let (mut sink, _log) = RecordingSink::new(SinkVerdict::Continue);
+
+    let outcome = executor(model.clone())
+        .run(
+            &task(vec![ResponseItem::user_text("q")], a_tool()),
+            &mut sink,
+            &NeverCancel,
+        )
+        .await
+        .expect("the first answer stands");
+
+    assert_eq!(model.calls(), 2, "continued once, not retried further");
+    assert_eq!(outcome.termination.status(), ResponseStatus::Completed);
+    assert_eq!(outcome.items.len(), 1);
+}
+
+#[tokio::test]
+async fn a_plain_answer_is_never_continued() {
+    let model = Arc::new(SequencedModel::new(vec![vec![
+        ResponseChunk::TextBlock("我来解释一下：猫是哺乳动物。".into()),
+        done(FinishReason::Stop),
+    ]]));
+    let (mut sink, _log) = RecordingSink::new(SinkVerdict::Continue);
+
+    executor(model.clone())
+        .run(
+            &task(vec![ResponseItem::user_text("q")], a_tool()),
+            &mut sink,
+            &NeverCancel,
+        )
+        .await
+        .expect("completes");
+
+    assert_eq!(
+        model.calls(),
+        1,
+        "phrasing alone never triggers a continuation"
+    );
+}
+
+#[tokio::test]
+async fn without_tools_on_offer_a_tool_calls_reason_is_not_chased() {
+    let model = Arc::new(SequencedModel::new(vec![vec![
+        ResponseChunk::TextBlock("answer".into()),
+        done(FinishReason::MissingToolCalls),
+    ]]));
+    let (mut sink, _log) = RecordingSink::new(SinkVerdict::Continue);
+
+    executor(model.clone())
+        .run(
+            &task(vec![ResponseItem::user_text("q")], vec![]),
+            &mut sink,
+            &NeverCancel,
+        )
+        .await
+        .expect("completes");
+
+    assert_eq!(model.calls(), 1);
 }

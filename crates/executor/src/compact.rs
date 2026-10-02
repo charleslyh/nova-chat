@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use async_trait::async_trait;
 use futures::StreamExt;
 use nova_agent_runtime::AgentTask;
-use nova_responses::{ConversationId, ResponseId, ResponseItem};
+use nova_responses::{ConversationId, ResponseId};
 
-use crate::context::{append_items, items_to_messages, with_instructions};
+use crate::context::{append_items, keep_reasoning_of_current_loop, with_instructions};
 use crate::wire::{
     ChatCompletion, ModelError, RequestMessage, ResponseChunk, ToolManifest, TransportOverrides,
 };
@@ -173,8 +173,11 @@ pub async fn prepare_messages(
     summarizer: &dyn ConversationSummarizer,
 ) -> Result<Vec<RequestMessage>, ModelError> {
     let mut conversation = cached_conversation(cache, task)
-        .unwrap_or_else(|| full_conversation(&task.items))
-        .or_else(|_| full_conversation(&task.items))?;
+        .unwrap_or_else(|| full_conversation(task))
+        .or_else(|_| full_conversation(task))?;
+    // A cached prefix was built while an older loop was current, so the
+    // retention rule is applied to the assembled whole, every round.
+    keep_reasoning_of_current_loop(&mut conversation);
 
     if let Some(window) = window_tokens {
         let fixed = with_instructions(task.params.instructions.as_deref(), Vec::new());
@@ -221,11 +224,22 @@ fn cached_conversation(
         return None;
     }
     let mut messages = entry.messages.clone();
-    Some(append_items(&mut messages, &task.items[entry.covered_items..]).map(|()| messages))
+    let covered = entry.covered_items;
+    Some(
+        append_items(
+            &mut messages,
+            &task.items[covered..],
+            covered,
+            &task.reasoning,
+        )
+        .map(|()| messages),
+    )
 }
 
-fn full_conversation(items: &[ResponseItem]) -> Result<Vec<RequestMessage>, ModelError> {
-    items_to_messages(items)
+fn full_conversation(task: &AgentTask) -> Result<Vec<RequestMessage>, ModelError> {
+    let mut messages = Vec::with_capacity(task.items.len());
+    append_items(&mut messages, &task.items, 0, &task.reasoning)?;
+    Ok(messages)
 }
 
 fn auto_threshold(window_tokens: usize) -> usize {
@@ -383,8 +397,12 @@ fn message_tokens(message: &RequestMessage, count: fn(&str) -> usize) -> usize {
         RequestMessage::Assistant {
             content,
             tool_calls,
+            reasoning,
         } => {
             let mut tokens = count(content);
+            if let Some(reasoning) = reasoning {
+                tokens += count(reasoning);
+            }
             if let Some(calls) = tool_calls {
                 for call in calls {
                     tokens += count(&call.name) + count(&call.arguments.to_string());
@@ -584,9 +602,12 @@ fn render_transcript(messages: &[RequestMessage]) -> String {
                 out.push_str("[user]\n");
                 out.push_str(content);
             }
+            // Reasoning is left out of the summary input: the summary records
+            // what happened, not how the model thought about it.
             RequestMessage::Assistant {
                 content,
                 tool_calls,
+                ..
             } => {
                 out.push_str("[assistant]\n");
                 out.push_str(content);
@@ -615,7 +636,7 @@ fn render_transcript(messages: &[RequestMessage]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nova_responses::{Attempt, NodeTag};
+    use nova_responses::{Attempt, NodeTag, ResponseItem};
 
     struct FixedSummary(&'static str);
 
@@ -642,6 +663,7 @@ mod tests {
             params,
             exec_context: None,
             items,
+            reasoning: Default::default(),
             inherited_len,
             previous_response_id,
             conversation_id,
@@ -666,6 +688,7 @@ mod tests {
                 "type": "object",
                 "properties": {"city": {"type": "string"}}
             }),
+            strict: None,
         }];
         let estimate = Hy3TokenEstimator::estimate(&messages, &tools, &[]);
         assert!(estimate.total > 3);
@@ -726,6 +749,7 @@ mod tests {
             RequestMessage::Assistant {
                 content: "answer".into(),
                 tool_calls: None,
+                reasoning: None,
             },
             RequestMessage::User {
                 content: "current".into(),

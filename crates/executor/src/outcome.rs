@@ -62,6 +62,9 @@ impl Termination {
     pub fn classify(reason: &FinishReason) -> Self {
         match reason {
             FinishReason::Stop => Self::Completed,
+            // What reached us is a finished round; recovering the lost call is
+            // the runner's job, not a termination of its own.
+            FinishReason::MissingToolCalls => Self::Completed,
             FinishReason::Length => Self::Truncated(IncompleteReason::MaxOutputTokens),
             // The protocol has no "interrupted" reason; the output budget is the
             // closest official one, and what matters is that it is not `completed`.
@@ -164,6 +167,7 @@ mod tests {
             FinishReason::Stop,
             FinishReason::Length,
             FinishReason::Interrupted,
+            FinishReason::MissingToolCalls,
             FinishReason::Refusal { reason: None },
             FinishReason::Refusal {
                 reason: Some("no".to_string()),

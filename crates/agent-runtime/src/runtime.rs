@@ -288,13 +288,21 @@ impl AgentRuntime {
         let inherited_len = snapshot.item_count();
         let previous_response_id = record.previous_response_id().cloned();
         let conversation_id = record.conversation_id().cloned();
-        let mut items: Vec<ResponseItem> = snapshot.into_items();
+        let mut reasoning = std::collections::BTreeMap::new();
+        let mut items: Vec<ResponseItem> = Vec::with_capacity(inherited_len);
+        for (index, entry) in snapshot.entries.into_iter().enumerate() {
+            if let Some(text) = entry.reasoning.filter(|text| !text.is_empty()) {
+                reasoning.insert(index, text);
+            }
+            items.push(entry.item);
+        }
         items.extend(record.spec.input_items.clone());
 
         let task = AgentTask {
             params: record.spec.params.clone(),
             exec_context: record.exec_context.clone(),
             items,
+            reasoning,
             inherited_len,
             previous_response_id,
             conversation_id,

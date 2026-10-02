@@ -731,6 +731,71 @@ async fn reasoning_is_persisted_but_never_fed_back_as_context() {
     let _ = id;
 }
 
+/// Records the reasoning the runtime hands over with the history.
+struct RecordsReasoning(Arc<std::sync::Mutex<Option<std::collections::BTreeMap<usize, String>>>>);
+
+#[async_trait]
+impl nova_agent_runtime::AgentRunner for RecordsReasoning {
+    fn name(&self) -> &str {
+        "records-reasoning"
+    }
+
+    async fn run(
+        &self,
+        task: &nova_agent_runtime::AgentTask,
+        sink: &mut dyn AgentEventSink,
+        _cancel: &dyn nova_agent_runtime::CancelProbe,
+    ) -> Result<nova_agent_runtime::AgentOutcome, nova_agent_runtime::AgentError> {
+        *self.0.lock().expect("lock") = Some(task.reasoning.clone());
+        sink.text_delta("ok").await.expect("sink");
+        Ok(nova_agent_runtime::AgentOutcome {
+            items: vec![ResponseItem::assistant_text("ok")],
+            usage: Usage::new(1, 1),
+            termination: nova_agent_runtime::AgentTermination::Completed,
+        })
+    }
+}
+
+/// Interleaved-thinking models need their reasoning back within a tool loop,
+/// so the runtime hands the stored reasoning to the runner, keyed by the item
+/// it preceded. Which of it reaches the model is the executor's call.
+#[tokio::test]
+async fn stored_reasoning_reaches_the_next_turns_runner() {
+    let world = MemWorld::new();
+    let (_first, conv) = queue(&world, "think", true).await;
+    let e = engine(&world, Arc::new(ReasoningThenAnswer));
+    assert_eq!(e.run_once(2_000).await, Executed::Completed);
+
+    let second = ResponseId::new(node());
+    let mut rec = record(&second, "again", true);
+    rec.spec.anchor = ContextAnchor::Conversation(conv.clone());
+    world
+        .ledger
+        .create(rec, IdempotencyKey::parse(&uuid::Uuid::new_v4().to_string()).expect("a uuid is a valid key"), 3_000)
+        .await
+        .expect("create");
+
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let e = AgentRuntime::new(
+        AgentRuntimeDeps {
+            ledger: world.ledger.clone(),
+            event_log: world.event_log.clone(),
+            runner: Arc::new(RecordsReasoning(seen.clone())),
+            clock: world.clock.clone(),
+            conversations: Some(world.conversation.clone()),
+        },
+        AgentRuntimeConfig::default(),
+    );
+    assert_eq!(e.run_once(4_000).await, Executed::Completed);
+
+    let reasoning = seen.lock().expect("lock").clone().expect("the runner ran");
+    assert_eq!(
+        reasoning,
+        std::collections::BTreeMap::from([(1, "Let me think about this.".to_string())]),
+        "keyed by the first output item of the turn it preceded"
+    );
+}
+
 // ===== Heartbeat: long generation vs. reap =====
 
 struct GatedScheduler {

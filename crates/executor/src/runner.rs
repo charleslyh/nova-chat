@@ -168,6 +168,10 @@ struct RoundState {
     /// may be retried: a second attempt after output would show it twice.
     emitted: bool,
     interruption: Option<Interruption>,
+    /// The thinking streamed this round, so a continuation can carry it.
+    reasoning: String,
+    /// The upstream reported `tool_calls` but no call survived its parser.
+    missing_calls: bool,
 }
 
 #[async_trait]
@@ -233,6 +237,7 @@ impl AgentRunner for SingleTurnExecutor {
                 sink,
                 cancel,
                 self.timeouts,
+                &item_id(task, 1),
             )
             .await?;
 
@@ -243,14 +248,18 @@ impl AgentRunner for SingleTurnExecutor {
             // `completed` round is retried and then failed.
             let blank = items.is_empty() && termination == Termination::Completed;
             let cut_silent = state.interruption.filter(|_| !state.emitted);
-            if (blank || cut_silent.is_some()) && attempt < ROUND_ATTEMPTS {
+            let lost = lost_tool_call(&state, termination, &tools);
+            let lost_silent = lost.filter(|_| !state.emitted);
+            if (blank || cut_silent.is_some() || lost_silent.is_some()) && attempt < ROUND_ATTEMPTS
+            {
                 spent = accumulate(spent, state.usage);
                 attempt += 1;
                 tracing::warn!(
                     response_id = %task.provenance.response_id,
                     attempt,
                     interruption = cut_silent.map_or("", Interruption::as_str),
-                    "round produced no output; asking once more"
+                    lost_tool_call = lost_silent.unwrap_or(""),
+                    "round produced no usable output; asking once more"
                 );
                 continue;
             }
@@ -277,6 +286,62 @@ impl AgentRunner for SingleTurnExecutor {
                 );
             }
 
+            let mut items = items;
+            let mut termination = termination;
+            let mut calls = state.calls.len();
+            let mut chars = state.text.len();
+            let mut usage = accumulate(spent, state.usage);
+            if let Some(cause) = lost {
+                // The user already saw "I'll use the tool…": re-asking would show
+                // it twice, so the round is continued instead — the announcement
+                // is kept as said, and the model is told its call went missing.
+                let mut followup = messages.clone();
+                followup.push(RequestMessage::Assistant {
+                    content: state.text.clone(),
+                    tool_calls: None,
+                    reasoning: (!state.reasoning.is_empty()).then(|| state.reasoning.clone()),
+                });
+                followup.push(RequestMessage::User {
+                    content: TOOL_CALL_NUDGE.to_string(),
+                });
+                let (second, second_termination) = stream_round(
+                    provider.as_ref(),
+                    &followup,
+                    &tools,
+                    &transport,
+                    task,
+                    sink,
+                    cancel,
+                    self.timeouts,
+                    &item_id(task, 2),
+                )
+                .await?;
+                tracing::warn!(
+                    response_id = %task.provenance.response_id,
+                    cause,
+                    recovered = !second.calls.is_empty(),
+                    calls = second.calls.len(),
+                    "round announced a tool call that never arrived; continued once"
+                );
+                // A follow-up that produced nothing leaves the first answer
+                // standing as it was.
+                if second.emitted {
+                    items.extend(round_items(&second, second_termination));
+                    termination = second_termination;
+                }
+                calls += second.calls.len();
+                chars += second.text.len();
+                usage = accumulate(usage, second.usage);
+            } else if announces_a_tool_call(&state, termination, &tools) {
+                // Not acted on: without a structural signal, phrasing alone is too
+                // weak to override an answer. Logged to size the problem.
+                tracing::info!(
+                    response_id = %task.provenance.response_id,
+                    chars = state.text.len(),
+                    "round reads like a tool announcement but called no tool"
+                );
+            }
+
             tracing::info!(
                 target: "agent_trace",
                 phase = "exec.settled",
@@ -286,17 +351,67 @@ impl AgentRunner for SingleTurnExecutor {
                     .incomplete_reason()
                     .map_or("", |reason| reason.as_str()),
                 interruption = state.interruption.map_or("", Interruption::as_str),
-                calls = state.calls.len(),
-                chars = state.text.len(),
+                lost_tool_call = lost.unwrap_or(""),
+                calls,
+                chars,
             );
 
             return Ok(AgentOutcome {
                 items,
-                usage: accumulate(spent, state.usage),
+                usage,
                 termination: termination.report(),
             });
         }
     }
+}
+
+/// Said to the model when its round announced a tool call that never arrived.
+const TOOL_CALL_NUDGE: &str = "[system notice] Your previous message announced a tool call, \
+but no tool call reached the system: it was malformed or lost. Make that tool call now, in the \
+proper tool-call format. Do not repeat what you already said.";
+
+/// Tool-call markup that only shows up in text when the server failed to parse
+/// it into a call (Hy3, Qwen XML and Hermes-style formats).
+const LEAKED_TOOL_MARKUP: &[&str] = &["<tool_call", "<tool_sep", "<arg_key>", "<function="];
+
+/// Why a finished round that offered tools is known to have lost its call:
+/// the upstream said it stopped for tools but none survived, or the call's
+/// markup leaked into the text. Both are structural, so neither misfires on an
+/// ordinary answer.
+fn lost_tool_call(
+    state: &RoundState,
+    termination: Termination,
+    tools: &[ToolManifest],
+) -> Option<&'static str> {
+    if tools.is_empty() || !state.calls.is_empty() || termination != Termination::Completed {
+        return None;
+    }
+    if state.missing_calls {
+        return Some("finish_reason_tool_calls");
+    }
+    LEAKED_TOOL_MARKUP
+        .iter()
+        .any(|marker| state.text.contains(marker))
+        .then_some("leaked_markup")
+}
+
+/// A short answer that only announces work, in a round that offered tools and
+/// called none.
+fn announces_a_tool_call(
+    state: &RoundState,
+    termination: Termination,
+    tools: &[ToolManifest],
+) -> bool {
+    const PHRASES: &[&str] = &[
+        "我来", "让我", "我将", "我先", "I'll ", "I will ", "Let me ",
+    ];
+    let text = state.text.trim();
+    !tools.is_empty()
+        && state.calls.is_empty()
+        && termination == Termination::Completed
+        && !text.is_empty()
+        && text.chars().count() <= 200
+        && (text.ends_with(['：', ':']) || PHRASES.iter().any(|phrase| text.contains(phrase)))
 }
 
 /// One attempt at the round: open the stream, consume it, and close whatever
@@ -312,6 +427,7 @@ async fn stream_round(
     sink: &mut dyn AgentEventSink,
     cancel: &dyn CancelProbe,
     timeouts: StreamTimeouts,
+    item_id: &str,
 ) -> Result<(RoundState, Termination), AgentError> {
     let mut state = RoundState::default();
     let started = Instant::now();
@@ -379,12 +495,13 @@ async fn stream_round(
         match chunk {
             ResponseChunk::Think(text) => {
                 state.emitted = true;
+                state.reasoning.push_str(&text);
                 guard(sink.reasoning_text_delta(&text).await)?;
             }
             ResponseChunk::TextBlock(text) => {
                 state.emitted = true;
                 if !state.message_open {
-                    open_message(sink, &item_id(task)).await?;
+                    open_message(sink, item_id).await?;
                     state.message_open = true;
                 }
                 state.text.push_str(&text);
@@ -393,13 +510,14 @@ async fn stream_round(
             ResponseChunk::ThinkDone => {}
             ResponseChunk::TextDone => {
                 if state.message_open {
-                    close_message(sink, &item_id(task), &state.text).await?;
+                    close_message(sink, item_id, &state.text).await?;
                     state.message_open = false;
                 }
             }
             ResponseChunk::ToolCall(call) => pending_calls.push(call),
             ResponseChunk::Done { reason, usage } => {
                 state.usage = map_usage(usage.as_ref());
+                state.missing_calls = reason == FinishReason::MissingToolCalls;
                 termination = Some(if reason == FinishReason::Interrupted {
                     cut(&mut state, Interruption::StreamClosed)
                 } else {
@@ -418,7 +536,7 @@ async fn stream_round(
     // Closing it keeps the lifecycle well-formed without risking a second close
     // of one already finished above.
     if state.message_open {
-        close_message(sink, &item_id(task), &state.text).await?;
+        close_message(sink, item_id, &state.text).await?;
     }
 
     if state.interruption.is_some() {
@@ -486,20 +604,26 @@ fn declared_tools(task: &AgentTask) -> Vec<ToolManifest> {
                 name,
                 description,
                 parameters,
-                ..
+                strict,
             } => ToolManifest {
                 name: name.clone(),
                 description: description.clone().unwrap_or_default(),
                 parameters: parameters.clone(),
+                strict: *strict,
             },
         })
         .collect()
 }
 
-/// Stable within a response, which is all an item id has to be: this executor
-/// produces at most one text item per round.
-fn item_id(task: &AgentTask) -> String {
-    format!("msg_{}", task.provenance.response_id)
+/// Stable within a response, which is all an item id has to be. A round has
+/// one text item per pass; only a continued round (see [`TOOL_CALL_NUDGE`])
+/// has a second.
+fn item_id(task: &AgentTask, pass: usize) -> String {
+    if pass <= 1 {
+        format!("msg_{}", task.provenance.response_id)
+    } else {
+        format!("msg_{}_{pass}", task.provenance.response_id)
+    }
 }
 
 async fn open_message(sink: &mut dyn AgentEventSink, item_id: &str) -> Result<(), AgentError> {

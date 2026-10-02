@@ -162,6 +162,80 @@ pub struct HttpChatCompletion {
     api_model: String,
     reasoning_effort: Option<ReasoningEffort>,
     max_completion_tokens: Option<u32>,
+    wire_options: WireOptions,
+}
+
+/// How an assistant turn's reasoning goes back to the upstream. It must match
+/// how the endpoint delivers reasoning, since that is the shape its chat
+/// template renders history in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReasoningReplay {
+    /// As `reasoning_content`: endpoints with a server-side reasoning parser.
+    Field,
+    /// Wrapped in think markers ahead of `content`: endpoints that inline the
+    /// chain of thought in the body (Hy3 without a reasoning parser), whose
+    /// template expects it back the way the model wrote it.
+    Inline,
+    Off,
+}
+
+/// The markers an inlined thought is wrapped in on replay. Configurable
+/// because some deployments suffix them (`</think:abcd>`) and their template
+/// only recognises the exact form the model was trained on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ThinkMarkers {
+    open: String,
+    close: String,
+}
+
+/// Endpoint switches for what history carries to the upstream. Read from the
+/// endpoint's extensions; none of them is sent upstream as a field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WireOptions {
+    /// `reasoning_replay = "field" | "inline" | "off"`; default `field`.
+    reasoning_replay: ReasoningReplay,
+    /// `think_open` / `think_close`; default `<think>` / `</think>`.
+    think_markers: ThinkMarkers,
+    /// Forward the caller's per-tool `strict` flag. Off by default, since
+    /// strict mode turns on constrained decoding, which not every serving
+    /// stack supports for every tool-call format.
+    strict_tools: bool,
+}
+
+impl WireOptions {
+    fn from_extensions(extensions: &Value) -> Self {
+        let reasoning_replay = match extensions.get("reasoning_replay").and_then(Value::as_str) {
+            None | Some("field") => ReasoningReplay::Field,
+            Some("inline") => ReasoningReplay::Inline,
+            Some("off") => ReasoningReplay::Off,
+            Some(other) => {
+                tracing::warn!(
+                    value = other,
+                    "unknown reasoning_replay; replaying as a field"
+                );
+                ReasoningReplay::Field
+            }
+        };
+        let marker = |name: &str, default: &str| match extensions.get(name) {
+            None => default.to_string(),
+            Some(Value::String(text)) if !text.trim().is_empty() => text.clone(),
+            Some(other) => {
+                tracing::warn!(key = name, value = %other, default, "invalid think marker; using the default");
+                default.to_string()
+            }
+        };
+        Self {
+            reasoning_replay,
+            think_markers: ThinkMarkers {
+                open: marker("think_open", "<think>"),
+                close: marker("think_close", "</think>"),
+            },
+            strict_tools: extensions
+                .get("strict_tools")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
 }
 
 impl HttpChatCompletion {
@@ -177,6 +251,7 @@ impl HttpChatCompletion {
             api_model: endpoint.api_model,
             reasoning_effort: reasoning_effort(&endpoint.extensions),
             max_completion_tokens: max_completion_tokens(&endpoint.extensions),
+            wire_options: WireOptions::from_extensions(&endpoint.extensions),
         }
     }
 
@@ -233,8 +308,12 @@ impl HttpChatCompletion {
     ) -> CreateChatCompletionRequest {
         CreateChatCompletionRequest {
             model: self.api_model.clone(),
-            messages: to_wire_messages(messages),
-            tools: map_tools(tools),
+            messages: to_wire_messages(
+                messages,
+                self.wire_options.reasoning_replay,
+                &self.wire_options.think_markers,
+            ),
+            tools: map_tools(tools, self.wire_options.strict_tools),
             stream: Some(stream),
             stream_options: stream.then_some(ChatCompletionStreamOptions {
                 include_usage: Some(true),
@@ -326,14 +405,20 @@ impl HttpChatCompletion {
             }
             chunks.push(Ok(ResponseChunk::TextDone));
         }
+        let mut call_count = 0;
         if let Some(tool_calls) = &choice.message.tool_calls {
             for call in tool_calls_from_message(tool_calls) {
+                call_count += 1;
                 chunks.push(Ok(ResponseChunk::ToolCall(call)));
             }
         }
-        let reason = finish_reason(
+        let reason = reconcile_tool_calls(
+            finish_reason(
+                choice.finish_reason.as_ref(),
+                choice.message.refusal.clone().unwrap_or_default(),
+            ),
             choice.finish_reason.as_ref(),
-            choice.message.refusal.clone().unwrap_or_default(),
+            call_count,
         );
         if wire_enabled() {
             tracing::info!(
@@ -492,10 +577,15 @@ impl HttpChatCompletion {
                         &finalized,
                         usage.as_ref(),
                     );
+                    let call_count = finalized.len();
                     for call in finalized {
                         yield Ok(ResponseChunk::ToolCall(call));
                     }
-                    let reason = finish_reason(Some(reason), refusal);
+                    let reason = reconcile_tool_calls(
+                        finish_reason(Some(reason), refusal),
+                        Some(reason),
+                        call_count,
+                    );
                     yield Ok(ResponseChunk::Done {
                         reason,
                         usage: usage.as_ref().map(map_usage),
@@ -592,7 +682,11 @@ fn redact(text: &str) -> String {
     format!("{}…[+{} bytes]", &text[..cut], text.len() - cut)
 }
 
-fn to_wire_messages(messages: &[RequestMessage]) -> Vec<WireMessage> {
+fn to_wire_messages(
+    messages: &[RequestMessage],
+    replay: ReasoningReplay,
+    markers: &ThinkMarkers,
+) -> Vec<WireMessage> {
     messages
         .iter()
         .map(|message| match message {
@@ -607,30 +701,21 @@ fn to_wire_messages(messages: &[RequestMessage]) -> Vec<WireMessage> {
             RequestMessage::Assistant {
                 content,
                 tool_calls,
-            } => WireMessage::Assistant(WireAssistantMessage {
-                // A tool-call-only assistant turn must send no content field
-                // at all; an empty string is rejected by some providers.
-                content: if content.is_empty() && tool_calls.is_some() {
-                    None
-                } else {
-                    Some(WireAssistantContent::Text(content.clone()))
-                },
-                tool_calls: tool_calls.as_ref().map(|calls| {
-                    calls
-                        .iter()
-                        .map(|call| {
-                            WireMessageToolCalls::Function(WireMessageToolCall {
-                                id: call.call_id.clone(),
-                                function: FunctionCall {
-                                    name: call.name.clone(),
-                                    arguments: wire_arguments(call),
-                                },
-                            })
-                        })
-                        .collect()
-                }),
-                ..Default::default()
-            }),
+                reasoning,
+            } => {
+                let reasoning = reasoning.as_deref().filter(|text| !text.is_empty());
+                let (content, reasoning_content) = match (replay, reasoning) {
+                    (ReasoningReplay::Inline, Some(thought)) => (
+                        format!("{}{thought}{}{content}", markers.open, markers.close),
+                        None,
+                    ),
+                    (ReasoningReplay::Field, Some(thought)) => {
+                        (content.clone(), Some(thought.to_string()))
+                    }
+                    _ => (content.clone(), None),
+                };
+                wire_assistant(content, tool_calls.as_deref(), reasoning_content)
+            }
             RequestMessage::Tool { content, call_id } => WireMessage::Tool(WireToolMessage {
                 content: WireToolContent::Text(content.clone()),
                 tool_call_id: call_id.clone(),
@@ -639,7 +724,39 @@ fn to_wire_messages(messages: &[RequestMessage]) -> Vec<WireMessage> {
         .collect()
 }
 
-fn map_tools(tools: &[ToolManifest]) -> Option<Vec<WireTools>> {
+fn wire_assistant(
+    content: String,
+    tool_calls: Option<&[ToolCallRequest]>,
+    reasoning_content: Option<String>,
+) -> WireMessage {
+    WireMessage::Assistant(WireAssistantMessage {
+        // A tool-call-only assistant turn must send no content field
+        // at all; an empty string is rejected by some providers.
+        content: if content.is_empty() && tool_calls.is_some() {
+            None
+        } else {
+            Some(WireAssistantContent::Text(content))
+        },
+        tool_calls: tool_calls.map(|calls| {
+            calls
+                .iter()
+                .map(|call| {
+                    WireMessageToolCalls::Function(WireMessageToolCall {
+                        id: call.call_id.clone(),
+                        function: FunctionCall {
+                            name: call.name.clone(),
+                            arguments: wire_arguments(call),
+                        },
+                    })
+                })
+                .collect()
+        }),
+        reasoning_content,
+        ..Default::default()
+    })
+}
+
+fn map_tools(tools: &[ToolManifest], forward_strict: bool) -> Option<Vec<WireTools>> {
     (!tools.is_empty()).then(|| {
         tools
             .iter()
@@ -651,12 +768,30 @@ fn map_tools(tools: &[ToolManifest]) -> Option<Vec<WireTools>> {
                         // Already a Value: no re-parse, so a schema can no
                         // longer be silently dropped on the way out.
                         parameters: Some(tool.parameters.clone()),
-                        strict: None,
+                        strict: tool.strict.filter(|_| forward_strict),
                     },
                 })
             })
             .collect()
     })
+}
+
+/// A round the upstream ended with `finish_reason: "tool_calls"` yet whose
+/// calls all failed to survive parsing is not a plain stop: the model meant to
+/// call, so the runner gets the chance to recover the call.
+fn reconcile_tool_calls(
+    reason: FinishReason,
+    wire: Option<&WireFinishReason>,
+    calls: usize,
+) -> FinishReason {
+    if calls == 0
+        && reason == FinishReason::Stop
+        && matches!(wire, Some(WireFinishReason::ToolCalls))
+    {
+        tracing::warn!("[llm] finish_reason is tool_calls but no tool call was parsed");
+        return FinishReason::MissingToolCalls;
+    }
+    reason
 }
 
 fn tool_calls_from_message(calls: &[WireMessageToolCalls]) -> Vec<ToolCallRequest> {
@@ -956,8 +1091,9 @@ mod tests {
             name: "t".into(),
             description: "d".into(),
             parameters: schema.clone(),
+            strict: None,
         }];
-        let mapped = map_tools(&tools).expect("tools present");
+        let mapped = map_tools(&tools, false).expect("tools present");
         match &mapped[0] {
             WireTools::Function(tool) => {
                 assert_eq!(tool.function.parameters.as_ref(), Some(&schema));
@@ -968,7 +1104,7 @@ mod tests {
 
     #[test]
     fn no_tools_declares_no_tools_field() {
-        assert!(map_tools(&[]).is_none());
+        assert!(map_tools(&[], false).is_none());
     }
 
     #[test]
@@ -1014,14 +1150,19 @@ mod tests {
 
     #[test]
     fn assistant_tool_call_turn_sends_no_content_field() {
-        let wire = to_wire_messages(&[RequestMessage::Assistant {
-            content: String::new(),
-            tool_calls: Some(vec![ToolCallRequest {
-                call_id: "c1".into(),
-                name: "t".into(),
-                arguments: serde_json::json!({}),
-            }]),
-        }]);
+        let wire = to_wire_messages(
+            &[RequestMessage::Assistant {
+                content: String::new(),
+                tool_calls: Some(vec![ToolCallRequest {
+                    call_id: "c1".into(),
+                    name: "t".into(),
+                    arguments: serde_json::json!({}),
+                }]),
+                reasoning: None,
+            }],
+            ReasoningReplay::Field,
+            &WireOptions::from_extensions(&Value::Null).think_markers,
+        );
         match &wire[0] {
             WireMessage::Assistant(message) => assert!(message.content.is_none()),
             other => panic!("expected an assistant message, got {other:?}"),
@@ -1285,21 +1426,26 @@ mod tests {
     /// model its arguments were broken, so the wire only needs valid JSON.
     #[test]
     fn replayed_malformed_arguments_go_out_as_an_empty_object() {
-        let wire = to_wire_messages(&[RequestMessage::Assistant {
-            content: String::new(),
-            tool_calls: Some(vec![
-                ToolCallRequest {
-                    call_id: "broken".into(),
-                    name: "video_tool".into(),
-                    arguments: Value::String("{\"op\":\"t2v\",\"prompt\":\"雨".into()),
-                },
-                ToolCallRequest {
-                    call_id: "fine".into(),
-                    name: "video_tool".into(),
-                    arguments: serde_json::json!({ "op": "t2v" }),
-                },
-            ]),
-        }]);
+        let wire = to_wire_messages(
+            &[RequestMessage::Assistant {
+                content: String::new(),
+                tool_calls: Some(vec![
+                    ToolCallRequest {
+                        call_id: "broken".into(),
+                        name: "video_tool".into(),
+                        arguments: Value::String("{\"op\":\"t2v\",\"prompt\":\"雨".into()),
+                    },
+                    ToolCallRequest {
+                        call_id: "fine".into(),
+                        name: "video_tool".into(),
+                        arguments: serde_json::json!({ "op": "t2v" }),
+                    },
+                ]),
+                reasoning: None,
+            }],
+            ReasoningReplay::Field,
+            &WireOptions::from_extensions(&Value::Null).think_markers,
+        );
         let WireMessage::Assistant(message) = &wire[0] else {
             panic!("expected an assistant message, got {:?}", wire[0]);
         };
@@ -1351,6 +1497,133 @@ mod tests {
         assert_eq!(
             budget(serde_json::json!({ "max_completion_tokens": "32000" })),
             None
+        );
+    }
+
+    /// The assistant turn as replayed under `extensions`: (content, reasoning_content).
+    fn replayed(extensions: Value, content: &str) -> (Option<String>, Option<String>) {
+        let completion = HttpChatCompletion::new(
+            ModelEndpoint::new(ApiKey::new("k"), "http://h/v1", "m").with_extensions(extensions),
+        );
+        let request = completion.request(
+            &[RequestMessage::Assistant {
+                content: content.into(),
+                tool_calls: (content.is_empty()).then(|| {
+                    vec![ToolCallRequest {
+                        call_id: "c1".into(),
+                        name: "t".into(),
+                        arguments: serde_json::json!({}),
+                    }]
+                }),
+                reasoning: Some("plan".into()),
+            }],
+            &[],
+            true,
+        );
+        match &request.messages[0] {
+            WireMessage::Assistant(message) => (
+                message.content.as_ref().map(|content| match content {
+                    WireAssistantContent::Text(text) => text.clone(),
+                    other => panic!("expected text content, got {other:?}"),
+                }),
+                message.reasoning_content.clone(),
+            ),
+            other => panic!("expected an assistant message, got {other:?}"),
+        }
+    }
+
+    /// Interleaved thinking: the assistant turn goes back with the reasoning
+    /// it was produced with, as a field by default.
+    #[test]
+    fn assistant_reasoning_is_replayed_as_reasoning_content_by_default() {
+        assert_eq!(
+            replayed(serde_json::json!({}), "on it"),
+            (Some("on it".into()), Some("plan".into()))
+        );
+        assert_eq!(
+            replayed(serde_json::json!({ "reasoning_replay": "off" }), "on it"),
+            (Some("on it".into()), None)
+        );
+    }
+
+    /// An endpoint that inlines its thought in the body gets it back the way
+    /// the model wrote it, ahead of the reply — including on a turn that only
+    /// called tools, which otherwise sends no content at all.
+    #[test]
+    fn inline_replay_puts_the_thought_back_in_think_markers() {
+        let inline = serde_json::json!({ "reasoning_replay": "inline" });
+        assert_eq!(
+            replayed(inline.clone(), "on it"),
+            (Some("<think>plan</think>on it".into()), None)
+        );
+        assert_eq!(
+            replayed(inline, ""),
+            (Some("<think>plan</think>".into()), None)
+        );
+    }
+
+    /// A deployment whose template suffixes its markers gets them back in
+    /// exactly that form; a blank or non-string marker falls back.
+    #[test]
+    fn inline_replay_uses_the_configured_think_markers() {
+        let suffixed = serde_json::json!({
+            "reasoning_replay": "inline",
+            "think_open": "<think:abcd>",
+            "think_close": "</think:abcd>",
+        });
+        assert_eq!(
+            replayed(suffixed, "on it"),
+            (Some("<think:abcd>plan</think:abcd>on it".into()), None)
+        );
+        let invalid = serde_json::json!({
+            "reasoning_replay": "inline",
+            "think_open": "  ",
+            "think_close": 1,
+        });
+        assert_eq!(
+            replayed(invalid, "on it"),
+            (Some("<think>plan</think>on it".into()), None)
+        );
+    }
+
+    #[test]
+    fn strict_reaches_the_wire_only_when_the_endpoint_opts_in() {
+        let tools = vec![ToolManifest {
+            name: "t".into(),
+            description: "d".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+            strict: Some(true),
+        }];
+        let strict_of = |forward| match &map_tools(&tools, forward).expect("tools")[0] {
+            WireTools::Function(tool) => tool.function.strict,
+            other => panic!("expected a function tool, got {other:?}"),
+        };
+        assert_eq!(strict_of(false), None);
+        assert_eq!(strict_of(true), Some(true));
+    }
+
+    /// The Hy3 failure: the server parsed no call out of malformed markup but
+    /// still reported `tool_calls`, keeping only the announcement as text.
+    #[tokio::test]
+    async fn tool_calls_reported_but_none_parsed_is_flagged() {
+        let base_url = serve_deltas_ending(
+            vec![serde_json::json!({ "content": "我来帮你生成。" })],
+            Some("tool_calls"),
+        )
+        .await;
+        let chunks = turn_chunks(&base_url).await;
+        assert_eq!(final_reason(&chunks), Some(FinishReason::MissingToolCalls));
+    }
+
+    #[test]
+    fn tool_calls_reported_with_calls_is_a_plain_stop() {
+        assert_eq!(
+            reconcile_tool_calls(FinishReason::Stop, Some(&WireFinishReason::ToolCalls), 1),
+            FinishReason::Stop
+        );
+        assert_eq!(
+            reconcile_tool_calls(FinishReason::Stop, Some(&WireFinishReason::Stop), 0),
+            FinishReason::Stop
         );
     }
 }

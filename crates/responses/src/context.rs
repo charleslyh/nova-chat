@@ -15,8 +15,10 @@ use crate::protocol::ResponseItem;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextEntry {
     pub item: ResponseItem,
-    /// Render-only: a model does not read its own thinking, so this is never fed
-    /// back into model context.
+    /// Kept with the turn it preceded. The executor replays it within the
+    /// current tool loop, since interleaved-thinking models expect their own
+    /// reasoning back on each assistant turn; older turns' reasoning stays
+    /// render-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
 }

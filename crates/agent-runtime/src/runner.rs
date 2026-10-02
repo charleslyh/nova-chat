@@ -10,6 +10,8 @@
 //! implementation depend on the agent layer without dragging the whole domain
 //! into every provider adapter.
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use nova_responses::{
     ConversationId, IncompleteReason, ModelParams, RequestProvenance, ResponseId, ResponseItem,
@@ -32,6 +34,10 @@ pub struct AgentTask {
     pub exec_context: Option<Value>,
     /// Initial conversation (`snapshot items + this turn's input`, D30).
     pub items: Vec<ResponseItem>,
+    /// Thinking recorded with the inherited history, keyed by the index in
+    /// `items` of the item it precedes (the first output item of its turn).
+    /// Interleaved-thinking models need it replayed within a tool loop.
+    pub reasoning: BTreeMap<usize, String>,
     /// How many leading `items` were inherited from the snapshot. The tail is
     /// this turn's own input. The completion tier uses the split to reuse a
     /// compressed prefix stored under `previous_response_id`.

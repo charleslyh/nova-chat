@@ -17,7 +17,7 @@
 //! - **`custom_tool_call` is not context.** It carries tool run-time render
 //!   metadata (an authorization prompt, a sub-agent announcement) and is skipped.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use nova_agent_runtime::AgentTask;
 use nova_responses::{ContentPart, ResponseItem, Role};
@@ -34,7 +34,8 @@ use crate::wire::{ModelError, RequestMessage, ToolCallRequest};
 pub fn messages_for_task(task: &AgentTask) -> Result<Vec<RequestMessage>, ModelError> {
     let mut messages = Vec::new();
     push_system(&mut messages, task.params.instructions.as_deref());
-    append_items(&mut messages, &task.items)?;
+    append_items(&mut messages, &task.items, 0, &task.reasoning)?;
+    keep_reasoning_of_current_loop(&mut messages);
     if messages.is_empty() {
         return Err(ModelError::new("response context contains no messages"));
     }
@@ -51,7 +52,29 @@ pub(crate) fn with_instructions(
     messages
 }
 
+/// Drop the reasoning of every assistant turn before the last user message.
+///
+/// Interleaved-thinking models need their reasoning back within the current
+/// tool loop, which starts at the user's latest message; earlier loops are
+/// settled, and replaying their thinking would only grow the context.
+pub(crate) fn keep_reasoning_of_current_loop(messages: &mut [RequestMessage]) {
+    let Some(last_user) = messages
+        .iter()
+        .rposition(|message| matches!(message, RequestMessage::User { .. }))
+    else {
+        return;
+    };
+    for message in &mut messages[..last_user] {
+        if let RequestMessage::Assistant { reasoning, .. } = message {
+            *reasoning = None;
+        }
+    }
+}
+
 /// Append protocol items onto an existing completion transcript.
+///
+/// `first_index` is the position of `items[0]` in the task's full item list,
+/// which is what `reasoning` is keyed by.
 ///
 /// Tool outputs must still follow their call. Calls already present on
 /// `messages` count, so a later turn can attach an output to a call that
@@ -59,10 +82,13 @@ pub(crate) fn with_instructions(
 pub(crate) fn append_items(
     messages: &mut Vec<RequestMessage>,
     items: &[ResponseItem],
+    first_index: usize,
+    reasoning: &BTreeMap<usize, String>,
 ) -> Result<(), ModelError> {
     let mut known_calls = known_call_ids(messages);
 
-    for item in items {
+    for (offset, item) in items.iter().enumerate() {
+        let thought = reasoning.get(&(first_index + offset)).cloned();
         match item {
             ResponseItem::Message { role, content, .. } => {
                 let text = flatten_text(content)?;
@@ -71,6 +97,7 @@ pub(crate) fn append_items(
                     Role::Assistant => RequestMessage::Assistant {
                         content: text,
                         tool_calls: None,
+                        reasoning: thought,
                     },
                     // Developer collapses into System: the wire subset this
                     // transport targets has no separate developer role.
@@ -92,16 +119,25 @@ pub(crate) fn append_items(
                     arguments: serde_json::from_str(arguments)
                         .unwrap_or_else(|_| serde_json::Value::String(arguments.clone())),
                 };
-                // Parallel calls from one round belong on a single assistant
-                // message, which is how they were emitted.
+                // Calls join the assistant turn right before them: either the
+                // parallel calls of one round, or the text the same round said
+                // first. A new round always starts after a tool output or a
+                // user message, so an adjacent assistant turn is this round's.
                 match messages.last_mut() {
                     Some(RequestMessage::Assistant {
-                        content,
-                        tool_calls: Some(tool_calls),
-                    }) if content.is_empty() => tool_calls.push(call),
+                        tool_calls,
+                        reasoning,
+                        ..
+                    }) => {
+                        tool_calls.get_or_insert_with(Vec::new).push(call);
+                        if reasoning.is_none() {
+                            *reasoning = thought;
+                        }
+                    }
                     _ => messages.push(RequestMessage::Assistant {
                         content: String::new(),
                         tool_calls: Some(vec![call]),
+                        reasoning: thought,
                     }),
                 }
             }
@@ -147,9 +183,10 @@ fn known_call_ids(messages: &[RequestMessage]) -> HashSet<String> {
     known
 }
 
-pub(crate) fn items_to_messages(items: &[ResponseItem]) -> Result<Vec<RequestMessage>, ModelError> {
+#[cfg(test)]
+fn items_to_messages(items: &[ResponseItem]) -> Result<Vec<RequestMessage>, ModelError> {
     let mut messages = Vec::with_capacity(items.len());
-    append_items(&mut messages, items)?;
+    append_items(&mut messages, items, 0, &BTreeMap::new())?;
     Ok(messages)
 }
 
@@ -328,5 +365,90 @@ mod tests {
             }
             other => panic!("expected an assistant message, got {other:?}"),
         }
+    }
+
+    fn assistant(text: &str) -> ResponseItem {
+        ResponseItem::assistant_text(text)
+    }
+
+    fn with_reasoning(items: &[ResponseItem], reasoning: &[(usize, &str)]) -> Vec<RequestMessage> {
+        let map = reasoning
+            .iter()
+            .map(|(index, text)| (*index, text.to_string()))
+            .collect();
+        let mut messages = Vec::new();
+        append_items(&mut messages, items, 0, &map).expect("translates");
+        keep_reasoning_of_current_loop(&mut messages);
+        messages
+    }
+
+    fn reasoning_of(message: &RequestMessage) -> Option<&str> {
+        match message {
+            RequestMessage::Assistant { reasoning, .. } => reasoning.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The interleaved-thinking contract: within the current tool loop every
+    /// assistant turn goes back with the reasoning it was produced with.
+    #[test]
+    fn reasoning_rides_the_assistant_turn_it_preceded() {
+        let messages = with_reasoning(
+            &[
+                user("q"),
+                call("c1", "t", "{}"),
+                output("c1", "r1"),
+                assistant("done"),
+            ],
+            &[(1, "plan"), (3, "conclude")],
+        );
+        assert_eq!(reasoning_of(&messages[1]), Some("plan"));
+        assert_eq!(reasoning_of(&messages[3]), Some("conclude"));
+    }
+
+    #[test]
+    fn reasoning_before_the_latest_user_message_is_dropped() {
+        let messages = with_reasoning(
+            &[
+                user("q1"),
+                assistant("a1"),
+                user("q2"),
+                call("c1", "t", "{}"),
+            ],
+            &[(1, "old"), (3, "new")],
+        );
+        assert_eq!(reasoning_of(&messages[1]), None, "a settled loop");
+        assert_eq!(reasoning_of(&messages[3]), Some("new"));
+    }
+
+    /// One round that says what it will do and then calls is one assistant
+    /// turn, the way the model produced it, carrying that round's reasoning.
+    #[test]
+    fn a_rounds_text_and_its_calls_share_one_assistant_turn() {
+        let messages = with_reasoning(
+            &[user("q"), assistant("on it"), call("c1", "t", "{}")],
+            &[(1, "plan")],
+        );
+        assert_eq!(messages.len(), 2);
+        match &messages[1] {
+            RequestMessage::Assistant {
+                content,
+                tool_calls,
+                reasoning,
+            } => {
+                assert_eq!(content, "on it");
+                assert_eq!(tool_calls.as_ref().map(Vec::len), Some(1));
+                assert_eq!(reasoning.as_deref(), Some("plan"));
+            }
+            other => panic!("expected an assistant message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reasoning_is_keyed_by_the_position_in_the_full_item_list() {
+        let map = BTreeMap::from([(5, "late".to_string())]);
+        let mut messages = Vec::new();
+        append_items(&mut messages, &[assistant("a")], 5, &map).expect("translates");
+        assert_eq!(reasoning_of(&messages[0]), Some("late"));
     }
 }
