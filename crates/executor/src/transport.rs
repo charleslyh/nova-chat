@@ -21,6 +21,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use async_openai::config::OpenAIConfig;
 use async_openai::types::chat::{
@@ -163,6 +164,12 @@ pub struct HttpChatCompletion {
     reasoning_effort: Option<ReasoningEffort>,
     max_completion_tokens: Option<u32>,
     wire_options: WireOptions,
+    /// The closing think marker the upstream used, verbatim, suffix included.
+    /// Remembered because replaying a thought has to wrap it in the very marker
+    /// this endpoint emits, and the suffix is deployment-specific.
+    /// `Arc` because the stream generator has to share it without borrowing
+    /// `self`.
+    seen_marker: Arc<Mutex<Option<String>>>,
 }
 
 /// How an assistant turn's reasoning goes back to the upstream. It must match
@@ -190,7 +197,8 @@ enum ReasoningField {
 
 /// The markers an inlined thought is wrapped in on replay. Configurable
 /// because some deployments suffix them (`</think:abcd>`) and their template
-/// only recognises the exact form the model was trained on.
+/// only recognises the exact form the model was trained on — and because some
+/// emit no opening marker at all, which an empty `open` replays faithfully.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ThinkMarkers {
     open: String,
@@ -238,19 +246,26 @@ impl WireOptions {
                 ReasoningReplay::Field(field)
             }
         };
-        let marker = |name: &str, default: &str| match extensions.get(name) {
+        // An empty closing marker would wrap the thought in nothing at all, so
+        // only the opening one may be empty.
+        let marker = |name: &str, default: &str, may_be_empty: bool| match extensions.get(name) {
             None => default.to_string(),
-            Some(Value::String(text)) if !text.trim().is_empty() => text.clone(),
+            Some(Value::String(text)) if may_be_empty || !text.trim().is_empty() => text.clone(),
             Some(other) => {
-                tracing::warn!(key = name, value = %other, default, "invalid think marker; using the default");
+                tracing::warn!(
+                    key = name,
+                    value = %other,
+                    default,
+                    "invalid think marker; using the default"
+                );
                 default.to_string()
             }
         };
         Self {
             reasoning_replay,
             think_markers: ThinkMarkers {
-                open: marker("reasoning_inline_open_tag", "<think>"),
-                close: marker("reasoning_inline_close_tag", "</think>"),
+                open: marker("reasoning_inline_open_tag", "<think>", true),
+                close: marker("reasoning_inline_close_tag", "</think>", false),
             },
             strict_tools: extensions
                 .get("strict_tools")
@@ -274,6 +289,24 @@ impl HttpChatCompletion {
             reasoning_effort: reasoning_effort(&endpoint.extensions),
             max_completion_tokens: max_completion_tokens(&endpoint.extensions),
             wire_options: WireOptions::from_extensions(&endpoint.extensions),
+            seen_marker: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// The closing marker seen from this endpoint, or the configured fallback.
+    fn close_marker(&self) -> String {
+        self.seen_marker
+            .lock()
+            .expect("lock")
+            .clone()
+            .unwrap_or_else(|| self.wire_options.think_markers.close.clone())
+    }
+
+    fn remember_close_marker(&self, marker: Option<String>) {
+        if let Some(marker) = marker {
+            if !marker.is_empty() {
+                *self.seen_marker.lock().expect("lock") = Some(marker);
+            }
         }
     }
 
@@ -322,7 +355,8 @@ impl HttpChatCompletion {
         !matches!(self.reasoning_effort, None | Some(ReasoningEffort::None))
     }
 
-    fn request(
+    /// The request this turn would put on the wire.
+    pub(crate) fn request(
         &self,
         messages: &[RequestMessage],
         tools: &[ToolManifest],
@@ -333,7 +367,8 @@ impl HttpChatCompletion {
             messages: to_wire_messages(
                 messages,
                 self.wire_options.reasoning_replay,
-                &self.wire_options.think_markers,
+                &self.wire_options.think_markers.open,
+                &self.close_marker(),
             ),
             tools: map_tools(tools, self.wire_options.strict_tools),
             stream: Some(stream),
@@ -373,7 +408,23 @@ impl ChatCompletion for HttpChatCompletion {
         if !stream {
             return self.blocking_turn(request, &client).await;
         }
-        self.streaming_turn(request, &client).await
+        self.streaming_turn(request, &client, Arc::clone(&self.seen_marker))
+            .await
+    }
+}
+
+impl Clone for HttpChatCompletion {
+    fn clone(&self) -> Self {
+        Self {
+            client: Client::build(self.http.clone(), self.config.clone()),
+            config: self.config.clone(),
+            http: self.http.clone(),
+            api_model: self.api_model.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            max_completion_tokens: self.max_completion_tokens,
+            wire_options: self.wire_options.clone(),
+            seen_marker: Arc::clone(&self.seen_marker),
+        }
     }
 }
 
@@ -411,6 +462,7 @@ impl HttpChatCompletion {
             .filter(|content| !content.is_empty())
         {
             let mut parts = splitter.push(content);
+            self.remember_close_marker(splitter.close_marker().map(str::to_string));
             parts.extend(splitter.finish());
             let mut thought = false;
             for part in parts {
@@ -457,10 +509,13 @@ impl HttpChatCompletion {
         Ok(Box::pin(futures::stream::iter(chunks)))
     }
 
+    /// `seen_marker` receives the closing think marker the stream met, so the
+    /// next round on this endpoint replays a thought wrapped in the same one.
     async fn streaming_turn(
         &self,
         request: CreateChatCompletionRequest,
         client: &Client<OpenAIConfig>,
+        seen_marker: Arc<Mutex<Option<String>>>,
     ) -> Result<ChunkStream, ModelError> {
         let mut upstream = client
             .chat()
@@ -475,6 +530,7 @@ impl HttpChatCompletion {
         let thinking = self.thinks();
         let model = self.api_model.clone();
         let output = async_stream::stream! {
+            let seen_marker = seen_marker;
             let mut calls: HashMap<u32, (String, String, String)> = HashMap::new();
             let mut refusal = String::new();
             let mut usage = None;
@@ -486,6 +542,11 @@ impl HttpChatCompletion {
             let mut splitter = ThinkSplitter::new(thinking);
 
             while let Some(item) = upstream.next().await {
+                // Only a whole marker is worth remembering: one straddling
+                // chunks is first seen half-written.
+                if let Some(marker) = splitter.close_marker() {
+                    *seen_marker.lock().expect("lock") = Some(marker.to_string());
+                }
                 let response = match item {
                     Ok(response) => response,
                     Err(error) => {
@@ -538,6 +599,11 @@ impl HttpChatCompletion {
                     saw_reasoning = true;
                     yield Ok(ResponseChunk::Think(reasoning));
                 }
+                // Only a whole marker is worth remembering: one straddling
+                // chunks is first seen half-written.
+                if let Some(marker) = splitter.close_marker() {
+                    *seen_marker.lock().expect("lock") = Some(marker.to_string());
+                }
                 if let Some(content) = choice.delta.content.as_deref().filter(|text| !text.is_empty()) {
                     let delta = normalize_text_delta(&acc_text, content);
                     if !delta.is_empty() {
@@ -577,9 +643,15 @@ impl HttpChatCompletion {
                         usage = Some(extra_usage);
                     }
                     for part in splitter.finish() {
-                        if let Split::Text(text) = part {
-                            saw_text = true;
-                            yield Ok(ResponseChunk::TextBlock(text));
+                        match part {
+                            Split::Think(text) => {
+                                saw_reasoning = true;
+                                yield Ok(ResponseChunk::Think(text));
+                            }
+                            Split::Text(text) => {
+                                saw_text = true;
+                                yield Ok(ResponseChunk::TextBlock(text));
+                            }
                         }
                     }
                     if saw_reasoning {
@@ -621,9 +693,15 @@ impl HttpChatCompletion {
             // still emitted, but the round is reported as interrupted so the
             // runner neither commits it as finished nor trusts its tool calls.
             for part in splitter.finish() {
-                if let Split::Text(text) = part {
-                    saw_text = true;
-                    yield Ok(ResponseChunk::TextBlock(text));
+                match part {
+                    Split::Think(text) => {
+                        saw_reasoning = true;
+                        yield Ok(ResponseChunk::Think(text));
+                    }
+                    Split::Text(text) => {
+                        saw_text = true;
+                        yield Ok(ResponseChunk::TextBlock(text));
+                    }
                 }
             }
             if saw_reasoning {
@@ -707,7 +785,8 @@ fn redact(text: &str) -> String {
 fn to_wire_messages(
     messages: &[RequestMessage],
     replay: ReasoningReplay,
-    markers: &ThinkMarkers,
+    open: &str,
+    close: &str,
 ) -> Vec<WireMessage> {
     messages
         .iter()
@@ -727,10 +806,9 @@ fn to_wire_messages(
             } => {
                 let reasoning = reasoning.as_deref().filter(|text| !text.is_empty());
                 let (content, replayed) = match (replay, reasoning) {
-                    (ReasoningReplay::Inline, Some(thought)) => (
-                        format!("{}{thought}{}{content}", markers.open, markers.close),
-                        None,
-                    ),
+                    (ReasoningReplay::Inline, Some(thought)) => {
+                        (format!("{open}{thought}{close}{content}"), None)
+                    }
                     (ReasoningReplay::Field(field), Some(thought)) => {
                         (content.clone(), Some((field, thought.to_string())))
                     }
@@ -1195,7 +1273,8 @@ mod tests {
                 reasoning: None,
             }],
             ReasoningReplay::Field(ReasoningField::ReasoningContent),
-            &WireOptions::from_extensions(&Value::Null).think_markers,
+            "<think>",
+            "</think>",
         );
         match &wire[0] {
             WireMessage::Assistant(message) => assert!(message.content.is_none()),
@@ -1478,7 +1557,8 @@ mod tests {
                 reasoning: None,
             }],
             ReasoningReplay::Field(ReasoningField::ReasoningContent),
-            &WireOptions::from_extensions(&Value::Null).think_markers,
+            "<think>",
+            "</think>",
         );
         let WireMessage::Assistant(message) = &wire[0] else {
             panic!("expected an assistant message, got {:?}", wire[0]);
@@ -1642,8 +1722,50 @@ mod tests {
         assert_eq!(body, "Hi!");
     }
 
+    /// The off-format body a live session produced — the model closed a thought
+    /// it never wrote, thought, then closed again — reaches the caller as
+    /// reasoning and reply, with no marker in either.
+    #[tokio::test]
+    async fn an_off_format_body_is_split_at_its_last_marker_over_the_wire() {
+        let base_url = serve_deltas(vec![
+            serde_json::json!({ "content": "</think:6124c78e>Asset card locked? " }),
+            serde_json::json!({ "content": "Let me check the card.</think:6124c78e>" }),
+            serde_json::json!({ "content": "Asset card locked: asset_87fd." }),
+        ])
+        .await;
+        let completion = HttpChatCompletion::new(
+            ModelEndpoint::new(ApiKey::new("key"), &base_url, "test-model")
+                .with_extensions(serde_json::json!({ "reasoning_effort": "high" })),
+        );
+        let mut stream = completion
+            .completion(
+                &[RequestMessage::User {
+                    content: "hi".to_string(),
+                }],
+                &[],
+                true,
+                &TransportOverrides::new(),
+            )
+            .await
+            .unwrap();
+
+        let mut reasoning = String::new();
+        let mut body = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk.unwrap() {
+                ResponseChunk::Think(text) => reasoning.push_str(&text),
+                ResponseChunk::TextBlock(text) => body.push_str(&text),
+                _ => {}
+            }
+        }
+        assert_eq!(reasoning, "Asset card locked? Let me check the card.");
+        assert_eq!(body, "Asset card locked: asset_87fd.");
+        assert!(!body.contains("</think"), "no marker may reach the reply");
+    }
+
     /// A deployment whose template suffixes its markers gets them back in
-    /// exactly that form; a blank or non-string marker falls back.
+    /// exactly that form; one that emits no opening marker gets none, and a
+    /// non-string closing marker falls back.
     #[test]
     fn inline_replay_uses_the_configured_think_markers() {
         let suffixed = serde_json::json!({
@@ -1655,15 +1777,78 @@ mod tests {
             replayed(suffixed, "on it"),
             (Some("<think:abcd>plan</think:abcd>on it".into()), None)
         );
-        let invalid = serde_json::json!({
+        // Hy3-H20-Temp sends no opening marker, so its thought must not be
+        // replayed wrapped in one it never wrote.
+        let no_open = serde_json::json!({
             "reasoning_replay": "inline",
-            "reasoning_inline_open_tag": "  ",
-            "reasoning_inline_close_tag": 1,
+            "reasoning_inline_open_tag": "",
+            "reasoning_inline_close_tag": "</think:6124c78e>",
         });
+        assert_eq!(
+            replayed(no_open, "on it"),
+            (Some("plan</think:6124c78e>on it".into()), None)
+        );
+        let invalid =
+            serde_json::json!({ "reasoning_replay": "inline", "reasoning_inline_close_tag": 1 });
         assert_eq!(
             replayed(invalid, "on it"),
             (Some("<think>plan</think>on it".into()), None)
         );
+    }
+
+    /// A suffixed marker need not be configured: the one the endpoint was seen
+    /// to close a thought with is used from the next round on.
+    #[tokio::test]
+    async fn the_closing_marker_the_upstream_used_is_replayed_with() {
+        let base_url = serve_deltas(vec![
+            serde_json::json!({ "content": "pon" }),
+            serde_json::json!({ "content": "der" }),
+            serde_json::json!({ "content": "</think:abcd>Hi" }),
+        ])
+        .await;
+        let completion = HttpChatCompletion::new(
+            ModelEndpoint::new(ApiKey::new("key"), &base_url, "test-model").with_extensions(
+                serde_json::json!({
+                    "reasoning_effort": "high",
+                    "reasoning_replay": "inline",
+                    "reasoning_inline_open_tag": "",
+                }),
+            ),
+        );
+        let mut stream = completion
+            .completion(
+                &[RequestMessage::User {
+                    content: "hi".to_string(),
+                }],
+                &[],
+                true,
+                &TransportOverrides::new(),
+            )
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        let request = completion.request(
+            &[RequestMessage::Assistant {
+                content: "Hi".into(),
+                tool_calls: None,
+                reasoning: Some("plan".into()),
+            }],
+            &[],
+            true,
+        );
+        match &request.messages[0] {
+            WireMessage::Assistant(message) => {
+                assert_eq!(
+                    message.content.as_ref().and_then(|content| match content {
+                        WireAssistantContent::Text(text) => Some(text.clone()),
+                        _ => None,
+                    }),
+                    Some("plan</think:abcd>Hi".into())
+                );
+            }
+            other => panic!("expected an assistant message, got {other:?}"),
+        }
     }
 
     #[test]

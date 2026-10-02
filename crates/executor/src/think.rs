@@ -9,7 +9,10 @@
 //!
 //! [`ThinkSplitter`] holds the leading block back until it can be classified:
 //! everything before the closing marker is reasoning, everything after is the
-//! reply. Two properties make it streamable:
+//! reply. A turn may think more than once — Hy3 interleaves a short thought with
+//! each tool call — so several segments can appear in one body and the reply is
+//! only what follows the last closing marker. Two properties make it
+//! streamable:
 //!
 //! - The closing marker arrives LAST, so the leading block is classified on
 //!   trust — this deployment is ours and always thinks when it is asked to.
@@ -29,19 +32,33 @@ pub(crate) enum Split {
     Text(String),
 }
 
-/// Classifies a streamed body into reasoning before the closing think marker
-/// and reply after it.
+/// Classifies a streamed body into reasoning and reply.
+///
+/// A deployment that inlines its CoT delimits it with a closing marker only, so
+/// the shape is `thought</think>reply` and a body that opens with a marker has
+/// no thought in it at all. The model sometimes goes further off-format — it
+/// closes an empty thought, thinks, and closes again — and splitting at the
+/// first marker would then show that second thought, marker included, as reply.
+/// Such a body is held and split at its *last* marker instead of streamed.
 pub(crate) struct ThinkSplitter {
     /// Body held until it can be classified.
     pending: String,
-    /// The closing marker was seen: everything from here on is reply.
-    closed: bool,
+    /// What the held body is: reasoning, or reply.
+    thinking: bool,
+    /// Off-format body: nothing is emitted until `finish`, which splits the
+    /// whole body at its last marker. Set by a marker with no thought before it
+    /// (the turn opened by closing a thought it never wrote), or by any marker
+    /// met while already replying.
+    buffered: bool,
     /// Set when this turn is not splitting — the provider carries its own
     /// reasoning field, or nothing asked the model to think.
     disabled: bool,
-    /// Something was already classified as reasoning, so a leading opening
-    /// marker is no longer expected.
-    emitted: bool,
+    /// The closing marker this turn used, verbatim, suffix included.
+    close_marker: Option<String>,
+    /// Whether the current segment already produced reasoning. A marker with
+    /// nothing in front of it is only "unopened" when this is false: the
+    /// thought it closes may simply have arrived in an earlier chunk.
+    thought_emitted: bool,
 }
 
 impl ThinkSplitter {
@@ -51,9 +68,11 @@ impl ThinkSplitter {
     pub(crate) fn new(thinking: bool) -> Self {
         Self {
             pending: String::new(),
-            closed: false,
+            thinking,
+            buffered: false,
             disabled: !thinking,
-            emitted: false,
+            close_marker: None,
+            thought_emitted: false,
         }
     }
 
@@ -61,52 +80,140 @@ impl ThinkSplitter {
     /// whatever is already held is reply text.
     pub(crate) fn disable(&mut self) -> Vec<Split> {
         self.disabled = true;
+        self.thinking = false;
         self.release()
+    }
+
+    /// The closing marker this turn used, suffix included — `</think:abcd>` on a
+    /// deployment that suffixes it. Recording it beats guessing: replaying a
+    /// thought has to wrap it in the very marker this server emits.
+    pub(crate) fn close_marker(&self) -> Option<&str> {
+        self.close_marker.as_deref()
     }
 
     pub(crate) fn push(&mut self, piece: &str) -> Vec<Split> {
         self.pending.push_str(piece);
-        if self.disabled || self.closed {
+        if self.disabled {
             return self.release();
         }
-        if let Some((start, end)) = close_marker(&self.pending) {
-            self.closed = true;
-            let thought = self.pending[..start].to_string();
-            self.pending = self.pending[end..].to_string();
-            let mut out = Vec::new();
-            let thought = strip_open_marker(&thought);
-            if !thought.is_empty() {
-                self.emitted = true;
-                out.push(Split::Think(thought.to_string()));
-            }
-            out.extend(self.release());
-            return out;
+        if self.buffered {
+            return Vec::new();
         }
-        // Everything but a tail that could still turn into a marker: a marker
-        // opens with `<`, and one can straddle chunks.
+        let mut out = Vec::new();
+        // One pass per segment the held body already contains.
+        loop {
+            if self.thinking {
+                let Some((start, end)) = close_marker(&self.pending) else {
+                    break;
+                };
+                let whole = std::mem::take(&mut self.pending);
+                self.close_marker = Some(whole[start..end].to_string());
+                let before = &whole[..start];
+                self.pending = whole[end..].to_string();
+                if before.trim().is_empty() && !self.thought_emitted {
+                    // Nothing was thought: this turn opened by closing a
+                    // thought it never wrote. Hold the rest and split it at its
+                    // last marker rather than call everything after it reply.
+                    self.buffered = true;
+                    return out;
+                }
+                self.thinking = false;
+                self.thought_emitted = false;
+                let thought = strip_markers(before);
+                if !thought.is_empty() {
+                    out.push(Split::Think(thought));
+                }
+            } else if let Some((start, end)) = close_marker(&self.pending) {
+                // A marker while replying is off-format as well: what follows
+                // it is a thought the model forgot to open. Hold it; showing
+                // the marker as prose is never right.
+                let whole = std::mem::take(&mut self.pending);
+                self.close_marker = Some(whole[start..end].to_string());
+                let before = whole[..start].to_string();
+                self.pending = whole[end..].to_string();
+                self.buffered = true;
+                if !before.is_empty() {
+                    out.push(Split::Text(before));
+                }
+                return out;
+            } else {
+                // Another thought can open after the close; only a complete
+                // marker starts one, and the text before it is reply.
+                let Some(open) = open_marker(&self.pending) else {
+                    break;
+                };
+                let whole = std::mem::take(&mut self.pending);
+                let reply = whole[..open.start].to_string();
+                self.pending = whole[open.end..].to_string();
+                self.thinking = true;
+                self.thought_emitted = false;
+                if !reply.is_empty() {
+                    out.push(Split::Text(reply));
+                }
+            }
+        }
+        // Everything but a tail that could still become a marker: one opens with
+        // `<`, and one can straddle chunks.
         let cut = self.emittable();
         if cut == 0 {
-            return Vec::new();
+            return out;
         }
-        let thought = self.pending[..cut].to_string();
+        let held = self.pending[..cut].to_string();
         self.pending = self.pending[cut..].to_string();
-        let thought = strip_open_marker(&thought);
-        if thought.is_empty() {
-            return Vec::new();
+        if self.thinking {
+            let held = strip_markers(&held);
+            if !held.is_empty() {
+                self.thought_emitted = true;
+                out.push(Split::Think(held));
+            }
+        } else {
+            out.push(Split::Text(held));
         }
-        self.emitted = true;
-        vec![Split::Think(thought.to_string())]
+        out
     }
 
     pub(crate) fn finish(mut self) -> Vec<Split> {
+        if self.buffered {
+            return self.release_buffered();
+        }
         self.release()
+    }
+
+    /// The held off-format body: thought up to its last marker, reply after it,
+    /// with no marker left in either.
+    fn release_buffered(&mut self) -> Vec<Split> {
+        let body = std::mem::take(&mut self.pending);
+        let (thought, reply) = match last_close_marker(&body) {
+            Some((start, end)) => {
+                self.close_marker = Some(body[start..end].to_string());
+                (strip_markers(&body[..start]), strip_markers(&body[end..]))
+            }
+            None => (String::new(), body),
+        };
+        let mut out = Vec::new();
+        if !thought.is_empty() {
+            out.push(Split::Think(thought));
+        }
+        if !reply.is_empty() {
+            out.push(Split::Text(reply));
+        }
+        out
     }
 
     fn release(&mut self) -> Vec<Split> {
         if self.pending.is_empty() {
             return Vec::new();
         }
-        vec![Split::Text(std::mem::take(&mut self.pending))]
+        let pending = std::mem::take(&mut self.pending);
+        // A thought the turn never closed was cut off, not answered.
+        if self.thinking {
+            let thought = strip_markers(&pending);
+            if thought.is_empty() {
+                return Vec::new();
+            }
+            return vec![Split::Think(thought)];
+        }
+        vec![Split::Text(pending)]
     }
 
     /// Bytes of the held block that can be classified right now.
@@ -115,13 +222,8 @@ impl ThinkSplitter {
         if text.is_empty() {
             return 0;
         }
-        // An opening marker is dropped rather than shown, and it can arrive
-        // split too, so an incomplete one at the head is withheld.
-        if !self.emitted && text.trim_start().starts_with("<think") && !text.contains('>') {
-            return 0;
-        }
         match text.rfind('<') {
-            Some(start) if is_marker_tail(&text[start..]) => start,
+            Some(start) if is_marker_tail(&text[start..], self.thinking) => start,
             _ => text.len(),
         }
     }
@@ -136,19 +238,73 @@ fn close_marker(text: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// Whether this tail may still become a marker once more chunks arrive.
-fn is_marker_tail(tail: &str) -> bool {
-    "</think".starts_with(tail) || (tail.starts_with("</think") && !tail.contains('>'))
+/// Whether this tail may still become a marker once more chunks arrive. While
+/// thinking only a closing marker ends the thought; while replying either one
+/// matters, since a closing marker there is what an unopened thought looks like.
+fn is_marker_tail(tail: &str, thinking: bool) -> bool {
+    let markers: &[&str] = if thinking {
+        &["</think"]
+    } else {
+        &["</think", "<think"]
+    };
+    markers.iter().any(|marker| {
+        (!tail.is_empty() && marker.starts_with(tail))
+            || (tail.starts_with(marker) && !tail.contains('>'))
+    })
 }
 
-/// Drop a leading opening marker: it delimits the CoT, it is not part of it.
-/// Hy3 sends none, delimiting by the closing one alone.
-fn strip_open_marker(text: &str) -> &str {
-    let rest = text.trim_start();
-    match rest.find("<think") {
-        Some(0) => rest.find('>').map_or(text, |end| &rest[end + 1..]),
-        _ => text,
+/// Byte range of the LAST complete closing marker in `text`, if any.
+fn last_close_marker(text: &str) -> Option<(usize, usize)> {
+    let mut found = None;
+    let mut from = 0;
+    while let Some(offset) = text[from..].find("</think") {
+        let start = from + offset;
+        let Some(close) = text[start..].find('>') else {
+            break;
+        };
+        found = Some((start, start + close + 1));
+        from = start + close + 1;
     }
+    found
+}
+
+/// Drop every complete think marker from `text`: a marker delimits, it is never
+/// part of what the user reads.
+fn strip_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let next = ["</think", "<think"]
+            .iter()
+            .filter_map(|marker| rest.find(marker).map(|at| (at, *marker)))
+            .min();
+        let Some((at, marker)) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..at]);
+        let tail = &rest[at + marker.len()..];
+        match tail.find('>') {
+            Some(close) => rest = &tail[close + 1..],
+            // An unterminated marker is not one: keep it as text.
+            None => {
+                out.push_str(&rest[at..]);
+                return out;
+            }
+        }
+    }
+}
+
+/// Byte range of a COMPLETE opening marker at the head of `text`. Only a whole
+/// one counts: a partial `<thi` has to wait for more chunks.
+fn open_marker(text: &str) -> Option<std::ops::Range<usize>> {
+    let rest = text.trim_start();
+    let offset = text.len() - rest.len();
+    if !rest.starts_with("<think") {
+        return None;
+    }
+    let end = rest.find('>')? + 1;
+    Some(offset..offset + end)
 }
 
 #[cfg(test)]
@@ -171,11 +327,21 @@ mod tests {
             }
         }
         for part in splitter.finish() {
-            if let Split::Text(part) = part {
-                text.push_str(&part);
+            match part {
+                Split::Think(part) => think.push_str(&part),
+                Split::Text(part) => text.push_str(&part),
             }
         }
         (think, text)
+    }
+
+    /// The closing marker a turn used, verbatim; `None` when no segment closed.
+    fn marker_of(pieces: &[&str]) -> Option<String> {
+        let mut splitter = ThinkSplitter::new(true);
+        for piece in pieces {
+            splitter.push(piece);
+        }
+        splitter.close_marker().map(str::to_string)
     }
 
     /// Hy3 as it answers today: no opening marker, the thought first, `</think>`
@@ -269,5 +435,121 @@ mod tests {
         let (think, text) = split_all(&["<think:1>", "pondering", "</think:1>", "the reply"], true);
         assert_eq!(think, "pondering");
         assert_eq!(text, "the reply");
+    }
+
+    /// The deployment's off-format body, as a live turn produced it: the model
+    /// closed a thought it never wrote, thought, then closed again. Splitting at
+    /// the first marker put that second thought *and* its marker into the reply.
+    #[test]
+    fn a_body_that_opens_by_closing_an_unwritten_thought_splits_at_its_last_marker() {
+        let (think, text) = split_all(
+            &[
+                "</think:6124c78e>Asset card locked? Let me check.\n\nActually: generate",
+                " serially.</think:6124c78e>Asset card locked: asset_87fd.",
+            ],
+            true,
+        );
+        assert_eq!(
+            think,
+            "Asset card locked? Let me check.\n\nActually: generate serially."
+        );
+        assert_eq!(text, "Asset card locked: asset_87fd.");
+        assert!(!text.contains("</think"), "no marker may reach the reply");
+    }
+
+    /// The common off-format turn: the model closes an empty thought and replies.
+    /// Nothing was thought, and the marker is not prose.
+    #[test]
+    fn a_body_that_only_closes_an_empty_thought_is_all_reply() {
+        let (think, text) = split_all(&["</think:6124c78e>", "设定图: asset_2e30"], true);
+        assert_eq!(think, "");
+        assert_eq!(text, "设定图: asset_2e30");
+    }
+
+    /// A body that is nothing but a marker: the model said nothing at all.
+    #[test]
+    fn a_body_that_is_only_a_marker_says_nothing() {
+        let (think, text) = split_all(&["</think:6124c78e>"], true);
+        assert_eq!(think, "");
+        assert_eq!(text, "");
+    }
+
+    /// A marker met while replying starts a thought the model forgot to open:
+    /// that segment is reasoning, the text on either side of it is reply, and
+    /// the marker itself is never prose.
+    #[test]
+    fn a_marker_met_while_replying_opens_a_thought_segment() {
+        let (think, text) = split_all(
+            &[
+                "thought one</think:6124c78e>reply one</think:6124c78e>",
+                "thinking again</think:6124c78e>reply two",
+            ],
+            true,
+        );
+        assert_eq!(think, "thought onethinking again");
+        assert_eq!(text, "reply onereply two");
+    }
+
+    /// A stray marker split across chunks is never emitted as prose either.
+    #[test]
+    fn a_stray_marker_split_across_chunks_still_drops() {
+        let (think, text) = split_all(
+            &["</thi", "nk:6124c78e>reply", "</thi", "nk:6124c78e>more"],
+            true,
+        );
+        assert_eq!(think, "reply");
+        assert_eq!(text, "more");
+    }
+
+    /// A tool loop thinks once per tool, so one body can hold several segments
+    /// and the reply is only what follows the last closing marker. Stopping at
+    /// the first close left every later thought shown as reply.
+    #[test]
+    fn a_second_thought_after_the_first_close_is_reasoning_too() {
+        let (think, text) = split_all(
+            &[
+                "first thought",
+                "</think:6124c78e>first answer",
+                "<think>second thought",
+                "</think:6124c78e>second answer",
+            ],
+            true,
+        );
+        assert_eq!(think, "first thoughtsecond thought");
+        assert_eq!(text, "first answersecond answer");
+    }
+
+    /// A thought the turn never closed was cut off, not answered: classifying it
+    /// as reply is what made half-written thinking visible.
+    #[test]
+    fn an_unclosed_thought_stays_reasoning() {
+        let (think, text) = split_all(&["still pondering"], true);
+        assert_eq!(think, "still pondering");
+        assert_eq!(text, "");
+    }
+
+    /// An opening marker anywhere in the body delimits, it is not shown.
+    #[test]
+    fn a_thought_opening_within_the_body_is_dropped() {
+        let (think, text) = split_all(&["<think>ponder", "ing</think>reply"], true);
+        assert_eq!(think, "pondering");
+        assert_eq!(text, "reply");
+    }
+
+    /// The suffix is deployment-specific, so replaying a thought has to use the
+    /// marker this server actually emits rather than the plain one.
+    #[test]
+    fn the_close_marker_is_reported_verbatim() {
+        assert_eq!(
+            marker_of(&["ponder", "</thi", "nk:abcd>", "reply"]),
+            Some("</think:abcd>".to_string())
+        );
+        assert_eq!(marker_of(&["no marker here"]), None);
+    }
+
+    #[test]
+    fn probe_close_marker_only_segments() {
+        let (think, text) = split_all(&["seg1", "</think:abcd>seg2", "</think:abcd>reply"], true);
+        println!("think={think:?} text={text:?}");
     }
 }

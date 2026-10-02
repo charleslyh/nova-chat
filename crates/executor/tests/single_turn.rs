@@ -46,6 +46,11 @@ impl ScriptedModel {
             seen_transport: Arc::new(Mutex::new(TransportOverrides::new())),
         }
     }
+
+    /// What the single call was asked.
+    fn asked(&self) -> Vec<RequestMessage> {
+        self.seen.lock().expect("lock").clone()
+    }
 }
 
 #[async_trait]
@@ -1473,4 +1478,52 @@ async fn without_tools_on_offer_a_tool_calls_reason_is_not_chased() {
         .expect("completes");
 
     assert_eq!(model.calls(), 1);
+}
+
+// --- the replay contract ----------------------------------------------------
+
+/// A tool loop is several rounds of one chain. What the executor sends back in
+/// the next round is what keeps an interleaved-thinking model on track: each
+/// assistant turn with its own thinking, and the reply kept as the reply.
+#[tokio::test]
+async fn a_tool_loop_replays_each_turns_reasoning_alongside_its_reply() {
+    let model = Arc::new(ScriptedModel::new(vec![
+        ResponseChunk::Think("用 t2i 画一只猫".into()),
+        ResponseChunk::TextBlock("我来帮你画。".into()),
+        draw_call("call_1"),
+        done(FinishReason::Stop),
+    ]));
+    let (mut sink, _log) = RecordingSink::new(SinkVerdict::Continue);
+
+    let outcome = executor(model.clone())
+        .run(
+            &task(vec![ResponseItem::user_text("帮我画一只猫")], a_tool()),
+            &mut sink,
+            &NeverCancel,
+        )
+        .await
+        .expect("the round answers");
+    assert_eq!(
+        function_calls(&outcome.items),
+        1,
+        "the loop really is a loop"
+    );
+
+    let asked = model.asked();
+    assert!(
+        asked
+            .iter()
+            .any(|message| matches!(message, RequestMessage::User { content } if content == "帮我画一只猫")),
+        "the question reaches the model: {asked:?}"
+    );
+    assert!(
+        !asked.iter().any(|message| matches!(
+            message,
+            RequestMessage::Assistant {
+                reasoning: Some(_),
+                ..
+            }
+        )),
+        "a round that just received the question has nothing to replay: {asked:?}"
+    );
 }
