@@ -411,29 +411,38 @@ impl HttpChatCompletion {
         Cow::Owned(Client::build(self.http.clone(), config))
     }
 
-    /// Whether this turn asks the model to think. `none` is a level of the enum,
-    /// not an absent one: such a turn is sent a request that says "do not
-    /// think", so no CoT is coming and its body must not be held back for a
-    /// think marker that never arrives.
     /// The protocol's `reasoning_effort` field, when this endpoint is to be
-    /// sent one: the level, and only ever a value the enum has.
+    /// sent one: the level, and only ever a value the enum has. Every way of
+    /// saying "do not think" collapses onto the enum's own, `none`.
     fn standard_effort(&self) -> Option<ReasoningEffort> {
         match self.effort_via {
             ReasoningEffortVia::Template => None,
+            _ if self
+                .reasoning_effort_name
+                .as_deref()
+                .is_some_and(thinking_off) =>
+            {
+                Some(ReasoningEffort::None)
+            }
             _ => self.reasoning_effort.clone(),
         }
     }
 
     /// The chat-template switch, when this endpoint is to be sent one: the
-    /// level verbatim, since a deployment's own vocabulary is what its template
-    /// reads — `no_think` is not a level the protocol has.
+    /// level verbatim, except when it says "do not think", which each
+    /// deployment spells its own way.
     fn template_effort(&self) -> Option<Value> {
         match self.effort_via {
             ReasoningEffortVia::Standard => None,
-            _ => self
-                .reasoning_effort_name
-                .as_ref()
-                .map(|level| serde_json::json!({ "reasoning_effort": level })),
+            _ => {
+                let level = self.reasoning_effort_name.as_deref()?;
+                let word = if thinking_off(level) {
+                    THINKING_OFF_WORD
+                } else {
+                    level
+                };
+                Some(serde_json::json!({ "reasoning_effort": word }))
+            }
         }
     }
 
@@ -1158,9 +1167,14 @@ fn reasoning_effort_name(extensions: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Whether a level says "do not think". `no_think` is HunYuan's word for it,
-/// and it is not a value the protocol's enum has — which is why the switch
-/// has to travel as a template kwarg.
+/// The word a chat template reads for "do not think". Measured, not invented:
+/// `no_think` on a HunYuan host, which answers 400 to `none` in the field AND
+/// in the template, while a LiteLLM hop reads `none` from the field. Sending
+/// this in the template covers both.
+const THINKING_OFF_WORD: &str = "no_think";
+
+/// Whether a level says "do not think". Deployments spell it their own way:
+/// `no_think` is HunYuan's, `none` the enum's, and a LiteLLM hop reads either.
 fn thinking_off(level: &str) -> bool {
     matches!(
         level.trim().to_ascii_lowercase().as_str(),
@@ -1334,6 +1348,37 @@ mod tests {
         assert!(template.is_none());
     }
 
+    /// Every way of saying "do not think" is sent in the words each side reads:
+    /// `none` in the field, `no_think` in the template. One of our hosts answers
+    /// 400 to `none` anywhere near it, the other ignores the template alone.
+    #[test]
+    fn an_off_switch_is_spelled_the_way_each_side_reads_it() {
+        let sent = |level: &str| {
+            let request = HttpChatCompletion::new(
+                ModelEndpoint::new(ApiKey::new("k"), "http://h/v1", "m")
+                    .with_extensions(serde_json::json!({ "reasoning_effort": level })),
+            )
+            .request(&[], &[], true);
+            (request.reasoning_effort, request.chat_template_kwargs)
+        };
+        for level in ["none", "no_think", "no-think", "NONE"] {
+            let (standard, template) = sent(level);
+            assert_eq!(standard, Some(ReasoningEffort::None), "{level}");
+            assert_eq!(
+                template,
+                Some(serde_json::json!({ "reasoning_effort": "no_think" })),
+                "{level}"
+            );
+        }
+        // A level is nobody's off word: it travels as it was named.
+        let (standard, template) = sent("high");
+        assert_eq!(standard, Some(ReasoningEffort::High));
+        assert_eq!(
+            template,
+            Some(serde_json::json!({ "reasoning_effort": "high" }))
+        );
+    }
+
     /// HunYuan's switch is not a level of the protocol's enum, so it travels in
     /// the chat template kwargs — that is the field its serving stack reads —
     /// while the protocol's own field only carries what it can express.
@@ -1354,15 +1399,13 @@ mod tests {
             Some(serde_json::json!({ "reasoning_effort": "high" }))
         );
 
+        // Off: the enum's own word in the field, the deployment's in the
+        // template — a side that reads only one of them still gets the message.
         let off = request(serde_json::json!({ "reasoning_effort": "no_think" }));
-        assert!(
-            off.reasoning_effort.is_none(),
-            "no_think is not a level the protocol has"
-        );
+        assert_eq!(off.reasoning_effort, Some(ReasoningEffort::None));
         assert_eq!(
             off.chat_template_kwargs,
-            Some(serde_json::json!({ "reasoning_effort": "no_think" })),
-            "but it is a switch this deployment reads"
+            Some(serde_json::json!({ "reasoning_effort": "no_think" }))
         );
 
         let silent = request(serde_json::json!({}));
