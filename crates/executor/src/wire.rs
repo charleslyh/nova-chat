@@ -17,6 +17,8 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::runner::StreamTimeouts;
+
 /// A model turn failed. The message is for the operator; it is mapped to a
 /// protocol failure by the caller.
 #[derive(Debug, thiserror::Error)]
@@ -199,6 +201,13 @@ pub trait ChatCompletion: Send + Sync {
         stream: bool,
         transport: &TransportOverrides,
     ) -> Result<ChunkStream, ModelError>;
+
+    /// How long this endpoint's rounds may go quiet, when it names its own.
+    /// `None` leaves the executor's defaults in force: a queueing upstream and
+    /// a local one do not wait alike, so the endpoint that knows best says.
+    fn stream_timeouts(&self) -> Option<StreamTimeouts> {
+        None
+    }
 }
 
 /// The stream a provider returns.

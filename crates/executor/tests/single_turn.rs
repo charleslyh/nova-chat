@@ -937,6 +937,59 @@ async fn a_round_that_stays_silent_until_the_first_chunk_deadline_fails_after_on
     assert!(log.lock().expect("lock").calls.is_empty());
 }
 
+/// Stands in for an endpoint that configured its own timeouts.
+struct TimedStall {
+    timeouts: StreamTimeouts,
+}
+
+#[async_trait]
+impl ChatCompletion for TimedStall {
+    async fn completion(
+        &self,
+        _messages: &[RequestMessage],
+        _tools: &[ToolManifest],
+        _stream: bool,
+        _transport: &TransportOverrides,
+    ) -> Result<ChunkStream, ModelError> {
+        let stream: Pin<Box<dyn Stream<Item = _> + Send>> = Box::pin(futures::stream::pending());
+        Ok(stream)
+    }
+
+    fn stream_timeouts(&self) -> Option<StreamTimeouts> {
+        Some(self.timeouts)
+    }
+}
+
+/// The executor's defaults are for an endpoint that said nothing: a queueing
+/// upstream and a local one do not wait alike, so the endpoint's own clock wins.
+#[tokio::test]
+async fn an_endpoints_own_timeouts_beat_the_executors_defaults() {
+    let model = Arc::new(TimedStall {
+        timeouts: StreamTimeouts {
+            first_chunk: SHORT,
+            idle: LONG,
+            total: LONG,
+        },
+    });
+    let (mut sink, _log) = RecordingSink::new(SinkVerdict::Continue);
+
+    let started = std::time::Instant::now();
+    let error = executor(model)
+        .run(
+            &task(vec![ResponseItem::user_text("q")], vec![]),
+            &mut sink,
+            &NeverCancel,
+        )
+        .await
+        .expect_err("it never speaks");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "cut on the endpoint's clock, not on the 90s default"
+    );
+    assert!(matches!(error, AgentError::Failed { .. }));
+}
+
 #[tokio::test]
 async fn a_request_that_never_opens_is_bounded_by_the_first_chunk_deadline() {
     let model = Arc::new(StallingModel::hanging_on_open());

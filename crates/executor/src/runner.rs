@@ -225,6 +225,8 @@ impl AgentRunner for SingleTurnExecutor {
         // already done its tool work — eight productive rounds discarded for one
         // silent turn. Bounded because a model that is deterministically silent
         // is unlikely to answer on the second ask.
+        // The endpoint knows its own queueing; its word beats the defaults.
+        let timeouts = provider.stream_timeouts().unwrap_or(self.timeouts);
         let mut spent = Usage::default();
         let mut attempt = 1;
         loop {
@@ -236,7 +238,7 @@ impl AgentRunner for SingleTurnExecutor {
                 task,
                 sink,
                 cancel,
-                self.timeouts,
+                timeouts,
                 &item_id(task, 1),
             )
             .await?;
@@ -312,7 +314,7 @@ impl AgentRunner for SingleTurnExecutor {
                     task,
                     sink,
                     cancel,
-                    self.timeouts,
+                    timeouts,
                     &item_id(task, 2),
                 )
                 .await?;

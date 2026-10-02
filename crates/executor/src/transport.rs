@@ -22,6 +22,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_openai::config::OpenAIConfig;
 use async_openai::types::chat::{
@@ -46,6 +47,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::Value;
 
+use crate::runner::StreamTimeouts;
 use crate::think::{Split, ThinkSplitter};
 use crate::wire::{
     ChatCompletion, ChunkStream, FinishReason, ModelError, ModelUsage, RequestMessage,
@@ -169,6 +171,8 @@ pub struct HttpChatCompletion {
     reasoning_effort_name: Option<String>,
     max_completion_tokens: Option<u32>,
     wire_options: WireOptions,
+    effort_via: ReasoningEffortVia,
+    timeouts: EndpointTimeouts,
     /// The closing think marker the upstream used, verbatim, suffix included.
     /// Remembered because replaying a thought has to wrap it in the very marker
     /// this endpoint emits, and the suffix is deployment-specific.
@@ -208,6 +212,58 @@ enum ReasoningField {
 struct ThinkMarkers {
     open: String,
     close: String,
+}
+
+/// Where the thinking switch is sent. Not every deployment reads both: one may
+/// reject a level outside the protocol's enum outright, another may only honour
+/// the field and ignore the template.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReasoningEffortVia {
+    /// The protocol's field, when the value is a level of its enum, and the
+    /// template either way.
+    Both,
+    /// Only the protocol's field.
+    Standard,
+    /// Only the chat template: for a deployment that rejects the field.
+    Template,
+}
+
+/// How long one round of this endpoint may go quiet, when it says.
+///
+/// An endpoint knows its own queueing: one behind a busy gateway can spend
+/// minutes before anything arrives, a local one answers in under a second.
+/// Defaults, which stay in force when nothing is configured, cannot tell them
+/// apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EndpointTimeouts {
+    first_chunk: Option<Duration>,
+    idle: Option<Duration>,
+    total: Option<Duration>,
+}
+
+impl EndpointTimeouts {
+    fn from_extensions(extensions: &Value) -> Self {
+        let millis = |key: &str| {
+            extensions
+                .get(key)
+                .and_then(Value::as_u64)
+                .filter(|ms| *ms > 0)
+                .map(Duration::from_millis)
+        };
+        Self {
+            first_chunk: millis("stream_timeout_first_chunk_ms"),
+            idle: millis("stream_timeout_idle_ms"),
+            total: millis("stream_timeout_total_ms"),
+        }
+    }
+
+    fn or_default(self, fallback: StreamTimeouts) -> StreamTimeouts {
+        StreamTimeouts {
+            first_chunk: self.first_chunk.unwrap_or(fallback.first_chunk),
+            idle: self.idle.unwrap_or(fallback.idle),
+            total: self.total.unwrap_or(fallback.total),
+        }
+    }
 }
 
 /// Endpoint switches for what history carries to the upstream. Read from the
@@ -295,6 +351,8 @@ impl HttpChatCompletion {
             reasoning_effort_name: reasoning_effort_name(&endpoint.extensions),
             max_completion_tokens: max_completion_tokens(&endpoint.extensions),
             wire_options: WireOptions::from_extensions(&endpoint.extensions),
+            effort_via: effort_via(&endpoint.extensions),
+            timeouts: EndpointTimeouts::from_extensions(&endpoint.extensions),
             seen_marker: Arc::new(Mutex::new(None)),
         }
     }
@@ -357,6 +415,28 @@ impl HttpChatCompletion {
     /// not an absent one: such a turn is sent a request that says "do not
     /// think", so no CoT is coming and its body must not be held back for a
     /// think marker that never arrives.
+    /// The protocol's `reasoning_effort` field, when this endpoint is to be
+    /// sent one: the level, and only ever a value the enum has.
+    fn standard_effort(&self) -> Option<ReasoningEffort> {
+        match self.effort_via {
+            ReasoningEffortVia::Template => None,
+            _ => self.reasoning_effort.clone(),
+        }
+    }
+
+    /// The chat-template switch, when this endpoint is to be sent one: the
+    /// level verbatim, since a deployment's own vocabulary is what its template
+    /// reads — `no_think` is not a level the protocol has.
+    fn template_effort(&self) -> Option<Value> {
+        match self.effort_via {
+            ReasoningEffortVia::Standard => None,
+            _ => self
+                .reasoning_effort_name
+                .as_ref()
+                .map(|level| serde_json::json!({ "reasoning_effort": level })),
+        }
+    }
+
     /// What a thought opens with on this endpoint, `""` when thoughts announce
     /// themselves only by closing.
     ///
@@ -403,11 +483,8 @@ impl HttpChatCompletion {
                 include_usage: Some(true),
                 include_obfuscation: None,
             }),
-            reasoning_effort: self.reasoning_effort.clone(),
-            chat_template_kwargs: self
-                .reasoning_effort_name
-                .as_ref()
-                .map(|level| serde_json::json!({ "reasoning_effort": level })),
+            reasoning_effort: self.standard_effort(),
+            chat_template_kwargs: self.template_effort(),
             max_completion_tokens: self.max_completion_tokens,
             ..Default::default()
         }
@@ -442,6 +519,10 @@ impl ChatCompletion for HttpChatCompletion {
         self.streaming_turn(request, &client, Arc::clone(&self.seen_marker))
             .await
     }
+
+    fn stream_timeouts(&self) -> Option<StreamTimeouts> {
+        Some(self.timeouts.or_default(StreamTimeouts::default()))
+    }
 }
 
 impl Clone for HttpChatCompletion {
@@ -455,6 +536,8 @@ impl Clone for HttpChatCompletion {
             reasoning_effort_name: self.reasoning_effort_name.clone(),
             max_completion_tokens: self.max_completion_tokens,
             wire_options: self.wire_options.clone(),
+            effort_via: self.effort_via,
+            timeouts: EndpointTimeouts::from_extensions(&serde_json::Value::Null),
             seen_marker: Arc::clone(&self.seen_marker),
         }
     }
@@ -466,14 +549,10 @@ impl HttpChatCompletion {
         request: CreateChatCompletionRequest,
         client: &Client<OpenAIConfig>,
     ) -> Result<ChunkStream, ModelError> {
-        let response = client
-            .chat()
-            .create(request)
-            .await
-            .map_err(|error| {
-                tracing::info!(error = %error, "[llm] request failed (non-stream)");
-                provider_error(error)
-            })?;
+        let response = client.chat().create(request).await.map_err(|error| {
+            tracing::info!(error = %error, "[llm] request failed (non-stream)");
+            provider_error(error)
+        })?;
         let choice = response
             .choices
             .first()
@@ -1089,6 +1168,24 @@ fn thinking_off(level: &str) -> bool {
     )
 }
 
+/// Where an endpoint wants the thinking switch sent: `"standard"`, `"template"`,
+/// or `"both"` (the default). A deployment that rejects the protocol's field
+/// outright — a `no_think` or even a `none` there is a 400 — names `template`.
+fn effort_via(extensions: &Value) -> ReasoningEffortVia {
+    match extensions
+        .get("reasoning_effort_via")
+        .and_then(Value::as_str)
+    {
+        Some("standard") => ReasoningEffortVia::Standard,
+        Some("template") => ReasoningEffortVia::Template,
+        None | Some("both") => ReasoningEffortVia::Both,
+        Some(other) => {
+            tracing::warn!(value = other, "unknown reasoning_effort_via; sending both");
+            ReasoningEffortVia::Both
+        }
+    }
+}
+
 /// The output budget a configured endpoint names, if any. Thinking draws on the
 /// same budget as the tool arguments, so a deployment can raise it explicitly
 /// rather than leave it to the upstream default.
@@ -1169,6 +1266,72 @@ mod tests {
         assert!(thinks(serde_json::json!({ "reasoning_effort": "high" })));
         assert!(!thinks(serde_json::json!({ "reasoning_effort": "none" })));
         assert!(!thinks(serde_json::json!({})));
+    }
+
+    /// A busy endpoint and a local one do not wait alike, and only the endpoint
+    /// knows which it is. Whatever it does not name keeps the default.
+    #[test]
+    fn an_endpoint_names_its_own_timeouts() {
+        let timeouts = |extensions: Value| {
+            HttpChatCompletion::new(
+                ModelEndpoint::new(ApiKey::new("k"), "http://h/v1", "m")
+                    .with_extensions(extensions),
+            )
+            .stream_timeouts()
+            .expect("the transport reports the timeouts it was given")
+        };
+
+        let named = timeouts(serde_json::json!({
+            "stream_timeout_first_chunk_ms": 240_000,
+            "stream_timeout_idle_ms": 30_000,
+            "stream_timeout_total_ms": 900_000,
+        }));
+        assert_eq!(named.first_chunk, Duration::from_secs(240));
+        assert_eq!(named.idle, Duration::from_secs(30));
+        assert_eq!(named.total, Duration::from_secs(900));
+
+        let partial = timeouts(serde_json::json!({
+            "stream_timeout_first_chunk_ms": 1_000,
+            "stream_timeout_total_ms": 0,
+        }));
+        let default = StreamTimeouts::default();
+        assert_eq!(partial.first_chunk, Duration::from_secs(1));
+        assert_eq!(partial.idle, default.idle, "unnamed parts keep the default");
+        assert_eq!(partial.total, default.total, "zero is not a timeout");
+    }
+
+    /// Where the switch goes is the endpoint's call: a deployment that answers
+    /// the protocol's field with a 400 on `no_think` — even on `none` — has to
+    /// be able to keep it out of there.
+    #[test]
+    fn the_thinking_switch_goes_where_the_endpoint_says() {
+        let sent = |extensions: Value| {
+            let request = HttpChatCompletion::new(
+                ModelEndpoint::new(ApiKey::new("k"), "http://h/v1", "m")
+                    .with_extensions(extensions),
+            )
+            .request(&[], &[], true);
+            (request.reasoning_effort, request.chat_template_kwargs)
+        };
+        let kwargs = |level: &str| Some(serde_json::json!({ "reasoning_effort": level }));
+
+        let (standard, template) = sent(serde_json::json!({ "reasoning_effort": "high" }));
+        assert_eq!(standard, Some(ReasoningEffort::High));
+        assert_eq!(template, kwargs("high"), "both is the default");
+
+        let (standard, template) = sent(serde_json::json!({
+            "reasoning_effort": "no_think",
+            "reasoning_effort_via": "template",
+        }));
+        assert!(standard.is_none(), "the field would be a 400");
+        assert_eq!(template, kwargs("no_think"));
+
+        let (standard, template) = sent(serde_json::json!({
+            "reasoning_effort": "none",
+            "reasoning_effort_via": "standard",
+        }));
+        assert_eq!(standard, Some(ReasoningEffort::None));
+        assert!(template.is_none());
     }
 
     /// HunYuan's switch is not a level of the protocol's enum, so it travels in
