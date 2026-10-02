@@ -162,6 +162,11 @@ pub struct HttpChatCompletion {
     http: openai_reqwest::Client,
     api_model: String,
     reasoning_effort: Option<ReasoningEffort>,
+    /// The level the endpoint named, verbatim. Not the enum above: a
+    /// deployment's own vocabulary carries further than the protocol's —
+    /// HunYuan's `no_think` is not a level, and its chat template is where
+    /// the switch is read.
+    reasoning_effort_name: Option<String>,
     max_completion_tokens: Option<u32>,
     wire_options: WireOptions,
     /// The closing think marker the upstream used, verbatim, suffix included.
@@ -287,6 +292,7 @@ impl HttpChatCompletion {
             http,
             api_model: endpoint.api_model,
             reasoning_effort: reasoning_effort(&endpoint.extensions),
+            reasoning_effort_name: reasoning_effort_name(&endpoint.extensions),
             max_completion_tokens: max_completion_tokens(&endpoint.extensions),
             wire_options: WireOptions::from_extensions(&endpoint.extensions),
             seen_marker: Arc::new(Mutex::new(None)),
@@ -351,8 +357,29 @@ impl HttpChatCompletion {
     /// not an absent one: such a turn is sent a request that says "do not
     /// think", so no CoT is coming and its body must not be held back for a
     /// think marker that never arrives.
+    /// What a thought opens with on this endpoint, `""` when thoughts announce
+    /// themselves only by closing.
+    ///
+    /// Only an endpoint that delivers its thinking inline declares one: it is
+    /// the same declaration that says how a thought is replayed. Elsewhere
+    /// there is nothing to wait for, and the body keeps being read on trust.
+    fn thought_opening(&self) -> &str {
+        match self.wire_options.reasoning_replay {
+            ReasoningReplay::Inline => self.wire_options.think_markers.open.as_str(),
+            _ => "",
+        }
+    }
+
     fn thinks(&self) -> bool {
-        !matches!(self.reasoning_effort, None | Some(ReasoningEffort::None))
+        if self
+            .reasoning_effort_name
+            .as_deref()
+            .is_some_and(thinking_off)
+        {
+            return false;
+        }
+        self.reasoning_effort.is_some()
+            || matches!(self.wire_options.reasoning_replay, ReasoningReplay::Inline)
     }
 
     /// The request this turn would put on the wire.
@@ -377,6 +404,10 @@ impl HttpChatCompletion {
                 include_obfuscation: None,
             }),
             reasoning_effort: self.reasoning_effort.clone(),
+            chat_template_kwargs: self
+                .reasoning_effort_name
+                .as_ref()
+                .map(|level| serde_json::json!({ "reasoning_effort": level })),
             max_completion_tokens: self.max_completion_tokens,
             ..Default::default()
         }
@@ -421,6 +452,7 @@ impl Clone for HttpChatCompletion {
             http: self.http.clone(),
             api_model: self.api_model.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
+            reasoning_effort_name: self.reasoning_effort_name.clone(),
             max_completion_tokens: self.max_completion_tokens,
             wire_options: self.wire_options.clone(),
             seen_marker: Arc::clone(&self.seen_marker),
@@ -448,7 +480,7 @@ impl HttpChatCompletion {
             .ok_or_else(|| ModelError::new("model returned no choices"))?;
 
         let mut chunks = Vec::new();
-        let mut splitter = ThinkSplitter::new(self.thinks());
+        let mut splitter = ThinkSplitter::new(self.thinks(), self.thought_opening());
         if let Some(reasoning) = extract_reasoning(&response, "message") {
             // The provider carries the CoT in its own field: nothing to split.
             splitter.disable();
@@ -525,9 +557,11 @@ impl HttpChatCompletion {
                 tracing::info!(error = %error, "[llm] request failed (stream)");
                 provider_error(error)
             })?;
-        // Whether this turn asked the model to think: only such a turn can be
-        // receiving an INLINED CoT, so only such a turn holds its body.
+        // Whether this turn can be receiving an INLINED CoT: only such a turn
+        // holds its body. The opening marker it would announce one with is
+        // cloned because the stream generator outlives this borrow.
         let thinking = self.thinks();
+        let open_marker = self.thought_opening().to_string();
         let model = self.api_model.clone();
         let output = async_stream::stream! {
             let seen_marker = seen_marker;
@@ -539,7 +573,7 @@ impl HttpChatCompletion {
             let mut acc_text = String::new();
             // Raw `reasoning_content` field, accumulated for the wire dump only.
             let mut acc_reasoning = String::new();
-            let mut splitter = ThinkSplitter::new(thinking);
+            let mut splitter = ThinkSplitter::new(thinking, &open_marker);
 
             while let Some(item) = upstream.next().await {
                 // Only a whole marker is worth remembering: one straddling
@@ -1031,6 +1065,30 @@ fn wire_arguments(call: &ToolCallRequest) -> String {
     wire
 }
 
+/// The `reasoning_effort` the endpoint named, verbatim.
+///
+/// Kept beside the enum because the two do not carry the same thing: the enum
+/// is what the protocol accepts, this is what the deployment says. A value
+/// outside the enum is still a switch this deployment understands.
+fn reasoning_effort_name(extensions: &Value) -> Option<String> {
+    extensions
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|level| !level.is_empty())
+        .map(str::to_string)
+}
+
+/// Whether a level says "do not think". `no_think` is HunYuan's word for it,
+/// and it is not a value the protocol's enum has — which is why the switch
+/// has to travel as a template kwarg.
+fn thinking_off(level: &str) -> bool {
+    matches!(
+        level.trim().to_ascii_lowercase().as_str(),
+        "" | "none" | "no_think" | "no-think"
+    )
+}
+
 /// The output budget a configured endpoint names, if any. Thinking draws on the
 /// same budget as the tool arguments, so a deployment can raise it explicitly
 /// rather than leave it to the upstream default.
@@ -1111,6 +1169,83 @@ mod tests {
         assert!(thinks(serde_json::json!({ "reasoning_effort": "high" })));
         assert!(!thinks(serde_json::json!({ "reasoning_effort": "none" })));
         assert!(!thinks(serde_json::json!({})));
+    }
+
+    /// HunYuan's switch is not a level of the protocol's enum, so it travels in
+    /// the chat template kwargs — that is the field its serving stack reads —
+    /// while the protocol's own field only carries what it can express.
+    #[test]
+    fn the_thinking_switch_reaches_the_chat_template() {
+        let request = |extensions: Value| {
+            HttpChatCompletion::new(
+                ModelEndpoint::new(ApiKey::new("k"), "http://h/v1", "m")
+                    .with_extensions(extensions),
+            )
+            .request(&[], &[], true)
+        };
+
+        let high = request(serde_json::json!({ "reasoning_effort": "high" }));
+        assert_eq!(high.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(
+            high.chat_template_kwargs,
+            Some(serde_json::json!({ "reasoning_effort": "high" }))
+        );
+
+        let off = request(serde_json::json!({ "reasoning_effort": "no_think" }));
+        assert!(
+            off.reasoning_effort.is_none(),
+            "no_think is not a level the protocol has"
+        );
+        assert_eq!(
+            off.chat_template_kwargs,
+            Some(serde_json::json!({ "reasoning_effort": "no_think" })),
+            "but it is a switch this deployment reads"
+        );
+
+        let silent = request(serde_json::json!({}));
+        assert!(silent.reasoning_effort.is_none());
+        assert!(
+            silent.chat_template_kwargs.is_none(),
+            "an endpoint that names no level says nothing about thinking"
+        );
+    }
+
+    /// An endpoint that replays thinking inline is one that delivers it inline:
+    /// it thinks whether or not it was asked to, so its body is split even when
+    /// no level was named. An explicit switch off still wins.
+    #[test]
+    fn an_endpoint_replaying_thinking_inline_splits_without_a_level() {
+        let thinks = |extensions: Value| {
+            HttpChatCompletion::new(
+                ModelEndpoint::new(ApiKey::new("k"), "http://h/v1", "m")
+                    .with_extensions(extensions),
+            )
+            .thinks()
+        };
+        assert!(thinks(serde_json::json!({ "reasoning_replay": "inline" })));
+        assert!(!thinks(serde_json::json!({})));
+        assert!(!thinks(
+            serde_json::json!({ "reasoning_replay": "inline", "reasoning_effort": "no_think" })
+        ));
+    }
+
+    /// Over the wire, the endpoint that started all this: no level named, the
+    /// CoT inlined, thoughts announced only by closing.
+    #[tokio::test]
+    async fn an_endpoint_that_only_closes_its_thoughts_splits_them_anyway() {
+        let base_url = serve_deltas(vec![
+            serde_json::json!({ "content": "ponder" }),
+            serde_json::json!({ "content": "</think:abcd>Hi there!" }),
+        ])
+        .await;
+        let (thinking, body) = one_turn(
+            &base_url,
+            serde_json::json!({ "reasoning_replay": "inline", "reasoning_inline_open_tag": "" }),
+            TransportOverrides::new(),
+        )
+        .await;
+        assert_eq!(thinking, "ponder");
+        assert_eq!(body, "Hi there!");
     }
 
     #[test]

@@ -69,6 +69,6 @@ strum = { version = "0.26", features = ["derive"] }
 # …pinned to a rev that carries `reasoning_content`: a provider that streams the
 # chain of thought in its own field (hy4) is invisible to the typed schema
 # without it, and no upstream release has the field.
-async-openai = { git = "https://git.woa.com/yuanbao-multimodal/async-openai.git", rev = "206330c4a86a775b37997a7d16df2b846a02479f", features = ["chat-completion"] }
+async-openai = { git = "https://git.woa.com/yuanbao-multimodal/async-openai.git", rev = "57a0cf8faa51930e1de59192374e580a7d1f7dfe", features = ["chat-completion"] }
 # Stream construction for the executor's streaming turn.
 async-stream = "0.3"

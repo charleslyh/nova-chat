@@ -65,10 +65,19 @@ impl ThinkSplitter {
     /// `thinking` is whether this turn asked the model to think. A turn that did
     /// not cannot be receiving a CoT, and holding its body would stall the
     /// whole reply behind a marker that is never coming.
-    pub(crate) fn new(thinking: bool) -> Self {
+    ///
+    /// `open` is what a thought opens with on this endpoint, `""` when thoughts
+    /// announce themselves only by closing — Hy3, whose body is
+    /// `thought</think>reply`. Such a turn can only be read on trust, so its
+    /// leading block is taken as reasoning. An endpoint whose thoughts DO open
+    /// with a marker needs no trust: everything before the first marker is
+    /// reply, which is what keeps a turn that never thought from being read as
+    /// one.
+    pub(crate) fn new(thinking: bool, open: &str) -> Self {
+        let announced = !open.trim().is_empty();
         Self {
             pending: String::new(),
-            thinking,
+            thinking: thinking && !announced,
             buffered: false,
             disabled: !thinking,
             close_marker: None,
@@ -205,15 +214,26 @@ impl ThinkSplitter {
             return Vec::new();
         }
         let pending = std::mem::take(&mut self.pending);
-        // A thought the turn never closed was cut off, not answered.
+        // A tail the stream ended inside is not prose either.
+        let body = match pending.rfind('<') {
+            Some(start) if is_marker_tail(&pending[start..], self.thinking) => &pending[..start],
+            _ => pending.as_str(),
+        };
+        if body.is_empty() {
+            return Vec::new();
+        }
+        // A thought the turn never closed is a thought that ran out of stream.
+        // It was classified on the way in — by this endpoint's marker, or by
+        // the trust an inlined CoT requires — and reclassifying the tail here
+        // would split one answer across the thinking panel and the reply.
         if self.thinking {
-            let thought = strip_markers(&pending);
+            let thought = strip_markers(body);
             if thought.is_empty() {
                 return Vec::new();
             }
             return vec![Split::Think(thought)];
         }
-        vec![Split::Text(pending)]
+        vec![Split::Text(body.to_string())]
     }
 
     /// Bytes of the held block that can be classified right now.
@@ -315,7 +335,13 @@ mod tests {
     /// chooses, never in the pieces that suit the reader — and collect what was
     /// classified.
     fn split_all(pieces: &[&str], thinking: bool) -> (String, String) {
-        let mut splitter = ThinkSplitter::new(thinking);
+        split_all_opening(pieces, thinking, "")
+    }
+
+    /// [`split_all`] on an endpoint whose thoughts open with `open`, `<think>`
+    /// being the one the protocol's own deployments use.
+    fn split_all_opening(pieces: &[&str], thinking: bool, open: &str) -> (String, String) {
+        let mut splitter = ThinkSplitter::new(thinking, open);
         let mut think = String::new();
         let mut text = String::new();
         for piece in pieces {
@@ -337,7 +363,7 @@ mod tests {
 
     /// The closing marker a turn used, verbatim; `None` when no segment closed.
     fn marker_of(pieces: &[&str]) -> Option<String> {
-        let mut splitter = ThinkSplitter::new(true);
+        let mut splitter = ThinkSplitter::new(true, "");
         for piece in pieces {
             splitter.push(piece);
         }
@@ -382,7 +408,7 @@ mod tests {
     /// and a body already held is released as reply.
     #[test]
     fn a_provider_with_its_own_reasoning_field_stops_splitting() {
-        let mut splitter = ThinkSplitter::new(true);
+        let mut splitter = ThinkSplitter::new(true, "");
         splitter.disable();
         assert!(
             matches!(splitter.push("held").as_slice(), [Split::Text(body)] if body == "held"),
@@ -396,7 +422,7 @@ mod tests {
     /// whole point of streaming.
     #[test]
     fn a_thinking_turn_streams_the_cot_as_it_arrives() {
-        let mut splitter = ThinkSplitter::new(true);
+        let mut splitter = ThinkSplitter::new(true, "");
         let mut think = String::new();
         for piece in ["The", " user", " says hi", ".</thi", "nk:1>", "Hi!"] {
             for part in splitter.push(piece) {
@@ -412,17 +438,26 @@ mod tests {
     /// back: there is no marker coming, so every delta must stream through.
     #[test]
     fn thinking_off_never_holds_the_body() {
-        let mut splitter = ThinkSplitter::new(false);
+        let mut splitter = ThinkSplitter::new(false, "");
         assert!(
             matches!(splitter.push("Hello").as_slice(), [Split::Text(body)] if body == "Hello")
         );
     }
 
-    /// The accepted gamble: a turn that asked the model to think gets its leading
-    /// block treated as thinking even if the marker never comes. Hy3 always
-    /// thinks when it is asked to, so the marker is a formality, not a question.
+    /// An endpoint whose thoughts open with a marker needs no trust: a body
+    /// with no marker anywhere is the reply. This is the shape that used to
+    /// hide whole answers in the thinking panel.
     #[test]
-    fn a_turn_asked_to_think_treats_the_leading_block_as_thinking() {
+    fn a_body_with_no_marker_is_the_reply_when_thoughts_announce_themselves() {
+        let (think, text) = split_all_opening(&["Just the answer."], true, "<think>");
+        assert!(think.is_empty());
+        assert_eq!(text, "Just the answer.");
+    }
+
+    /// The same body on Hy3, whose thoughts only close: there is nothing to
+    /// announce them, so the leading block is taken on trust.
+    #[test]
+    fn a_body_with_no_marker_is_reasoning_on_an_endpoint_that_only_closes() {
         let (think, text) = split_all(&["Just the answer."], true);
         assert_eq!(think, "Just the answer.");
         assert!(text.is_empty());
@@ -519,13 +554,30 @@ mod tests {
         assert_eq!(text, "first answersecond answer");
     }
 
-    /// A thought the turn never closed was cut off, not answered: classifying it
-    /// as reply is what made half-written thinking visible.
+    /// A thought the model opened and never closed is reasoning wherever the
+    /// stream stopped: its own marker is proof the turn delimits thoughts.
     #[test]
-    fn an_unclosed_thought_stays_reasoning() {
-        let (think, text) = split_all(&["still pondering"], true);
+    fn an_opened_but_unclosed_thought_stays_reasoning() {
+        let (think, text) = split_all_opening(&["<think>still pondering"], true, "<think>");
         assert_eq!(think, "still pondering");
         assert_eq!(text, "");
+    }
+
+    /// The same body on an endpoint whose thoughts announce themselves: no
+    /// marker means nothing was thought.
+    #[test]
+    fn an_unclosed_body_is_the_reply_when_thoughts_announce_themselves() {
+        let (think, text) = split_all_opening(&["still pondering"], true, "<think>");
+        assert!(think.is_empty());
+        assert_eq!(text, "still pondering");
+    }
+
+    /// A stream that ends inside a marker: the tail is not prose either.
+    #[test]
+    fn a_marker_the_stream_ended_inside_never_reaches_the_reply() {
+        let (think, text) = split_all(&["ponder</think>the reply", "</thi"], true);
+        assert_eq!(think, "ponder");
+        assert_eq!(text, "the reply");
     }
 
     /// An opening marker anywhere in the body delimits, it is not shown.
