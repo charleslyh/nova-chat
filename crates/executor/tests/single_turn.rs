@@ -8,17 +8,18 @@
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use nova_agent_runtime::{
     AgentError, AgentEventSink, AgentRunner, AgentTask, AgentTermination, CancelProbe, SinkError,
     SinkVerdict,
 };
 use nova_executor::{
     ChatCompletion, ChunkStream, FinishReason, ModelCatalog, ModelEntry, ModelError, ModelUsage,
-    RequestMessage, ResponseChunk, SingleTurnExecutor, ToolCallRequest, ToolManifest,
-    TransportOverrides,
+    RequestMessage, ResponseChunk, SingleTurnExecutor, StreamTimeouts, ToolCallRequest,
+    ToolManifest, TransportOverrides,
 };
 use nova_responses::{
     IncompleteReason, ItemStatus, ModelParams, NodeTag, RequestProvenance, ResponseId,
@@ -714,7 +715,9 @@ async fn reasoning_is_streamed_but_is_not_an_output_item() {
 }
 
 #[tokio::test]
-async fn a_stream_that_ends_without_done_is_treated_as_a_stop() {
+async fn a_stream_that_ends_without_done_is_cut_off_not_stopped() {
+    // A gateway timeout closes the stream with no terminator. Reporting that as
+    // a natural stop once committed half-written tool arguments.
     let model = Arc::new(ScriptedModel::new(vec![
         ResponseChunk::TextBlock("truncated stream".into()),
         ResponseChunk::TextDone,
@@ -728,9 +731,277 @@ async fn a_stream_that_ends_without_done_is_treated_as_a_stop() {
             &NeverCancel,
         )
         .await
-        .expect("a missing terminator is not a failure");
+        .expect("a cut-off round with output is an outcome, not a failure");
 
+    assert_eq!(outcome.termination.status(), ResponseStatus::Incomplete);
+    match &outcome.items[..] {
+        [ResponseItem::Message { status, .. }] => {
+            assert_eq!(*status, Some(ItemStatus::Incomplete));
+        }
+        other => panic!("expected the partial answer, got {other:?}"),
+    }
+}
+
+// --- interrupted rounds -----------------------------------------------------
+
+/// A stream that yields `head` and then never yields again, the way a stalled
+/// upstream looks from here. `hang_on_open` stalls before the stream exists.
+struct StallingModel {
+    head: Vec<ResponseChunk>,
+    hang_on_open: bool,
+    calls: AtomicUsize,
+}
+
+impl StallingModel {
+    fn new(head: Vec<ResponseChunk>) -> Self {
+        Self {
+            head,
+            hang_on_open: false,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn hanging_on_open() -> Self {
+        Self {
+            hang_on_open: true,
+            ..Self::new(vec![])
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ChatCompletion for StallingModel {
+    async fn completion(
+        &self,
+        _messages: &[RequestMessage],
+        _tools: &[ToolManifest],
+        _stream: bool,
+        _transport: &TransportOverrides,
+    ) -> Result<ChunkStream, ModelError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.hang_on_open {
+            std::future::pending::<()>().await;
+        }
+        let head = futures::stream::iter(self.head.clone().into_iter().map(Ok));
+        let stream: Pin<Box<dyn Stream<Item = _> + Send>> =
+            Box::pin(head.chain(futures::stream::pending()));
+        Ok(stream)
+    }
+}
+
+/// Keeps thinking forever, one fragment every `every`: never idle, never done.
+struct EndlessThinker {
+    every: Duration,
+}
+
+#[async_trait]
+impl ChatCompletion for EndlessThinker {
+    async fn completion(
+        &self,
+        _messages: &[RequestMessage],
+        _tools: &[ToolManifest],
+        _stream: bool,
+        _transport: &TransportOverrides,
+    ) -> Result<ChunkStream, ModelError> {
+        let every = self.every;
+        let stream: Pin<Box<dyn Stream<Item = _> + Send>> =
+            Box::pin(futures::stream::unfold((), move |()| async move {
+                tokio::time::sleep(every).await;
+                Some((Ok(ResponseChunk::Think("hmm".into())), ()))
+            }));
+        Ok(stream)
+    }
+}
+
+fn quick(model: Arc<dyn ChatCompletion>, timeouts: StreamTimeouts) -> SingleTurnExecutor {
+    executor(model).with_stream_timeouts(timeouts)
+}
+
+const SHORT: Duration = Duration::from_millis(50);
+const LONG: Duration = Duration::from_secs(30);
+
+#[tokio::test]
+async fn an_interrupted_round_never_announces_its_tool_calls() {
+    // The incident: the fragment `{"op":"t2v","prompt":"雨` was announced, run
+    // as a tool call and replayed. A cut-off round's calls are not trustworthy.
+    let model = Arc::new(ScriptedModel::new(vec![
+        ResponseChunk::TextBlock("on it".into()),
+        ResponseChunk::TextDone,
+        ResponseChunk::ToolCall(ToolCallRequest {
+            call_id: "call_1".into(),
+            name: "video_tool".into(),
+            arguments: serde_json::Value::String("{\"op\":\"t2v\",\"prompt\":\"雨".into()),
+        }),
+        done(FinishReason::Interrupted),
+    ]));
+    let (mut sink, log) = RecordingSink::new(SinkVerdict::Continue);
+
+    let outcome = executor(model)
+        .run(
+            &task(vec![ResponseItem::user_text("q")], vec![]),
+            &mut sink,
+            &NeverCancel,
+        )
+        .await
+        .expect("output was produced, so this is an outcome");
+
+    assert_eq!(outcome.termination.status(), ResponseStatus::Incomplete);
+    assert!(
+        !outcome
+            .items
+            .iter()
+            .any(|item| matches!(item, ResponseItem::FunctionCall { .. })),
+        "no call of a cut-off round may reach the outcome: {:?}",
+        outcome.items
+    );
+    let added = log
+        .lock()
+        .expect("lock")
+        .calls
+        .iter()
+        .filter(|call| *call == "output_item_added")
+        .count();
+    assert_eq!(added, 1, "only the text item was announced");
+}
+
+#[tokio::test]
+async fn a_round_interrupted_before_any_output_is_asked_once_more() {
+    let model = Arc::new(SequencedModel::new(vec![
+        vec![done(FinishReason::Interrupted)],
+        vec![
+            ResponseChunk::TextBlock("answer".into()),
+            done(FinishReason::Stop),
+        ],
+    ]));
+    let (mut sink, _log) = RecordingSink::new(SinkVerdict::Continue);
+
+    let outcome = executor(model.clone())
+        .run(
+            &task(vec![ResponseItem::user_text("q")], vec![]),
+            &mut sink,
+            &NeverCancel,
+        )
+        .await
+        .expect("the second attempt answers");
+
+    assert_eq!(model.calls(), 2);
     assert_eq!(outcome.termination.status(), ResponseStatus::Completed);
+}
+
+#[tokio::test]
+async fn a_round_that_stays_silent_until_the_first_chunk_deadline_fails_after_one_retry() {
+    let model = Arc::new(StallingModel::new(vec![]));
+    let (mut sink, log) = RecordingSink::new(SinkVerdict::Continue);
+
+    let error = quick(
+        model.clone(),
+        StreamTimeouts {
+            first_chunk: SHORT,
+            idle: LONG,
+            total: LONG,
+        },
+    )
+    .run(
+        &task(vec![ResponseItem::user_text("q")], vec![]),
+        &mut sink,
+        &NeverCancel,
+    )
+    .await
+    .expect_err("a model that never speaks is a failure");
+
+    assert_eq!(model.calls(), 2, "retried once, no more");
+    match error {
+        AgentError::Failed { message, .. } => {
+            assert!(message.contains("first_chunk_timeout"), "{message}");
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
+    assert!(log.lock().expect("lock").calls.is_empty());
+}
+
+#[tokio::test]
+async fn a_request_that_never_opens_is_bounded_by_the_first_chunk_deadline() {
+    let model = Arc::new(StallingModel::hanging_on_open());
+    let (mut sink, _log) = RecordingSink::new(SinkVerdict::Continue);
+
+    let error = quick(
+        model.clone(),
+        StreamTimeouts {
+            first_chunk: SHORT,
+            idle: LONG,
+            total: LONG,
+        },
+    )
+    .run(
+        &task(vec![ResponseItem::user_text("q")], vec![]),
+        &mut sink,
+        &NeverCancel,
+    )
+    .await
+    .expect_err("never opened");
+
+    assert_eq!(model.calls(), 2);
+    assert!(matches!(error, AgentError::Failed { .. }));
+}
+
+#[tokio::test]
+async fn a_stream_that_stalls_after_output_is_incomplete_and_not_retried() {
+    let model = Arc::new(StallingModel::new(vec![ResponseChunk::TextBlock(
+        "partial".into(),
+    )]));
+    let (mut sink, log) = RecordingSink::new(SinkVerdict::Continue);
+
+    let outcome = quick(
+        model.clone(),
+        StreamTimeouts {
+            first_chunk: LONG,
+            idle: SHORT,
+            total: LONG,
+        },
+    )
+    .run(
+        &task(vec![ResponseItem::user_text("q")], vec![]),
+        &mut sink,
+        &NeverCancel,
+    )
+    .await
+    .expect("partial output is an outcome");
+
+    assert_eq!(model.calls(), 1, "the caller already saw output: no retry");
+    assert_eq!(outcome.termination.status(), ResponseStatus::Incomplete);
+    assert_eq!(log.lock().expect("lock").text, "partial");
+}
+
+#[tokio::test]
+async fn a_stream_that_never_finishes_is_cut_at_the_round_deadline() {
+    let model = Arc::new(EndlessThinker {
+        every: Duration::from_millis(5),
+    });
+    let (mut sink, _log) = RecordingSink::new(SinkVerdict::Continue);
+
+    let started = std::time::Instant::now();
+    let outcome = quick(
+        model,
+        StreamTimeouts {
+            first_chunk: LONG,
+            idle: LONG,
+            total: Duration::from_millis(100),
+        },
+    )
+    .run(
+        &task(vec![ResponseItem::user_text("q")], vec![]),
+        &mut sink,
+        &NeverCancel,
+    )
+    .await
+    .expect("thinking was streamed, so this is an outcome");
+
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(outcome.termination.status(), ResponseStatus::Incomplete);
 }
 
 // --- what reaches the model -------------------------------------------------

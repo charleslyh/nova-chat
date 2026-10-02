@@ -63,6 +63,9 @@ impl Termination {
         match reason {
             FinishReason::Stop => Self::Completed,
             FinishReason::Length => Self::Truncated(IncompleteReason::MaxOutputTokens),
+            // The protocol has no "interrupted" reason; the output budget is the
+            // closest official one, and what matters is that it is not `completed`.
+            FinishReason::Interrupted => Self::Truncated(IncompleteReason::MaxOutputTokens),
             FinishReason::Refusal { reason: Some(_) } => Self::Completed,
             FinishReason::Refusal { reason: None } => {
                 Self::Truncated(IncompleteReason::ContentFilter)
@@ -121,6 +124,16 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_stream_is_incomplete_not_completed() {
+        let termination = Termination::classify(&FinishReason::Interrupted);
+        assert_eq!(termination.status(), ResponseStatus::Incomplete);
+        assert_eq!(
+            termination.incomplete_reason(),
+            Some(IncompleteReason::MaxOutputTokens)
+        );
+    }
+
+    #[test]
     fn a_filtered_round_is_incomplete_for_content_filter() {
         let termination = Termination::classify(&FinishReason::Refusal { reason: None });
         assert_eq!(termination.status(), ResponseStatus::Incomplete);
@@ -150,6 +163,7 @@ mod tests {
         for reason in [
             FinishReason::Stop,
             FinishReason::Length,
+            FinishReason::Interrupted,
             FinishReason::Refusal { reason: None },
             FinishReason::Refusal {
                 reason: Some("no".to_string()),

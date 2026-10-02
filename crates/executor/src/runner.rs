@@ -27,6 +27,7 @@
 //!   failure rides along on the error.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -34,6 +35,7 @@ use nova_agent_runtime::{
     AgentError, AgentEventSink, AgentOutcome, AgentRunner, AgentTask, CancelProbe, SinkVerdict,
 };
 use nova_responses::{ContentPart, ItemStatus, ResponseItem, Role, Usage};
+use tokio::time::Instant;
 
 use crate::catalog::ModelCatalog;
 use crate::compact::{prepare_messages, ContextCache, ModelSummarizer};
@@ -41,8 +43,8 @@ use crate::outcome::Termination;
 use crate::passthrough::overrides_from_exec_context;
 use crate::transport::{HttpChatCompletion, ModelEndpoint};
 use crate::wire::{
-    ChatCompletion, ModelUsage, RequestMessage, ResponseChunk, ToolCallRequest, ToolManifest,
-    TransportOverrides,
+    ChatCompletion, FinishReason, ModelUsage, RequestMessage, ResponseChunk, ToolCallRequest,
+    ToolManifest, TransportOverrides,
 };
 
 /// Builds a provider for a resolved endpoint.
@@ -62,6 +64,35 @@ pub struct SingleTurnExecutor {
     env: EnvReader,
     /// Compressed completion context from earlier responses, keyed by response id.
     context_cache: ContextCache,
+    timeouts: StreamTimeouts,
+}
+
+/// How long one round's stream may go quiet before it is abandoned.
+///
+/// The model client itself has no timeout, so without these a gateway's own
+/// cut-off (600s at the LiteLLM proxy) ends the round instead — silently, with
+/// a stream that simply stops, which once committed half-written tool arguments
+/// as a finished round. Abandoning first keeps the decision here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamTimeouts {
+    /// From sending the request to the first chunk of the stream.
+    pub first_chunk: Duration,
+    /// Between two consecutive chunks once the stream has started.
+    pub idle: Duration,
+    /// The whole round. Kept under the gateway's 600s so we cut, not it.
+    pub total: Duration,
+}
+
+impl Default for StreamTimeouts {
+    /// Sized against observed rounds: first chunk p99 ≈ 7s, longest healthy
+    /// round ≈ 310s.
+    fn default() -> Self {
+        Self {
+            first_chunk: Duration::from_secs(90),
+            idle: Duration::from_secs(120),
+            total: Duration::from_secs(570),
+        }
+    }
 }
 
 impl SingleTurnExecutor {
@@ -71,6 +102,7 @@ impl SingleTurnExecutor {
             provider: Arc::new(|endpoint| Arc::new(HttpChatCompletion::new(endpoint))),
             env: Arc::new(|name| std::env::var(name).ok()),
             context_cache: ContextCache::new(),
+            timeouts: StreamTimeouts::default(),
         }
     }
 
@@ -85,12 +117,41 @@ impl SingleTurnExecutor {
         self.env = env;
         self
     }
+
+    /// Replace the stream timeouts.
+    pub fn with_stream_timeouts(mut self, timeouts: StreamTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
 }
 
-/// How many times a round that finishes normally but produces nothing is asked
-/// again. Two, not unbounded: the point is to survive one silent turn, not to
-/// spend until the model talks.
-const EMPTY_ROUND_ATTEMPTS: usize = 2;
+/// How many times a round is attempted when it produced nothing: a normal
+/// finish with no output, or a stream interrupted before any output reached
+/// the caller. Two, not unbounded: the point is to survive one bad round, not
+/// to spend until the model talks. A round interrupted AFTER output is never
+/// retried, since the caller has already seen part of it.
+const ROUND_ATTEMPTS: usize = 2;
+
+/// Why a round's stream stopped without the upstream finishing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Interruption {
+    FirstChunkTimeout,
+    IdleTimeout,
+    TotalTimeout,
+    /// The stream closed with no finish reason.
+    StreamClosed,
+}
+
+impl Interruption {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstChunkTimeout => "first_chunk_timeout",
+            Self::IdleTimeout => "idle_timeout",
+            Self::TotalTimeout => "total_timeout",
+            Self::StreamClosed => "stream_closed",
+        }
+    }
+}
 
 /// Everything accumulated while reading one round's stream.
 #[derive(Default)]
@@ -103,6 +164,10 @@ struct RoundState {
     /// Tracked rather than inferred from `text`: an adapter may or may not send
     /// `TextDone`, and closing the item twice would archive the answer twice.
     message_open: bool,
+    /// Whether anything reached the sink. Decides whether an interrupted round
+    /// may be retried: a second attempt after output would show it twice.
+    emitted: bool,
+    interruption: Option<Interruption>,
 }
 
 #[async_trait]
@@ -150,12 +215,12 @@ impl AgentRunner for SingleTurnExecutor {
             tools = tools.len(),
         );
 
-        // One retry, and only for the one anomaly worth a second attempt: a
-        // round that finished normally yet produced nothing. A blank final answer
-        // used to fail a chain that had already done its tool work — eight
-        // productive rounds discarded for one silent turn. Bounded rather than
-        // open-ended because a model that is deterministically silent is unlikely
-        // to answer on the second ask; this buys one chance, not a guarantee.
+        // One retry, and only for a round that gave the caller nothing: one that
+        // finished normally yet produced nothing, or one whose stream was cut
+        // before any output. A blank final answer used to fail a chain that had
+        // already done its tool work — eight productive rounds discarded for one
+        // silent turn. Bounded because a model that is deterministically silent
+        // is unlikely to answer on the second ask.
         let mut spent = Usage::default();
         let mut attempt = 1;
         loop {
@@ -167,6 +232,7 @@ impl AgentRunner for SingleTurnExecutor {
                 task,
                 sink,
                 cancel,
+                self.timeouts,
             )
             .await?;
 
@@ -176,19 +242,39 @@ impl AgentRunner for SingleTurnExecutor {
             // reply. A truncated round legitimately may carry nothing, so only a
             // `completed` round is retried and then failed.
             let blank = items.is_empty() && termination == Termination::Completed;
-            if blank && attempt < EMPTY_ROUND_ATTEMPTS {
+            let cut_silent = state.interruption.filter(|_| !state.emitted);
+            if (blank || cut_silent.is_some()) && attempt < ROUND_ATTEMPTS {
                 spent = accumulate(spent, state.usage);
                 attempt += 1;
                 tracing::warn!(
                     response_id = %task.provenance.response_id,
                     attempt,
-                    "round completed with no output items; asking once more"
+                    interruption = cut_silent.map_or("", Interruption::as_str),
+                    "round produced no output; asking once more"
                 );
                 continue;
+            }
+            if let Some(cause) = cut_silent {
+                let usage = accumulate(spent, state.usage);
+                return Err(failed(
+                    format!(
+                        "model stream interrupted before any output ({})",
+                        cause.as_str()
+                    ),
+                    usage,
+                ));
             }
             if blank {
                 let usage = accumulate(spent, state.usage);
                 return Err(failed("model produced no output items", usage));
+            }
+            if let Some(cause) = state.interruption {
+                tracing::warn!(
+                    response_id = %task.provenance.response_id,
+                    interruption = cause.as_str(),
+                    chars = state.text.len(),
+                    "round interrupted after output; reporting it incomplete"
+                );
             }
 
             tracing::info!(
@@ -199,6 +285,7 @@ impl AgentRunner for SingleTurnExecutor {
                 reason = termination
                     .incomplete_reason()
                     .map_or("", |reason| reason.as_str()),
+                interruption = state.interruption.map_or("", Interruption::as_str),
                 calls = state.calls.len(),
                 chars = state.text.len(),
             );
@@ -215,6 +302,7 @@ impl AgentRunner for SingleTurnExecutor {
 /// One attempt at the round: open the stream, consume it, and close whatever
 /// item is still open. Its own function so a round that comes back blank can be
 /// asked again without re-deriving the context.
+#[allow(clippy::too_many_arguments)]
 async fn stream_round(
     provider: &dyn ChatCompletion,
     messages: &[RequestMessage],
@@ -223,23 +311,58 @@ async fn stream_round(
     task: &AgentTask,
     sink: &mut dyn AgentEventSink,
     cancel: &dyn CancelProbe,
+    timeouts: StreamTimeouts,
 ) -> Result<(RoundState, Termination), AgentError> {
-    let mut stream = provider
-        .completion(messages, tools, true, transport)
-        .await
-        .map_err(|error| failed(error, Usage::default()))?;
-
     let mut state = RoundState::default();
+    let started = Instant::now();
+    let deadline = started + timeouts.total;
+    let first_deadline = (started + timeouts.first_chunk).min(deadline);
+    let cut = |state: &mut RoundState, cause| {
+        state.interruption = Some(cause);
+        Termination::classify(&FinishReason::Interrupted)
+    };
+
+    let opened = tokio::time::timeout_at(
+        first_deadline,
+        provider.completion(messages, tools, true, transport),
+    )
+    .await;
+    let Ok(opened) = opened else {
+        let termination = cut(&mut state, Interruption::FirstChunkTimeout);
+        return Ok((state, termination));
+    };
+    let mut stream = opened.map_err(|error| failed(error, Usage::default()))?;
+
     let mut termination = None;
     let mut first_chunk = true;
+    // Tool calls are announced only once the round is known to have finished:
+    // the transport emits them right before `Done`, and an interrupted round's
+    // calls may carry truncated arguments that must never be executed.
+    let mut pending_calls = Vec::new();
 
     loop {
+        let wait_until = if first_chunk {
+            first_deadline
+        } else {
+            (Instant::now() + timeouts.idle).min(deadline)
+        };
         // `biased` so a fence that has already moved wins over a chunk that
         // happens to be ready: the point is to stop spending promptly.
         let next = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(AgentError::Superseded),
-            item = stream.next() => item,
+            item = tokio::time::timeout_at(wait_until, stream.next()) => item,
+        };
+        let Ok(next) = next else {
+            let cause = if first_chunk {
+                Interruption::FirstChunkTimeout
+            } else if Instant::now() >= deadline {
+                Interruption::TotalTimeout
+            } else {
+                Interruption::IdleTimeout
+            };
+            termination = Some(cut(&mut state, cause));
+            break;
         };
         let Some(item) = next else { break };
         let chunk = item.map_err(|error| failed(error, state.usage))?;
@@ -255,9 +378,11 @@ async fn stream_round(
 
         match chunk {
             ResponseChunk::Think(text) => {
+                state.emitted = true;
                 guard(sink.reasoning_text_delta(&text).await)?;
             }
             ResponseChunk::TextBlock(text) => {
+                state.emitted = true;
                 if !state.message_open {
                     open_message(sink, &item_id(task)).await?;
                     state.message_open = true;
@@ -272,28 +397,45 @@ async fn stream_round(
                     state.message_open = false;
                 }
             }
-            ResponseChunk::ToolCall(call) => {
-                let arguments = arguments_to_string(&call.arguments);
-                guard(sink.tool_call(&call.call_id, &call.name, &arguments).await)?;
-                state.calls.push(call);
-            }
+            ResponseChunk::ToolCall(call) => pending_calls.push(call),
             ResponseChunk::Done { reason, usage } => {
                 state.usage = map_usage(usage.as_ref());
-                termination = Some(Termination::classify(&reason));
+                termination = Some(if reason == FinishReason::Interrupted {
+                    cut(&mut state, Interruption::StreamClosed)
+                } else {
+                    Termination::classify(&reason)
+                });
                 break;
             }
         }
     }
 
-    // A stream that ended without `Done` still produced a round; treat the
-    // silence as a natural stop rather than inventing a failure.
-    let termination = termination.unwrap_or(Termination::Completed);
+    // A stream that ended without `Done` was cut off, not finished: treating
+    // the silence as a stop once committed half-written tool arguments.
+    let termination = termination.unwrap_or_else(|| cut(&mut state, Interruption::StreamClosed));
 
     // `TextDone` is optional for adapters, so an item may still be open here.
     // Closing it keeps the lifecycle well-formed without risking a second close
     // of one already finished above.
     if state.message_open {
         close_message(sink, &item_id(task), &state.text).await?;
+    }
+
+    if state.interruption.is_some() {
+        if !pending_calls.is_empty() {
+            tracing::warn!(
+                response_id = %task.provenance.response_id,
+                calls = pending_calls.len(),
+                "dropping the tool calls of an interrupted round"
+            );
+        }
+    } else {
+        for call in pending_calls {
+            state.emitted = true;
+            let arguments = arguments_to_string(&call.arguments);
+            guard(sink.tool_call(&call.call_id, &call.name, &arguments).await)?;
+            state.calls.push(call);
+        }
     }
 
     Ok((state, termination))

@@ -38,7 +38,7 @@ pub mod wire;
 
 pub use catalog::{CatalogError, ModelCatalog, ModelEntry};
 pub use outcome::Termination;
-pub use runner::{EnvReader, ProviderFactory, SingleTurnExecutor};
+pub use runner::{EnvReader, ProviderFactory, SingleTurnExecutor, StreamTimeouts};
 pub use transport::{ApiKey, HttpChatCompletion, ModelEndpoint};
 pub use wire::{
     ChatCompletion, ChunkStream, FinishReason, ModelError, ModelUsage, RequestMessage,

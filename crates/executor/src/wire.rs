@@ -89,6 +89,11 @@ pub enum FinishReason {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// The stream ended without the upstream saying why. A gateway that times
+    /// out closes the connection mid-round, so this is a cut-off, never a stop:
+    /// calling it `Stop` once committed half-written tool arguments as a
+    /// finished round.
+    Interrupted,
 }
 
 /// Token accounting for one model round.

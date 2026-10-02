@@ -161,6 +161,7 @@ pub struct HttpChatCompletion {
     http: openai_reqwest::Client,
     api_model: String,
     reasoning_effort: Option<ReasoningEffort>,
+    max_completion_tokens: Option<u32>,
 }
 
 impl HttpChatCompletion {
@@ -175,6 +176,7 @@ impl HttpChatCompletion {
             http,
             api_model: endpoint.api_model,
             reasoning_effort: reasoning_effort(&endpoint.extensions),
+            max_completion_tokens: max_completion_tokens(&endpoint.extensions),
         }
     }
 
@@ -239,6 +241,7 @@ impl HttpChatCompletion {
                 include_obfuscation: None,
             }),
             reasoning_effort: self.reasoning_effort.clone(),
+            max_completion_tokens: self.max_completion_tokens,
             ..Default::default()
         }
     }
@@ -501,8 +504,10 @@ impl HttpChatCompletion {
                 }
             }
 
-            // The stream ended without a finish_reason. Still a complete round
-            // from our side: emit what was collected and call it a stop.
+            // The stream ended without a finish_reason: the upstream (or a
+            // gateway in front of it) closed mid-round. What was collected is
+            // still emitted, but the round is reported as interrupted so the
+            // runner neither commits it as finished nor trusts its tool calls.
             for part in splitter.finish() {
                 if let Split::Text(text) = part {
                     saw_text = true;
@@ -516,6 +521,12 @@ impl HttpChatCompletion {
                 yield Ok(ResponseChunk::TextDone);
             }
             let finalized = finalize_calls(calls);
+            tracing::warn!(
+                model = %model,
+                chars = acc_text.len(),
+                calls = finalized.len(),
+                "[llm] stream ended without finish_reason; reporting the round as interrupted"
+            );
             log_stream_result(
                 &model,
                 "ended without finish_reason",
@@ -529,8 +540,13 @@ impl HttpChatCompletion {
             for call in finalized {
                 yield Ok(ResponseChunk::ToolCall(call));
             }
+            let reason = if refusal.is_empty() {
+                FinishReason::Interrupted
+            } else {
+                finish_reason(None, refusal)
+            };
             yield Ok(ResponseChunk::Done {
-                reason: finish_reason(None, refusal),
+                reason,
                 usage: usage.as_ref().map(map_usage),
             });
         };
@@ -607,7 +623,7 @@ fn to_wire_messages(messages: &[RequestMessage]) -> Vec<WireMessage> {
                                 id: call.call_id.clone(),
                                 function: FunctionCall {
                                     name: call.name.clone(),
-                                    arguments: serialize_arguments(&call.arguments),
+                                    arguments: wire_arguments(call),
                                 },
                             })
                         })
@@ -743,10 +759,40 @@ fn parse_arguments(arguments: &str) -> Value {
 
 fn serialize_arguments(arguments: &Value) -> String {
     match arguments {
-        Value::String(arguments) => arguments.clone(),
-        Value::Null => "{}".to_string(),
+        // A raw string is what `parse_arguments` kept for output that was not
+        // JSON. The gateway validates replayed history and rejects the whole
+        // request on one such call, so it goes out as `{}`.
+        Value::String(raw) if serde_json::from_str::<Value>(raw).is_ok() => raw.clone(),
+        Value::String(_) | Value::Null => "{}".to_string(),
         arguments => serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string()),
     }
+}
+
+/// [`serialize_arguments`] for one replayed call, noting a substitution.
+fn wire_arguments(call: &ToolCallRequest) -> String {
+    let wire = serialize_arguments(&call.arguments);
+    if let Value::String(raw) = &call.arguments {
+        if wire != *raw {
+            tracing::warn!(
+                call_id = %call.call_id,
+                name = %call.name,
+                raw_bytes = raw.len(),
+                "replaying a tool call whose arguments are not JSON; sending {{}} instead"
+            );
+        }
+    }
+    wire
+}
+
+/// The output budget a configured endpoint names, if any. Thinking draws on the
+/// same budget as the tool arguments, so a deployment can raise it explicitly
+/// rather than leave it to the upstream default.
+fn max_completion_tokens(extensions: &Value) -> Option<u32> {
+    extensions
+        .get("max_completion_tokens")
+        .and_then(Value::as_u64)
+        .filter(|tokens| *tokens > 0)
+        .and_then(|tokens| u32::try_from(tokens).ok())
 }
 
 /// The `reasoning_effort` a configured endpoint names: the protocol's own enum,
@@ -985,6 +1031,12 @@ mod tests {
     /// Serve `deltas` as the upstream endpoint's SSE stream, then a stop frame.
     /// Returns the base URL a transport is built against.
     async fn serve_deltas(deltas: Vec<Value>) -> String {
+        serve_deltas_ending(deltas, Some("stop")).await
+    }
+
+    /// Like [`serve_deltas`], closing on `finish` — or, given `None`, closing
+    /// the stream with no finish frame at all, the way a timed-out gateway does.
+    async fn serve_deltas_ending(deltas: Vec<Value>, finish: Option<&str>) -> String {
         use axum::response::sse::Event;
 
         let mut frames: Vec<Result<Event, std::convert::Infallible>> = deltas
@@ -1002,16 +1054,18 @@ mod tests {
                 ))
             })
             .collect();
-        frames.push(Ok(Event::default().data(
-            serde_json::json!({
-                "id": "chatcmpl-test",
-                "object": "chat.completion.chunk",
-                "created": 0,
-                "model": "test-model",
-                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
-            })
-            .to_string(),
-        )));
+        if let Some(finish) = finish {
+            frames.push(Ok(Event::default().data(
+                serde_json::json!({
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "test-model",
+                    "choices": [{ "index": 0, "delta": {}, "finish_reason": finish }],
+                })
+                .to_string(),
+            )));
+        }
         let app = axum::Router::new().route(
             "/v1/chat/completions",
             axum::routing::post(move |_body: String| async move {
@@ -1167,5 +1221,136 @@ mod tests {
             one_turn(&base_url, serde_json::json!({}), TransportOverrides::new()).await;
         assert_eq!(thinking, "");
         assert_eq!(body, "Just the answer.");
+    }
+
+    /// Every chunk one streamed turn yields, in order.
+    async fn turn_chunks(base_url: &str) -> Vec<ResponseChunk> {
+        let completion = HttpChatCompletion::new(ModelEndpoint::new(
+            ApiKey::new("key"),
+            base_url,
+            "test-model",
+        ));
+        let messages = vec![RequestMessage::User {
+            content: "hi".to_string(),
+        }];
+        let mut stream = completion
+            .completion(&messages, &[], true, &TransportOverrides::new())
+            .await
+            .unwrap();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk.unwrap());
+        }
+        chunks
+    }
+
+    fn final_reason(chunks: &[ResponseChunk]) -> Option<FinishReason> {
+        chunks.iter().rev().find_map(|chunk| match chunk {
+            ResponseChunk::Done { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+    }
+
+    /// The incident shape: a gateway timeout closes the SSE stream while a tool
+    /// call's arguments are half written. That must surface as an interruption,
+    /// not as the natural stop that once committed the fragment as a finished call.
+    #[tokio::test]
+    async fn a_stream_closed_without_a_finish_reason_is_interrupted() {
+        let base_url = serve_deltas_ending(
+            vec![serde_json::json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "video_tool", "arguments": "{\"op\":\"t2v\",\"prompt\":\"雨" },
+                }],
+            })],
+            None,
+        )
+        .await;
+        let chunks = turn_chunks(&base_url).await;
+        assert_eq!(final_reason(&chunks), Some(FinishReason::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn a_stream_closed_on_a_finish_reason_is_not_interrupted() {
+        let base_url =
+            serve_deltas_ending(vec![serde_json::json!({ "content": "done" })], Some("stop")).await;
+        let chunks = turn_chunks(&base_url).await;
+        assert_eq!(final_reason(&chunks), Some(FinishReason::Stop));
+    }
+
+    /// Replaying a malformed argument string verbatim is what the gateway 400s
+    /// on, failing the whole chain. The call's own tool output already tells the
+    /// model its arguments were broken, so the wire only needs valid JSON.
+    #[test]
+    fn replayed_malformed_arguments_go_out_as_an_empty_object() {
+        let wire = to_wire_messages(&[RequestMessage::Assistant {
+            content: String::new(),
+            tool_calls: Some(vec![
+                ToolCallRequest {
+                    call_id: "broken".into(),
+                    name: "video_tool".into(),
+                    arguments: Value::String("{\"op\":\"t2v\",\"prompt\":\"雨".into()),
+                },
+                ToolCallRequest {
+                    call_id: "fine".into(),
+                    name: "video_tool".into(),
+                    arguments: serde_json::json!({ "op": "t2v" }),
+                },
+            ]),
+        }]);
+        let WireMessage::Assistant(message) = &wire[0] else {
+            panic!("expected an assistant message, got {:?}", wire[0]);
+        };
+        let arguments: Vec<_> = message
+            .tool_calls
+            .as_ref()
+            .expect("tool calls present")
+            .iter()
+            .map(|call| match call {
+                WireMessageToolCalls::Function(call) => call.function.arguments.clone(),
+                other => panic!("expected a function call, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            arguments,
+            vec!["{}".to_string(), r#"{"op":"t2v"}"#.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_raw_argument_string_that_is_valid_json_goes_out_verbatim() {
+        assert_eq!(
+            serialize_arguments(&Value::String(r#"{"a": 1}"#.into())),
+            r#"{"a": 1}"#
+        );
+    }
+
+    /// The output budget is an endpoint setting: absent means the request names
+    /// none, and a value that is not a positive integer is not a budget.
+    #[test]
+    fn max_completion_tokens_comes_from_the_endpoint_extensions() {
+        let budget = |extensions: Value| {
+            HttpChatCompletion::new(
+                ModelEndpoint::new(ApiKey::new("k"), "http://h/v1", "m")
+                    .with_extensions(extensions),
+            )
+            .request(&[], &[], true)
+            .max_completion_tokens
+        };
+        assert_eq!(
+            budget(serde_json::json!({ "max_completion_tokens": 32000 })),
+            Some(32000)
+        );
+        assert_eq!(budget(serde_json::json!({})), None);
+        assert_eq!(
+            budget(serde_json::json!({ "max_completion_tokens": 0 })),
+            None
+        );
+        assert_eq!(
+            budget(serde_json::json!({ "max_completion_tokens": "32000" })),
+            None
+        );
     }
 }
