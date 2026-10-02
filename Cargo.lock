@@ -84,7 +84,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "async-openai"
 version = "0.42.0"
-source = "git+https://git.woa.com/yuanbao-multimodal/async-openai.git?rev=d367ede295d9d5c0453d906c3e4e713b63f4b8d9#d367ede295d9d5c0453d906c3e4e713b63f4b8d9"
+source = "git+https://git.woa.com/yuanbao-multimodal/async-openai.git?rev=206330c4a86a775b37997a7d16df2b846a02479f#206330c4a86a775b37997a7d16df2b846a02479f"
 dependencies = [
  "async-openai-macros",
  "base64 0.22.1",
@@ -111,7 +111,7 @@ dependencies = [
 [[package]]
 name = "async-openai-macros"
 version = "0.3.0"
-source = "git+https://git.woa.com/yuanbao-multimodal/async-openai.git?rev=d367ede295d9d5c0453d906c3e4e713b63f4b8d9#d367ede295d9d5c0453d906c3e4e713b63f4b8d9"
+source = "git+https://git.woa.com/yuanbao-multimodal/async-openai.git?rev=206330c4a86a775b37997a7d16df2b846a02479f#206330c4a86a775b37997a7d16df2b846a02479f"
 dependencies = [
  "proc-macro2",
  "quote",

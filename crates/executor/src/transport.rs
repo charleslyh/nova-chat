@@ -170,13 +170,22 @@ pub struct HttpChatCompletion {
 /// template renders history in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReasoningReplay {
-    /// As `reasoning_content`: endpoints with a server-side reasoning parser.
-    Field,
+    /// As a message field: endpoints with a server-side reasoning parser.
+    Field(ReasoningField),
     /// Wrapped in think markers ahead of `content`: endpoints that inline the
     /// chain of thought in the body (Hy3 without a reasoning parser), whose
     /// template expects it back the way the model wrote it.
     Inline,
     Off,
+}
+
+/// Which message field carries replayed reasoning. `reasoning_content` is the
+/// DeepSeek-era name most OpenAI-compatible servers and gateways read;
+/// vLLM 0.16+ emits `reasoning`, and a server may come to read only that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReasoningField {
+    ReasoningContent,
+    Reasoning,
 }
 
 /// The markers an inlined thought is wrapped in on replay. Configurable
@@ -192,7 +201,9 @@ struct ThinkMarkers {
 /// endpoint's extensions; none of them is sent upstream as a field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WireOptions {
-    /// `reasoning_replay = "field" | "inline" | "off"`; default `field`.
+    /// `reasoning_replay = "field" | "inline" | "off"`, default `field`; for
+    /// `field`, `reasoning_field = "reasoning_content" | "reasoning"`, default
+    /// `reasoning_content`.
     reasoning_replay: ReasoningReplay,
     /// `think_open` / `think_close`; default `<think>` / `</think>`.
     think_markers: ThinkMarkers,
@@ -204,8 +215,19 @@ struct WireOptions {
 
 impl WireOptions {
     fn from_extensions(extensions: &Value) -> Self {
+        let field = match extensions.get("reasoning_field").and_then(Value::as_str) {
+            None | Some("reasoning_content") => ReasoningField::ReasoningContent,
+            Some("reasoning") => ReasoningField::Reasoning,
+            Some(other) => {
+                tracing::warn!(
+                    value = other,
+                    "unknown reasoning_field; replaying as reasoning_content"
+                );
+                ReasoningField::ReasoningContent
+            }
+        };
         let reasoning_replay = match extensions.get("reasoning_replay").and_then(Value::as_str) {
-            None | Some("field") => ReasoningReplay::Field,
+            None | Some("field") => ReasoningReplay::Field(field),
             Some("inline") => ReasoningReplay::Inline,
             Some("off") => ReasoningReplay::Off,
             Some(other) => {
@@ -213,7 +235,7 @@ impl WireOptions {
                     value = other,
                     "unknown reasoning_replay; replaying as a field"
                 );
-                ReasoningReplay::Field
+                ReasoningReplay::Field(field)
             }
         };
         let marker = |name: &str, default: &str| match extensions.get(name) {
@@ -704,17 +726,17 @@ fn to_wire_messages(
                 reasoning,
             } => {
                 let reasoning = reasoning.as_deref().filter(|text| !text.is_empty());
-                let (content, reasoning_content) = match (replay, reasoning) {
+                let (content, replayed) = match (replay, reasoning) {
                     (ReasoningReplay::Inline, Some(thought)) => (
                         format!("{}{thought}{}{content}", markers.open, markers.close),
                         None,
                     ),
-                    (ReasoningReplay::Field, Some(thought)) => {
-                        (content.clone(), Some(thought.to_string()))
+                    (ReasoningReplay::Field(field), Some(thought)) => {
+                        (content.clone(), Some((field, thought.to_string())))
                     }
                     _ => (content.clone(), None),
                 };
-                wire_assistant(content, tool_calls.as_deref(), reasoning_content)
+                wire_assistant(content, tool_calls.as_deref(), replayed)
             }
             RequestMessage::Tool { content, call_id } => WireMessage::Tool(WireToolMessage {
                 content: WireToolContent::Text(content.clone()),
@@ -727,8 +749,13 @@ fn to_wire_messages(
 fn wire_assistant(
     content: String,
     tool_calls: Option<&[ToolCallRequest]>,
-    reasoning_content: Option<String>,
+    reasoning: Option<(ReasoningField, String)>,
 ) -> WireMessage {
+    let (reasoning_content, reasoning) = match reasoning {
+        Some((ReasoningField::ReasoningContent, text)) => (Some(text), None),
+        Some((ReasoningField::Reasoning, text)) => (None, Some(text)),
+        None => (None, None),
+    };
     WireMessage::Assistant(WireAssistantMessage {
         // A tool-call-only assistant turn must send no content field
         // at all; an empty string is rejected by some providers.
@@ -752,6 +779,7 @@ fn wire_assistant(
                 .collect()
         }),
         reasoning_content,
+        reasoning,
         ..Default::default()
     })
 }
@@ -866,19 +894,25 @@ fn map_usage(usage: &CompletionUsage) -> ModelUsage {
     }
 }
 
-/// Reasoning text is not part of the typed wire schema, so it is dug out of the
-/// serialised form: `choices[0].{message|delta}.reasoning_content`.
+/// Reasoning is dug out of the serialised form,
+/// `choices[0].{message|delta}.{reasoning_content|reasoning}`: the DeepSeek-era
+/// name first, then the one vLLM 0.16+ emits. An endpoint sending both carries
+/// the same text in each, so only one is taken.
 fn extract_reasoning(value: &impl serde::Serialize, container: &str) -> Option<String> {
-    serde_json::to_value(value)
-        .ok()?
+    let value = serde_json::to_value(value).ok()?;
+    let message = value
         .get("choices")?
         .as_array()?
         .first()?
         .get(container)?
-        .get("reasoning_content")?
-        .as_str()
-        .filter(|text| !text.is_empty())
-        .map(str::to_string)
+        .clone();
+    ["reasoning_content", "reasoning"].iter().find_map(|field| {
+        message
+            .get(*field)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    })
 }
 
 fn parse_arguments(arguments: &str) -> Value {
@@ -1160,7 +1194,7 @@ mod tests {
                 }]),
                 reasoning: None,
             }],
-            ReasoningReplay::Field,
+            ReasoningReplay::Field(ReasoningField::ReasoningContent),
             &WireOptions::from_extensions(&Value::Null).think_markers,
         );
         match &wire[0] {
@@ -1443,7 +1477,7 @@ mod tests {
                 ]),
                 reasoning: None,
             }],
-            ReasoningReplay::Field,
+            ReasoningReplay::Field(ReasoningField::ReasoningContent),
             &WireOptions::from_extensions(&Value::Null).think_markers,
         );
         let WireMessage::Assistant(message) = &wire[0] else {
@@ -1502,6 +1536,15 @@ mod tests {
 
     /// The assistant turn as replayed under `extensions`: (content, reasoning_content).
     fn replayed(extensions: Value, content: &str) -> (Option<String>, Option<String>) {
+        let (content, reasoning_content, _) = replayed_fields(extensions, content);
+        (content, reasoning_content)
+    }
+
+    /// (content, reasoning_content, reasoning) of the replayed assistant turn.
+    fn replayed_fields(
+        extensions: Value,
+        content: &str,
+    ) -> (Option<String>, Option<String>, Option<String>) {
         let completion = HttpChatCompletion::new(
             ModelEndpoint::new(ApiKey::new("k"), "http://h/v1", "m").with_extensions(extensions),
         );
@@ -1527,6 +1570,7 @@ mod tests {
                     other => panic!("expected text content, got {other:?}"),
                 }),
                 message.reasoning_content.clone(),
+                message.reasoning.clone(),
             ),
             other => panic!("expected an assistant message, got {other:?}"),
         }
@@ -1560,6 +1604,42 @@ mod tests {
             replayed(inline, ""),
             (Some("<think>plan</think>".into()), None)
         );
+    }
+
+    /// The field the reasoning rides in follows the endpoint: the newer
+    /// `reasoning` name only when asked for, and never both.
+    #[test]
+    fn field_replay_uses_the_configured_field_name() {
+        assert_eq!(
+            replayed_fields(serde_json::json!({}), "on it"),
+            (Some("on it".into()), Some("plan".into()), None)
+        );
+        assert_eq!(
+            replayed_fields(
+                serde_json::json!({ "reasoning_field": "reasoning" }),
+                "on it"
+            ),
+            (Some("on it".into()), None, Some("plan".into()))
+        );
+        assert_eq!(
+            replayed_fields(serde_json::json!({ "reasoning_field": "bogus" }), "on it"),
+            (Some("on it".into()), Some("plan".into()), None)
+        );
+    }
+
+    /// vLLM 0.16+ streams its thinking as `reasoning`; it must still reach the
+    /// caller as reasoning, not be dropped.
+    #[tokio::test]
+    async fn a_streamed_reasoning_field_under_the_newer_name_becomes_thinking() {
+        let base_url = serve_deltas(vec![
+            serde_json::json!({ "reasoning": "ponder" }),
+            serde_json::json!({ "content": "Hi!" }),
+        ])
+        .await;
+        let (thinking, body) =
+            one_turn(&base_url, serde_json::json!({}), TransportOverrides::new()).await;
+        assert_eq!(thinking, "ponder");
+        assert_eq!(body, "Hi!");
     }
 
     /// A deployment whose template suffixes its markers gets them back in
