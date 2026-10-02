@@ -205,7 +205,7 @@ struct WireOptions {
     /// `field`, `reasoning_field = "reasoning_content" | "reasoning"`, default
     /// `reasoning_content`.
     reasoning_replay: ReasoningReplay,
-    /// `think_open` / `think_close`; default `<think>` / `</think>`.
+    /// `reasoning_inline_open_tag` / `reasoning_inline_close_tag`; default `<think>` / `</think>`.
     think_markers: ThinkMarkers,
     /// Forward the caller's per-tool `strict` flag. Off by default, since
     /// strict mode turns on constrained decoding, which not every serving
@@ -249,8 +249,8 @@ impl WireOptions {
         Self {
             reasoning_replay,
             think_markers: ThinkMarkers {
-                open: marker("think_open", "<think>"),
-                close: marker("think_close", "</think>"),
+                open: marker("reasoning_inline_open_tag", "<think>"),
+                close: marker("reasoning_inline_close_tag", "</think>"),
             },
             strict_tools: extensions
                 .get("strict_tools")
@@ -1648,8 +1648,8 @@ mod tests {
     fn inline_replay_uses_the_configured_think_markers() {
         let suffixed = serde_json::json!({
             "reasoning_replay": "inline",
-            "think_open": "<think:abcd>",
-            "think_close": "</think:abcd>",
+            "reasoning_inline_open_tag": "<think:abcd>",
+            "reasoning_inline_close_tag": "</think:abcd>",
         });
         assert_eq!(
             replayed(suffixed, "on it"),
@@ -1657,8 +1657,8 @@ mod tests {
         );
         let invalid = serde_json::json!({
             "reasoning_replay": "inline",
-            "think_open": "  ",
-            "think_close": 1,
+            "reasoning_inline_open_tag": "  ",
+            "reasoning_inline_close_tag": 1,
         });
         assert_eq!(
             replayed(invalid, "on it"),
